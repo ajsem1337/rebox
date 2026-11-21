@@ -738,6 +738,22 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy
     return device_CreateComputePipelineState(p, desc, riid, out);
 }
 
+/* Slot 60: CreateGraphicsPipelineState with an extension array, as an engine
+ * RHI calls it (TomBox, a UE5 title): (desc, extension count, extensions, riid,
+ * out). The desc has the PC layout (0x290 bytes); the extensions have no PC
+ * equivalent and are ignored. */
+static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineStateX(struct proxy *p,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, UINT ext_count, const void *ext, REFIID riid, void **out)
+{
+    if (ext_count)
+    {
+        static LONG once;
+        if (!InterlockedExchange(&once, 1))
+            rebox_log("d3d12_xs: Xbox CreateGraphicsPipelineStateX: %u extension structs ignored", ext_count);
+    }
+    return device_CreateGraphicsPipelineState(p, desc, riid, out);
+}
+
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
  * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f.
  * Xbox2Windows saw Layout 0x101 with +0x34 = 3 and +0x38 = 0 there. */
@@ -1189,6 +1205,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(38, device_GetCopyableFootprints),
         FN(43, device_GetAdapterLuid),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
+        FN(60, device_CreateGraphicsPipelineStateX),
         FN(62, device_CreateComputePipelineStateX),
         FN(68, device_Slot68),
         FN(69, device_Slot69),

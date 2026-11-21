@@ -1175,6 +1175,36 @@ static void test_xbox(void)
     test_ffx(dev, queue);
     test_present_format(dev, queue);
 
+    /* Slot 60, graphics PSO with an extension array (TomBox): console VS/PS
+     * bytes get fallbacks unless REBOX_SHADER_FALLBACK=0. */
+    if (rs)
+    {
+        static const char vs_bytes[] = "REBOX-FAKE-CONSOLE-VS60", ps_bytes[] = "REBOX-FAKE-CONSOLE-PS60";
+        const char *fb = getenv("REBOX_SHADER_FALLBACK");
+        BOOL strict = fb && *fb == '0';
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
+        BYTE ext[0x40] = { 0 };
+        void *pso = NULL;
+
+        gd.pRootSignature = rs;
+        gd.VS = (D3D12_SHADER_BYTECODE){ vs_bytes, sizeof(vs_bytes) };
+        gd.PS = (D3D12_SHADER_BYTECODE){ ps_bytes, sizeof(ps_bytes) };
+        gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        gd.SampleMask = ~0u;
+        gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        gd.RasterizerState.DepthClipEnable = TRUE;
+        gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        gd.NumRenderTargets = 1;
+        gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        gd.SampleDesc.Count = 1;
+        hr = XSLOT(dev, 60, HRESULT, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, UINT, const void *, REFIID, void **)(
+                dev, &gd, 1, ext, &IID_ID3D12PipelineState, &pso);
+        CHECK(SUCCEEDED(hr) != strict, "graphics PSO through slot 60 with an extension %s (%#lx)",
+              strict ? "rejected in strict mode" : "gets fallbacks", hr);
+        if (pso) XSLOT(pso, 2, ULONG)(pso);
+    }
+
     /* Slot 76 as the FidelityFX upscaler calls it (Xbox2Windows): a 0x40-byte
      * desc with Xbox texture layout 0x101 and extension word 3. */
     {
