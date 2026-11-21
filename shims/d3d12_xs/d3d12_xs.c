@@ -109,10 +109,14 @@ static const struct
  * (generated/fallback_shaders.h): graphics draws nothing, compute does
  * nothing, and the title keeps running with that effect missing. They use no
  * resources, so they fit any root signature. REBOX_SHADER_FALLBACK=0
- * restores failing, to find missing shaders. Mesh pipelines have no fallback. */
+ * restores failing, to find missing shaders. Mesh pipelines get a mesh
+ * shader that emits nothing and an amplification shader that launches
+ * nothing (DXIL, SM 6.5). */
 static const D3D12_SHADER_BYTECODE fallback_vs_bc = { fallback_vs, sizeof(fallback_vs) };
 static const D3D12_SHADER_BYTECODE fallback_ps_bc = { fallback_ps, sizeof(fallback_ps) };
 static const D3D12_SHADER_BYTECODE fallback_cs_bc = { fallback_cs, sizeof(fallback_cs) };
+static const D3D12_SHADER_BYTECODE fallback_ms_bc = { fallback_ms, sizeof(fallback_ms) };
+static const D3D12_SHADER_BYTECODE fallback_as_bc = { fallback_as, sizeof(fallback_as) };
 static const D3D12_SHADER_BYTECODE no_shader;
 
 static BOOL fallback_enabled(void)
@@ -217,8 +221,6 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
 
     if (miss && fallback_enabled())
     {
-        BOOL mesh = FALSE;
-
         for (UINT i = 0; i < stage_count; i++)
         {
             UINT type = *(const UINT *)(stream + stages[i]);
@@ -230,8 +232,10 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
                 *bc = bc->BytecodeLength ? fallback_ps_bc : no_shader;
             else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS)
                 *bc = fallback_cs_bc;
-            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
-                mesh = TRUE;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
+                *bc = fallback_ms_bc;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS)
+                *bc = fallback_as_bc;
             else
                 *bc = no_shader; /* HS, DS, GS */
         }
@@ -239,10 +243,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
             memset(stream + stream_output, 0, sizeof(D3D12_STREAM_OUTPUT_DESC));
         if (topology && *(UINT *)(stream + topology) == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
             *(UINT *)(stream + topology) = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        if (mesh)
-            rebox_log("d3d12_xs: mesh-shader PSO with a missing translation has no fallback");
-        else
-            note_fallback("stream");
+        note_fallback("stream");
     }
 
     copy.SizeInBytes = desc->SizeInBytes;

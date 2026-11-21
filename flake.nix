@@ -134,7 +134,7 @@
       # Stock Wine here so the shell doesn't need a WineGDK build; the shims
       # and the smoke test don't depend on WineGDK.
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ mingwCC python pkgs.gnumake pkgs.wineWow64Packages.unstable pkgs.vkd3d pkgs.vulkan-tools pkgs.vulkan-headers pkgs.vulkan-loader ];
+        packages = [ mingwCC python pkgs.gnumake pkgs.wineWow64Packages.unstable pkgs.vkd3d pkgs.vulkan-tools pkgs.vulkan-headers pkgs.vulkan-loader pkgs.directx-shader-compiler ];
         shellHook = ''
           export WINE=wine
           export VKD3D_PROTON_DIR=${self.packages.${system}.vkd3d-proton-win}/x64

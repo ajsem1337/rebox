@@ -88,7 +88,8 @@ GFX10.3 code), is looked up in the cache.
 A miss would fail PSO creation, which a title rarely survives. So by default the whole pipeline
 gets fallback shaders instead (`generated/fallback_shaders.h`, from `tools/gen_fallback_shaders.sh`):
 graphics draws nothing, compute does nothing, and the effect is just missing. Each one is logged.
-Mesh-shader pipelines have no fallback. `REBOX_SHADER_FALLBACK=0` restores failing, for hunting
+Mesh pipelines get a mesh shader that emits nothing and an amplification shader that launches
+nothing (DXIL from `dxc`). `REBOX_SHADER_FALLBACK=0` restores failing, for hunting
 down missing translations.
 
 ## Verified so far

@@ -276,6 +276,45 @@ static void test_d3d12(const char *fake_path, BOOL expect_hit)
         if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
     }
 
+    /* A mesh pipeline from untranslated console AS/MS/PS gets the mesh
+     * fallbacks (when the device has mesh shaders and fallbacks are on). */
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = { 0 };
+        const char *fb = getenv("REBOX_SHADER_FALLBACK");
+        static const char as_bytes[] = "REBOX-FAKE-CONSOLE-AS", ms_bytes[] = "REBOX-FAKE-CONSOLE-MS",
+                          ps_bytes[] = "REBOX-FAKE-CONSOLE-MESH-PS";
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(8))) s_rs;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(8))) s_as, s_ms, s_ps;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } __attribute__((aligned(8))) s_rt;
+        struct { __typeof__(s_rs) rs; __typeof__(s_as) as, ms, ps; __typeof__(s_rt) rt; } mstream;
+        D3D12_PIPELINE_STATE_STREAM_DESC mdesc = { sizeof(mstream), &mstream };
+
+        if (FAILED(ID3D12Device2_CheckFeatureSupport(device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))
+            || o7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED || (fb && *fb == '0'))
+            printf("skip mesh fallback check (mesh tier %u)\n", o7.MeshShaderTier);
+        else
+        {
+            memset(&mstream, 0, sizeof(mstream));
+            mstream.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            mstream.rs.v = rs;
+            mstream.as.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+            mstream.as.v.pShaderBytecode = as_bytes;
+            mstream.as.v.BytecodeLength = sizeof(as_bytes);
+            mstream.ms.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+            mstream.ms.v.pShaderBytecode = ms_bytes;
+            mstream.ms.v.BytecodeLength = sizeof(ms_bytes);
+            mstream.ps.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+            mstream.ps.v.pShaderBytecode = ps_bytes;
+            mstream.ps.v.BytecodeLength = sizeof(ps_bytes);
+            mstream.rt.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+            mstream.rt.v.NumRenderTargets = 1;
+            mstream.rt.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            hr = ID3D12Device2_CreatePipelineState(device, &mdesc, &IID_ID3D12PipelineState, (void **)&pso);
+            CHECK(SUCCEEDED(hr), "mesh PSO from untranslated console AS/MS/PS gets fallbacks (%#lx)", hr);
+            if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+        }
+    }
+
     ID3D12RootSignature_Release(rs);
     ID3D12Device2_Release(device);
 }
