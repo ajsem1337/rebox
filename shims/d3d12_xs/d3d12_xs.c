@@ -67,7 +67,22 @@ SUBOBJ(sample_desc, DXGI_SAMPLE_DESC)
 SUBOBJ(cached_pso, D3D12_CACHED_PIPELINE_STATE)
 SUBOBJ(depth_stencil1, D3D12_DEPTH_STENCIL_DESC1)
 SUBOBJ(view_instancing, D3D12_VIEW_INSTANCING_DESC)
+/* Newer public subobjects the mingw headers lack. Only their sizes matter
+ * here; every field is 4 bytes wide (stencil masks are two UINT8s padded to
+ * 4), as in the D3D12 headers:
+ *   DEPTH_STENCIL_DESC2: 4 fields, 2 x DEPTH_STENCILOP_DESC1 (5 words), 1 field
+ *   RASTERIZER_DESC1: 11 fields; RASTERIZER_DESC2: 10 fields */
+typedef struct { UINT words[15]; } depth_stencil_desc2;
+typedef struct { UINT words[11]; } rasterizer_desc1;
+typedef struct { UINT words[10]; } rasterizer_desc2;
+SUBOBJ(depth_stencil2, depth_stencil_desc2)
+SUBOBJ(rasterizer1, rasterizer_desc1)
+SUBOBJ(rasterizer2, rasterizer_desc2)
 #undef SUBOBJ
+
+#define SUBOBJECT_TYPE_DEPTH_STENCIL2 26
+#define SUBOBJECT_TYPE_RASTERIZER1 27
+#define SUBOBJECT_TYPE_RASTERIZER2 28
 
 #define LAYOUT(name, stage) { offsetof(subobj_##name, inner), sizeof(subobj_##name), stage }
 static const struct
@@ -101,6 +116,9 @@ static const struct
     [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING] = LAYOUT(view_instancing, NULL),
     [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS] = LAYOUT(bytecode, "as"),
     [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS] = LAYOUT(bytecode, "ms"),
+    [SUBOBJECT_TYPE_DEPTH_STENCIL2] = LAYOUT(depth_stencil2, NULL),
+    [SUBOBJECT_TYPE_RASTERIZER1] = LAYOUT(rasterizer1, NULL),
+    [SUBOBJECT_TYPE_RASTERIZER2] = LAYOUT(rasterizer2, NULL),
 };
 #undef LAYOUT
 

@@ -173,9 +173,10 @@ down missing translations.
   but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
-  ignores them, and the smoke test checks that it still does. Their meaning is unknown. Streams with
-  subobject types the mingw headers lack (DEPTH_STENCIL2, RASTERIZER1/2, Xbox-specific ones) skip
-  substitution and are logged.
+  ignores them, and the smoke test checks that it still does. Their meaning is unknown. Pipeline
+  streams are parsed up to the public type 28 (DEPTH_STENCIL2, RASTERIZER1/2 included). A stream
+  with a type beyond that, such as an Xbox-specific one, skips substitution and is logged once,
+  because its size is unknown.
 - **XALLOC_ATTRIBUTES** decoding follows [SlimEra](https://github.com/XWine1/SlimEra)'s Xbox One
   ERA definition (alignment 2^n, at least 16 bytes), which matches the 32-byte alignment Bink relies
   on. Scarlett's header hasn't been seen, so page sizes and the meaning of graphics memory types

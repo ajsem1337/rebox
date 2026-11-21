@@ -301,6 +301,47 @@ static void test_d3d12(const char *fake_path, BOOL expect_hit)
         if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
     }
 
+    /* A graphics stream with the newer subobjects (DEPTH_STENCIL2 = 26,
+     * RASTERIZER2 = 28) and untranslated console VS/PS: d3d12_xs must parse
+     * past them to substitute fallbacks; strict mode must still fail. */
+    {
+        const char *fb = getenv("REBOX_SHADER_FALLBACK");
+        BOOL strict = fb && *fb == '0';
+        static const char vs_bytes[] = "REBOX-FAKE-CONSOLE-VS", ps_bytes[] = "REBOX-FAKE-CONSOLE-PS";
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(8))) s_rs;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(8))) s_bc;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; UINT v[10]; } __attribute__((aligned(8))) s_rast2;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; UINT v[15]; } __attribute__((aligned(8))) s_ds2;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } __attribute__((aligned(8))) s_rt;
+        struct { __typeof__(s_rs) rs; __typeof__(s_bc) vs; __typeof__(s_rast2) rast; __typeof__(s_ds2) ds;
+                 __typeof__(s_bc) ps; __typeof__(s_rt) rt; } gstream;
+        D3D12_PIPELINE_STATE_STREAM_DESC gdesc = { sizeof(gstream), &gstream };
+
+        memset(&gstream, 0, sizeof(gstream));
+        gstream.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+        gstream.rs.v = rs;
+        gstream.vs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+        gstream.vs.v.pShaderBytecode = vs_bytes;
+        gstream.vs.v.BytecodeLength = sizeof(vs_bytes);
+        gstream.rast.t = 28; /* RASTERIZER2: solid, cull back, depth clip on */
+        gstream.rast.v[0] = D3D12_FILL_MODE_SOLID;
+        gstream.rast.v[1] = D3D12_CULL_MODE_BACK;
+        gstream.rast.v[6] = TRUE;
+        gstream.ds.t = 26; /* DEPTH_STENCIL2: depth and stencil off */
+        gstream.ds.v[1] = D3D12_DEPTH_WRITE_MASK_ALL;
+        gstream.ds.v[2] = D3D12_COMPARISON_FUNC_LESS;
+        gstream.ps.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+        gstream.ps.v.pShaderBytecode = ps_bytes;
+        gstream.ps.v.BytecodeLength = sizeof(ps_bytes);
+        gstream.rt.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+        gstream.rt.v.NumRenderTargets = 1;
+        gstream.rt.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hr = ID3D12Device2_CreatePipelineState(device, &gdesc, &IID_ID3D12PipelineState, (void **)&pso);
+        CHECK(SUCCEEDED(hr) != strict, "graphics stream with DEPTH_STENCIL2/RASTERIZER2 and console VS/PS %s (%#lx)",
+              strict ? "rejected in strict mode" : "gets fallbacks", hr);
+        if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+    }
+
     /* A mesh pipeline from untranslated console AS/MS/PS gets the mesh
      * fallbacks (when the device has mesh shaders and fallbacks are on). */
     {
