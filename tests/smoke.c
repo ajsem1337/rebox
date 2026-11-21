@@ -1096,8 +1096,8 @@ static void test_console_shader(void *dev, void *queue)
     if (SUCCEEDED(hr))
     {
         cd.pRootSignature = rs;
-        cd.CS.pShaderBytecode = test_console_cs;
-        cd.CS.BytecodeLength = sizeof(test_console_cs);
+        cd.CS.pShaderBytecode = test_console_comp;
+        cd.CS.BytecodeLength = sizeof(test_console_comp);
         hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
                 &IID_ID3D12PipelineState, &pso);
         CHECK(SUCCEEDED(hr), "compute PSO from SCSV SPIR-V (patched vkd3d-proton) %#lx", hr);
@@ -1157,6 +1157,140 @@ done:
     if (pso) XSLOT(pso, 2, ULONG)(pso);
     if (rs) XSLOT(rs, 2, ULONG)(rs);
     if (blob) ID3D10Blob_Release(blob);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
+/* Console graphics pipelines (patch 0002): SCSV VS and PS carrying DXBC
+ * I/O signatures. The VS draws a fullscreen triangle into an 8x8 target; the
+ * PS writes its SGPRs to dwords 64-95 of the root UAV in s0:s1, and a marker
+ * at 96. Same root parameters as the compute test, set through the graphics
+ * slots, so the draw path's packing is checked. */
+static void test_console_graphics(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    static const UINT constants[4] = { 0x55555555, 0x66666666, 0x77777777, 0x88888888 };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC rtvd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0 };
+    D3D12_ROOT_PARAMETER params[3] = {
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = { 0, 0 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, 4 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = { 1, &range } },
+    };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, params };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 512, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    D3D12_VIEWPORT vp = { 0, 0, 8, 8, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 8, 8 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
+    void *heap = NULL, *rtv_heap = NULL, *rs = NULL, *pso = NULL, *list = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *buf = NULL, *rt = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D10Blob *blob = NULL;
+    UINT64 gpu, va, table;
+    SIZE_T rtv;
+    UINT inc, *out = NULL;
+    HRESULT hr;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &rtvd,
+                &IID_ID3D12DescriptorHeap, &rtv_heap);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+    if (SUCCEEDED(hr))
+    {
+        gd.pRootSignature = rs;
+        gd.VS = (D3D12_SHADER_BYTECODE){ test_console_vert, sizeof(test_console_vert) };
+        gd.PS = (D3D12_SHADER_BYTECODE){ test_console_frag, sizeof(test_console_frag) };
+        gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        gd.SampleMask = ~0u;
+        gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        gd.RasterizerState.DepthClipEnable = TRUE;
+        gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        gd.NumRenderTargets = 1;
+        gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        gd.SampleDesc.Count = 1;
+        hr = XSLOT(dev, 10, HRESULT, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &gd,
+                &IID_ID3D12PipelineState, &pso);
+        CHECK(SUCCEEDED(hr), "graphics PSO from SCSV VS/PS with embedded signatures (patched vkd3d-proton) %#lx", hr);
+    }
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&rt);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    if (FAILED(hr)) goto done;
+
+    gpu = XSLOT(heap, 10, UINT64)(heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    va = ID3D12Resource_GetGPUVirtualAddress(buf);
+    rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
+    XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, rt, NULL, rtv);
+
+    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+    XSLOT(list, 34, void, void *)(list, rs);                                           /* PC 30 */
+    XSLOT(list, 25, void, void *)(list, pso);
+    XSLOT(list, 46, void, UINT, UINT64)(list, 0, va);                                 /* PC 42 */
+    XSLOT(list, 40, void, UINT, UINT, const void *, UINT)(list, 1, 4, constants, 0);  /* PC 36 */
+    XSLOT(list, 36, void, UINT, UINT64)(list, 2, gpu + 3 * inc);                      /* PC 32 */
+    XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
+    XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
+    XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL); /* PC 46 */
+    XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (FAILED(hr = ID3D12Resource_Map(buf, 0, NULL, (void **)&out)))
+    {
+        CHECK(0, "map the console pixel shader's output (%#lx)", hr);
+        goto done;
+    }
+    table = out[64 + 6] | (UINT64)out[64 + 7] << 32;
+    CHECK(out[96] == 0x5ca7f4a9, "console VS/PS drew (pixel shader marker %#x)", out[96]);
+    CHECK((out[64] | (UINT64)out[65] << 32) == va, "graphics s0:s1 = root UAV address %#llx (got %#x:%#x)",
+          (unsigned long long)va, out[65], out[64]);
+    CHECK(!memcmp(out + 66, constants, sizeof(constants)), "graphics s2-s5 = root constants (%#x %#x %#x %#x)",
+          out[66], out[67], out[68], out[69]);
+    CHECK(table == 0 || table == gpu + 3 * inc, "graphics s6:s7 = descriptor table at the heap's real address %#llx "
+          "(got %#llx)", (unsigned long long)(gpu + 3 * inc), (unsigned long long)table);
+    ID3D12Resource_Unmap(buf, 0, NULL);
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (rt) ID3D12Resource_Release(rt);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (blob) ID3D10Blob_Release(blob);
+    if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
@@ -1278,6 +1412,7 @@ static void test_xbox(void)
     test_pacing(dev);
     test_real_heap_va(dev, queue);
     test_console_shader(dev, queue);
+    test_console_graphics(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);

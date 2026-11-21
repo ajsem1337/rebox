@@ -73,22 +73,26 @@ There are two places this could live:
    it back to vkd3d-proton's handle: root descriptor tables (Xbox 35/36) and UAV clears (Xbox 53/54).
    `REBOX_REAL_HEAP_VA=0` keeps the virtual handles. Whether the address equals the CPU pointer
    (`heap_base = 0`) depends on the layer identity-mapping the descriptor heap's memory type.
-2. **Console pipelines** (compute done, `patches/vkd3d-proton/0002`). A translated shader reaches
-   vkd3d-proton as an `SCSV` blob in place of DXBC: a 36-byte header (magic `SCSV`, version 1,
-   Vulkan stage bit, wave size 0/32/64, workgroup size, SPIR-V offset and size) followed by the
-   SPIR-V. vkd3d-proton uses that SPIR-V as is (entry point `main`) and requests the wave size.
+2. **Console pipelines** (compute and graphics done, `patches/vkd3d-proton/0002`). A translated
+   shader reaches vkd3d-proton as an `SCSV` blob in place of DXBC: a 44-byte header (magic `SCSV`,
+   version 1, Vulkan stage bit, wave size 0/32/64, workgroup size, SPIR-V offset and size, DXBC
+   offset and size) followed by the SPIR-V and, for graphics stages, the original console DXBC
+   container. vkd3d-proton reads I/O signatures from that container, so vertex attribute locations
+   are the input signature's registers (as Leonida's contract expects) and stage I/O is validated
+   as usual; the translated stages must agree on varying locations themselves. vkd3d-proton uses that SPIR-V as is (entry point `main`) and requests the wave size.
    Every root signature's push-constant range is widened to at least 144 bytes. Console pipelines
    therefore share the root signature's layout and stay compatible with its descriptor sets.
-   `d3d12_xs` passes `SCSV` blobs through its shader cache unchanged. Still to do: graphics
-   (vkd3d-proton takes stage I/O signatures from DXBC, which `SCSV` lacks), and producing `SCSV`
-   from translator output in the cache. Originally planned:
+   `d3d12_xs` passes `SCSV` blobs through its shader cache unchanged. Still to do: producing
+   `SCSV` from translator output in the cache, and tessellation/mesh stages (untested).
+   Originally planned:
    - look up `<stage>/<fssm hash>.spv` in the shader directory;
    - build the pipeline with the root signature's layout plus a console push-constant block
      (s0-s31, `heap_base`, `code_base`) and the bindless sets the contract names;
    - set the required subgroup size from the shader's wave mode;
    - with no translation, fall back as `d3d12_xs` does today.
-3. **SGPR packing at draw and dispatch** (dispatch done, in 0002; the push follows vkd3d's own and
-   invalidates it so ordinary pipelines get their data back). From vkd3d's root-parameter state, write s0-s31 in root
+3. **SGPR packing at draw and dispatch** (done, in 0002; at draws it uses the graphics or mesh
+   layout; the push follows vkd3d's own and invalidates it so ordinary pipelines get their data
+   back). From vkd3d's root-parameter state, write s0-s31 in root
    order: one dword per 32-bit constant, two per root descriptor or descriptor table (its real
    VA). This is Leonida's default mapping. It is an assumption until the exe shows the real one;
    keep it table-driven so a measured map replaces it.
@@ -120,7 +124,8 @@ There are two places this could live:
 3. ~~Patch 2 and 3 with a hand-written SPIR-V "console" shader~~ Done for compute: the shader
    (GLSL in `tools/gen_fallback_shaders.sh`) writes s0-s31 to the root UAV in s0:s1. The smoke test
    checks the UAV address, the root constants, and the table's real heap address (0 on lavapipe,
-   the real address on RADV). Graphics next.
+   the real address on RADV). Graphics too: an SCSV VS draws a fullscreen triangle and the PS
+   writes its SGPRs, set through the graphics root slots.
 4. Patch 4 and a translated compute shader from Leonida's output (needs the user's `the shader archive`;
    run on the 890M with `tests/manual-test.sh`).
 5. With the exe: measure the open questions above, then graphics.

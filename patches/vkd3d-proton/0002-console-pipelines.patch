@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index 84976e6..349d699 100644
+index 84976e6..e977892 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -8140,6 +8140,75 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
@@ -88,8 +88,21 @@ index 84976e6..349d699 100644
  
  #ifdef VKD3D_ENABLE_PROFILING
      vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
+@@ -8673,6 +8745,12 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+             d3d12_command_list_update_dynamic_state(list);
+ 
+         d3d12_command_list_update_descriptors(list);
++
++        if (list->state && list->state->rebox_console && list->graphics_bindings.root_signature)
++            d3d12_command_list_rebox_push(list, &list->graphics_bindings,
++                    pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS
++                    ? &list->graphics_bindings.root_signature->mesh
++                    : &list->graphics_bindings.root_signature->graphics);
+     }
+ 
+     if (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE)
 diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
-index ce7f54e..e71da14 100644
+index ce7f54e..722c8b4 100644
 --- a/libs/vkd3d/state.c
 +++ b/libs/vkd3d/state.c
 @@ -370,6 +370,18 @@ static HRESULT vkd3d_create_pipeline_layout_for_stage_mask(struct d3d12_device *
@@ -111,7 +124,7 @@ index ce7f54e..e71da14 100644
      bind_point_layout->vk_push_stages = range.stageFlags;
      return vkd3d_create_pipeline_layout(device, set_layout_count, set_layouts,
              range.stageFlags ? 1 : 0, &range,
-@@ -2817,6 +2829,41 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
+@@ -2817,6 +2829,62 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
          return S_OK;
  }
  
@@ -121,9 +134,30 @@ index ce7f54e..e71da14 100644
 +
 +    if (!h || code->BytecodeLength < sizeof(*h) || h->magic != VKD3D_REBOX_CONSOLE_MAGIC || h->version != 1
 +            || (h->spirv_offset & 3) || h->spirv_offset < sizeof(*h) || h->spirv_size < 20
-+            || h->spirv_offset > code->BytecodeLength || h->spirv_size > code->BytecodeLength - h->spirv_offset)
++            || h->spirv_offset > code->BytecodeLength || h->spirv_size > code->BytecodeLength - h->spirv_offset
++            || (h->dxbc_size && (h->dxbc_offset > code->BytecodeLength
++                    || h->dxbc_size > code->BytecodeLength - h->dxbc_offset)))
 +        return NULL;
 +    return h;
++}
++
++struct vkd3d_shader_code vkd3d_rebox_shader_dxbc(const D3D12_SHADER_BYTECODE *code)
++{
++    const struct vkd3d_rebox_console_shader *h = vkd3d_rebox_console_shader(code);
++    struct vkd3d_shader_code dxbc;
++
++    memset(&dxbc, 0, sizeof(dxbc));
++    if (!h)
++    {
++        dxbc.code = code->pShaderBytecode;
++        dxbc.size = code->BytecodeLength;
++    }
++    else if (h->dxbc_size)
++    {
++        dxbc.code = (const uint8_t *)h + h->dxbc_offset;
++        dxbc.size = h->dxbc_size;
++    }
++    return dxbc;
 +}
 +
 +/* The console shader's SPIR-V is used as is: no DXBC to convert. */
@@ -153,7 +187,7 @@ index ce7f54e..e71da14 100644
  static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
          VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code,
          struct vkd3d_shader_code *spirv_code, struct vkd3d_shader_code_debug *spirv_code_debug)
-@@ -2835,6 +2882,9 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+@@ -2835,6 +2903,9 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
          memset(spirv_code, 0, sizeof(*spirv_code));
      }
  
@@ -163,7 +197,7 @@ index ce7f54e..e71da14 100644
      if (!spirv_code->code)
      {
          TRACE("Calling vkd3d_shader_compile_dxbc.\n");
-@@ -3214,6 +3264,7 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+@@ -3214,6 +3285,7 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
      HRESULT hr;
  
      state->pipeline_type = VKD3D_PIPELINE_TYPE_COMPUTE;
@@ -171,11 +205,29 @@ index ce7f54e..e71da14 100644
      d3d12_pipeline_state_init_shader_interface(state, device,
              VK_SHADER_STAGE_COMPUTE_BIT, &shader_interface);
      shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
+@@ -5238,7 +5310,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
+     for (i = 0; i < ARRAY_SIZE(shader_stages_lut); ++i)
+     {
+         const D3D12_SHADER_BYTECODE *b = (const void *)((uintptr_t)desc + shader_stages_lut[i].offset);
+-        const struct vkd3d_shader_code dxbc = {b->pShaderBytecode, b->BytecodeLength};
++        const struct vkd3d_shader_code dxbc = vkd3d_rebox_shader_dxbc(b);
+ 
+         if (!(graphics->stage_flags & shader_stages_lut[i].stage))
+             continue;
+@@ -5255,6 +5327,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
+ 
+         prev_stage = curr_stage;
+         curr_stage = shader_stages_lut[i].stage;
++        if (vkd3d_rebox_console_shader(b))
++            state->rebox_console = true;
+ 
+         memset(&io_input_signature, 0, sizeof(io_input_signature));
+ 
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 63154f9..e587ff8 100644
+index 63154f9..fb70090 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -2265,11 +2265,31 @@ struct vkd3d_pipeline_cache_compatibility
+@@ -2265,11 +2265,36 @@ struct vkd3d_pipeline_cache_compatibility
  };
  
  /* ID3D12PipelineState */
@@ -195,8 +247,13 @@ index 63154f9..e587ff8 100644
 +    uint32_t workgroup_size[3];
 +    uint32_t spirv_offset;  /* from the start of the header, 4-aligned */
 +    uint32_t spirv_size;
++    uint32_t dxbc_offset;   /* the original console DXBC container, for its I/O */
++    uint32_t dxbc_size;     /* signatures (graphics stages); 0 if absent */
 +};
 +const struct vkd3d_rebox_console_shader *vkd3d_rebox_console_shader(const D3D12_SHADER_BYTECODE *code);
++/* What signature parsing should read: the embedded DXBC of a console shader,
++ * or the bytecode itself. */
++struct vkd3d_shader_code vkd3d_rebox_shader_dxbc(const D3D12_SHADER_BYTECODE *code);
 +
  struct d3d12_pipeline_state
  {
