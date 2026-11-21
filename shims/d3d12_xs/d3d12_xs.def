@@ -6,6 +6,7 @@ EXPORTS
     ReboxGpuFree
     ReboxGpuQuery
     ReboxGpuBytesInUse
+    ReboxBlit
     D3D12GetDebugInterface = d3d12.D3D12GetDebugInterface
     D3D12SerializeRootSignature = d3d12.D3D12SerializeRootSignature
     D3D12SerializeVersionedRootSignature = d3d12.D3D12SerializeVersionedRootSignature

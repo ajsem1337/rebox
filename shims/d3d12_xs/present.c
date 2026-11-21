@@ -330,7 +330,7 @@ static void wait_idle(struct present_queue *s)
     if (ID3D12Fence_GetCompletedValue(s->fence) < s->fence_value)
     {
         ID3D12Fence_SetEventOnCompletion(s->fence, s->fence_value, s->event);
-        WaitForSingleObject(s->event, 5000);
+        WaitForSingleObject(s->event, INFINITE); /* reading or reusing before the GPU is done corrupts */
     }
 }
 
@@ -600,7 +600,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     if (ID3D12Fence_GetCompletedValue(s->fence) < s->ring[r].done)
     {
         ID3D12Fence_SetEventOnCompletion(s->fence, s->ring[r].done, s->event);
-        WaitForSingleObject(s->event, 5000);
+        WaitForSingleObject(s->event, INFINITE); /* reading or reusing before the GPU is done corrupts */
     }
     ID3D12CommandAllocator_Reset(s->ring[r].alloc);
     ID3D12GraphicsCommandList_Reset(s->ring[r].list, s->ring[r].alloc, NULL);

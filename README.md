@@ -18,6 +18,7 @@ shims/xmem/               xmem.dll: XMemAlloc/Free(+Default), allocation hooks, 
                           GPU-visible memory types come from d3d12_xs
 shims/d3d12_xs/           d3d12_xs.dll: Xbox device/queue/command-list/descriptor-heap proxies (proxy.c),
                           GPU memory (gpu_memory.c), shader substitution, forwards to vkd3d-proton
+shims/amd_fidelityfx_loader_xbox/  FidelityFX API stub: FSR-style queries, bilinear upscale via d3d12_xs
 shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA2 voices played as silence
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
@@ -62,6 +63,7 @@ Once the exe is dumped:
 | `WINEPREFIX` | Default `~/.local/share/rebox/<TitleId>` |
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
+| `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
 | `REBOX_LOG=/path` | Also append shim logs to this file |
@@ -102,6 +104,9 @@ down missing translations.
   disassembly here.
 - `XMemVirtualQuery` takes `(process, address, info)` with a 0x40-byte info struct, as
   XboxBvhBuilder.dll calls it, and the smoke test covers that call.
+- The FidelityFX stub answers a render-resolution query as FSR does. It scales a cleared 32x24
+  render into a 64x48 output through `ffxDispatch` on an Xbox command list, and the presented
+  frame has the render's colour.
 - Fallback shaders: a graphics PSO built from untranslated console bytes is created, a draw with
   it leaves the frame untouched, and compute and stream PSOs work too. Strict mode still rejects
   them.
@@ -140,6 +145,12 @@ down missing translations.
   (e.g. FFmpeg's `xma2` decoder) is still to do. Bink's audio is decoded to PCM by Bink and is
   unaffected. Wine also reports a mastering voice as created when there's no audio device, after
   which FAudio crashes on the first source voice; that only matters on machines without audio.
+- **Upscaling is bilinear.** The console FidelityFX upscaler runs precompiled-ISA shaders, which
+  would become no-op fallbacks and leave its output unwritten. `rebox-run` runs the title from
+  `$WINEPREFIX/package`, a directory of symlinks to the package, with our
+  `amd_fidelityfx_loader_xbox.dll` in place of the package's. That stub answers FSR's queries
+  (quality-mode ratios, but no jitter) and scales the colour input into the output with a
+  compute blit. There's no temporal anti-aliasing; frame generation reports no provider.
 - **Textures written through their GPU VA** get scratch memory (see docs/d3d12x.md): no crash,
   but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root

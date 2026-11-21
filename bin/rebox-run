@@ -13,6 +13,7 @@
 #   WINEPREFIX            default: ~/.local/share/rebox/<TitleId>
 #   REBOX_SHADER_CACHE Unix path to the AnyPS5 cache; default: $WINEPREFIX/shader-cache
 #   REBOX_GPUVA_LAYER_DIR  directory holding VK_LAYER_REBOX_gpuva_identity's manifest (flake sets it)
+#   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
 #   REBOX_DUMP_SHADERS, REBOX_STUB_FATAL, REBOX_LOG: see README
@@ -61,8 +62,28 @@ sys32="$WINEPREFIX/drive_c/windows/system32"
 install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
 install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REBOX_SHIMS_DIR"/xaudio2_9.dll "$sys32"/
 
+# Package DLLs we replace live in the game directory, which Wine searches
+# before system32. So the title runs from a shadow directory: symlinks to
+# the package, with our replacements copied over the ones they stand in for.
+#   amd_fidelityfx_loader_xbox.dll  FidelityFX stub (bilinear upscale); the
+#                                   console's needs precompiled-ISA shaders.
+#                                   REBOX_FFX_STUB=0 keeps the original.
+shadow="$WINEPREFIX/package"
+rm -rf "$shadow"
+mkdir -p "$shadow"
+for entry in "$game_dir"/* "$game_dir"/.[!.]*; do
+    [[ -e $entry ]] && ln -s "$entry" "$shadow/"
+done
+replace_package_dll() {
+    [[ -e $shadow/$1 && -f $REBOX_SHIMS_DIR/$1 ]] || return 0
+    rm -f "$shadow/$1"
+    install -m 644 "$REBOX_SHIMS_DIR/$1" "$shadow/$1"
+    echo "rebox-run: using our $1" >&2
+}
+[[ ${REBOX_FFX_STUB:-1} != 0 ]] && replace_package_dll amd_fidelityfx_loader_xbox.dll
+
 # Mount the package as G: too, for titles that assume a package drive.
-ln -sfn "$game_dir" "$WINEPREFIX/dosdevices/g:"
+ln -sfn "$shadow" "$WINEPREFIX/dosdevices/g:"
 
 cache=${REBOX_SHADER_CACHE:-$WINEPREFIX/shader-cache}
 mkdir -p "$cache"
@@ -92,5 +113,5 @@ if [[ -z ${VK_ICD_FILENAMES:-} && -n ${REBOX_RADV_ICD:-} && ${REBOX_STOCK_VULKAN
 fi
 
 echo "rebox-run: $exe (title $title_id), prefix $WINEPREFIX, shader cache $cache" >&2
-cd "$game_dir"
-exec "$WINE" "$game_dir/$exe" "$@"
+cd "$shadow"
+exec "$WINE" "$shadow/$exe" "$@"

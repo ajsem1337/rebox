@@ -63,6 +63,8 @@ struct proxy
     struct embedded *active, *retired;
     unsigned resets;
     struct present_queue *present; /* queues that have presented */
+    ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
+    UINT heap_count;
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -721,6 +723,8 @@ static void STDMETHODCALLTYPE list_SetDescriptorHeaps(struct proxy *p, UINT coun
         count = ARRAYSIZE(raw); /* D3D12 allows one CBV/SRV/UAV and one sampler heap */
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(heaps[i]);
+    p->heap_count = count < 2 ? count : 2;
+    memcpy(p->heaps, raw, p->heap_count * sizeof(*raw));
     ID3D12GraphicsCommandList_SetDescriptorHeaps(INNER(p, ID3D12GraphicsCommandList), count, raw);
 }
 
@@ -782,6 +786,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     }
     p->retired = keep;
     embedded_free_list(drop);
+    p->heap_count = 0;
     return ID3D12GraphicsCommandList_Reset(INNER(p, ID3D12GraphicsCommandList), alloc, pso);
 }
 
@@ -931,6 +936,20 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     build(&copy_list_class, 11, copy_slots, ARRAYSIZE(copy_slots));
     build(&heap_class, 9, heap_slots, ARRAYSIZE(heap_slots));
     return TRUE;
+}
+
+ID3D12GraphicsCommandList *proxy_list(void *list, ID3D12DescriptorHeap **heaps, UINT *heap_count)
+{
+    struct proxy *p = list;
+
+    *heap_count = 0;
+    if (!is_proxy(list))
+        return list;
+    if (p->cls != &list_class && p->cls != &copy_list_class)
+        return NULL;
+    *heap_count = p->heap_count;
+    memcpy(heaps, p->heaps, p->heap_count * sizeof(*heaps));
+    return INNER(p, ID3D12GraphicsCommandList);
 }
 
 HRESULT proxy_query_device(ID3D12Device *inner, REFIID riid, void **out)

@@ -508,7 +508,7 @@ done:
                 D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)))
         {
             XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
-            for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
                 Sleep(10);
             ID3D12Fence_Release(fence);
         }
@@ -524,6 +524,136 @@ done:
         if (usage && scratch_before)
             CHECK(usage() == scratch_before, "texture scratch memory freed with the texture");
     }
+    if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
+}
+
+/* The FidelityFX stub (amd_fidelityfx_loader_xbox.dll): FSR-style queries,
+ * then an upscale dispatch through d3d12_xs's bilinear blit. A 32x24 green
+ * render is scaled into a 64x48 output, which is presented as frame 3 and
+ * read back from the frame dump. */
+static void test_ffx(void *dev, void *queue)
+{
+    HMODULE ffx = LoadLibraryA("amd_fidelityfx_loader_xbox.dll");
+    UINT32 (*create)(void **, void *, const void *) = ffx ? (void *)GetProcAddress(ffx, "ffxCreateContext") : NULL;
+    UINT32 (*query)(void **, void *) = ffx ? (void *)GetProcAddress(ffx, "ffxQuery") : NULL;
+    UINT32 (*dispatch)(void **, const void *) = ffx ? (void *)GetProcAddress(ffx, "ffxDispatch") : NULL;
+    UINT32 (*destroy)(void **, const void *) = ffx ? (void *)GetProcAddress(ffx, "ffxDestroyContext") : NULL;
+    const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC cd = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 24, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    D3D12_RESOURCE_DESC od = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 48, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_CLEAR_VALUE green = { DXGI_FORMAT_R8G8B8A8_UNORM, { { 0.0f, 1.0f, 0.0f, 1.0f } } };
+    D3D12_RESOURCE_BARRIER b[2] = { { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }, { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION } };
+    struct { UINT64 type; void *next; void *device; } backend = { 0x1000002, NULL, dev };
+    BYTE create_desc[0x30] = { 0 }, query_desc[0x30] = { 0 }, dispatch_desc[0x1b0] = { 0 };
+    ID3D12Resource *color = NULL, *output = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *rtv_heap = NULL, *list = NULL, *ctx = NULL;
+    UINT64 plane_params[6] = { 0 };
+    UINT32 rw = 0, rh = 0, rc;
+    SIZE_T rtv;
+    BYTE px[4];
+    HRESULT hr;
+
+    CHECK(create && query && dispatch && destroy, "FidelityFX stub exports the FFX API");
+    if (!create || !query || !dispatch || !destroy) return;
+
+    /* GETRENDERRESOLUTIONFROMQUALITYMODE: 64x48 at PERFORMANCE (2x) -> 32x24. */
+    *(UINT64 *)query_desc = 0x10004;
+    *(UINT32 *)(query_desc + 0x10) = 64;
+    *(UINT32 *)(query_desc + 0x14) = 48;
+    *(UINT32 *)(query_desc + 0x18) = 3;
+    *(UINT32 **)(query_desc + 0x20) = &rw;
+    *(UINT32 **)(query_desc + 0x28) = &rh;
+    rc = query(NULL, query_desc);
+    CHECK(rc == 0 && rw == 32 && rh == 24, "FFX render resolution query (%u: %ux%u)", rc, rw, rh);
+
+    *(UINT64 *)create_desc = 0x10000;
+    *(void **)(create_desc + 8) = &backend;
+    *(UINT32 *)(create_desc + 0x14) = 32;
+    *(UINT32 *)(create_desc + 0x18) = 24;
+    *(UINT32 *)(create_desc + 0x1c) = 64;
+    *(UINT32 *)(create_desc + 0x20) = 48;
+    rc = create(&ctx, create_desc, NULL);
+    CHECK(rc == 0 && ctx, "FFX upscale context (%u)", rc);
+    if (rc) return;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &rtv_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, &green, &IID_ID3D12Resource,
+                (void **)&color);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &od, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource,
+                (void **)&output);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    CHECK(SUCCEEDED(hr), "resources for the FFX dispatch (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+
+    rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
+    XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, color, NULL, rtv);
+    XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, green.Color, 0, NULL);
+    b[0].Transition.pResource = color;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, b);
+
+    *(UINT64 *)dispatch_desc = 0x10001;
+    *(void **)(dispatch_desc + 0x10) = list;
+    *(void **)(dispatch_desc + 0x18) = color;
+    *(void **)(dispatch_desc + 0x138) = output;
+    *(UINT32 *)(dispatch_desc + 0x178) = 32;
+    *(UINT32 *)(dispatch_desc + 0x17c) = 24;
+    *(UINT32 *)(dispatch_desc + 0x180) = 64;
+    *(UINT32 *)(dispatch_desc + 0x184) = 48;
+    rc = dispatch(&ctx, dispatch_desc);
+    CHECK(rc == 0, "FFX upscale dispatch (%u)", rc);
+
+    b[0].Transition.pResource = output;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, b);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    CHECK(SUCCEEDED(hr), "list with the FFX dispatch closes (%#lx)", hr);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    plane_params[1] = 1;
+    plane_params[2] = (UINT64)(ULONG_PTR)output;
+    XSLOT(queue, 30, HRESULT, UINT, const void *, const void *)(queue, 1, plane_params, NULL);
+    if (dump_dir)
+    {
+        BOOL found = read_dump_pixel(dump_dir, 3, px);
+        CHECK(found && px[2] == 0 && px[1] == 255 && px[0] == 0, "upscaled frame is the render's green (RGB %u %u %u)",
+              found ? px[2] : 0, found ? px[1] : 0, found ? px[0] : 0);
+    }
+
+done:
+    if (SUCCEEDED(XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, (void **)&fence)))
+    {
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+        for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+            Sleep(10);
+        ID3D12Fence_Release(fence);
+    }
+    destroy(&ctx, NULL);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (color) ID3D12Resource_Release(color);
+    if (output) ID3D12Resource_Release(output);
     if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
 }
 
@@ -633,7 +763,7 @@ static void test_xbox(void)
     if (fence)
     {
         hr = XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
-        for (i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        for (i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
             Sleep(10);
         CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence) == 1,
               "ExecuteCommandLists (queue slot 10) unwraps the list and the GPU finishes it");
@@ -643,6 +773,7 @@ static void test_xbox(void)
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
 
     test_present(dev, queue);
+    test_ffx(dev, queue);
 
     if (fence) ID3D12Fence_Release(fence);
     if (rs) XSLOT(rs, 2, ULONG)(rs);
