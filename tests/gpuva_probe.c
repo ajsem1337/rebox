@@ -39,6 +39,9 @@
 #define SIZE (2u << 20)
 #define PATTERN 0x5ca71e77u
 
+/* Set when VK_INSTANCE_LAYERS loads VK_LAYER_REBOX_gpuva_identity. */
+static int layer_active;
+
 static VkInstance instance;
 static VkPhysicalDevice phys;
 static VkDevice device;
@@ -353,7 +356,10 @@ static uint64_t try_alloc_map(const char *label, uint64_t replay, uint64_t cpu_w
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (probe != (void *)(uintptr_t)cpu_want)
     {
-        printf("  FAIL: CPU range %#" PRIx64 " unavailable (kernel half or in use)\n", cpu_want);
+        if (layer_active)
+            printf("  n/a: the identity layer has reserved this window in-process; see [plain]\n");
+        else
+            printf("  FAIL: CPU range %#" PRIx64 " unavailable (kernel half or in use)\n", cpu_want);
         if (probe != MAP_FAILED)
             munmap(probe, req.size);
         vkDestroyBuffer(device, buf, NULL);
@@ -435,6 +441,9 @@ int main(int argc, char **argv)
     uint64_t base = argc > 1 ? strtoull(argv[1], NULL, 16) : 0x200000000000ull;
     uint64_t placed, low, high;
     int imp, plain;
+    const char *layers = getenv("VK_INSTANCE_LAYERS");
+
+    layer_active = layers && strstr(layers, "REBOX_gpuva_identity") != NULL;
 
     if (!init())
     {
@@ -447,10 +456,13 @@ int main(int argc, char **argv)
     high = try_alloc_map("replay-high", HIGH_HALF | base, base);
     plain = try_plain();
 
-    printf("\nimport:      %s\n", imp ? "IDENTITY OK" : "no");
-    printf("placed:      %s\n", placed ? "IDENTITY OK" : "no");
-    printf("replay-low:  %s\n", low == base ? "IDENTITY OK" : "no");
-    printf("replay-high: %s\n", high == (HIGH_HALF | base) ? "OFFSET OK (gpu = cpu | 0xffff800000000000)" : "no");
+    /* With the layer loaded, it owns the window, so the raw strategies
+     * can't map there; only [plain] (the layer's own path) is meaningful. */
+    const char *no = layer_active ? "n/a (layer active)" : "no";
+    printf("\nimport:      %s\n", imp ? "IDENTITY OK" : no);
+    printf("placed:      %s\n", placed ? "IDENTITY OK" : no);
+    printf("replay-low:  %s\n", low == base ? "IDENTITY OK" : no);
+    printf("replay-high: %s\n", high == (HIGH_HALF | base) ? "OFFSET OK (gpu = cpu | 0xffff800000000000)" : no);
     printf("plain:       %s\n", plain ? "IDENTITY OK" : "no (expected without the layer)");
     if (software)
         printf("(software device: not meaningful)\n");
