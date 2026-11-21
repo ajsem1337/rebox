@@ -1,0 +1,838 @@
+From 6b3ad682efa3df4bd5a79185e7560280e3c3a676 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Sat, 21 Nov 2026 02:23:52 +0000
+Subject: [PATCH] feat(shader): speculate descriptor table pointers and words
+ with a runtime check
+
+A T# or S# whose table pointer, or one of whose words, reaches its use
+as a phi with an arm the SRT walker cannot evaluate (a lane mask, a
+ballot, a route that never reaches the use) is refused with "is not a
+valid runtime value", even when every path that does reach it carries
+the same user-data pointer or the same loaded word.
+
+With APS5_SPECULATE_DESCRIPTORS set, such a refusal prepares the program
+again with DescriptorPointerSpeculation before the SRT walker: the
+pointer is guessed from its only user-data leaf (the high half from the
+next user-data register, else 0), and a word from its only load at a
+constant offset (re-issued before the descriptor when the original does
+not dominate it). The descriptor is built from the guess, and the shader
+raises DescriptorFault at the load when the value it computes differs,
+so a wrong guess is reported rather than silent. Off by default:
+per-lane pointers selected in waterfall loops are not told apart from
+stale arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tests/DescriptorPointerSpeculation.cpp    | 101 +++++
+ ...descriptor_pointer_speculation_tests.cmake |   8 +
+ .../tests/execution/DescriptorSpeculation.cpp | 176 +++++++++
+ core/shader/recompiler/CMakeLists.txt         |   1 +
+ .../DescriptorPointerSpeculation.hpp          |  21 +
+ .../include/Optimization/ResourceProgram.hpp  |   2 +
+ .../src/DescriptorPointerSpeculation.cpp      | 363 ++++++++++++++++++
+ core/shader/recompiler/Recompiler.cpp         |  19 +
+ docs/dev/ENVIRONMENT.md                       |   1 +
+ 9 files changed, 692 insertions(+)
+ create mode 100644 core/libs/prx/libSceAgcDriver/tests/DescriptorPointerSpeculation.cpp
+ create mode 100644 core/libs/prx/libSceAgcDriver/tests/cmake/agc_descriptor_pointer_speculation_tests.cmake
+ create mode 100644 core/libs/prx/libSceAgcDriver/tests/execution/DescriptorSpeculation.cpp
+ create mode 100644 core/shader/recompiler/Optimization/include/Optimization/DescriptorPointerSpeculation.hpp
+ create mode 100644 core/shader/recompiler/Optimization/src/DescriptorPointerSpeculation.cpp
+
+diff --git a/core/libs/prx/libSceAgcDriver/tests/DescriptorPointerSpeculation.cpp b/core/libs/prx/libSceAgcDriver/tests/DescriptorPointerSpeculation.cpp
+new file mode 100644
+index 0000000000..8372380078
+--- /dev/null
++++ b/core/libs/prx/libSceAgcDriver/tests/DescriptorPointerSpeculation.cpp
+@@ -0,0 +1,101 @@
++#include "BdaAbi.hpp"
++#include "Recompiler.hpp"
++#include <array>
++#include <cstdint>
++#include <cstdlib>
++#include <cstdio>
++#include <exception>
++#include <span>
++#include <spirv/unified1/spirv.hpp>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Check(bool condition, const std::string& message) {
++    if (!condition) throw std::runtime_error(message);
++}
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 5> capabilities{
++        spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityClipDistance, spv::CapabilityInt64Atomics,
++    };
++    static constexpr std::array<std::string_view, 4> extensions{
++        "SPV_EXT_descriptor_indexing", "SPV_KHR_8bit_storage", "SPV_KHR_float_controls", "SPV_KHR_physical_storage_buffer",
++    };
++    return {0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false,
++            {1024, 1024, 64}, 1024, 32768, {}, {}};
++}
++
++alignas(256) constexpr std::array<std::uint32_t, 16> PointerClobbered{
++    0xbe940300u, 0xbe950301u, 0xbf068002u, 0xbf850002u, 0x7d880083u, 0xbe94036au, 0xf40c020au, 0xfa000000u,
++    0x7e020300u, 0x7e040300u, 0x7e060300u, 0x7e080300u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
++alignas(256) constexpr std::array<std::uint32_t, 16> DescriptorClobbered{
++    0xbe940300u, 0xbe950301u, 0xf40c020au, 0xfa000000u, 0xbf8cc07fu, 0xbf068002u, 0xbf850002u, 0x7d880083u,
++    0xbe88036au, 0x7e020300u, 0x7e040300u, 0x7e060300u, 0x7e080300u, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
++RecompileResult Compile(std::span<const std::uint32_t> code) {
++    constexpr std::uint32_t Width = 32u;
++    constexpr std::uint32_t Format32x4Float = 77u;
++    constexpr std::uint32_t Type1D = 8u;
++    alignas(256) static std::array<std::uint32_t, Width * 4u> texels{};
++    alignas(256) static std::array<std::uint32_t, 8> table{};
++    const auto texelAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
++    table = {
++        static_cast<std::uint32_t>(texelAddress >> 8u),
++        static_cast<std::uint32_t>((texelAddress >> 40u) & 0xffu) | (Format32x4Float << 20u) | (((Width - 1u) & 3u) << 30u),
++        (Width - 1u) >> 2u,
++        0xfacu | (Type1D << 28u),
++        0u, 0u, 0u, 0u,
++    };
++    const auto tableAddress = reinterpret_cast<std::uintptr_t>(table.data());
++    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
++    const std::array<MemoryRegion, 3> memory{{
++        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
++        {tableAddress, std::as_bytes(std::span<const std::uint32_t>(table))},
++        {static_cast<std::uintptr_t>(texelAddress), std::as_bytes(std::span<const std::uint32_t>(texels))},
++    }};
++    RecompileRequest request{};
++    request.shader = {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
++    request.target = Target();
++    request.layout = {0, 0, 0, 128};
++    request.context.waveSize = 32;
++    request.context.userDataBaseRegister = 0;
++    request.context.userData = userData;
++    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {true, false, false}, false, 1u};
++    request.context.memory = memory;
++    request.useCache = false;
++    return Recompile(request);
++}
++
++void CheckSpeculated(std::span<const std::uint32_t> code, const char* what) {
++    const auto result = Compile(code);
++    Check(!result.bindings.empty(), std::string(what) + ": the image store produced no binding");
++    Check(result.descriptorFaults != 0u, std::string(what) + ": the speculated descriptor has no runtime check");
++}
++
++}
++
++int main() {
++#ifdef _WIN32
++    _putenv_s("APS5_SPECULATE_DESCRIPTORS", "1");
++#else
++    setenv("APS5_SPECULATE_DESCRIPTORS", "1", 1);
++#endif
++    try {
++        CheckSpeculated(PointerClobbered, "a table pointer clobbered with a lane mask on an unexecuted path");
++        CheckSpeculated(DescriptorClobbered, "a T# word clobbered with a lane mask on an unexecuted path");
++        std::puts("descriptor pointer and word speculation pass");
++        return 0;
++    } catch (const std::exception& error) {
++        const std::string message = error.what();
++        std::fprintf(stderr, "%s\n", message.substr(0, message.find("\nRecompileRequest:")).c_str());
++        return 1;
++    }
++}
+diff --git a/core/libs/prx/libSceAgcDriver/tests/cmake/agc_descriptor_pointer_speculation_tests.cmake b/core/libs/prx/libSceAgcDriver/tests/cmake/agc_descriptor_pointer_speculation_tests.cmake
+new file mode 100644
+index 0000000000..8c3b512396
+--- /dev/null
++++ b/core/libs/prx/libSceAgcDriver/tests/cmake/agc_descriptor_pointer_speculation_tests.cmake
+@@ -0,0 +1,8 @@
++add_test_executable(agc_descriptor_pointer_speculation_tests EXCLUDE_FROM_ALL tests/DescriptorPointerSpeculation.cpp)
++target_link_libraries(agc_descriptor_pointer_speculation_tests PRIVATE shader_recompiler_agc_driver libc)
++set_target_properties(agc_descriptor_pointer_speculation_tests PROPERTIES CXX_EXTENSIONS OFF)
++configure_windows_unwind(agc_descriptor_pointer_speculation_tests)
++
++if(BUILD_TESTING)
++    agc_add_default_test(agc_descriptor_pointer_speculation_tests)
++endif()
+diff --git a/core/libs/prx/libSceAgcDriver/tests/execution/DescriptorSpeculation.cpp b/core/libs/prx/libSceAgcDriver/tests/execution/DescriptorSpeculation.cpp
+new file mode 100644
+index 0000000000..96b68901de
+--- /dev/null
++++ b/core/libs/prx/libSceAgcDriver/tests/execution/DescriptorSpeculation.cpp
+@@ -0,0 +1,176 @@
++#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
++#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
++#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
++#include "prx/libc/include/GuestAllocations.hpp"
++#include "Recompiler.hpp"
++#include "VulkanTestDevice.hpp"
++#include "tests/TemporaryFile.hpp"
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <span>
++#include <string>
++#include <string_view>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace {
++
++using AgcDriver::Graphics::Require;
++using ShaderRecompiler::ShaderStage;
++
++constexpr std::uint32_t Width = 32;
++constexpr std::uint32_t Format32x4Uint = 75;
++constexpr std::uint32_t Type1D = 8;
++constexpr std::size_t BlockBytes = 65536;
++alignas(256) std::array<std::uint32_t, 8> Table{};
++
++class GuestBlock {
++public:
++    GuestBlock() : block(static_cast<std::uint32_t*>(std::aligned_alloc(BlockBytes, BlockBytes))) {
++        Require(block != nullptr, "descriptor speculation: cannot allocate the guest block");
++        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
++    }
++
++    ~GuestBlock() {
++        GuestAllocations::Mutation().Remove(block);
++        std::free(block);
++    }
++
++    GuestBlock(const GuestBlock&) = delete;
++    GuestBlock& operator=(const GuestBlock&) = delete;
++
++    std::span<std::uint32_t> Texels() const { return {block, Width * 4u}; }
++
++private:
++    std::uint32_t* block;
++};
++
++alignas(256) constexpr std::array<std::uint32_t, 16> SkippedClobber{
++    0xbe940300u, 0xbe950301u, 0xbf068002u, 0xbf850002u, 0x7d880083u, 0xbe94036au, 0xf40c020au, 0xfa000000u,
++    0x7e020300u, 0x7e040300u, 0x7e060300u, 0x7e080300u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
++alignas(256) constexpr std::array<std::uint32_t, 16> TakenClobber{
++    0xbe940300u, 0xbe950301u, 0xbf068702u, 0xbf850002u, 0x7d880083u, 0xbe94036au, 0xf40c020au, 0xfa000000u,
++    0x7e020300u, 0x7e040300u, 0x7e060300u, 0x7e080300u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
++class StderrCapture {
++public:
++    StderrCapture() {
++        std::fflush(stderr);
++        file = TemporaryFile::Open();
++        Require(file != nullptr, "cannot open a temporary file for stderr");
++#ifdef _WIN32
++        saved = _dup(_fileno(stderr));
++        _dup2(_fileno(file), _fileno(stderr));
++#else
++        saved = dup(fileno(stderr));
++        dup2(fileno(file), fileno(stderr));
++#endif
++    }
++    std::string Finish() {
++        std::fflush(stderr);
++#ifdef _WIN32
++        _dup2(saved, _fileno(stderr));
++        _close(saved);
++#else
++        dup2(saved, fileno(stderr));
++        close(saved);
++#endif
++        std::rewind(file);
++        std::string text;
++        char buffer[4096];
++        for (std::size_t read = 0; (read = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, read);
++        std::fclose(file);
++        std::fwrite(text.data(), 1, text.size(), stderr);
++        return text;
++    }
++
++private:
++    std::FILE* file = nullptr;
++    int saved = -1;
++};
++
++std::string Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::span<std::uint32_t> texels) {
++    std::ranges::fill(texels, 0xdeadbeefu);
++    const auto texelAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
++    Table = {
++        static_cast<std::uint32_t>(texelAddress >> 8u),
++        static_cast<std::uint32_t>((texelAddress >> 40u) & 0xffu) | (Format32x4Uint << 20u) | (((Width - 1u) & 3u) << 30u),
++        (Width - 1u) >> 2u,
++        0xfacu | (Type1D << 28u),
++        0u, 0u, 0u, 0u,
++    };
++    const auto tableAddress = reinterpret_cast<std::uintptr_t>(Table.data());
++    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
++    const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
++        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
++        {tableAddress, std::as_bytes(std::span<const std::uint32_t>(Table))},
++    }};
++    const ShaderRecompiler::ShaderComputeStageInfo compute{{Width, 1, 1}, 0u, {true, false, false}, false, 1};
++    ShaderRecompiler::RecompileRequest request{
++        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
++        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
++        device.Target(),
++        {0, 0, 0, 128}
++    };
++    request.useCache = false;
++    const auto result = ShaderRecompiler::Recompile(request);
++    Require(result.descriptorFaults != 0u, "descriptor speculation: the speculated table pointer has no runtime check");
++    StderrCapture log;
++    try {
++        device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
++        device.WaitIdle();
++        AgcDriver::Graphics::StorageTexture::FlushPending(texelAddress, texels.size_bytes(), nullptr, "test");
++        device.WaitIdle();
++    } catch (...) {
++        static_cast<void>(log.Finish());
++        throw;
++    }
++    return log.Finish();
++}
++
++bool Faulted(const std::string& log) {
++    return log.find("BDA access failed") != std::string::npos && log.find("instruction=0x18") != std::string::npos && log.find("reason=8") != std::string::npos;
++}
++
++}
++
++int main() {
++    try {
++    #ifdef _WIN32
++    _putenv_s("APS5_SPECULATE_DESCRIPTORS", "1");
++#else
++    setenv("APS5_SPECULATE_DESCRIPTORS", "1", 1);
++#endif
++        const auto device = OpenVulkanTestDevice();
++        if (!device) return VulkanTestSkipped;
++        GuestBlock block;
++        const auto texels = block.Texels();
++        const auto skipped = Run(*device, SkippedClobber, texels);
++        Require(!Faulted(skipped), "descriptor speculation: the guessed table pointer faulted although the guess was right:\n" + skipped);
++        for (std::uint32_t x = 0; x < Width; ++x) {
++            for (std::uint32_t component = 0; component < 4u; ++component) {
++                const auto actual = texels[x * 4u + component];
++                Require(actual == x, "descriptor speculation: texel " + std::to_string(x) + " component " + std::to_string(component) + " is " + std::to_string(actual) + ", expected " + std::to_string(x));
++            }
++        }
++        const auto taken = Run(*device, TakenClobber, texels);
++        Require(Faulted(taken), "descriptor speculation: a wrong guess was not reported as an invalid descriptor at the load:\n" + taken);
++        std::puts("descriptor speculation runs the guessed table and reports a wrong guess");
++        return 0;
++    } catch (const std::exception& error) {
++        const std::string message = error.what();
++        std::cerr << message.substr(0, message.find("\nRecompileRequest:")) << '\n';
++        return 1;
++    }
++}
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index accd9df4fe..e9077f6f32 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -104,6 +104,7 @@ function(add_shader_recompiler target runtimeTarget)
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DeadCodeEliminator.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/UnobservedPhiEliminator.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/GotoPhiRefiner.cpp
++            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DescriptorPointerSpeculation.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/HostInterpolationChecker.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ReadLaneEliminator.cpp
+             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/MaskedSelectEliminator.cpp
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/DescriptorPointerSpeculation.hpp b/core/shader/recompiler/Optimization/include/Optimization/DescriptorPointerSpeculation.hpp
+new file mode 100644
+index 0000000000..25f52d3f5a
+--- /dev/null
++++ b/core/shader/recompiler/Optimization/include/Optimization/DescriptorPointerSpeculation.hpp
+@@ -0,0 +1,21 @@
++#ifndef CORE_SHADER_RECOMPILIER_OPTIMIZATION_INCLUDE_OPTIMIZATION_DESCRIPTORPOINTERSPECULATION_HPP
++#define CORE_SHADER_RECOMPILIER_OPTIMIZATION_INCLUDE_OPTIMIZATION_DESCRIPTORPOINTERSPECULATION_HPP
++
++#include "IntermediateRepresentation/IrProgram.hpp"
++#include <cstdint>
++
++namespace ShaderRecompiler {
++
++struct DescriptorPointerSpeculationStats {
++    std::uint32_t speculatedPointers = 0;
++    std::uint32_t speculatedDescriptors = 0;
++};
++
++class DescriptorPointerSpeculation {
++public:
++    [[nodiscard]] DescriptorPointerSpeculationStats Speculate(IrProgram& program, std::uint32_t waveSize) const;
++};
++
++}
++
++#endif
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/ResourceProgram.hpp b/core/shader/recompiler/Optimization/include/Optimization/ResourceProgram.hpp
+index 3e4930b2a8..832829a83a 100644
+--- a/core/shader/recompiler/Optimization/include/Optimization/ResourceProgram.hpp
++++ b/core/shader/recompiler/Optimization/include/Optimization/ResourceProgram.hpp
+@@ -18,6 +18,7 @@ public:
+ 
+ private:
+     friend IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation);
++    friend IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation, bool speculateDescriptors);
+     friend struct PreparedInterface;
+     std::shared_ptr<const PreparedControlFlow> frontend;
+     std::shared_ptr<SourceEntry> interfaceSource;
+@@ -27,6 +28,7 @@ private:
+ 
+ [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request);
+ [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation);
++[[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation, bool speculateDescriptors);
+ [[nodiscard]] std::uint64_t FrontEndBuilds();
+ [[nodiscard]] std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request);
+ 
+diff --git a/core/shader/recompiler/Optimization/src/DescriptorPointerSpeculation.cpp b/core/shader/recompiler/Optimization/src/DescriptorPointerSpeculation.cpp
+new file mode 100644
+index 0000000000..ecfb00c59a
+--- /dev/null
++++ b/core/shader/recompiler/Optimization/src/DescriptorPointerSpeculation.cpp
+@@ -0,0 +1,363 @@
++#include "Optimization/DescriptorPointerSpeculation.hpp"
++#include "IntermediateRepresentation/IrBuilder.hpp"
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <initializer_list>
++#include <optional>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++namespace ShaderRecompiler {
++
++namespace {
++
++constexpr std::size_t MaxLeafVisits = 4096;
++
++bool IsLoad(const IrValue& value) {
++    const auto opcode = value.Opcode();
++    if (opcode != IrOpcode::LoadAddressU32 && opcode != IrOpcode::ReadConst && opcode != IrOpcode::ReadConstBuffer) return false;
++    for (std::size_t index = 1; index < value.ArgumentCount(); ++index) {
++        const IrValue* argument = value.Argument(index);
++        if (argument != nullptr && !argument->Resolve()->HasImmediate()) return false;
++    }
++    return true;
++}
++
++struct Leaves {
++    std::unordered_set<IrValue*> candidates;
++    std::unordered_set<IrValue*> loads;
++    std::unordered_set<const IrValue*> visited;
++    bool opaque = false;
++    bool failed = false;
++};
++
++bool IsCandidate(const IrValue& value) {
++    return (value.HasImmediate() && value.Type() == IrType::U32) || value.Opcode() == IrOpcode::GetUserData;
++}
++
++void CollectLeaves(IrValue* value, std::optional<std::uint32_t> lane, std::uint32_t waveSize, Leaves& out) {
++    if (out.failed) return;
++    value = value->Resolve();
++    if (!out.visited.insert(value).second) return;
++    if (out.visited.size() > MaxLeafVisits) {
++        out.failed = true;
++        return;
++    }
++    if (value->IsPhi()) {
++        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) CollectLeaves(value->Argument(index), lane, waveSize, out);
++        return;
++    }
++    if (value->Opcode() == IrOpcode::SelectU32) {
++        CollectLeaves(value->Argument(1), lane, waveSize, out);
++        CollectLeaves(value->Argument(2), lane, waveSize, out);
++        return;
++    }
++    if (lane.has_value() && value->Opcode() == IrOpcode::WriteLane) {
++        const IrValue* selector = value->Argument(1)->Resolve();
++        if (!selector->HasImmediate()) {
++            out.failed = true;
++            return;
++        }
++        if (selector->ImmediateU32() % waveSize == *lane) {
++            CollectLeaves(value->Argument(0), std::nullopt, waveSize, out);
++        } else {
++            CollectLeaves(value->Argument(2), lane, waveSize, out);
++        }
++        return;
++    }
++    if (!lane.has_value() && value->Opcode() == IrOpcode::ReadLane) {
++        const IrValue* selector = value->Argument(1)->Resolve();
++        if (selector->HasImmediate()) {
++            CollectLeaves(value->Argument(0), selector->ImmediateU32() % waveSize, waveSize, out);
++            return;
++        }
++    }
++    if (!lane.has_value() && IsCandidate(*value)) {
++        out.candidates.insert(value);
++        return;
++    }
++    if (!lane.has_value() && IsLoad(*value)) {
++        out.loads.insert(value);
++        return;
++    }
++    out.opaque = true;
++}
++
++std::optional<std::uint32_t> UserDataIndex(const IrValue& value) {
++    if (value.Opcode() != IrOpcode::GetUserData || value.ArgumentCount() == 0u || value.Argument(0) == nullptr) return std::nullopt;
++    return value.Argument(0)->Register().index;
++}
++
++std::optional<std::unordered_set<IrValue*>> Candidates(IrValue& pointer, std::uint32_t waveSize, bool& opaque) {
++    Leaves leaves;
++    CollectLeaves(&pointer, std::nullopt, waveSize, leaves);
++    if (leaves.failed) return std::nullopt;
++    opaque = opaque || leaves.opaque;
++    return std::move(leaves.candidates);
++}
++
++IrValue* UniqueUserData(const std::unordered_set<IrValue*>& candidates) {
++    IrValue* found = nullptr;
++    for (IrValue* candidate : candidates) {
++        if (!UserDataIndex(*candidate).has_value()) continue;
++        if (found != nullptr && UserDataIndex(*found) != UserDataIndex(*candidate)) return nullptr;
++        found = candidate;
++    }
++    return found;
++}
++
++IrValue* UniqueImmediate(const std::unordered_set<IrValue*>& candidates) {
++    IrValue* found = nullptr;
++    for (IrValue* candidate : candidates) {
++        if (!candidate->HasImmediate()) return nullptr;
++        if (found != nullptr && found->ImmediateU32() != candidate->ImmediateU32()) return nullptr;
++        found = candidate;
++    }
++    return found;
++}
++
++IrValue* GuessLow(IrValue& low, std::uint32_t waveSize, bool& opaque) {
++    if (IsCandidate(low)) return &low;
++    const auto candidates = Candidates(low, waveSize, opaque);
++    if (!candidates.has_value()) return nullptr;
++    if (IrValue* userData = UniqueUserData(*candidates)) return userData;
++    return UniqueImmediate(*candidates);
++}
++
++IrValue* GuessHigh(IrValue& high, const IrValue& low, std::uint32_t waveSize, bool& opaque) {
++    if (IsCandidate(high)) return &high;
++    const auto candidates = Candidates(high, waveSize, opaque);
++    if (!candidates.has_value()) return nullptr;
++    const auto lowIndex = UserDataIndex(low);
++    IrValue* zero = nullptr;
++    for (IrValue* candidate : *candidates) {
++        if (lowIndex.has_value() && UserDataIndex(*candidate) == *lowIndex + 1u) return candidate;
++        if (candidate->HasImmediate() && candidate->ImmediateU32() == 0u) zero = candidate;
++    }
++    if (zero != nullptr) return zero;
++    if (IrValue* userData = UniqueUserData(*candidates)) return userData;
++    return UniqueImmediate(*candidates);
++}
++
++bool FeedsDescriptor(const IrValue& address) {
++    for (const IrValue* load : address.Uses()) {
++        if (load->Opcode() != IrOpcode::LoadAddressU32) continue;
++        for (const IrValue* user : load->Uses()) {
++            const auto opcode = user->Opcode();
++            if (opcode == IrOpcode::GetImageResource || opcode == IrOpcode::GetSamplerResource || opcode == IrOpcode::GetBufferResource) return true;
++        }
++    }
++    return false;
++}
++
++std::uint32_t LoadPc(const IrValue& address) {
++    for (const IrValue* load : address.Uses()) {
++        if (load->Opcode() == IrOpcode::LoadAddressU32) return load->Flags<MemoryFlags>().pc;
++    }
++    return 0u;
++}
++
++class Dominance {
++public:
++    explicit Dominance(const IrProgram& program) {
++        const auto& order = program.BlockOrder();
++        if (order.empty()) return;
++        std::vector<const IrBlock*> post;
++        std::unordered_set<const IrBlock*> seen{order.front()};
++        std::vector<std::pair<const IrBlock*, std::size_t>> stack{{order.front(), 0u}};
++        while (!stack.empty()) {
++            auto& [block, next] = stack.back();
++            if (next < block->Successors().size()) {
++                const IrBlock* successor = block->Successors()[next++];
++                if (seen.insert(successor).second) stack.emplace_back(successor, 0u);
++                continue;
++            }
++            post.push_back(block);
++            stack.pop_back();
++        }
++        m_order.assign(post.rbegin(), post.rend());
++        for (std::size_t position = 0; position < m_order.size(); ++position) m_index[m_order[position]] = position;
++        m_idom.assign(m_order.size(), None);
++        m_idom[0] = 0;
++        for (bool changed = true; changed;) {
++            changed = false;
++            for (std::size_t position = 1; position < m_order.size(); ++position) {
++                std::size_t candidate = None;
++                for (const IrBlock* predecessor : m_order[position]->Predecessors()) {
++                    const auto found = m_index.find(predecessor);
++                    if (found == m_index.end() || m_idom[found->second] == None) continue;
++                    candidate = candidate == None ? found->second : Intersect(candidate, found->second);
++                }
++                if (candidate != m_idom[position]) {
++                    m_idom[position] = candidate;
++                    changed = true;
++                }
++            }
++        }
++    }
++
++    bool Dominates(const IrBlock* dominator, const IrBlock* block) const {
++        const auto from = m_index.find(dominator);
++        auto at = m_index.find(block);
++        if (from == m_index.end() || at == m_index.end()) return false;
++        for (std::size_t position = at->second;; position = m_idom[position]) {
++            if (position == from->second) return true;
++            if (position == 0u || m_idom[position] == None) return false;
++        }
++    }
++
++private:
++    static constexpr std::size_t None = static_cast<std::size_t>(-1);
++
++    std::size_t Intersect(std::size_t left, std::size_t right) const {
++        while (left != right) {
++            while (left > right) left = m_idom[left];
++            while (right > left) right = m_idom[right];
++        }
++        return left;
++    }
++
++    std::vector<const IrBlock*> m_order;
++    std::unordered_map<const IrBlock*, std::size_t> m_index;
++    std::vector<std::size_t> m_idom;
++};
++
++bool Available(const IrValue& value, const IrValue& user, const Dominance& dominance) {
++    if (value.HasImmediate() || value.Parent() == nullptr) return true;
++    if (value.Parent() != user.Parent()) return dominance.Dominates(value.Parent(), user.Parent());
++    for (const IrValue* inst : user.Parent()->Instructions()) {
++        if (inst == &value) return true;
++        if (inst == &user) return false;
++    }
++    return false;
++}
++
++IrValue& Insert(IrProgram& program, IrValue& position, IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments) {
++    IrValue& value = program.CreateValue(opcode, type);
++    for (IrValue* argument : arguments) value.AddArgument(argument);
++    position.Parent()->InsertInstructionBefore(&position, &value);
++    return value;
++}
++
++IrValue* Rematerialize(IrProgram& program, IrValue& load, IrValue& user, const Dominance& dominance) {
++    if (Available(load, user, dominance)) return &load;
++    if (load.Opcode() != IrOpcode::LoadAddressU32 || load.ArgumentCount() != 4u) return nullptr;
++    IrValue* address = load.Argument(0)->Resolve();
++    if (address->Opcode() != IrOpcode::GetAddressResource || address->ArgumentCount() != 2u) return nullptr;
++    for (std::size_t index = 0; index < address->ArgumentCount(); ++index) {
++        if (!Available(*address->Argument(index)->Resolve(), user, dominance)) return nullptr;
++    }
++    for (std::size_t index = 1; index < load.ArgumentCount(); ++index) {
++        if (!Available(*load.Argument(index)->Resolve(), user, dominance)) return nullptr;
++    }
++    auto flags = load.Flags<MemoryFlags>();
++    auto& memory = program.Resources().memoryInfo;
++    if (flags.index >= memory.size()) return nullptr;
++    memory.push_back(memory[flags.index]);
++    flags.index = static_cast<std::uint32_t>(memory.size() - 1u);
++    IrValue& clone = Insert(program, user, IrOpcode::GetAddressResource, address->Type(), {address->Argument(0)->Resolve(), address->Argument(1)->Resolve()});
++    IrValue& read = program.CreateValue(IrOpcode::LoadAddressU32, load.Type());
++    read.SetFlags(flags);
++    read.AddArgument(&clone);
++    for (std::size_t index = 1; index < load.ArgumentCount(); ++index) read.AddArgument(load.Argument(index)->Resolve());
++    user.Parent()->InsertInstructionBefore(&user, &read);
++    return &read;
++}
++
++std::uint32_t LoadPcOf(const IrValue& load) {
++    return load.Opcode() == IrOpcode::LoadAddressU32 ? load.Flags<MemoryFlags>().pc : 0u;
++}
++
++std::optional<Leaves> DescriptorWordLeaves(IrValue& word, std::uint32_t waveSize) {
++    if (!word.IsPhi()) return std::nullopt;
++    Leaves leaves;
++    CollectLeaves(&word, std::nullopt, waveSize, leaves);
++    if (leaves.failed || leaves.loads.empty() || !leaves.opaque) return std::nullopt;
++    return leaves;
++}
++
++IrValue* PickLoad(const Leaves& leaves, std::optional<std::uint32_t> pc) {
++    if (leaves.loads.size() == 1u) return *leaves.loads.begin();
++    IrValue* latest = nullptr;
++    for (IrValue* load : leaves.loads) {
++        if (pc.has_value() && LoadPcOf(*load) == *pc) return load;
++        if (!pc.has_value() && (latest == nullptr || LoadPcOf(*load) > LoadPcOf(*latest))) latest = load;
++    }
++    return latest;
++}
++
++}
++
++DescriptorPointerSpeculationStats DescriptorPointerSpeculation::Speculate(IrProgram& program, std::uint32_t waveSize) const {
++    DescriptorPointerSpeculationStats stats;
++    IrBuilder builder(program);
++    std::vector<IrValue*> addresses;
++    for (const auto& block : program.Blocks()) {
++        for (IrValue* inst : block->Instructions()) {
++            if (inst->Opcode() == IrOpcode::GetAddressResource && inst->ArgumentCount() == 2u && FeedsDescriptor(*inst)) addresses.push_back(inst);
++        }
++    }
++    for (IrValue* address : addresses) {
++        std::array<IrValue*, 2> actual{address->Argument(0)->Resolve(), address->Argument(1)->Resolve()};
++        bool opaque = false;
++        IrValue* low = GuessLow(*actual[0], waveSize, opaque);
++        IrValue* high = low != nullptr ? GuessHigh(*actual[1], *low, waveSize, opaque) : nullptr;
++        if (low == nullptr || high == nullptr || !opaque || (low == actual[0] && high == actual[1])) continue;
++        const std::array<IrValue*, 2> guess{low, high};
++        IrValue* mismatch = nullptr;
++        for (std::size_t half = 0; half < 2u; ++half) {
++            if (guess[half] == actual[half]) continue;
++            IrValue& differs = Insert(program, *address, IrOpcode::INotEqual32, IrType::Bool, {actual[half], guess[half]});
++            mismatch = mismatch == nullptr ? &differs : &Insert(program, *address, IrOpcode::LogicalOr, IrType::Bool, {mismatch, &differs});
++        }
++        static_cast<void>(Insert(program, *address, IrOpcode::DescriptorFault, IrType::Void, {mismatch, actual[0], actual[1], &builder.Constant(LoadPc(*address))}));
++        for (std::size_t half = 0; half < 2u; ++half) address->ReplaceArgument(half, guess[half]);
++        program.Info().usesFaultBuffer = true;
++        ++stats.speculatedPointers;
++    }
++    const Dominance dominance(program);
++    std::vector<IrValue*> descriptors;
++    for (const auto& block : program.Blocks()) {
++        for (IrValue* inst : block->Instructions()) {
++            const auto opcode = inst->Opcode();
++            if (opcode == IrOpcode::GetImageResource || opcode == IrOpcode::GetSamplerResource || opcode == IrOpcode::GetBufferResource) descriptors.push_back(inst);
++        }
++    }
++    for (IrValue* descriptor : descriptors) {
++        std::vector<std::optional<Leaves>> words;
++        std::optional<std::uint32_t> pc;
++        bool agreed = true;
++        for (std::size_t dword = 0; dword < descriptor->ArgumentCount(); ++dword) {
++            words.push_back(DescriptorWordLeaves(*descriptor->Argument(dword)->Resolve(), waveSize));
++            if (!words.back().has_value() || words.back()->loads.size() != 1u) continue;
++            const auto loadPc = LoadPcOf(**words.back()->loads.begin());
++            if (pc.has_value() && *pc != loadPc) agreed = false;
++            pc = loadPc;
++        }
++        if (!agreed) pc.reset();
++        IrValue* mismatch = nullptr;
++        std::vector<std::pair<std::size_t, IrValue*>> replacements;
++        for (std::size_t dword = 0; dword < descriptor->ArgumentCount(); ++dword) {
++            if (!words[dword].has_value()) continue;
++            IrValue* actual = descriptor->Argument(dword)->Resolve();
++            IrValue* picked = PickLoad(*words[dword], pc);
++            IrValue* guess = picked != nullptr ? Rematerialize(program, *picked, *descriptor, dominance) : nullptr;
++            if (guess == nullptr) continue;
++            IrValue& differs = Insert(program, *descriptor, IrOpcode::INotEqual32, IrType::Bool, {actual, guess});
++            mismatch = mismatch == nullptr ? &differs : &Insert(program, *descriptor, IrOpcode::LogicalOr, IrType::Bool, {mismatch, &differs});
++            replacements.emplace_back(dword, guess);
++        }
++        if (mismatch == nullptr) continue;
++        const std::uint32_t faultPc = LoadPcOf(*replacements.front().second);
++        static_cast<void>(Insert(program, *descriptor, IrOpcode::DescriptorFault, IrType::Void, {mismatch, &builder.Constant(0u), &builder.Constant(0u), &builder.Constant(faultPc)}));
++        for (const auto& [dword, guess] : replacements) descriptor->ReplaceArgument(dword, guess);
++        program.Info().usesFaultBuffer = true;
++        ++stats.speculatedDescriptors;
++    }
++    return stats;
++}
++
++}
+diff --git a/core/shader/recompiler/Recompiler.cpp b/core/shader/recompiler/Recompiler.cpp
+index 10f1f2c0d8..71aa130b2d 100644
+--- a/core/shader/recompiler/Recompiler.cpp
++++ b/core/shader/recompiler/Recompiler.cpp
+@@ -39,6 +39,7 @@
+ #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
+ #include "Optimization/include/Optimization/NanPayloadEliminator.hpp"
+ #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
++#include "Optimization/include/Optimization/DescriptorPointerSpeculation.hpp"
+ #include "Optimization/include/Optimization/GotoPhiRefiner.hpp"
+ #include "Optimization/include/Optimization/RedundantValueEliminator.hpp"
+ #include "Optimization/include/Optimization/RequestMemoryView.hpp"
+@@ -61,6 +62,7 @@
+ #include <exception>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <ControlFlow/RequestSerializer.hpp>
+ 
+ namespace ShaderRecompiler {
+@@ -248,6 +250,17 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
+ }
+ 
+ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation) {
++    static const bool speculateDescriptors = std::getenv("APS5_SPECULATE_DESCRIPTORS") != nullptr;
++    if (!speculateDescriptors) return PrepareResourceProgram(request, preparation, false);
++    try {
++        return PrepareResourceProgram(request, preparation, false);
++    } catch (const std::runtime_error& error) {
++        if (std::string_view(error.what()).find("is not a valid runtime value") == std::string_view::npos) throw;
++    }
++    return PrepareResourceProgram(request, preparation, true);
++}
++
++IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation, bool speculateDescriptors) {
+     frontEndBuilds.fetch_add(1, std::memory_order_relaxed);
+     ShaderPreparationContext local;
+     auto& context = preparation != nullptr ? *preparation : local;
+@@ -400,6 +413,12 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
+     if (gotoPhiRefiner.Refine(program).replacedOperands != 0u) {
+         deadCodeEliminator.Eliminate(program);
+     }
++    if (speculateDescriptors) {
++        constexpr DescriptorPointerSpeculation descriptorPointerSpeculation;
++        if (const auto speculation = descriptorPointerSpeculation.Speculate(program, translateOptions.waveSize); speculation.speculatedPointers != 0u || speculation.speculatedDescriptors != 0u) {
++            deadCodeEliminator.Eliminate(program);
++        }
++    }
+     constexpr SrtWalker srtWalker;
+     srtWalker.BuildPlan(program);
+     deadCodeEliminator.Eliminate(program);
+diff --git a/docs/dev/ENVIRONMENT.md b/docs/dev/ENVIRONMENT.md
+index 58b9485c7b..9dd407db1c 100644
+--- a/docs/dev/ENVIRONMENT.md
++++ b/docs/dev/ENVIRONMENT.md
+@@ -73,6 +73,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
+ | `APS5_RESULT_MEMO_MB` | integer | `core/shader/recompiler/Recompiler.cpp` | 256 | MiB the result memos of all shader sources may hold before the least recently used results are dropped (0 keeps them until their set evicts them) |
+ | `APS5_SAVEEXEC_WRITE_FIRST` | presence | `core/shader/recompiler/Translation/src/ControlFlowInstructions.cpp` |  | writes the saved exec to the destination before reading the source in s_*_saveexec |
+ | `APS5_SINGLE_LANE` | string | `core/shader/recompiler/Recompiler.cpp` |  | hex code addresses (comma separated, or all) of wave64 programs kept at one guest lane per invocation |
++| `APS5_SPECULATE_DESCRIPTORS` | presence | `core/shader/recompiler/Recompiler.cpp` |  | when a descriptor is refused for having no valid runtime value, prepares the program again guessing a table pointer or descriptor word that only unprovable phi arms make ambiguous; the shader checks the guess and reports a mismatch as an invalid-descriptor fault |
+ | `APS5_SRT_DEBUG` | presence | `core/shader/recompiler/Optimization/src/RequestMemoryView.cpp` |  | prints extra SRT descriptor-walk debug output, such as guest reads outside the request memory |
+ | `APS5_STRICT_DESCRIPTOR_WEBS` | string | `core/shader/recompiler/Optimization/src/ResourceTracker.cpp` |  | makes a T# or S# read in a descriptor web throw when a path's descriptor dwords depend on the program counter, EXEC, a lane mask, the lane index or an image read or sample result (not a gather or an image atomic), instead of selecting the first descriptor and recording an `InvalidDescriptor` fault when a lane takes that path; 0 leaves it off |
+ | `APS5_TRACE_BDA` | presence | `core/shader/recompiler/Optimization/src/ResourceTracker.cpp` |  | prints the first few accesses that make a program take the address-based path |
+-- 
+2.55.0
+

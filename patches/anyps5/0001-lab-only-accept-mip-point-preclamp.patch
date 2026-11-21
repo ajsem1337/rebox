@@ -1,0 +1,15 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/GuestSamplerResource.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/GuestSamplerResource.cpp
+index fd33efab23..19097d3849 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/GuestSamplerResource.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/GuestSamplerResource.cpp
+@@ -106,7 +106,9 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
+     const auto reductionMode = toVkReductionMode(filterMode);
+     static_cast<void>(disableDegamma);
+     static_cast<void>(lodBiasSec);
+-    Require(!pointPreclamp, "guest sampler descriptor uses point preclamping which is not implemented");
++    // xsx-shader-lab: Scarlett D3D12 static samplers set MIP_POINT_PRECLAMP. It only changes which
++    // mip a point mip filter picks at exact half-level LODs, so accept it as an approximation.
++    static_cast<void>(pointPreclamp);
+     static_cast<void>(anisoOverride);
+     Require(!blendZeroPrt, "guest sampler descriptor uses PRT blend-zero which is not implemented");
+     if (mipFilter > 2u) Require(false, "guest sampler descriptor uses an unknown mip filter " + std::to_string(mipFilter));

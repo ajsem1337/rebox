@@ -92,8 +92,15 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 
 ## Order of work
 
-1. Build AnyPS5's recompiler alone (no AGC driver) as a mingw DLL with the lab's patches, and
-   compile one PS09 compute shader through it under Wine with a snapshot, as `rdna-run` does.
+1. ~~Build AnyPS5's recompiler alone as a mingw DLL~~ Done: `anyps5/` builds
+   `rebox_anyps5.dll` (16 MB, imports only kernel32/msvcrt/ntdll) from an AnyPS5 checkout with
+   `patches/anyps5/` applied, using AnyPS5's own `add_shader_recompiler()`. The guest libc is
+   replaced by an include path and two stream functions; winpthreads is linked statically. Its C API
+   (`anyps5/rebox_anyps5.h`) compiles a compute shader and exposes the SPIR-V, bindings, push
+   data and subgroup size. Under Wine, `sa5_check.exe` compiles a built-in shader and the lab's
+   `sh_00000_CS` (2,657 words, 4 bindings) with no guest memory. Still to do: build it in the flake
+   from a pinned AnyPS5 (`fc973e0189` plus SPIRV-Headers, SPIRV-Tools, glslang), and fill the
+   `SpirvTarget` from vkd3d-proton's physical device instead of fixed values.
 2. Shadow heap: GFX10 encoders for buffer and 2D views and samplers, and a smoke test that
    AnyPS5's own decoders read them back to the view that was created.
 3. Deferred compute pipelines and the dispatch path, with a hand-written compute shader whose
