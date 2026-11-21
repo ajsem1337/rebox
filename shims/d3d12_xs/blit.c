@@ -16,6 +16,7 @@
 
 #include "../common/rebox_log.h"
 #include "../../generated/blit_shaders.h"
+#include "blit.h"
 #include "gpu_memory.h"
 #include "proxy.h"
 

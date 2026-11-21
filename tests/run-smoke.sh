@@ -47,7 +47,7 @@ export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9=n"
 export REBOX_SHADER_CACHE="Z:${work//\//\\}\\cache"
 # PresentX frame dumps, checked by the smoke test.
 mkdir -p "$work/frames"
-export REBOX_DUMP_FRAMES="Z:${work//\//\\}\\frames" REBOX_DUMP_FRAMES_AT=1,2,3
+export REBOX_DUMP_FRAMES="Z:${work//\//\\}\\frames" REBOX_DUMP_FRAMES_AT=1,2,3,4
 
 # SMOKE_ONLY=<file> runs just that case (for debugging).
 for f in fake.bin console.dxbc translated.dxbc; do

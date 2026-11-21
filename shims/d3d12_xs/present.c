@@ -39,6 +39,7 @@
 #include <string.h>
 
 #include "../common/rebox_log.h"
+#include "blit.h"
 #include "present.h"
 
 #define RING 3
@@ -57,6 +58,9 @@ struct present_queue
         UINT64 done;
     } ring[RING];
     UINT64 frames;
+
+    ID3D12Resource *convert; /* RGBA8 copy of planes a swapchain can't take */
+    UINT convert_w, convert_h;
 
     HWND hwnd;
     IDXGISwapChain3 *swapchain;
@@ -494,35 +498,68 @@ static ID3D12Resource *plane_resource(ID3D12Device *device, const void *plane_pa
     return NULL;
 }
 
-static void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UINT kind, UINT from, BOOL to_copy)
+/* Moves the plane from its tracked state to the one the presenter reads it
+ * in (copy source, or shader resource for the conversion blit), or back. */
+static void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UINT kind, UINT from, BOOL shader_read,
+        BOOL forward)
 {
     if (kind == TRACK_LAYOUT)
     {
+        UINT layout = shader_read ? D3D12_BARRIER_LAYOUT_SHADER_RESOURCE : D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+        UINT sync = shader_read ? D3D12_BARRIER_SYNC_COMPUTE_SHADING : D3D12_BARRIER_SYNC_COPY;
+        UINT access = shader_read ? D3D12_BARRIER_ACCESS_SHADER_RESOURCE : D3D12_BARRIER_ACCESS_COPY_SOURCE;
         D3D12_TEXTURE_BARRIER t = {
-            .SyncBefore = to_copy ? D3D12_BARRIER_SYNC_ALL : D3D12_BARRIER_SYNC_COPY,
-            .SyncAfter = to_copy ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_ALL,
-            .AccessBefore = to_copy ? D3D12_BARRIER_ACCESS_COMMON : D3D12_BARRIER_ACCESS_COPY_SOURCE,
-            .AccessAfter = to_copy ? D3D12_BARRIER_ACCESS_COPY_SOURCE : D3D12_BARRIER_ACCESS_COMMON,
-            .LayoutBefore = to_copy ? from : D3D12_BARRIER_LAYOUT_COPY_SOURCE,
-            .LayoutAfter = to_copy ? D3D12_BARRIER_LAYOUT_COPY_SOURCE : from,
+            .SyncBefore = forward ? D3D12_BARRIER_SYNC_ALL : sync,
+            .SyncAfter = forward ? sync : D3D12_BARRIER_SYNC_ALL,
+            .AccessBefore = forward ? D3D12_BARRIER_ACCESS_COMMON : access,
+            .AccessAfter = forward ? access : D3D12_BARRIER_ACCESS_COMMON,
+            .LayoutBefore = forward ? from : layout,
+            .LayoutAfter = forward ? layout : from,
             .pResource = res,
             .Subresources = { 0xffffffff },
         };
         D3D12_BARRIER_GROUP g = { .Type = D3D12_BARRIER_TYPE_TEXTURE, .NumBarriers = 1, .pTextureBarriers = &t };
 
-        if (from != D3D12_BARRIER_LAYOUT_COPY_SOURCE)
+        if (from != layout)
             ID3D12GraphicsCommandList7_Barrier((ID3D12GraphicsCommandList7 *)list, 1, &g);
     }
-    else if (from != D3D12_RESOURCE_STATE_COPY_SOURCE)
+    else
     {
+        UINT state = shader_read ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
         D3D12_RESOURCE_BARRIER b = { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
 
+        if (from == state)
+            return;
         b.Transition.pResource = res;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = to_copy ? from : D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter = to_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : from;
+        b.Transition.StateBefore = forward ? from : state;
+        b.Transition.StateAfter = forward ? state : from;
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
     }
+}
+
+/* The RGBA8 target planes in other formats are converted into. */
+static BOOL ensure_convert(struct present_queue *s, UINT width, UINT height)
+{
+    D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+                                 DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+
+    if (s->convert && s->convert_w == width && s->convert_h == height)
+        return TRUE;
+    if (s->convert)
+    {
+        wait_idle(s);
+        ID3D12Resource_Release(s->convert);
+        s->convert = NULL;
+    }
+    if (FAILED(ID3D12Device_CreateCommittedResource(s->device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&s->convert)))
+        return FALSE;
+    s->convert_w = width;
+    s->convert_h = height;
+    return TRUE;
 }
 
 static void barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res, D3D12_RESOURCE_STATES before,
@@ -542,11 +579,11 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
 {
     struct present_queue *s = *state;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
-    ID3D12Resource *plane, *back = NULL, *readback = NULL;
+    ID3D12Resource *plane, *src, *back = NULL, *readback = NULL;
     D3D12_RESOURCE_DESC desc;
     DXGI_FORMAT format;
     UINT kind = TRACK_LEGACY, from = D3D12_RESOURCE_STATE_COMMON;
-    BOOL show, dump;
+    BOOL show, dump, convert;
     UINT64 frame, total = 0;
     unsigned r;
     static LONG logged;
@@ -578,15 +615,24 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
 
     desc = ID3D12Resource_GetDesc(plane);
-    format = swapchain_format(desc.Format);
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
-        || format == DXGI_FORMAT_UNKNOWN)
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
     {
         static LONG once;
         if (!InterlockedExchange(&once, 1))
-            rebox_log("d3d12_xs: PresentX: plane (dimension %u, format %u, %u samples) can't be copied to a "
-                         "swapchain; needs a blit", desc.Dimension, desc.Format, desc.SampleDesc.Count);
+            rebox_log("d3d12_xs: PresentX: plane (dimension %u, %u samples) can't be presented",
+                         desc.Dimension, desc.SampleDesc.Count);
         return S_OK;
+    }
+    /* Formats a swapchain can't take are converted to RGBA8 with a blit
+     * (HDR values are clamped, not tone-mapped). */
+    if ((convert = (format = swapchain_format(desc.Format)) == DXGI_FORMAT_UNKNOWN))
+    {
+        static LONG once;
+        if (!InterlockedExchange(&once, 1))
+            rebox_log("d3d12_xs: PresentX: plane format %u is converted to RGBA8 for display", desc.Format);
+        format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (!ensure_convert(s, (UINT)desc.Width, desc.Height))
+            return S_OK;
     }
     lookup(plane, &kind, &from);
 
@@ -605,12 +651,20 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     ID3D12CommandAllocator_Reset(s->ring[r].alloc);
     ID3D12GraphicsCommandList_Reset(s->ring[r].list, s->ring[r].alloc, NULL);
 
-    transition(s->ring[r].list, plane, kind, from, TRUE);
+    transition(s->ring[r].list, plane, kind, from, convert, TRUE);
+    src = plane;
+    if (convert)
+    {
+        ReboxBlit(s->ring[r].list, plane, (UINT)desc.Width, desc.Height, s->convert, (UINT)desc.Width, desc.Height);
+        barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        src = s->convert;
+        desc = ID3D12Resource_GetDesc(src);
+    }
     if (show && SUCCEEDED(IDXGISwapChain3_GetBuffer(s->swapchain, IDXGISwapChain3_GetCurrentBackBufferIndex(s->swapchain),
                                                     &IID_ID3D12Resource, (void **)&back)))
     {
         barrier(s->ring[r].list, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-        ID3D12GraphicsCommandList_CopyResource(s->ring[r].list, back, plane);
+        ID3D12GraphicsCommandList_CopyResource(s->ring[r].list, back, src);
         barrier(s->ring[r].list, back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     }
     if (dump)
@@ -625,14 +679,16 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&readback)))
         {
             D3D12_TEXTURE_COPY_LOCATION dst = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-            D3D12_TEXTURE_COPY_LOCATION src = { plane, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_TEXTURE_COPY_LOCATION from_loc = { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
 
             dst.PlacedFootprint = fp;
-            src.SubresourceIndex = 0;
-            ID3D12GraphicsCommandList_CopyTextureRegion(s->ring[r].list, &dst, 0, 0, 0, &src, NULL);
+            from_loc.SubresourceIndex = 0;
+            ID3D12GraphicsCommandList_CopyTextureRegion(s->ring[r].list, &dst, 0, 0, 0, &from_loc, NULL);
         }
     }
-    transition(s->ring[r].list, plane, kind, from, FALSE);
+    if (convert)
+        barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(s->ring[r].list, plane, kind, from, convert, FALSE);
 
     if (SUCCEEDED(ID3D12GraphicsCommandList_Close(s->ring[r].list)))
     {
@@ -670,6 +726,8 @@ void present_queue_destroy(struct present_queue *s)
         wait_idle(s);
     if (s->swapchain)
         IDXGISwapChain3_Release(s->swapchain);
+    if (s->convert)
+        ID3D12Resource_Release(s->convert);
     if (s->hwnd)
         PostMessageW(s->hwnd, WM_QUIT, 0, 0);
     for (int i = 0; i < RING; i++)

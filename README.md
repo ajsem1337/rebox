@@ -130,8 +130,8 @@ down missing translations.
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
   log and return `E_NOTIMPL`; `REBOX_STUB_FATAL=1` stops at the first one. `PresentX` shows
   plane 0 in a window through a DXGI swapchain. Not done yet:
-  - planes in formats a swapchain can't take (e.g. R11G11B10) need a shader blit, and only
-    plane 0 is shown;
+  - only plane 0 is shown (no HUD-plane composition yet). Planes in formats a swapchain can't
+    take, such as R11G11B10, are converted to RGBA8 with a blit: HDR is clamped, not tone-mapped;
   - frame pacing calls are no-ops (vsync paces instead);
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
