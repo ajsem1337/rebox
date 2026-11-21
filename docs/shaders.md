@@ -148,3 +148,29 @@ There are two places this could live:
 Meanwhile `d3d12_xs` keeps its fallback shaders, so a title runs with effects missing rather than
 failing. The `.dxil` cache path stays for PC-format shaders the console title may carry, such as
 the BVH builder's once lowered.
+
+## First run of Leonida's translator on the game's shaders (2026-11-21)
+
+`the shader archive` (412 MB) carves into 26,503 DXBC containers, all SM 6.6 with `ISG1`/`OSG1` and no
+`RTS0`. They unpack to FSSM and disassemble with LLVM 21 (`gfx1013`): 25,030 clean, 1,473 with
+some invalid words. Leonida's `rdna2spirv.py` translates them, run as a separate program from a
+local clone (GPLv3; its output is data, nothing of it is in this repo). Its modules use set 0
+only: binding 1 samplers, 2 the descriptor hash table (a storage buffer), every other binding
+image or storage-image arrays. The push block is s0-s31 plus `heap_base`/`code_base`, as ours.
+
+Integration so far:
+
+- the lookup table now uses Leonida's layout and is one table for all heaps (T# and S# lookups
+  share it);
+- `patches/vkd3d-proton/0004` remaps an `SCSV` module's set 0 binding 0 (resource heap) and
+  binding 1 (sampler heap) to the device's real bindless sets, so a glue step only has to
+  normalise bindings and turn the hash-table storage buffer into a pointer from push dwords 36-37.
+
+**Blocker: descriptor-table pointers are 32-bit.** The game's shaders read a table pointer's low
+dword and zero the high one (the translator reports `truncates_table_ptr_high`), then load from
+`heap_base + pointer`. On the console, descriptor heaps sit below 4 GiB. RADV puts descriptor
+buffers in its 32-bit window at `0xffff8000_xxxxxxxx`, and `heap_base` can't absorb that, because
+Leonida adds it to every address, absolute buffer addresses included. Proposed fix: extend the
+RADV patch so 32-bit allocations come from the kernel's low 32-bit VA range (no
+`AMDGPU_VA_RANGE_HIGH`) with `address32_hi = 0`. Heaps then sit below 4 GiB and `heap_base`
+stays 0.

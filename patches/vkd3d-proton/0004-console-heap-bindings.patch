@@ -1,0 +1,100 @@
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 722c8b4..0536bd1 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2861,15 +2861,84 @@ struct vkd3d_shader_code vkd3d_rebox_shader_dxbc(const D3D12_SHADER_BYTECODE
+     return dxbc;
+ }
+ 
++/* Console shaders name the bindless heaps by contract: descriptor set 0,
++ * binding 0 for the CBV/SRV/UAV heap (any number of differently typed
++ * variables may alias it, as with mutable descriptors) and binding 1 for the
++ * sampler heap. Point them at this device's real sets and bindings. */
++static void vkd3d_rebox_remap_heap_bindings(struct d3d12_device *device, uint32_t *words, size_t count)
++{
++    const struct vkd3d_bindless_state *bindless = &device->bindless_state;
++    uint32_t resource_set = ~0u, resource_binding = 0, sampler_set = ~0u, sampler_binding = 0;
++    uint32_t *set_word, *binding_word;
++    size_t i, j, len;
++
++    for (j = 0; j < bindless->set_count; j++)
++    {
++        const struct vkd3d_bindless_set_info *info = &bindless->set_info[j];
++        if (info->heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && sampler_set == ~0u)
++        {
++            sampler_set = j;
++            sampler_binding = info->binding_index;
++        }
++        else if (info->heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && resource_set == ~0u
++                && (info->flags & VKD3D_BINDLESS_SET_IMAGE))
++        {
++            resource_set = j;
++            resource_binding = info->binding_index;
++        }
++    }
++
++    /* For every decorated variable, find its DescriptorSet and Binding words. */
++    for (i = 5; i < count; i += len)
++    {
++        uint32_t target, set = ~0u, binding = ~0u;
++
++        if (!(len = words[i] >> 16))
++            return;
++        if ((words[i] & 0xffff) != 71 /* OpDecorate */ || len < 4 || words[i + 2] != 34 /* DescriptorSet */)
++            continue;
++        target = words[i + 1];
++        set_word = &words[i + 3];
++        set = *set_word;
++        binding_word = NULL;
++        for (size_t k = 5, kl; k < count; k += kl)
++        {
++            if (!(kl = words[k] >> 16))
++                break;
++            if ((words[k] & 0xffff) == 71 && kl >= 4 && words[k + 1] == target && words[k + 2] == 33 /* Binding */)
++            {
++                binding_word = &words[k + 3];
++                binding = *binding_word;
++                break;
++            }
++        }
++        if (set != 0 || !binding_word || binding > 1)
++            continue;
++        if (binding == 0 && resource_set != ~0u)
++        {
++            *set_word = resource_set;
++            *binding_word = resource_binding;
++        }
++        else if (binding == 1 && sampler_set != ~0u)
++        {
++            *set_word = sampler_set;
++            *binding_word = sampler_binding;
++        }
++        else
++            WARN("rebox: no bindless set for console heap binding %u.\n", binding);
++    }
++}
++
+ /* The console shader's SPIR-V is used as is: no DXBC to convert. */
+-static HRESULT vkd3d_rebox_load_console_shader(const struct vkd3d_rebox_console_shader *h,
+-        struct vkd3d_shader_code *spirv_code)
++static HRESULT vkd3d_rebox_load_console_shader(struct d3d12_device *device,
++        const struct vkd3d_rebox_console_shader *h, struct vkd3d_shader_code *spirv_code)
+ {
+     void *code;
+ 
+     if (!(code = vkd3d_malloc(h->spirv_size)))
+         return E_OUTOFMEMORY;
+     memcpy(code, (const uint8_t *)h + h->spirv_offset, h->spirv_size);
++    vkd3d_rebox_remap_heap_bindings(device, code, h->spirv_size / sizeof(uint32_t));
+     memset(spirv_code, 0, sizeof(*spirv_code));
+     spirv_code->code = code;
+     spirv_code->size = h->spirv_size;
+@@ -2904,7 +2973,7 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+     }
+ 
+     if (!spirv_code->code && vkd3d_rebox_console_shader(code))
+-        return vkd3d_rebox_load_console_shader(vkd3d_rebox_console_shader(code), spirv_code);
++        return vkd3d_rebox_load_console_shader(device, vkd3d_rebox_console_shader(code), spirv_code);
+ 
+     if (!spirv_code->code)
+     {
