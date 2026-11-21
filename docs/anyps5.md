@@ -80,7 +80,8 @@ words (16 dwords), which the dispatch path will have to fill.
    vkd3d-proton calls `d3d12_xs`'s `ReboxConsoleCompile` with the blob, the SGPRs, the bound
    heaps and, for each AnyPS5 descriptor kind, the bindless set and binding that holds it (as
    `vkd3d_bindless_state_find_binding` numbers them).
-3. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps through its
+3. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps (at their title
+   addresses) and `d3d12_xs`'s GPU memory chunks (xmem's allocations, at their GPU VAs) through its
    in-memory cache, which parses the code once and makes a variant per new set of descriptors.
    Each guest binding's elements are found in the bound heap's shadow (`shadow_find_index`),
    which gives heap slots. `sa5_finalize` (`anyps5/spirv_remap.cpp`) then:
@@ -105,9 +106,16 @@ What AnyPS5's driver would do and this host does instead, from its sources:
 | ShaderData (62) | its words, as FlattenedSrt (compute normally uses push data instead) |
 | Image and sampler tables, LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
 
+Guest memory matters beyond descriptors. americas-recomp found that user-data pointers into
+memory the recompiler can't read make the SRT walk throw. Backing them took its the target title sample
+from 25 to 198 of 200 valid compiles. Resources the title creates itself are not in the guest
+memory yet. The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
+`image_sample_d_cl` needs it), limited to what RADV and lavapipe both have.
+
 The smoke test runs this whole path on lavapipe. `test_console_dispatch` creates a deferred PSO from
 hand-assembled RDNA2 code that stores `0x1234abcd` through the V# at the start of its descriptor
-table (heap slot 1), dispatches it, and reads the value back. `REBOX_DUMP_SPIRV=DIR` writes each
+table (heap slot 1), dispatches it, and reads the value back. A second dispatch gets the same V# through a pointer
+in root constants into `ReboxGpuAlloc` memory. `REBOX_DUMP_SPIRV=DIR` writes each
 finalized module.
 
 ## Where AnyPS5 runs
@@ -172,4 +180,10 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   variant cache and memo patches limit this; the pipeline cache should persist across runs.
 - **Speculated descriptors** (lab patch 0004) are checked at runtime through the fault buffer; the
   host must read it back and recompile on a mismatch.
+- **The real user-SGPR map.** TomBox reads, from the retail `the shader archive` PS09 cache
+  (unconfirmed except for one shader), per-shader metadata records (tag 0x41). Each gives a
+  binding's kind (SRV, CBV, UAV, sampler, direct), its dword offset, register, and a packed word
+  with the descriptor dword count (bits 0-7), user SGPR (bits 8-15) and register space. If that
+  holds, SGPRs come from those records, not root-parameter order (patch 0005 still packs in root
+  order).
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.

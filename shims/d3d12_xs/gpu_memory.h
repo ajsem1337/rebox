@@ -20,3 +20,8 @@ BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size);
 
 /* Bytes handed out by ReboxGpuAlloc and not yet freed. */
 UINT64 WINAPI ReboxGpuBytesInUse(void);
+
+/* Every chunk's GPU VA, CPU pointer and size, for the shader recompiler's guest memory
+ * (console_compile.c). Returns the count, at most max. */
+struct gpu_memory_region { UINT64 gpu; const void *cpu; SIZE_T size; };
+UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max);

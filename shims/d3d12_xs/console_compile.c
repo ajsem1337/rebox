@@ -264,9 +264,25 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                          (int)in->bindless[6][0], in->bindless[6][1]);
     }
 
+    /* Guest memory: the shadow heaps at their title addresses, then the GPU memory chunks
+     * (xmem's allocations, at their GPU VAs) that don't overlap them, so the SRT walk can follow
+     * user-data pointers into constant data. Title-created resources aren't included. */
     n = shadow_regions(shadows, MAX_REGIONS);
     for (UINT i = 0; i < n; i++)
         regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
+    {
+        struct gpu_memory_region chunks[MAX_REGIONS];
+        UINT count = gpu_memory_regions(chunks, MAX_REGIONS - n), shadow_count = n;
+        for (UINT i = 0; i < count; i++)
+        {
+            BOOL overlaps = FALSE;
+            for (UINT j = 0; j < shadow_count && !overlaps; j++)
+                overlaps = chunks[i].gpu < regions[j].address + regions[j].size
+                        && regions[j].address < chunks[i].gpu + chunks[i].size;
+            if (!overlaps && chunks[i].size)
+                regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
+        }
+    }
     memset(&req, 0, sizeof(req));
     req.code = (const UINT32 *)((const BYTE *)h + h->code_offset);
     req.code_dwords = h->code_dwords;

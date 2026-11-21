@@ -1696,6 +1696,63 @@ static void test_console_dispatch(void *dev, void *queue)
     }
     CHECK(out[0] == 0x1234abcd, "the deferred console shader, compiled by AnyPS5 at dispatch, wrote %#x through "
           "its V# (expected 0x1234abcd)", out[0]);
+
+    /* Same code, but s[0:1] comes from two root constants and points into GPU memory from
+     * ReboxGpuAlloc holding a copy of the V#: the recompiler has to read that memory too. */
+    {
+        HRESULT (WINAPI *galloc)(SIZE_T, SIZE_T, void **, UINT64 *) = (void *)GetProcAddress(m, "ReboxGpuAlloc");
+        HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+                (void *)GetProcAddress(m, "ReboxShadowHeap");
+        D3D12_ROOT_PARAMETER cparam = { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                                        .Constants = { 0, 0, 2 } };
+        D3D12_ROOT_SIGNATURE_DESC crsd = { 1, &cparam };
+        void *crs = NULL, *cpso = NULL, *mem = NULL;
+        ID3D10Blob *crs_blob = NULL;
+        BYTE *shadow = NULL;
+        UINT64 mem_gpu = 0;
+        UINT32 ptr[2];
+
+        out[0] = 0;
+        hr = galloc(256, 256, &mem, &mem_gpu);
+        if (SUCCEEDED(hr))
+            hr = shadow_heap(cpu, NULL, (void **)&shadow, NULL, NULL);
+        if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&crsd, D3D_ROOT_SIGNATURE_VERSION_1, &crs_blob, NULL)))
+            hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                    ID3D10Blob_GetBufferPointer(crs_blob), ID3D10Blob_GetBufferSize(crs_blob), &IID_ID3D12RootSignature,
+                    &crs);
+        if (SUCCEEDED(hr))
+        {
+            cd.pRootSignature = crs;
+            hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                    &IID_ID3D12PipelineState, &cpso);
+        }
+        if (SUCCEEDED(hr))
+            hr = ID3D12CommandAllocator_Reset(alloc);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        CHECK(SUCCEEDED(hr), "objects for the deferred dispatch through GPU memory (%#lx)", hr);
+        if (SUCCEEDED(hr))
+        {
+            memcpy(mem, shadow + inc, 16);
+            ptr[0] = (UINT32)mem_gpu;
+            ptr[1] = (UINT32)(mem_gpu >> 32);
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, crs);
+            XSLOT(list, 25, void, void *)(list, cpso);
+            XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 0, 2, ptr, 0);
+            XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+            hr = XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
+                Sleep(10);
+            CHECK(out[0] == 0x1234abcd, "a deferred console shader whose V# pointer leads into ReboxGpuAlloc "
+                  "memory wrote %#x (expected 0x1234abcd)", out[0]);
+        }
+        if (cpso) XSLOT(cpso, 2, ULONG)(cpso);
+        if (crs) XSLOT(crs, 2, ULONG)(crs);
+        if (crs_blob) ID3D10Blob_Release(crs_blob);
+    }
     ID3D12Resource_Unmap(out_buf, 0, NULL);
 
 done:

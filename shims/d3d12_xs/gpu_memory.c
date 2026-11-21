@@ -342,3 +342,14 @@ UINT64 WINAPI ReboxGpuBytesInUse(void)
     ReleaseSRWLockShared(&lock);
     return n;
 }
+
+UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
+{
+    UINT n = 0;
+
+    AcquireSRWLockShared(&lock);
+    for (struct chunk *c = chunks; c && n < max; c = c->next)
+        out[n++] = (struct gpu_memory_region){ c->gpu, c->cpu, c->size };
+    ReleaseSRWLockShared(&lock);
+    return n;
+}

@@ -25,9 +25,15 @@ namespace {
 // VkPhysicalDevice (subgroup size, limits, capabilities, extensions).
 SpirvTarget DefaultTarget(std::uint32_t wave)
 {
-    static constexpr std::array<std::uint32_t, 5> capabilities{
+    // Capabilities AnyPS5 gates on, limited to ones RADV and lavapipe both expose and vkd3d-proton
+    // enables. MinLod: without it image_sample_d_cl fails (americas-recomp, 29 the target title pixel shaders).
+    static constexpr std::array<std::uint32_t, 16> capabilities{
         spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess,
-        spv::CapabilityClipDistance, spv::CapabilityInt64Atomics,
+        spv::CapabilityClipDistance, spv::CapabilityInt64Atomics, spv::CapabilityMinLod, spv::CapabilityImageQuery,
+        spv::CapabilityImageGatherExtended, spv::CapabilityDerivativeControl,
+        spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityStorageImageWriteWithoutFormat,
+        spv::CapabilityGroupNonUniformVote, spv::CapabilityGroupNonUniformArithmetic,
+        spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformQuad,
     };
     static constexpr std::array<std::string_view, 4> extensions{
         "SPV_EXT_descriptor_indexing", "SPV_KHR_8bit_storage", "SPV_KHR_float_controls", "SPV_KHR_physical_storage_buffer",
