@@ -48,12 +48,22 @@ export REBOX_SHADER_CACHE="Z:${work//\//\\}\\cache"
 mkdir -p "$work/frames"
 export REBOX_DUMP_FRAMES="Z:${work//\//\\}\\frames" REBOX_DUMP_FRAMES_AT=1,2
 
+# SMOKE_ONLY=<file> runs just that case (for debugging).
 for f in fake.bin console.dxbc translated.dxbc; do
+    [[ -n ${SMOKE_ONLY:-} && $SMOKE_ONLY != "$f" ]] && continue
     echo "== $f"
     "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\$f"
 done
+[[ -n ${SMOKE_ONLY:-} ]] && exit 0
 
-# Negative control: same shader with the cache entry gone must fail.
+# Negative control: same shader with the cache entry gone must fail when
+# fallback shaders are off...
 echo "== fake.bin, no cache entry"
 rm "$work/cache/$(hash "$work/fake.bin").dxil"
-"$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" nocache
+REBOX_SHADER_FALLBACK=0 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" nocache
+
+# ...and succeed through the fallback shaders by default.
+echo "== fake.bin, no cache entry, fallback shaders"
+out=$("$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
+echo "$out"
+grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were not used"; exit 1; }

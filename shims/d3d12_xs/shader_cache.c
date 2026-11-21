@@ -149,8 +149,8 @@ static void record_miss(UINT64 hash, const D3D12_SHADER_BYTECODE *in, const char
     }
 }
 
-BOOL shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTECODE *out,
-                             const char *stage)
+enum shader_lookup shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTECODE *out,
+                                           const char *stage)
 {
     char path[MAX_PATH];
     struct entry *e;
@@ -158,10 +158,17 @@ BOOL shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTEC
 
     InitOnceExecuteOnce(&config_once, config_init, NULL, NULL);
 
-    if (!cache_dir || !in->pShaderBytecode || !in->BytecodeLength)
-        return FALSE;
+    if (!in->pShaderBytecode || !in->BytecodeLength)
+        return SHADER_NONE;
     if (is_pc_bytecode(in->pShaderBytecode, in->BytecodeLength))
-        return FALSE;
+        return SHADER_PC;
+    if (!cache_dir)
+    {
+        static LONG once;
+        if (!InterlockedExchange(&once, 1))
+            rebox_log("d3d12_xs: console shader but no REBOX_SHADER_CACHE; every console shader misses");
+        return SHADER_MISS;
+    }
 
     hash = shader_hash(in->pShaderBytecode, in->BytecodeLength);
 
@@ -192,8 +199,8 @@ BOOL shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTEC
     }
 
     if (!e || !e->data)
-        return FALSE;
+        return SHADER_MISS;
     out->pShaderBytecode = e->data;
     out->BytecodeLength = e->size;
-    return TRUE;
+    return SHADER_HIT;
 }

@@ -369,8 +369,8 @@ static void test_present(void *dev, void *queue)
     D3D12_RESOURCE_BARRIER to_present = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12Resource *tex = NULL;
-    void *rtv_heap = NULL, *list = NULL;
-    UINT64 plane_params[6] = { 0 };
+    void *rtv_heap = NULL, *list = NULL, *rs = NULL, *pso = NULL; /* alive until the GPU is done */
+    UINT64 plane_params[6] = { 0 }, scratch_before = 0;
     SIZE_T rtv;
     BYTE px[4];
     HRESULT hr;
@@ -392,11 +392,80 @@ static void test_present(void *dev, void *queue)
     CHECK(SUCCEEDED(hr), "render target, RTV heap and list for PresentX (%#lx)", hr);
     if (FAILED(hr)) goto done;
 
+    /* A texture's GPU VA is 0 under vkd3d-proton; titles write texels
+     * through it, so d3d12_xs hands out scratch GPU memory instead. */
+    {
+        UINT64 (WINAPI *usage)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGpuBytesInUse");
+        UINT64 va;
+
+        scratch_before = usage ? usage() : 0;
+        va = ID3D12Resource_GetGPUVirtualAddress(tex);
+        CHECK(va != 0, "texture GPU VA is backed by scratch memory (%#llx)", (unsigned long long)va);
+        if (va)
+        {
+            memset((void *)(ULONG_PTR)va, 0x11, 64 * 48 * 4);
+            CHECK(ID3D12Resource_GetGPUVirtualAddress(tex) == va && (!usage || usage() > scratch_before),
+                  "texel writes through it land, and the address is stable");
+        }
+    }
+
     /* CreateRenderTargetView (device slot 20), ClearRenderTargetView (list
      * slot 52 = PC 48), ResourceBarrier (slot 26) to PRESENT. */
     rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
     XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, tex, NULL, rtv);
     XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, clear.Color, 0, NULL);
+
+    /* A graphics PSO from console bytes with no translation gets fallback
+     * shaders, which must draw nothing: the frame stays the clear colour.
+     * Skipped when fallbacks are off (the strict run). */
+    if (!getenv("REBOX_SHADER_FALLBACK") || *getenv("REBOX_SHADER_FALLBACK") != '0')
+    {
+        static const char console_vs[] = "REBOX-FAKE-CONSOLE-VS", console_ps[] = "REBOX-FAKE-CONSOLE-PS";
+        PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+                GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12SerializeRootSignature");
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 0, NULL, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
+        D3D12_VIEWPORT vp = { 0, 0, 64, 48, 0, 1 };
+        D3D12_RECT sc = { 0, 0, 64, 48 };
+        ID3D10Blob *blob = NULL;
+
+        if (serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+        {
+            XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                    ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+            ID3D10Blob_Release(blob);
+        }
+        gd.pRootSignature = rs;
+        gd.VS.pShaderBytecode = console_vs;
+        gd.VS.BytecodeLength = sizeof(console_vs);
+        gd.PS.pShaderBytecode = console_ps;
+        gd.PS.BytecodeLength = sizeof(console_ps);
+        gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        gd.SampleMask = ~0u;
+        gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        gd.NumRenderTargets = 1;
+        gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        gd.SampleDesc.Count = 1;
+        hr = rs ? XSLOT(dev, 10, HRESULT, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &gd,
+                &IID_ID3D12PipelineState, &pso) : E_FAIL;
+        CHECK(SUCCEEDED(hr), "graphics PSO from untranslated console shaders gets fallbacks (%#lx)", hr);
+        if (pso)
+        {
+            /* RSSetViewports 21, RSSetScissorRects 22, IASetPrimitiveTopology
+             * 20, SetGraphicsRootSignature 34, SetPipelineState 25,
+             * OMSetRenderTargets 50, DrawInstanced 12. */
+            XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
+            XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
+            XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            XSLOT(list, 34, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, pso);
+            XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
+            XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
+        }
+    }
+
     to_present.Transition.pResource = tex;
     to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -429,9 +498,30 @@ static void test_present(void *dev, void *queue)
     }
 
 done:
+    /* The draw must finish before its PSO and root signature go. */
+    if (pso || rs)
+    {
+        ID3D12Fence *fence = NULL;
+        if (SUCCEEDED(XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0,
+                D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)))
+        {
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+            for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+                Sleep(10);
+            ID3D12Fence_Release(fence);
+        }
+    }
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
     if (list) XSLOT(list, 2, ULONG)(list);
     if (alloc) ID3D12CommandAllocator_Release(alloc);
-    if (tex) ID3D12Resource_Release(tex);
+    if (tex)
+    {
+        UINT64 (WINAPI *usage)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGpuBytesInUse");
+        ID3D12Resource_Release(tex);
+        if (usage && scratch_before)
+            CHECK(usage() == scratch_before, "texture scratch memory freed with the texture");
+    }
     if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
 }
 
@@ -525,6 +615,18 @@ static void test_xbox(void)
     hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
             &IID_ID3D12Fence, (void **)&fence);
     CHECK(SUCCEEDED(hr), "CreateFence (slot 36) %#lx", hr);
+
+    /* Unproxied children report the device proxy. (D3D12CreateDevice on the
+     * same adapter returns the same vkd3d-proton device, so there is no
+     * separate PC-path device to compare against.) */
+    if (fence)
+    {
+        ID3D12Device *got = NULL;
+
+        hr = ID3D12Fence_GetDevice(fence, &IID_ID3D12Device, (void **)&got);
+        CHECK(SUCCEEDED(hr) && (void *)got == dev, "raw fence GetDevice returns the device proxy (%p)", (void *)got);
+        if (got) ID3D12Device_Release(got);
+    }
     XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
     if (fence)
     {

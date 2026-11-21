@@ -61,6 +61,7 @@ Once the exe is dumped:
 | `WINEPREFIX` | Default `~/.local/share/rebox/<TitleId>` |
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
+| `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
 | `REBOX_LOG=/path` | Also append shim logs to this file |
 | `REBOX_GPUVA_WINDOW` | `BASE:SIZE` (hex) for identity-mapped GPU memory; default `200000000000:10000000000`; `off` stops xmem reserving it |
@@ -80,6 +81,12 @@ bytecode. Only a container with a `SHEX`/`SHDR` part or a `DXIL` part holding LL
 through. Everything else, including the console's `DXIL` parts (a `NOBC` stub around zlib `FSSM`
 GFX10.3 code), is looked up in the cache.
 
+A miss would fail PSO creation, which a title rarely survives. So by default the whole pipeline
+gets fallback shaders instead (`generated/fallback_shaders.h`, from `tools/gen_fallback_shaders.sh`):
+graphics draws nothing, compute does nothing, and the effect is just missing. Each one is logged.
+Mesh-shader pipelines have no fallback. `REBOX_SHADER_FALLBACK=0` restores failing, for hunting
+down missing translations.
+
 ## Verified so far
 
 - Shims build with mingw. `tests/run-smoke.sh` passes under stock Wine 11.21 + vkd3d-proton 3.0.1
@@ -94,6 +101,9 @@ GFX10.3 code), is looked up in the cache.
   disassembly here.
 - `XMemVirtualQuery` takes `(process, address, info)` with a 0x40-byte info struct, as
   XboxBvhBuilder.dll calls it, and the smoke test covers that call.
+- Fallback shaders: a graphics PSO built from untranslated console bytes is created, a draw with
+  it leaves the frame untouched, and compute and stream PSOs work too. Strict mode still rejects
+  them.
 - `PresentX` presents a cleared render target recorded through Xbox slots. Both plane-param
   layouts work (resource, or pointer to it), and the dumped frame has the cleared pixels. This
   was checked headless; the window and swapchain need a display.
@@ -116,13 +126,18 @@ GFX10.3 code), is looked up in the cache.
   - planes in formats a swapchain can't take (e.g. R11G11B10) need a shader blit, and only
     plane 0 is shown;
   - frame pacing calls are no-ops (vsync paces instead);
-  - `GetDevice` on unproxied objects (resources, PSOs) returns vkd3d-proton's PC device.
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
   CPU-visible D3D12 heaps. `rebox-run` loads `VK_LAYER_REBOX_gpuva_identity` and, on AMD,
   `.#radv-rebox`, which together make those heaps identity-mapped. Without them,
   `d3d12_xs` logs that GPU memory is not identity-mapped. Resources the title creates itself in
   default heaps still get ordinary (non-identity) GPU addresses.
+- **Audio: XMA2 doesn't play.** Under WineGDK, FAudio sends XMA2 to Wine's WMA decoder, which
+  accepts only WMA formats, so creating an XMA2 source voice fails, with or without GStreamer.
+  Planned mitigation: an `xaudio2_9.dll` wrapper that turns XMA2 voices into silent PCM voices with
+  the same timing. Bink's audio is decoded to PCM by Bink and is unaffected.
+- **Textures written through their GPU VA** get scratch memory (see docs/d3d12x.md): no crash,
+  but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
   ignores them, and the smoke test checks that it still does. Their meaning is unknown. Streams with

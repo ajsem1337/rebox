@@ -20,6 +20,7 @@
 #include "gpu_memory.h"
 #include "proxy.h"
 #include "shader_cache.h"
+#include "../../generated/fallback_shaders.h"
 
 static INIT_ONCE load_once = INIT_ONCE_STATIC_INIT;
 static PFN_D3D12_CREATE_DEVICE real_create_device;
@@ -103,19 +104,57 @@ static const struct
 };
 #undef LAYOUT
 
+/* A console shader with no translation would fail PSO creation, which a
+ * title rarely survives. Instead the whole pipeline gets fallback shaders
+ * (generated/fallback_shaders.h): graphics draws nothing, compute does
+ * nothing, and the title keeps running with that effect missing. They use no
+ * resources, so they fit any root signature. REBOX_SHADER_FALLBACK=0
+ * restores failing, to find missing shaders. Mesh pipelines have no fallback. */
+static const D3D12_SHADER_BYTECODE fallback_vs_bc = { fallback_vs, sizeof(fallback_vs) };
+static const D3D12_SHADER_BYTECODE fallback_ps_bc = { fallback_ps, sizeof(fallback_ps) };
+static const D3D12_SHADER_BYTECODE fallback_cs_bc = { fallback_cs, sizeof(fallback_cs) };
+static const D3D12_SHADER_BYTECODE no_shader;
+
+static BOOL fallback_enabled(void)
+{
+    const char *env = getenv("REBOX_SHADER_FALLBACK");
+    return !env || *env != '0';
+}
+
+static void note_fallback(const char *kind)
+{
+    static LONG count;
+    LONG n = InterlockedIncrement(&count);
+
+    if (n <= 16 || !(n & (n - 1)))
+        rebox_log("d3d12_xs: %s PSO #%ld uses fallback shaders (missing translation); the effect is skipped",
+                     kind, n);
+}
+
 static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC copy;
+    BOOL miss = FALSE;
 
     if (!desc)
         return orig_create_graphics(device, desc, riid, pso);
     copy = *desc;
-    shader_cache_substitute(&desc->VS, &copy.VS, "vs");
-    shader_cache_substitute(&desc->PS, &copy.PS, "ps");
-    shader_cache_substitute(&desc->DS, &copy.DS, "ds");
-    shader_cache_substitute(&desc->HS, &copy.HS, "hs");
-    shader_cache_substitute(&desc->GS, &copy.GS, "gs");
+    miss |= shader_cache_substitute(&desc->VS, &copy.VS, "vs") == SHADER_MISS;
+    miss |= shader_cache_substitute(&desc->PS, &copy.PS, "ps") == SHADER_MISS;
+    miss |= shader_cache_substitute(&desc->DS, &copy.DS, "ds") == SHADER_MISS;
+    miss |= shader_cache_substitute(&desc->HS, &copy.HS, "hs") == SHADER_MISS;
+    miss |= shader_cache_substitute(&desc->GS, &copy.GS, "gs") == SHADER_MISS;
+    if (miss && fallback_enabled())
+    {
+        copy.VS = fallback_vs_bc;
+        copy.PS = desc->PS.BytecodeLength ? fallback_ps_bc : no_shader;
+        copy.HS = copy.DS = copy.GS = no_shader;
+        memset(&copy.StreamOutput, 0, sizeof(copy.StreamOutput));
+        if (copy.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+            copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        note_fallback("graphics");
+    }
     return orig_create_graphics(device, &copy, riid, pso);
 }
 
@@ -127,7 +166,11 @@ static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
     if (!desc)
         return orig_create_compute(device, desc, riid, pso);
     copy = *desc;
-    shader_cache_substitute(&desc->CS, &copy.CS, "cs");
+    if (shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS && fallback_enabled())
+    {
+        copy.CS = fallback_cs_bc;
+        note_fallback("compute");
+    }
     return orig_create_compute(device, &copy, riid, pso);
 }
 
@@ -135,7 +178,9 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_PIPELINE_STATE_STREAM_DESC copy;
-    SIZE_T offset = 0;
+    SIZE_T offset = 0, stages[16], topology = 0, stream_output = 0;
+    UINT stage_count = 0;
+    BOOL miss = FALSE;
     BYTE *stream;
     HRESULT hr;
 
@@ -159,9 +204,45 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         if (subobj_layouts[type].stage)
         {
             D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + offset + subobj_layouts[type].offset);
-            shader_cache_substitute(bc, bc, subobj_layouts[type].stage);
+            miss |= shader_cache_substitute(bc, bc, subobj_layouts[type].stage) == SHADER_MISS;
+            if (stage_count < ARRAYSIZE(stages))
+                stages[stage_count++] = offset;
         }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY)
+            topology = offset + subobj_layouts[type].offset;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT)
+            stream_output = offset + subobj_layouts[type].offset;
         offset += subobj_layouts[type].size;
+    }
+
+    if (miss && fallback_enabled())
+    {
+        BOOL mesh = FALSE;
+
+        for (UINT i = 0; i < stage_count; i++)
+        {
+            UINT type = *(const UINT *)(stream + stages[i]);
+            D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + stages[i] + subobj_layouts[type].offset);
+
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS)
+                *bc = fallback_vs_bc;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS)
+                *bc = bc->BytecodeLength ? fallback_ps_bc : no_shader;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS)
+                *bc = fallback_cs_bc;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
+                mesh = TRUE;
+            else
+                *bc = no_shader; /* HS, DS, GS */
+        }
+        if (stream_output)
+            memset(stream + stream_output, 0, sizeof(D3D12_STREAM_OUTPUT_DESC));
+        if (topology && *(UINT *)(stream + topology) == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+            *(UINT *)(stream + topology) = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        if (mesh)
+            rebox_log("d3d12_xs: mesh-shader PSO with a missing translation has no fallback");
+        else
+            note_fallback("stream");
     }
 
     copy.SizeInBytes = desc->SizeInBytes;

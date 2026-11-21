@@ -16,7 +16,9 @@
  *
  * Resources, heaps, PSOs, root signatures, fences and allocators are not
  * proxied: their vtables match PC wherever we have evidence, and leaving them
- * raw avoids unwrapping them in every call that takes one. */
+ * raw avoids unwrapping them in every call that takes one. Their GetDevice
+ * is patched in vkd3d-proton's shared vtables instead (patch_child), so it
+ * hands back the device proxy rather than the PC device. */
 
 #define COBJMACROS
 #include <windows.h>
@@ -257,6 +259,215 @@ static HRESULT STDMETHODCALLTYPE child_GetDevice(struct proxy *p, REFIID riid, v
     return proxy_QueryInterface(device_proxy, riid, out);
 }
 
+/* -------------------------------------------- GetDevice on raw children
+ *
+ * vkd3d-proton shares one vtable per object class. Slot 7 (GetDevice) of
+ * each class's vtable is redirected here; objects of the shared device get
+ * the device proxy, objects of any other (PC-path) device keep their own. */
+
+typedef HRESULT (STDMETHODCALLTYPE *get_device_fn)(void *, REFIID, void **);
+
+static struct
+{
+    void **vtbl;
+    get_device_fn orig;
+} child_vtbls[32];
+static LONG child_vtbl_count;
+static SRWLOCK child_lock = SRWLOCK_INIT;
+
+static HRESULT STDMETHODCALLTYPE raw_child_GetDevice(void *self, REFIID riid, void **out)
+{
+    void **vtbl = *(void ***)self;
+    get_device_fn orig = NULL;
+    IUnknown *device = NULL;
+
+    AcquireSRWLockShared(&child_lock);
+    for (LONG i = 0; i < child_vtbl_count; i++)
+        if (child_vtbls[i].vtbl == vtbl)
+            orig = child_vtbls[i].orig;
+    ReleaseSRWLockShared(&child_lock);
+    if (!orig)
+        return E_FAIL;
+    if (device_proxy && SUCCEEDED(orig(self, &IID_ID3D12Device, (void **)&device)))
+    {
+        BOOL shared = device == device_proxy->inner;
+        IUnknown_Release(device);
+        if (shared)
+            return proxy_QueryInterface(device_proxy, riid, out);
+    }
+    return orig(self, riid, out);
+}
+
+static void patch_child(void *object)
+{
+    void **vtbl;
+    DWORD old;
+
+    if (!object)
+        return;
+    vtbl = *(void ***)object;
+    if (vtbl[7] == (void *)raw_child_GetDevice)
+        return;
+    AcquireSRWLockExclusive(&child_lock);
+    if (vtbl[7] != (void *)raw_child_GetDevice && child_vtbl_count < (LONG)ARRAYSIZE(child_vtbls))
+    {
+        /* Register first: another thread may call through the slot as
+         * soon as it is written. */
+        child_vtbls[child_vtbl_count].vtbl = vtbl;
+        child_vtbls[child_vtbl_count].orig = vtbl[7];
+        child_vtbl_count++;
+        VirtualProtect(&vtbl[7], sizeof(void *), PAGE_READWRITE, &old);
+        vtbl[7] = (void *)raw_child_GetDevice;
+        VirtualProtect(&vtbl[7], sizeof(void *), old, &old);
+    }
+    ReleaseSRWLockExclusive(&child_lock);
+}
+
+/* ------------------------------------------ texture GPU VAs (mitigation)
+ *
+ * On the console a texture's GPU VA is the address of its memory, and titles
+ * write texel data through it (ScarlettX saw this in a retail title).
+ * vkd3d-proton returns 0 for textures, so such a write would crash. Until
+ * textures are backed by identity memory with detiling, each texture that is
+ * asked gets a scratch block of GPU memory its size: writes land
+ * harmlessly, the texture doesn't see them, and it is logged once. The block
+ * is freed with the texture. */
+
+typedef UINT64 (STDMETHODCALLTYPE *get_va_fn)(void *);
+typedef ULONG (STDMETHODCALLTYPE *release_fn)(void *);
+
+static get_va_fn orig_resource_get_va;
+static release_fn orig_resource_release;
+
+static struct scratch
+{
+    void *resource, *cpu;
+    struct scratch *next;
+} *scratch_list;
+static SRWLOCK scratch_lock = SRWLOCK_INIT;
+
+static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
+{
+    UINT64 va = orig_resource_get_va(self);
+    D3D12_RESOURCE_ALLOCATION_INFO info;
+    D3D12_RESOURCE_DESC desc;
+    struct scratch *sc;
+    void *cpu = NULL;
+    static LONG logged;
+
+    if (va || !device_proxy)
+        return va;
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)self)[10])(self, &desc);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return 0;
+
+    AcquireSRWLockShared(&scratch_lock);
+    for (sc = scratch_list; sc && sc->resource != self; sc = sc->next)
+        ;
+    if (sc)
+        cpu = sc->cpu;
+    ReleaseSRWLockShared(&scratch_lock);
+    if (cpu)
+        return (UINT64)(ULONG_PTR)cpu;
+
+    ((D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT,
+            const D3D12_RESOURCE_DESC *))PC_SLOT(device_proxy->inner, 25))(device_proxy->inner, &info, 0, 1, &desc);
+    if (FAILED(ReboxGpuAlloc(info.SizeInBytes ? info.SizeInBytes : 65536, 64 << 10, &cpu, NULL)))
+        return 0;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: title asked for a texture's GPU VA (%ux%u, format %u); giving scratch memory: "
+                     "texel writes through it are not seen by the texture yet", (UINT)desc.Width, desc.Height,
+                     desc.Format);
+    sc = calloc(1, sizeof(*sc));
+    sc->resource = self;
+    sc->cpu = cpu;
+    AcquireSRWLockExclusive(&scratch_lock);
+    sc->next = scratch_list;
+    scratch_list = sc;
+    ReleaseSRWLockExclusive(&scratch_lock);
+    return (UINT64)(ULONG_PTR)cpu;
+}
+
+static ULONG STDMETHODCALLTYPE resource_Release(void *self)
+{
+    ULONG refs = orig_resource_release(self);
+    struct scratch **p, *sc = NULL;
+
+    if (refs || !scratch_list)
+        return refs;
+    AcquireSRWLockExclusive(&scratch_lock);
+    for (p = &scratch_list; *p && (*p)->resource != self; p = &(*p)->next)
+        ;
+    if ((sc = *p))
+        *p = sc->next;
+    ReleaseSRWLockExclusive(&scratch_lock);
+    if (sc)
+    {
+        ReboxGpuFree(sc->cpu);
+        free(sc);
+    }
+    return refs;
+}
+
+static void patch_resource_class(void *resource)
+{
+    void **vtbl = *(void ***)resource;
+    DWORD old;
+
+    if (vtbl[11] == (void *)resource_GetGPUVirtualAddress)
+        return;
+    VirtualProtect(vtbl, 12 * sizeof(void *), PAGE_READWRITE, &old);
+    orig_resource_release = vtbl[2];
+    orig_resource_get_va = vtbl[11];
+    vtbl[2] = (void *)resource_Release;
+    vtbl[11] = (void *)resource_GetGPUVirtualAddress;
+    VirtualProtect(vtbl, 12 * sizeof(void *), old, &old);
+}
+
+/* One object of each class the title gets unwrapped, created and released
+ * just to reach its vtable. PSOs need shader bytecode, so their vtable is
+ * patched when the first one is created through the proxy instead. */
+static void patch_child_classes(ID3D12Device *device)
+{
+    D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC buffer = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+    D3D12_HEAP_DESC heap_desc = { 64 << 10, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS };
+    D3D12_QUERY_HEAP_DESC query_desc = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 0 };
+    D3D12_INDIRECT_ARGUMENT_DESC arg = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+    D3D12_COMMAND_SIGNATURE_DESC sig_desc = { sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &arg, 0 };
+    D3D12_ROOT_SIGNATURE_DESC rs_desc = { 0 };
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize;
+    ID3D10Blob *blob = NULL;
+    IUnknown *obj;
+    HMODULE d3d12;
+
+#define PROBE(call) do { obj = NULL; if (SUCCEEDED(call)) { patch_child(obj); IUnknown_Release(obj); } } while (0)
+    obj = NULL;
+    if (SUCCEEDED(ID3D12Device_CreateCommittedResource(device, &heap_props, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&obj)))
+    {
+        patch_child(obj);
+        patch_resource_class(obj);
+        IUnknown_Release(obj);
+    }
+    PROBE(ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)&obj));
+    PROBE(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&obj));
+    PROBE(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
+            (void **)&obj));
+    PROBE(ID3D12Device_CreateQueryHeap(device, &query_desc, &IID_ID3D12QueryHeap, (void **)&obj));
+    PROBE(ID3D12Device_CreateCommandSignature(device, &sig_desc, NULL, &IID_ID3D12CommandSignature, (void **)&obj));
+    if ((d3d12 = GetModuleHandleA("d3d12.dll"))
+        && (serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)GetProcAddress(d3d12, "D3D12SerializeRootSignature"))
+        && SUCCEEDED(serialize(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+    {
+        PROBE(ID3D12Device_CreateRootSignature(device, 0, ID3D10Blob_GetBufferPointer(blob),
+                ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&obj));
+        ID3D10Blob_Release(blob);
+    }
+#undef PROBE
+}
+
 /* Wraps a freshly created inner object for the caller. */
 static HRESULT wrap_result(HRESULT hr, IUnknown *inner, struct proxy_class *cls, void **out)
 {
@@ -385,6 +596,26 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, 
     return hr;
 }
 
+/* PSO creation (slots 10, 11): forwarded; the first PSO patches the PSO
+ * class's GetDevice. */
+static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy *p,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
+{
+    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(INNER(p, ID3D12Device), desc, riid, out);
+    if (SUCCEEDED(hr) && out)
+        patch_child(*out);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(struct proxy *p,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
+{
+    HRESULT hr = ID3D12Device_CreateComputePipelineState(INNER(p, ID3D12Device), desc, riid, out);
+    if (SUCCEEDED(hr) && out)
+        patch_child(*out);
+    return hr;
+}
+
 /* Slot 62 (XboxBvhBuilder.dll 0x18000c4e1): CreateComputePipelineState with
  * two extra arguments, zero at the only call seen. */
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy *p,
@@ -397,7 +628,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy
             rebox_log("d3d12_xs: Xbox CreateComputePipelineStateX extra args %#llx %#llx ignored",
                          (unsigned long long)extra1, (unsigned long long)extra2);
     }
-    return ID3D12Device_CreateComputePipelineState(INNER(p, ID3D12Device), desc, riid, out);
+    return device_CreateComputePipelineState(p, desc, riid, out);
 }
 
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
@@ -641,6 +872,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     /* Device: PC through slot 43 (original ID3D12Device). */
     static const struct slot device_slots[] = {
         FN(8, device_CreateCommandQueue),
+        FN(10, device_CreateGraphicsPipelineState),
+        FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
         FN(27, device_CreateCommittedResource),
@@ -711,6 +944,7 @@ HRESULT proxy_query_device(ID3D12Device *inner, REFIID riid, void **out)
     {
         ID3D12Device_AddRef(inner);
         device_proxy = proxy_create((IUnknown *)inner, &device_class);
+        patch_child_classes(inner);
     }
     ReleaseSRWLockExclusive(&lock);
     if (device_proxy->inner != (IUnknown *)inner)
