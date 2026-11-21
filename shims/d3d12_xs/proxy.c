@@ -594,6 +594,58 @@ static const D3D12_HEAP_PROPERTIES *buffer_heap(const D3D12_HEAP_PROPERTIES *pro
     return storage;
 }
 
+/* Xbox resource descs can carry console texture layouts (>= 0x100). The
+ * FidelityFX upscaler's recurrent texture uses 0x101 (Xbox2Windows,
+ * docs/experiments.md). They select console tilings vkd3d-proton doesn't
+ * know, so they become UNKNOWN, the driver's choice; titles that address
+ * texels themselves go through scratch GPU VAs instead. Each distinct
+ * value is logged once. */
+static const D3D12_RESOURCE_DESC *pc_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC *storage)
+{
+    static LONG seen[8];
+
+    if (!desc || desc->Layout < 0x100)
+        return desc;
+    if (!InterlockedExchange(&seen[desc->Layout & 7], 1))
+        rebox_log("d3d12_xs: Xbox texture layout %#x (%ux%u, format %u) treated as UNKNOWN", desc->Layout,
+                     (UINT)desc->Width, desc->Height, desc->Format);
+    *storage = *desc;
+    storage->Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return storage;
+}
+
+/* Slot 25, through the hidden return pointer as on PC (16-byte result). */
+static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAllocationInfo(struct proxy *p,
+        D3D12_RESOURCE_ALLOCATION_INFO *ret, UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC *descs)
+{
+    typedef D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *fn)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT,
+            UINT, const D3D12_RESOURCE_DESC *);
+    D3D12_RESOURCE_DESC *copy = NULL;
+
+    for (UINT i = 0; descs && i < count; i++)
+        if (descs[i].Layout >= 0x100)
+        {
+            if (!copy && (copy = malloc(count * sizeof(*copy))))
+                memcpy(copy, descs, count * sizeof(*copy));
+            if (copy)
+                pc_desc(&descs[i], &copy[i]);
+        }
+    ((fn)PC_SLOT(p->inner, 25))(p->inner, ret, visible_mask, count, copy ? copy : descs);
+    free(copy);
+    return ret;
+}
+
+/* Slot 38. */
+static void STDMETHODCALLTYPE device_GetCopyableFootprints(struct proxy *p, const D3D12_RESOURCE_DESC *desc,
+        UINT first, UINT count, UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts, UINT *rows,
+        UINT64 *row_sizes, UINT64 *total)
+{
+    D3D12_RESOURCE_DESC storage;
+
+    ID3D12Device_GetCopyableFootprints(INNER(p, ID3D12Device), pc_desc(desc, &storage), first, count, base, layouts,
+                                       rows, row_sizes, total);
+}
+
 /* Resource creation (slots 27, 28, 29, 30): forwarded, recording the
  * initial state for PresentX's copy out of the plane. */
 static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p, const D3D12_HEAP_PROPERTIES *props,
@@ -601,10 +653,12 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p,
         const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
     D3D12_HEAP_PROPERTIES storage;
+    D3D12_RESOURCE_DESC desc_storage;
     HRESULT hr;
 
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         props = buffer_heap(props, &storage);
+    desc = pc_desc(desc, &desc_storage);
     hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear, riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
@@ -627,7 +681,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID
         const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
         void **out)
 {
-    HRESULT hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, desc, state, clear, riid, out);
+    D3D12_RESOURCE_DESC storage;
+    HRESULT hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, pc_desc(desc, &storage),
+                                                   state, clear, riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -636,7 +692,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID
 static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, const D3D12_RESOURCE_DESC *desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
-    HRESULT hr = ID3D12Device_CreateReservedResource(INNER(p, ID3D12Device), desc, state, clear, riid, out);
+    D3D12_RESOURCE_DESC storage;
+    HRESULT hr = ID3D12Device_CreateReservedResource(INNER(p, ID3D12Device), pc_desc(desc, &storage), state, clear,
+                                                     riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -678,7 +736,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy
 }
 
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
- * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f. */
+ * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f.
+ * Xbox2Windows saw Layout 0x101 with +0x34 = 3 and +0x38 = 0 there. */
 static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceX(struct proxy *p,
         const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS flags, const BYTE *desc_x,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
@@ -691,8 +750,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceX(struct proxy *p
     memset(&desc, 0, sizeof(desc));
     memcpy(&desc, desc_x, offsetof(D3D12_RESOURCE_DESC, Flags) + sizeof(desc.Flags));
     if (!InterlockedExchange(&once, 1))
-        rebox_log("d3d12_xs: Xbox resource desc fields ignored: +0x34 %#x, +0x38 %#llx",
-                     *(const UINT *)(desc_x + 0x34), *(const unsigned long long *)(desc_x + 0x38));
+        rebox_log("d3d12_xs: Xbox resource desc fields ignored: layout %#x, +0x34 %#x, +0x38 %#llx",
+                     desc.Layout, *(const UINT *)(desc_x + 0x34), *(const unsigned long long *)(desc_x + 0x38));
     return device_CreateCommittedResource(p, props, flags, &desc, state, clear, riid, out);
 }
 
@@ -925,10 +984,12 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
+        FN(25, device_GetResourceAllocationInfo),
         FN(27, device_CreateCommittedResource),
         FN(28, device_CreateHeap),
         FN(29, device_CreatePlacedResource),
         FN(30, device_CreateReservedResource),
+        FN(38, device_GetCopyableFootprints),
         FN(43, device_GetAdapterLuid),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(62, device_CreateComputePipelineStateX),

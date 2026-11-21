@@ -852,6 +852,31 @@ static void test_xbox(void)
     test_ffx(dev, queue);
     test_present_format(dev, queue);
 
+    /* Slot 76 as the FidelityFX upscaler calls it (Xbox2Windows): a 0x40-byte
+     * desc with Xbox texture layout 0x101 and extension word 3. */
+    {
+        D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 48, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                   { 1, 0 }, (D3D12_TEXTURE_LAYOUT)0x101,
+                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+        D3D12_RESOURCE_ALLOCATION_INFO info = { 0 };
+        BYTE desc_x[0x40] = { 0 };
+        ID3D12Resource *tex = NULL;
+
+        memcpy(desc_x, &td, 0x34);
+        *(UINT *)(desc_x + 0x34) = 3;
+        hr = XSLOT(dev, 76, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const void *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, desc_x, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource,
+                (void **)&tex);
+        CHECK(SUCCEEDED(hr) && tex, "slot 76 texture with Xbox layout 0x101 (%#lx)", hr);
+        if (tex) ID3D12Resource_Release(tex);
+        XSLOT(dev, 25, D3D12_RESOURCE_ALLOCATION_INFO *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT,
+              const D3D12_RESOURCE_DESC *)(dev, &info, 0, 1, &td);
+        CHECK(info.SizeInBytes >= 64 * 48 * 4, "GetResourceAllocationInfo (slot 25) with Xbox layout 0x101 (%llu)",
+              (unsigned long long)info.SizeInBytes);
+    }
+
     /* DEFAULT-heap buffers become CPU-visible, so a title can write through
      * their GPU VA as on the console. */
     {
