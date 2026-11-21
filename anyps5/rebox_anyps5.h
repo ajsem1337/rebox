@@ -46,6 +46,7 @@ struct sa5_binding
     uint32_t word_count;        /* guest descriptor words: 4 (V#, S#) or 8 (T#) per element */
     const uint32_t *words;
     int32_t image_shape;        /* ShaderRecompiler::DescriptorImageShape, or -1 */
+    uint32_t role;              /* ShaderRecompiler::DescriptorRole: 0-2 guest buffers/images/samplers */
 };
 
 struct sa5_result;
@@ -59,6 +60,33 @@ SA5_API int sa5_result_binding(const struct sa5_result *result, uint32_t index, 
 SA5_API const void *sa5_result_push_constants(const struct sa5_result *result, uint32_t *size);
 SA5_API uint32_t sa5_result_subgroup_size(const struct sa5_result *result);
 SA5_API void sa5_result_free(struct sa5_result *result);
+
+/* Fitting a result to vkd3d-proton's bindings (spirv_remap.cpp). Specialization constants are
+ * frozen to the result's values. Each remap moves a guest descriptor array at (set, binding) to
+ * (new_set, new_binding) as a runtime array, element i becoming element heap_indices[i] there; kind
+ * is the binding's DescriptorKind. Each host buffer (a role AnyPS5's driver fills itself) becomes a
+ * buffer-device-address pointer read from the push block: 64-bit address push_slot (0-3) at byte
+ * 128 + 8 * push_slot. array_length is what OpArrayLength on it returns (its u32 count). */
+struct sa5_remap
+{
+    uint32_t set, binding, kind;
+    uint32_t new_set, new_binding;
+    uint32_t count;
+    const uint32_t *heap_indices;
+};
+
+struct sa5_host_buffer
+{
+    uint32_t set, binding;
+    uint32_t push_slot;
+    uint32_t array_length;
+};
+
+/* Returns 0 and the validated module in *out (free with sa5_free_words), or -1 and a message. */
+SA5_API int sa5_finalize(const struct sa5_result *result, const struct sa5_remap *remaps, uint32_t remap_count,
+                         const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t **out,
+                         uint32_t *out_count, char *error, size_t error_size);
+SA5_API void sa5_free_words(uint32_t *words);
 
 #ifdef __cplusplus
 }

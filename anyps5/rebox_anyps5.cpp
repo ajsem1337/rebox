@@ -17,11 +17,7 @@
 
 using namespace ShaderRecompiler;
 
-struct sa5_result
-{
-    RecompileResult result;
-    std::vector<std::uint32_t> spirv;
-};
+#include "sa5_internal.hpp"
 
 namespace {
 
@@ -128,6 +124,7 @@ SA5_API int sa5_result_binding(const sa5_result* result, std::uint32_t index, sa
     binding->word_count = static_cast<std::uint32_t>(b.guestDescriptor.size());
     binding->words = b.guestDescriptor.data();
     binding->image_shape = b.imageShape ? static_cast<std::int32_t>(*b.imageShape) : -1;
+    binding->role = static_cast<std::uint32_t>(b.role);
     return 0;
 }
 

@@ -1376,6 +1376,14 @@ static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size
         CHECK(0, "AnyPS5 compiles the shadow-heap round-trip shader: %s", error);
         return;
     }
+    if (getenv("SMOKE_DUMP_SPIRV"))
+    {
+        const UINT32 *(*spirv)(const struct sa5_result *, UINT32 *) = (void *)GetProcAddress(sa5, "sa5_result_spirv");
+        UINT32 words;
+        const UINT32 *code_out = spirv(result, &words);
+        FILE *f = fopen(getenv("SMOKE_DUMP_SPIRV"), "wb");
+        if (f) { fwrite(code_out, 4, words, f); fclose(f); }
+    }
     for (UINT32 i = 0; i < binding_count(result); i++)
     {
         struct sa5_binding b;
@@ -1410,6 +1418,55 @@ static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size
     CHECK(found_t, "AnyPS5 binds the T# written through CreateShaderResourceView");
     CHECK(found_v, "AnyPS5 binds the V# copied in through CopyDescriptorsSimple");
     CHECK(found_s, "AnyPS5 binds the S# written through CreateSampler");
+
+    /* Fit the module to bindless arrays (made-up sets here) at the heap slots found above, with
+     * the flattened SRT as a host buffer, and check the result validates. */
+    {
+        int (*finalize)(const struct sa5_result *, const struct sa5_remap *, UINT32, const struct sa5_host_buffer *,
+                UINT32, UINT32 **, UINT32 *, char *, size_t) = (void *)GetProcAddress(sa5, "sa5_finalize");
+        void (*free_words)(UINT32 *) = (void *)GetProcAddress(sa5, "sa5_free_words");
+        struct sa5_remap remaps[8];
+        struct sa5_host_buffer hosts[4];
+        UINT32 indices[8][16], nremap = 0, nhost = 0, *words = NULL, word_count = 0;
+        BOOL resolved = TRUE;
+
+        for (UINT32 i = 0; i < binding_count(result) && nremap < 8 && nhost < 4; i++)
+        {
+            struct sa5_binding b;
+            binding(result, i, &b);
+            if (b.role <= 2 && b.count <= 16)
+            {
+                UINT32 per = b.count ? b.word_count / b.count : 0;
+                for (UINT32 e = 0; e < b.count; e++)
+                {
+                    SIZE_T cpu = 0, start = b.kind == 6 ? smp_cpu : res_cpu;
+                    if (!find(b.words + e * per, per, b.kind == 6, &cpu))
+                        resolved = FALSE;
+                    indices[nremap][e] = (UINT32)((cpu - start) / (b.kind == 6 ? sinc : inc));
+                }
+                remaps[nremap] = (struct sa5_remap){ b.set, b.binding, b.kind, 1 + b.kind, 0, b.count, indices[nremap] };
+                nremap++;
+            }
+            else
+                hosts[nhost++] = (struct sa5_host_buffer){ b.set, b.binding, nhost, b.word_count };
+        }
+        CHECK(resolved && nremap == 3 && nhost == 1, "every guest binding resolves to a heap slot (%u guest, %u host)",
+              nremap, nhost);
+        if (finalize(result, remaps, nremap, hosts, nhost, &words, &word_count, error, sizeof(error)))
+            CHECK(0, "sa5_finalize rebinds the module onto bindless arrays: %s", error);
+        else
+        {
+            CHECK(word_count > 5, "sa5_finalize rebinds the module onto bindless arrays (%u words, valid)", word_count);
+            if (getenv("SMOKE_DUMP_SPIRV"))
+            {
+                char path[MAX_PATH];
+                FILE *f;
+                snprintf(path, sizeof(path), "%s.final", getenv("SMOKE_DUMP_SPIRV"));
+                if ((f = fopen(path, "wb"))) { fwrite(words, 4, word_count, f); fclose(f); }
+            }
+            free_words(words);
+        }
+    }
     result_free(result);
 }
 
