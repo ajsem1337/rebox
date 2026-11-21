@@ -197,3 +197,11 @@ down missing translations.
   [xodus-gaming/wine](https://github.com/xodus-gaming/wine) and
   [xodus-gaming/xgameruntime](https://github.com/xodus-gaming/xgameruntime), but that runtime only
   covers threading so far. Switch the `winegdk-src` input once it catches up.
+
+## Licence
+
+rebox is licensed under the GNU General Public License, version 2 only
+([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
+The patches in `patches/` modify vkd3d-proton (LGPL-2.1+) and Mesa (MIT) and are offered under
+those projects' licences too. Game data, dumps and anything derived from them (`build/`) are never
+part of the repository.
