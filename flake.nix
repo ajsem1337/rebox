@@ -91,7 +91,7 @@
           vulkanLayers = [ ];
         }).overrideAttrs (old: {
           pname = "radv-rebox";
-          patches = (old.patches or [ ]) ++ [ ./patches/mesa-radv-low-va-replay.patch ];
+          patches = (old.patches or [ ]) ++ [ ./patches/mesa-radv-low-va-replay.patch ./patches/mesa-radv-low-32bit-window.patch ];
         });
 
         # vkd3d-proton's PE DLLs built from source with our patches

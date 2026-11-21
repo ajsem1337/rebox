@@ -1,0 +1,61 @@
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index a4353b6..0612161 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -85,10 +85,17 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t
+  * space for CPU and GPU, so their GPU-visible memory has to sit at its CPU
+  * address, which is always in the lower half. Ordinary allocations, and
+  * replayed addresses from real captures (always upper half), are unchanged. */
++/* rebox: 32-bit allocations (descriptor buffers, shader binaries)
++ * come from the low 4 GiB of GPU VA instead of the high 32-bit window, with
++ * address32_hi = 0 to match (radv_amdgpu_winsys.c). Console shaders build
++ * descriptor-table pointers from 32 bits with a zero high dword, as console
++ * descriptor heaps sit below 4 GiB. RADV_REBOX_LOW_32BIT=0 restores the
++ * high window. */
+ static uint64_t
+ radv_amdgpu_va_range_flags(uint64_t replay_address, enum radeon_bo_flag flags)
+ {
+-   const bool low = replay_address && replay_address < (1ull << 47) && !(flags & RADEON_FLAG_32BIT);
++   const bool low = ((flags & RADEON_FLAG_32BIT) && radv_amdgpu_rebox_low_32bit()) ||
++                    (replay_address && replay_address < (1ull << 47) && !(flags & RADEON_FLAG_32BIT));
+ 
+    return (low ? 0 : AMDGPU_VA_RANGE_HIGH) | (flags & RADEON_FLAG_32BIT ? AMDGPU_VA_RANGE_32_BIT : 0) |
+           (flags & RADEON_FLAG_REPLAYABLE ? AMDGPU_VA_RANGE_REPLAYABLE : 0);
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index 8d06821..b314ad3 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -342,6 +342,10 @@ radv_amdgpu_winsys_query_info(int fd, const BITSET_WORD *debug_flags, bool is_vi
+       goto fail;
+    }
+ 
++   /* rebox: 32-bit allocations live in the low 4 GiB. */
++   if (radv_amdgpu_rebox_low_32bit())
++      info->base.address32_hi = 0;
++
+    /*
+     * Override the max submits on video queues.
+     * If you submit multiple session contexts in the same IB sequence the
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
+index bf1236b..c18c4e0 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
+@@ -11,6 +11,18 @@
+ #ifndef RADV_AMDGPU_WINSYS_H
+ #define RADV_AMDGPU_WINSYS_H
+ 
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* rebox: see radv_amdgpu_va_range_flags. */
++static inline bool
++radv_amdgpu_rebox_low_32bit(void)
++{
++   const char *e = getenv("RADV_REBOX_LOW_32BIT");
++   return !e || strcmp(e, "0");
++}
++
+ #include <pthread.h>
+ #include "util/list.h"
+ #include "util/rwlock.h"

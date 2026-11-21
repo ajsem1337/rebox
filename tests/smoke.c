@@ -1018,8 +1018,9 @@ static void test_real_heap_va(void *dev, void *queue)
     cpu = XSLOT(heap, 9, SIZE_T)(heap);
     gpu = XSLOT(heap, 10, UINT64)(heap);
     inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    printf("info heap GPU start %#llx, CPU start %#llx, increment %u: %s\n", (unsigned long long)gpu,
-           (unsigned long long)cpu, inc, gpu == cpu ? "real and identity-mapped" : "not the CPU address");
+    printf("info heap GPU start %#llx, CPU start %#llx, increment %u: %s, %s 4 GiB\n", (unsigned long long)gpu,
+           (unsigned long long)cpu, inc, gpu == cpu ? "real and identity-mapped" : "not the CPU address",
+           gpu < (1ull << 32) ? "below" : "above");
     /* The view goes in entry 1, so the table address carries an offset. */
     XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
             buf, NULL, &uav, cpu + inc);

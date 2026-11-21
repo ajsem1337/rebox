@@ -154,7 +154,11 @@ the BVH builder's once lowered.
 `the shader archive` (412 MB) carves into 26,503 DXBC containers, all SM 6.6 with `ISG1`/`OSG1` and no
 `RTS0`. They unpack to FSSM and disassemble with LLVM 21 (`gfx1013`): 25,030 clean, 1,473 with
 some invalid words. Leonida's `rdna2spirv.py` translates them, run as a separate program from a
-local clone (GPLv3; its output is data, nothing of it is in this repo). Its modules use set 0
+local clone (GPLv3; its output is data, nothing of it is in this repo). All 26,503 translate and
+pass `spirv-val` (25 minutes across all cores). 25,865 of them (97.6%; every mesh, compute but 5,
+and geometry shader) truncate descriptor-table pointers to 32 bits. Wave64 that needs real
+64-wide subgroups: 867 compute and all 9,282 mesh shaders (pixel, vertex and geometry wave64 is
+emulated as 2x32). No shader uses a binding above 19. Its modules use set 0
 only: binding 1 samplers, 2 the descriptor hash table (a storage buffer), every other binding
 image or storage-image arrays. The push block is s0-s31 plus `heap_base`/`code_base`, as ours.
 
