@@ -42,6 +42,8 @@ struct proxy_class
     unsigned slots;
     void **vtbl;
     LONG trapped[MAX_SLOTS];
+    LONG64 calls[MAX_SLOTS]; /* REBOX_SLOT_STATS */
+    BOOL custom[MAX_SLOTS], forwarded[MAX_SLOTS];
 };
 
 /* Command-list data from slot 148, freed a few Resets after use. */
@@ -960,19 +962,93 @@ struct slot
 #define FWD(x, p) { x, p, NULL }
 #define FN(x, f) { x, -1, (void *)(f) }
 
+/* REBOX_SLOT_STATS=N: count calls per slot and log the counts every N
+ * presents (and at exit), to see which slots a title really uses. Each slot
+ * then goes through mov rax, &counter; lock inc qword [rax]; mov rax,
+ * target; jmp rax. RAX carries no argument, so the call is otherwise
+ * untouched. */
+static int slot_stats_interval(void)
+{
+    static int interval = -1;
+    if (interval < 0)
+    {
+        const char *env = getenv("REBOX_SLOT_STATS");
+        interval = env ? atoi(env) : 0;
+        if (env && interval <= 0)
+            interval = 600;
+    }
+    return interval;
+}
+
+static void *counting_thunk(LONG64 *counter, void *target)
+{
+    BYTE *t = thunk_alloc(32);
+    UINT64 c = (UINT_PTR)counter, f = (UINT_PTR)target;
+
+    t[0] = 0x48; t[1] = 0xb8; memcpy(t + 2, &c, 8);
+    t[10] = 0xf0; t[11] = 0x48; t[12] = 0xff; t[13] = 0x00;
+    t[14] = 0x48; t[15] = 0xb8; memcpy(t + 16, &f, 8);
+    t[24] = 0xff; t[25] = 0xe0;
+    return t;
+}
+
 static void build(struct proxy_class *cls, unsigned pc_prefix, const struct slot *slots, unsigned count)
 {
     void **vtbl = calloc(cls->slots, sizeof(*vtbl));
     unsigned i;
 
     for (i = 0; i < cls->slots; i++)
+    {
         vtbl[i] = i < pc_prefix ? forward_thunk(i) : trap_thunk(cls, i);
+        cls->forwarded[i] = i < pc_prefix;
+    }
     vtbl[0] = (void *)proxy_QueryInterface;
     vtbl[1] = (void *)proxy_AddRef;
     vtbl[2] = (void *)proxy_Release;
+    cls->custom[0] = cls->custom[1] = cls->custom[2] = TRUE;
     for (i = 0; i < count; i++)
+    {
         vtbl[slots[i].xbox] = slots[i].custom ? slots[i].custom : forward_thunk(slots[i].pc);
+        cls->custom[slots[i].xbox] = slots[i].custom != NULL;
+        cls->forwarded[slots[i].xbox] = !slots[i].custom;
+    }
+    if (slot_stats_interval())
+        for (i = 0; i < cls->slots; i++)
+            vtbl[i] = counting_thunk(&cls->calls[i], vtbl[i]);
     cls->vtbl = vtbl;
+}
+
+void proxy_log_slot_stats(void)
+{
+    char line[1024];
+
+    if (!slot_stats_interval())
+        return;
+    for (unsigned c = 0; c < ARRAYSIZE(classes); c++)
+    {
+        struct proxy_class *cls = classes[c];
+        int n = snprintf(line, sizeof(line), "slot stats %s:", cls->name);
+
+        for (unsigned i = 3; i < cls->slots && n < (int)sizeof(line) - 40; i++)
+            if (cls->calls[i])
+                n += snprintf(line + n, sizeof(line) - n, " %u%s=%lld", i,
+                              cls->custom[i] ? "c" : cls->forwarded[i] ? "" : "T", (long long)cls->calls[i]);
+        rebox_log("d3d12_xs: %s", line);
+    }
+}
+
+static void log_slot_stats_at_exit(void)
+{
+    proxy_log_slot_stats();
+}
+
+void proxy_frame_presented(void)
+{
+    static LONG64 frames;
+    int interval = slot_stats_interval();
+
+    if (interval && !(InterlockedIncrement64(&frames) % interval))
+        proxy_log_slot_stats();
 }
 
 static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
@@ -1033,6 +1109,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     };
     unsigned n = 7;
 
+    if (slot_stats_interval())
+        atexit(log_slot_stats_at_exit);
     for (unsigned x = 33; x <= 62; x++)
         list_slots[n++] = (struct slot)FWD(x, x - 4);
 

@@ -41,6 +41,7 @@
 #include "../common/rebox_log.h"
 #include "blit.h"
 #include "present.h"
+#include "proxy.h"
 
 #define RING 3
 
@@ -596,6 +597,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
                      q ? q[0] : 0, q ? q[1] : 0, q ? q[2] : 0, q ? q[3] : 0, q ? q[4] : 0, q ? q[5] : 0,
                      params, p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0);
     }
+    proxy_frame_presented();
     if (!s && !(s = *state = present_create(queue)))
         return S_OK;
     frame = ++s->frames;

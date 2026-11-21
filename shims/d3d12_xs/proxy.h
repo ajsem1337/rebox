@@ -14,5 +14,11 @@ HRESULT proxy_query_device(ID3D12Device *inner, REFIID riid, void **out);
  * be restored. A list that isn't a proxy is returned as is, with no heaps. */
 ID3D12GraphicsCommandList *proxy_list(void *list, ID3D12DescriptorHeap **heaps, UINT *heap_count);
 
+/* REBOX_SLOT_STATS: called once per PresentX; logs per-slot call counts
+ * every N frames. Slots are marked c (our code), T (trap), or neither
+ * (forwarded to the PC slot). */
+void proxy_frame_presented(void);
+void proxy_log_slot_stats(void);
+
 /* Proxy -> vkd3d-proton object; anything else is returned unchanged. */
 void *proxy_unwrap(void *object);
