@@ -12,7 +12,10 @@ LDFLAGS += -shared -static-libgcc -Wl,--enable-stdcall-fixup
 SHIMS   := xmem d3d12_xs xaudio2_9 amd_fidelityfx_loader_xbox
 COMMON  := shims/common/rebox_log.c
 
-all: $(SHIMS:%=$(BUILD)/%.dll)
+# Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
+STUB_DLLS := $(notdir $(wildcard $(GEN)/dlls/*))
+
+all: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll)
 
 # XMA2 decoding in xaudio2_9 needs FFMPEG_XMA2 (the flake's ffmpeg-xma2:
 # static mingw libavcodec/libavutil); without it XMA2 plays as silence.
@@ -26,6 +29,10 @@ $(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h sh
 	@mkdir -p $(BUILD)
 	cat shims/$*/$*.def $(wildcard $(GEN)/$*_stubs.def) > $(BUILD)/$*.def
 	$(MINGW_CC) $(CFLAGS) $(CFLAGS_$*) -o $@ $(wildcard shims/$*/*.c) $(wildcard $(GEN)/$*_stubs.c) $(COMMON) $(BUILD)/$*.def $(LDFLAGS) $(LIBS_$*)
+
+$(BUILD)/stub/%.dll: $(GEN)/dlls/$$*/stubs.c $(GEN)/dlls/$$*/$$*.def $(COMMON) shims/common/rebox_log.h
+	@mkdir -p $(BUILD)/stub
+	$(MINGW_CC) $(CFLAGS) -Ishims/common -o $@ $(GEN)/dlls/$*/stubs.c $(COMMON) $(GEN)/dlls/$*/$*.def $(LDFLAGS)
 
 # Smoke test executable, run under Wine by tests/run-smoke.sh.
 $(BUILD)/smoke.exe: tests/smoke.c

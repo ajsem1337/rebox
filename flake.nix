@@ -118,7 +118,11 @@
           };
           nativeBuildInputs = [ mingwCC ];
           makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "FFMPEG_XMA2=${ffmpeg-xma2}" ];
-          installPhase = "mkdir -p $out && cp build/*.dll $out/";
+          installPhase = ''
+            mkdir -p $out
+            cp build/*.dll $out/
+            if [ -d build/stub ]; then mkdir -p $out/stub && cp build/stub/*.dll $out/stub/; fi
+          '';
         };
 
         scan-imports = pyTool "scan_imports.py" ./tools/scan_imports.py;

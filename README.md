@@ -24,7 +24,8 @@ layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mappi
                           memory at the same GPU and CPU address
 patches/                  Mesa patch letting RADV place memory at lower-half device addresses
 shims/common/             logging + REBOX_STUB macro for generated stubs
-generated/                stubs from tools/scan_imports.py --gen-stubs (one-off fill-in exports)
+generated/                stubs from tools/scan_imports.py --gen-stubs (one-off fill-in exports;
+                          dlls/<name>/ for whole DLLs nobody provides) and generated shaders
 tools/scan_imports.py     which imports can't be resolved under Wine + shims; generates stubs
 tools/anyps5_cache.py     links AnyPS5 output into the runtime cache, keyed by hash
 tools/d3d12x_probe.py     recovers D3D12.X IIDs, vtable slots and inlined field accesses from console binaries
@@ -48,7 +49,10 @@ Once the exe is dumped:
 2. **Stub the shim gaps.** In `nix develop`: `python3 tools/scan_imports.py ../xsx --provider build
    --provider "$VKD3D_PROTON_DIR" --provider "$DXVK_DIR" --provider "$WINE_DLL_DIR" --shims shims
    --gen-stubs generated`, then `make`. Stubs log once and return `E_NOTIMPL`. To make an entry
-   point real, implement it in `shims/<dll>/`, add it to that DLL's `.def`, and regenerate.
+   point real, implement it in `shims/<dll>/`, add it to that DLL's `.def`, and regenerate. A DLL
+   that nobody provides at all (e.g. `xg_xs.dll`) gets a whole stub DLL in
+   `generated/dlls/<name>/`, built to `build/stub/` and installed by `rebox-run`, so the exe
+   still loads. `tests/run-stubgen.sh` checks this end to end.
 3. **Link the shader cache.** `nix run .#anyps5-cache -- link --originals <shaders extracted from
    the shader archive> --translated <AnyPS5 output> --out ~/.local/share/rebox/7952987A/shader-cache`.
    Files are paired by relative path, ignoring extension.
