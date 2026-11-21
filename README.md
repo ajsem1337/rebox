@@ -3,9 +3,11 @@
 Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 
 - **WineGDK** for Wine itself and the GDK runtime (`xgameruntime`: XUser, XTaskQueue, XGameSave and so on)
-- **vkd3d-proton** for D3D12 on Vulkan, plus **DXVK's `dxgi.dll`** for adapter enumeration
+- **vkd3d-proton** for D3D12 on Vulkan, built from source with our patches (`.#vkd3d-proton-rebox`,
+  `patches/vkd3d-proton/`; none yet), plus **DXVK's `dxgi.dll`** for adapter enumeration
 - **shims for the console-only DLLs** WineGDK doesn't cover: `xmem.dll` and `d3d12_xs.dll` (D3D12.X)
-- **AnyPS5** to translate shaders offline; `d3d12_xs.dll` swaps the translations in at PSO creation
+- **an offline RDNA2 → SPIR-V translator** for the console shaders; running them needs the patched
+  vkd3d-proton described in [docs/shaders.md](docs/shaders.md) (not done yet)
 
 It's built for a layout like `../xsx`: loose files plus `MicrosoftGame.Config`. It needs the main
 `.exe`, which isn't in that dump yet.

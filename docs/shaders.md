@@ -98,8 +98,9 @@ There are two places this could live:
 
 ## Order of work
 
-1. Build vkd3d-proton from source in the flake (`.#vkd3d-proton-rebox`), unpatched, and switch
-   `rebox-run` to it. Smoke test unchanged.
+1. ~~Build vkd3d-proton from source in the flake (`.#vkd3d-proton-rebox`), unpatched, and switch
+   `rebox-run` to it.~~ Done: v3.0.1 cross-built with mingw (static winpthreads); the smoke test
+   passes unchanged on it.
 2. Patch 1 with a test: a shader reads a descriptor through the table VA it was given.
 3. Patch 2 and 3 with a hand-written SPIR-V "console" shader that writes its s0-s31 to a UAV, to
    check the packing against root parameters.

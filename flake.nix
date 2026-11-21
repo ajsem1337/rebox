@@ -94,6 +94,38 @@
           patches = (old.patches or [ ]) ++ [ ./patches/mesa-radv-low-va-replay.patch ];
         });
 
+        # vkd3d-proton's PE DLLs built from source with our patches
+        # (patches/vkd3d-proton/*.patch, applied in name order), for console
+        # shaders: docs/shaders.md. Same source and version as nixpkgs'
+        # native package; cross-compiled with its own build-win64.txt.
+        vkd3d-proton-rebox = pkgs.stdenvNoCC.mkDerivation {
+          pname = "vkd3d-proton-rebox";
+          inherit (pkgs.vkd3d-proton) version src;
+          patches = lib.sort lib.lessThan (lib.filter (lib.hasSuffix ".patch")
+            (lib.filesystem.listFilesRecursive ./patches/vkd3d-proton));
+          nativeBuildInputs = [ mingwCC pkgs.meson pkgs.ninja pkgs.glslang pkgs.python3 pkgs.wineWow64Packages.unstable ];
+          postPatch = ''
+            substituteInPlace meson.build \
+              --replace-fail "vkd3d_build = vcs_tag(" \
+                             "vkd3d_build = vcs_tag( fallback : '$(cat .nixpkgs-auxfiles/vkd3d_build)'", \
+              --replace-fail "vkd3d_version = vcs_tag(" \
+                             "vkd3d_version = vcs_tag( fallback : '$(cat .nixpkgs-auxfiles/vkd3d_version)'",
+          '';
+          configurePhase = ''
+            # -static links winpthreads (vkd3d-proton uses pthreads on Windows
+            # too); cross gcc ignores LIBRARY_PATH, so pass it to meson.
+            pthreads=${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib
+            meson setup build --cross-file build-win64.txt --buildtype release --prefix $out \
+              -Dc_link_args=-L$pthreads -Dcpp_link_args=-L$pthreads
+          '';
+          buildPhase = "ninja -C build -j$NIX_BUILD_CORES";
+          installPhase = ''
+            mkdir -p $out/x64
+            cp build/libs/d3d12/d3d12.dll build/libs/d3d12core/d3d12core.dll $out/x64/
+          '';
+          dontStrip = true; # native strip on PE files
+        };
+
         # Only dxgi.dll is used: vkd3d-proton needs a DXGI that enumerates
         # Vulkan adapters without a display, as in Proton.
         dxvk-win = pkgs.stdenvNoCC.mkDerivation rec {
@@ -133,7 +165,7 @@
         rebox-run = pkgs.writeShellScriptBin "rebox-run" ''
           export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH
           export WINE=''${WINE:-${winegdk}/bin/wine}
-          export VKD3D_PROTON_DIR=''${VKD3D_PROTON_DIR:-${vkd3d-proton-win}/x64}
+          export VKD3D_PROTON_DIR=''${VKD3D_PROTON_DIR:-${vkd3d-proton-rebox}/x64}
           export DXVK_DIR=''${DXVK_DIR:-${dxvk-win}/x64}
           export REBOX_SHIMS_DIR=''${REBOX_SHIMS_DIR:-${shims}}
           export REBOX_SCAN=${scan-imports}/bin/scan_imports.py
@@ -158,7 +190,7 @@
         packages = [ mingwCC python pkgs.gnumake pkgs.wineWow64Packages.unstable pkgs.vkd3d pkgs.vulkan-tools pkgs.vulkan-headers pkgs.vulkan-loader pkgs.directx-shader-compiler ];
         shellHook = ''
           export WINE=wine
-          export VKD3D_PROTON_DIR=${self.packages.${system}.vkd3d-proton-win}/x64
+          export VKD3D_PROTON_DIR=${self.packages.${system}.vkd3d-proton-rebox}/x64
           export DXVK_DIR=${self.packages.${system}.dxvk-win}/x64
           export REBOX_SHIMS_DIR=$PWD/build
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
