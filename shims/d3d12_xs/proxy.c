@@ -566,17 +566,61 @@ static LUID STDMETHODCALLTYPE device_GetAdapterLuid(struct proxy *p)
     return luid;
 }
 
-/* Resource creation (slots 27, 29, 30): forwarded, recording the initial
- * state for PresentX's copy out of the plane. */
+/* On the console every buffer is CPU-visible at its GPU VA. Here buffers
+ * in DEFAULT heaps, and DEFAULT heaps that hold only buffers, are created
+ * in CPU-visible custom heaps (WRITE_BACK, L0) instead, which vkd3d-proton
+ * keeps mapped and VK_LAYER_REBOX_gpuva_identity places at their GPU VA.
+ * Mixed heaps and textures are unchanged. REBOX_CPU_VISIBLE_BUFFERS=0
+ * turns it off. */
+static BOOL cpu_visible_buffers(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("REBOX_CPU_VISIBLE_BUFFERS");
+        enabled = !env || *env != '0';
+    }
+    return enabled;
+}
+
+static const D3D12_HEAP_PROPERTIES *buffer_heap(const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_PROPERTIES *storage)
+{
+    if (!props || props->Type != D3D12_HEAP_TYPE_DEFAULT || !cpu_visible_buffers())
+        return props;
+    *storage = *props;
+    storage->Type = D3D12_HEAP_TYPE_CUSTOM;
+    storage->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    storage->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    return storage;
+}
+
+/* Resource creation (slots 27, 28, 29, 30): forwarded, recording the
+ * initial state for PresentX's copy out of the plane. */
 static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p, const D3D12_HEAP_PROPERTIES *props,
         D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state,
         const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
-    HRESULT hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear,
-                                                      riid, out);
+    D3D12_HEAP_PROPERTIES storage;
+    HRESULT hr;
+
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        props = buffer_heap(props, &storage);
+    hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear, riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreateHeap(struct proxy *p, const D3D12_HEAP_DESC *desc, REFIID riid,
+        void **out)
+{
+    D3D12_HEAP_DESC d;
+
+    if (!desc || (desc->Flags & D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS) != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)
+        return ID3D12Device_CreateHeap(INNER(p, ID3D12Device), desc, riid, out);
+    d = *desc;
+    d.Properties = *buffer_heap(&desc->Properties, &d.Properties);
+    return ID3D12Device_CreateHeap(INNER(p, ID3D12Device), &d, riid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID3D12Heap *heap, UINT64 offset,
@@ -882,6 +926,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
         FN(27, device_CreateCommittedResource),
+        FN(28, device_CreateHeap),
         FN(29, device_CreatePlacedResource),
         FN(30, device_CreateReservedResource),
         FN(43, device_GetAdapterLuid),

@@ -63,6 +63,7 @@ Once the exe is dumped:
 | `WINEPREFIX` | Default `~/.local/share/rebox/<TitleId>` |
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
+| `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
@@ -136,8 +137,10 @@ down missing translations.
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
   CPU-visible D3D12 heaps. `rebox-run` loads `VK_LAYER_REBOX_gpuva_identity` and, on AMD,
   `.#radv-rebox`, which together make those heaps identity-mapped. Without them,
-  `d3d12_xs` logs that GPU memory is not identity-mapped. Resources the title creates itself in
-  default heaps still get ordinary (non-identity) GPU addresses.
+  `d3d12_xs` logs that GPU memory is not identity-mapped. Buffers the title creates in DEFAULT
+  heaps, and DEFAULT heaps that hold only buffers, are made CPU-visible (custom `WRITE_BACK`/`L0`),
+  so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out). Textures and mixed
+  heaps keep ordinary GPU addresses.
 - **Audio: XMA2 is silent.** Under WineGDK, FAudio sends XMA2 to Wine's WMA decoder, which
   accepts only WMA formats, so creating an XMA2 source voice fails. `shims/xaudio2_9` wraps Wine's
   `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM voices fed silence of about the

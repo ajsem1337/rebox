@@ -287,6 +287,8 @@ typedef HRESULT (WINAPI *xbox_create_fn)(IUnknown *, const void *, REFIID, void 
 typedef HRESULT (WINAPI *gpu_alloc_fn)(SIZE_T, SIZE_T, void **, UINT64 *);
 typedef void (WINAPI *gpu_free_fn)(void *);
 
+static BOOL gpu_identity; /* set by test_gpu_memory */
+
 static void test_gpu_memory(HMODULE m)
 {
     gpu_alloc_fn galloc = (gpu_alloc_fn)(void *)GetProcAddress(m, "ReboxGpuAlloc");
@@ -303,7 +305,8 @@ static void test_gpu_memory(HMODULE m)
     if (FAILED(hr)) return;
     memset(cpu, 0x5a, 1 << 20);
     /* Identity depends on the driver and layer; lavapipe gives it for free. */
-    printf("info GPU memory is %sidentity-mapped\n", (UINT64)(ULONG_PTR)cpu == gpu ? "" : "NOT ");
+    gpu_identity = (UINT64)(ULONG_PTR)cpu == gpu;
+    printf("info GPU memory is %sidentity-mapped\n", gpu_identity ? "" : "NOT ");
 
     /* A second heap (32 MiB gets its own): if the first was identity-mapped,
      * later ones must be too. RADV pads each allocation's VA range, which once
@@ -774,6 +777,39 @@ static void test_xbox(void)
 
     test_present(dev, queue);
     test_ffx(dev, queue);
+
+    /* DEFAULT-heap buffers become CPU-visible, so a title can write through
+     * their GPU VA as on the console. */
+    {
+        D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT }, got;
+        D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+        D3D12_HEAP_FLAGS flags;
+        ID3D12Resource *buf = NULL;
+
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&buf);
+        if (SUCCEEDED(hr))
+            hr = ID3D12Resource_GetHeapProperties(buf, &got, &flags);
+        CHECK(SUCCEEDED(hr) && got.Type == D3D12_HEAP_TYPE_CUSTOM
+              && got.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+              "DEFAULT-heap buffer is created CPU-visible (heap type %u)", got.Type);
+        if (buf)
+        {
+            UINT64 va = ID3D12Resource_GetGPUVirtualAddress(buf);
+            D3D12_RANGE none = { 0, 0 };
+            void *cpu = NULL;
+
+            ID3D12Resource_Map(buf, 0, &none, &cpu);
+            if (gpu_identity)
+                CHECK((UINT64)(ULONG_PTR)cpu == va, "DEFAULT-heap buffer is identity-mapped too (%p, %#llx)", cpu,
+                      (unsigned long long)va);
+            else
+                printf("info DEFAULT-heap buffer at CPU %p, GPU VA %#llx\n", cpu, (unsigned long long)va);
+            ID3D12Resource_Release(buf);
+        }
+    }
 
     if (fence) ID3D12Fence_Release(fence);
     if (rs) XSLOT(rs, 2, ULONG)(rs);
