@@ -125,7 +125,9 @@ There are two places this could live:
    (GLSL in `tools/gen_fallback_shaders.sh`) writes s0-s31 to the root UAV in s0:s1. The smoke test
    checks the UAV address, the root constants, and the table's real heap address (0 on lavapipe,
    the real address on RADV). Graphics too: an SCSV VS draws a fullscreen triangle and the PS
-   writes its SGPRs, set through the graphics root slots.
+   writes its SGPRs, set through the graphics root slots. Verified on the Radeon 890M (RADV,
+   2026-11-21): all three SGPR checks pass for dispatch and draw, with table addresses equal to
+   heap slot 10's start plus the table offset.
 4. Patch 4 and a translated compute shader from Leonida's output (needs the user's `the shader archive`;
    run on the 890M with `tests/manual-test.sh`).
 5. With the exe: measure the open questions above, then graphics.
