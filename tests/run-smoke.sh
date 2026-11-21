@@ -44,6 +44,13 @@ install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "
 install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REBOX_SHIMS_DIR"/xaudio2_9.dll \
     "$REBOX_SHIMS_DIR"/amd_fidelityfx_loader_xbox.dll "$sys32"/
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9=n"
+# AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
+if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
+    install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/
+    "$WINE" "$REBOX_ANYPS5_DIR"/sa5_check.exe | grep -q "^ok   compiled" \
+        || { echo "FAIL rebox_anyps5.dll did not compile the built-in shader"; exit 1; }
+    echo "ok   rebox_anyps5.dll compiles a compute shader under Wine"
+fi
 export REBOX_SHADER_CACHE="Z:${work//\//\\}\\cache"
 # PresentX frame dumps, checked by the smoke test.
 mkdir -p "$work/frames"

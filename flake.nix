@@ -126,6 +126,47 @@
           dontStrip = true; # native strip on PE files
         };
 
+        # AnyPS5's RDNA -> SPIR-V recompiler as rebox_anyps5.dll (anyps5/,
+        # docs/anyps5.md): a sparse checkout of AnyPS5 at a pinned commit, its
+        # three shader submodules at the revisions AnyPS5 pins, and
+        # patches/anyps5/ applied.
+        anyps5-src = let
+          sparse = pkgs.fetchgit {
+            url = "https://github.com/boykopovar/AnyPS5";
+            rev = "fc973e01897731a88e879fbd801e4ef5c6c29643";
+            sparseCheckout = [ "core/shader/recompiler" "core/libs/prx/libc/include" ];
+            hash = "sha256-wSwfEePRhd3G63sX7P6q1XvO/yko2iDwK4nYS9Rvk5U=";
+          };
+          sub = repo: rev: hash: pkgs.fetchFromGitHub { owner = "KhronosGroup"; inherit repo rev hash; };
+          headers = sub "SPIRV-Headers" "b824a462d4256d720bebb40e78b9eb8f78bbb305" "sha256-HjJjMuqTrYv5LUOWcexzPHb8nhOT4duooDAhDsd44Zo=";
+          tools = sub "SPIRV-Tools" "262bdab48146c937467f826699a40da0fdfc0f1a" "sha256-H+t7ZH4SB+XgWTLj9XaJWZwAWk8M2QeC98Zi5ay8PBc=";
+          glslang = sub "glslang" "ba1640446f3826a518721d1f083f3a8cca1120c3" "sha256-xplVnLcfVTg/iUScla8TAdHzvI/jq+cjLUSRgKNBKDI=";
+        in pkgs.runCommand "anyps5-src" { nativeBuildInputs = [ pkgs.git ]; } ''
+          cp -r ${sparse} $out && chmod -R u+w $out
+          mkdir -p $out/3rdparty
+          cp -r ${headers} $out/3rdparty/SPIRV-Headers
+          cp -r ${tools} $out/3rdparty/SPIRV-Tools
+          cp -r ${glslang} $out/3rdparty/glslang
+          chmod -R u+w $out
+          # Only the recompiler is built: skip hunks for AnyPS5's driver, tests and docs.
+          for p in ${./patches/anyps5}/*.patch; do git -C $out apply --include='core/shader/*' "$p"; done
+        '';
+
+        rebox-anyps5 = pkgs.stdenvNoCC.mkDerivation {
+          name = "rebox-anyps5";
+          src = lib.fileset.toSource { root = ./.; fileset = ./anyps5; };
+          nativeBuildInputs = [ mingwCC pkgs.cmake pkgs.ninja pkgs.python3 ];
+          dontUseCmakeConfigure = true;
+          buildPhase = ''
+            cmake -S anyps5 -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+              -DANYPS5_SOURCE=${anyps5-src} -DCMAKE_TOOLCHAIN_FILE=$PWD/anyps5/mingw-w64.cmake \
+              -DMINGW_PTHREADS=${pkgs.pkgsCross.mingwW64.windows.pthreads}
+            cmake --build build --target rebox_anyps5 sa5_check -j$NIX_BUILD_CORES
+          '';
+          installPhase = "mkdir -p $out && cp build/rebox_anyps5.dll build/sa5_check.exe $out/";
+          dontStrip = true;
+        };
+
         # Only dxgi.dll is used: vkd3d-proton needs a DXGI that enumerates
         # Vulkan adapters without a display, as in Proton.
         dxvk-win = pkgs.stdenvNoCC.mkDerivation rec {
@@ -154,6 +195,7 @@
             mkdir -p $out
             cp build/*.dll $out/
             if [ -d build/stub ]; then mkdir -p $out/stub && cp build/stub/*.dll $out/stub/; fi
+            cp ${rebox-anyps5}/rebox_anyps5.dll $out/
           '';
         };
 
@@ -194,6 +236,7 @@
           export DXVK_DIR=${self.packages.${system}.dxvk-win}/x64
           export REBOX_SHIMS_DIR=$PWD/build
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
+          export REBOX_ANYPS5_DIR=${self.packages.${system}.rebox-anyps5}
           export WINE_DLL_DIR=${pkgs.wineWow64Packages.unstable}/lib/wine/x86_64-windows
           # Software Vulkan only for machines (or sandboxes) without a GPU;
           # otherwise the system's drivers (e.g. RADV) are used.

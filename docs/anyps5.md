@@ -98,9 +98,12 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    replaced by an include path and two stream functions; winpthreads is linked statically. Its C API
    (`anyps5/rebox_anyps5.h`) compiles a compute shader and exposes the SPIR-V, bindings, push
    data and subgroup size. Under Wine, `sa5_check.exe` compiles a built-in shader and the lab's
-   `sh_00000_CS` (2,657 words, 4 bindings) with no guest memory. Still to do: build it in the flake
-   from a pinned AnyPS5 (`fc973e0189` plus SPIRV-Headers, SPIRV-Tools, glslang), and fill the
-   `SpirvTarget` from vkd3d-proton's physical device instead of fixed values.
+   `sh_00000_CS` (2,657 words, 4 bindings) with no guest memory. The flake builds it as
+   `.#rebox-anyps5` from a sparse checkout of AnyPS5 `fc973e0189` and the three submodules it
+   pins (SPIRV-Headers, SPIRV-Tools, glslang), applying only the patches' `core/shader/` hunks;
+   the `shims` package and `rebox-run` include the DLL, and `run-smoke.sh` compiles a shader
+   through it. Still to do: fill the `SpirvTarget` from vkd3d-proton's physical device instead of
+   fixed values.
 2. Shadow heap: GFX10 encoders for buffer and 2D views and samplers, and a smoke test that
    AnyPS5's own decoders read them back to the view that was created.
 3. Deferred compute pipelines and the dispatch path, with a hand-written compute shader whose
