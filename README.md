@@ -52,7 +52,10 @@ Once the exe is dumped:
    point real, implement it in `shims/<dll>/`, add it to that DLL's `.def`, and regenerate. A DLL
    that nobody provides at all (e.g. `xg_xs.dll`) gets a whole stub DLL in
    `generated/dlls/<name>/`, built to `build/stub/` and installed by `rebox-run`, so the exe
-   still loads. `tests/run-stubgen.sh` checks this end to end.
+   still loads. Forwarded exports in package DLLs are followed: if one forwards to a DLL nobody
+   provides, that DLL gets a stub too, and the report names the forwarder (`via dll.symbol`).
+   Import and export tables are read directly, so names pefile would drop (characters
+   outside `._?@$()<>`) still count. `tests/run-stubgen.sh` checks all of this end to end.
 3. **Link the shader cache.** `nix run .#anyps5-cache -- link --originals <shaders extracted from
    the shader archive> --translated <AnyPS5 output> --out ~/.local/share/rebox/7952987A/shader-cache`.
    Files are paired by relative path, ignoring extension.

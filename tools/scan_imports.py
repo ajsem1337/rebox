@@ -36,33 +36,80 @@ APISET_HOSTS = [
 ]
 
 
+# Import and export tables are read here rather than through pefile's parsed
+# entries: pefile drops names outside letters, digits and ._?@$()<> and
+# descriptors it left empty (Xbox2Windows found such names in packages).
+
+def _cstr(pe, rva, limit=4096):
+    return pe.get_data(rva, limit).split(b"\0", 1)[0].decode("latin-1")
+
+
+def _directory(pe, name):
+    d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY[name]]
+    return d.VirtualAddress, d.Size
+
+
 def pe_exports(path):
+    """(names, ordinals, forwards): forwards maps a name or ordinal to its
+    forwarder string ("dll.name" or "dll.#ordinal")."""
     try:
         pe = pefile.PE(str(path), fast_load=True)
-        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
-    except pefile.PEFormatError:
+        names, ordinals, forwards = set(), set(), {}
+        rva, size = _directory(pe, "IMAGE_DIRECTORY_ENTRY_EXPORT")
+        if not rva:
+            return names, ordinals, forwards
+        base = pe.get_dword_at_rva(rva + 16)
+        nfuncs, nnames = pe.get_dword_at_rva(rva + 20), pe.get_dword_at_rva(rva + 24)
+        funcs, name_ptrs, name_ords = (pe.get_dword_at_rva(rva + o) for o in (28, 32, 36))
+        by_index = {}
+        for i in range(nfuncs):
+            target = pe.get_dword_at_rva(funcs + 4 * i)
+            if not target:
+                continue
+            ordinals.add(base + i)
+            if rva <= target < rva + size:
+                by_index[i] = _cstr(pe, target, 512)
+                forwards[base + i] = by_index[i]
+        for i in range(nnames):
+            name = _cstr(pe, pe.get_dword_at_rva(name_ptrs + 4 * i), 512)
+            index = pe.get_word_at_rva(name_ords + 2 * i)
+            names.add(name)
+            if index in by_index:
+                forwards[name] = by_index[index]
+        return names, ordinals, forwards
+    except (pefile.PEFormatError, TypeError, AttributeError, IndexError):
         return None
-    names, ordinals = set(), set()
-    for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []):
-        if sym.name:
-            names.add(sym.name.decode())
-        ordinals.add(sym.ordinal)
-    return names, ordinals
 
 
 def pe_imports(path):
     pe = pefile.PE(str(path), fast_load=True)
-    pe.parse_data_directories(directories=[
-        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
-    ])
     out = collections.defaultdict(set)
-    for attr in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT"):
-        for entry in getattr(pe, attr, []):
-            dll = entry.dll.decode().lower()
-            for imp in entry.imports:
-                out[dll].add(imp.name.decode() if imp.name else imp.ordinal)
+    for dirname, desc_size, name_off, thunk_offs in (
+            ("IMAGE_DIRECTORY_ENTRY_IMPORT", 20, 12, (0, 16)),        # OriginalFirstThunk, else FirstThunk
+            ("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT", 32, 4, (16,))):    # ImportNameTable
+        rva, _ = _directory(pe, dirname)
+        while rva:
+            raw = pe.get_data(rva, desc_size)
+            if len(raw) < desc_size or not any(raw):
+                break
+            dll = _cstr(pe, pe.get_dword_at_rva(rva + name_off), 256).lower()
+            out[dll]  # a descriptor with no thunks still names a DLL the loader must find
+            thunk = next((t for t in (pe.get_dword_at_rva(rva + o) for o in thunk_offs) if t), 0)
+            while thunk:
+                v = pe.get_qword_at_rva(thunk)
+                if not v:
+                    break
+                out[dll].add(v & 0xFFFF if v >> 63 else _cstr(pe, (v & 0x7FFFFFFF) + 2, 512))
+                thunk += 8
+            rva += desc_size
     return out
+
+
+def split_forward(fwd):
+    """'dll.name' / 'dll.#7' -> ('dll.dll', 'name' / 7)."""
+    dll, _, sym = fwd.rpartition(".")
+    dll = dll.lower() + ".dll"
+    return dll, int(sym[1:]) if sym.startswith("#") and sym[1:].isdigit() else sym
 
 
 def load_providers(dirs):
@@ -73,7 +120,7 @@ def load_providers(dirs):
             if key in providers:
                 continue  # earlier providers win, like a search path
             exp = pe_exports(p)
-            if exp:
+            if exp is not None:
                 providers[key] = (exp, str(p))
     return providers
 
@@ -149,6 +196,32 @@ def main():
             for s in syms:
                 wanted[dll][s].add(t.name)
 
+    # Forwarded exports: binding to one makes the loader resolve its target
+    # too, which can be missing even when the forwarding DLL is present.
+    # Follow each chain and import the final target as well.
+    def lookup(dll, sym):
+        (names, ordinals, forwards), _ = providers[dll]
+        found = sym in names if isinstance(sym, str) else sym in ordinals
+        return found, forwards.get(sym) if found else None
+
+    queue = [(dll, s, u) for dll in wanted if dll in providers and not is_apiset(dll)
+             for s in wanted[dll] for u in wanted[dll][s]]
+    forwarded = set()
+    while queue:
+        dll, sym, user = queue.pop()
+        if (dll, sym) in forwarded:
+            continue
+        forwarded.add((dll, sym))
+        found, fwd = lookup(dll, sym)
+        if not fwd:
+            continue
+        tdll, tsym = split_forward(fwd)
+        if tdll == dll and tsym == sym:
+            continue
+        wanted[tdll][tsym].add(f"{user} via {dll[:-4]}.{sym if isinstance(sym, str) else '#%d' % sym}")
+        if tdll in providers and not is_apiset(tdll):
+            queue.append((tdll, tsym, user))
+
     problems = 0
     stubs = collections.defaultdict(set)
     missing_dlls = {}
@@ -159,7 +232,7 @@ def main():
             missing = {s for s in syms if not isinstance(s, str) or s not in apiset_names}
             where = "apiset"
         elif dll in providers:
-            (names, ordinals), where = providers[dll]
+            (names, ordinals, _), where = providers[dll]
             missing = {s for s in syms if (s not in names if isinstance(s, str) else s not in ordinals)}
         else:
             missing, where = set(syms), None
