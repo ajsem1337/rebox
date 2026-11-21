@@ -140,8 +140,9 @@ There are two places this could live:
    heap slot 10's start plus the table offset.
 4. ~~Patch 4~~ Done: a console shader reads the raw descriptor at its table address and finds
    its heap index through the lookup table, for a descriptor written straight into the heap and one
-   copied in (RADV only; lavapipe has no descriptor buffers and skips). Next: a translated compute
-   shader from Leonida's output (needs the user's `the shader archive`).
+   copied in (RADV only; lavapipe has no descriptor buffers and skips). Verified on the Radeon 890M
+   (2026-11-21): indices 2 and 3 found, in 0 and 1 probes. Next: a translated compute shader from
+   Leonida's output (needs the user's `the shader archive`).
 5. With the exe: measure the open questions above, then graphics.
 
 Meanwhile `d3d12_xs` keeps its fallback shaders, so a title runs with effects missing rather than
