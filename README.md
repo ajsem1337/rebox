@@ -176,8 +176,11 @@ down missing translations.
   ignores them, and the smoke test checks that it still does. Their meaning is unknown. Streams with
   subobject types the mingw headers lack (DEPTH_STENCIL2, RASTERIZER1/2, Xbox-specific ones) skip
   substitution and are logged.
-- **XALLOC_ATTRIBUTES** decoding is from memory of the XDK headers. Alignment is decoded so that a
-  wrong guess over-aligns rather than under-aligns.
+- **XALLOC_ATTRIBUTES** decoding follows [SlimEra](https://github.com/XWine1/SlimEra)'s Xbox One
+  ERA definition (alignment 2^n, at least 16 bytes), which matches the 32-byte alignment Bink relies
+  on. Scarlett's header hasn't been seen, so page sizes and the meaning of graphics memory types
+  beyond "GPU-visible" are unconfirmed. `XMemAlloc` memory is always zeroed, including blocks
+  reused from freed ones.
 - **WineGDK was archived 2026-11-13.** Its successors are
   [xodus-gaming/wine](https://github.com/xodus-gaming/wine) and
   [xodus-gaming/xgameruntime](https://github.com/xodus-gaming/xgameruntime), but that runtime only

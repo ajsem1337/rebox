@@ -30,7 +30,7 @@ struct chunk
     ID3D12Resource *buffer;
     BYTE *cpu;
     UINT64 gpu, size, used;
-    BOOL dedicated;
+    BOOL dedicated, dirty; /* dirty: something was freed, so ranges may hold old data */
     struct range *free;
     size_t free_count, free_cap;
     struct chunk *next;
@@ -209,6 +209,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
     struct allocation *a;
     struct chunk *c;
     UINT64 offset = 0;
+    BOOL recycled;
 
     if (!cpu)
         return E_INVALIDARG;
@@ -256,6 +257,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
     }
     a = calloc(1, sizeof(*a));
     a->cpu = c->cpu + offset;
+    recycled = c->dirty;
     a->chunk = c;
     a->offset = offset;
     a->size = size;
@@ -264,6 +266,12 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
     c->used += size;
     bytes_in_use += size;
     ReleaseSRWLockExclusive(&lock);
+
+    /* New heaps are zero-filled; ranges reused within a chunk aren't. XMemAlloc
+     * memory comes back zeroed, so clear them: anything from a chunk that has
+     * had a free. */
+    if (recycled)
+        memset(a->cpu, 0, size);
 
     *cpu = a->cpu;
     if (gpu)
@@ -291,6 +299,7 @@ void WINAPI ReboxGpuFree(void *cpu)
     c = a->chunk;
     range_free(c, a->offset, a->size);
     c->used -= a->size;
+    c->dirty = TRUE;
     bytes_in_use -= a->size;
     free(a);
     if (c->dedicated && !c->used)

@@ -1,8 +1,9 @@
 /* Replacement for the console's xmem.dll.
  *
- * XALLOC_ATTRIBUTES layout is from memory of the XDK/GDK headers, not from a
- * header on this machine. The decoding below is written so that a wrong
- * guess over-aligns rather than under-aligns. */
+ * The XALLOC_ATTRIBUTES layout matches SlimEra's Xbox One ERA definition
+ * (MIT): alignment 2^n with a 16-byte floor, and memory type 0 for the CPU
+ * heap. Scarlett's own header hasn't been seen. Every allocation comes back
+ * zeroed, as on the console. */
 
 #include <malloc.h>
 #include <stdlib.h>
@@ -35,9 +36,9 @@ static XMEMFREE_ROUTINE free_hook;
 
 static SIZE_T attr_alignment(XALLOC_ATTRIBUTES attr)
 {
-    /* 0 means default; otherwise treat n as 2^(n+1). If the real encoding is
-     * 4,8,16,... for 1,2,4,... this only ever over-aligns. */
-    unsigned int shift = attr.s.alignment ? attr.s.alignment + 1 : 4;
+    /* 2^n with a 16-byte floor, as in SlimEra's ERA XMemAllocDefault (MIT).
+     * Xbox2Windows saw Bink pass n = 5 and rely on 32-byte alignment. */
+    unsigned int shift = attr.s.alignment > 4 ? attr.s.alignment : 4;
 
     if (shift > 22)
         shift = 22;
@@ -181,7 +182,14 @@ void *WINAPI XMemAllocDefault(SIZE_T size, ULONGLONG attributes)
     }
     if (wants_pages(attr))
         return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    return _aligned_malloc(size ? size : 1, attr_alignment(attr));
+    /* Zeroed like the console's: pages are, and SlimEra and Xbox2Windows'
+     * stand-ins zero heap blocks too, so titles may rely on it. */
+    {
+        void *p = _aligned_malloc(size ? size : 1, attr_alignment(attr));
+        if (p)
+            memset(p, 0, size ? size : 1);
+        return p;
+    }
 }
 
 void WINAPI XMemFreeDefault(void *address, ULONGLONG attributes)

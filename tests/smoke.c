@@ -56,10 +56,35 @@ static void test_xmem(void)
     CHECK(xalloc && xfree && set_hooks && alloc_default && free_default, "xmem exports present");
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
 
-    /* alignment field (bits 24-28) = 6 -> 128-byte alignment, heap path */
-    a = xalloc(100, 6ull << 24);
+    /* alignment field (bits 24-28) = 7 -> 2^7 = 128-byte alignment, heap path */
+    a = xalloc(100, 7ull << 24);
     CHECK(a && !((ULONG_PTR)a & 127), "XMemAlloc aligned heap allocation %p", a);
-    if (a) { a[0] = a[99] = 1; xfree(a, 6ull << 24); }
+    if (a) { a[0] = a[99] = 1; xfree(a, 7ull << 24); }
+
+    /* Blocks come back zeroed even when the allocator reuses a dirty address
+     * (Xbox2Windows' era_heap_reuse): heap path and GPU-visible path. */
+    {
+        static const ULONGLONG kinds[] = { 5ull << 24, 0xa8004000 };
+        for (int k = 0; k < 2; k++)
+        {
+            BYTE *held[32] = { 0 }, *dirty = xalloc(4096, kinds[k]);
+            BOOL zero = dirty != NULL, reused = FALSE;
+            int n;
+
+            if (dirty) { memset(dirty, 0xa5, 4096); xfree(dirty, kinds[k]); }
+            for (n = 0; n < 32 && zero && !reused; n++)
+            {
+                if (!(held[n] = xalloc(4096, kinds[k]))) { zero = FALSE; break; }
+                for (int i = 0; i < 4096; i++)
+                    zero &= held[n][i] == 0;
+                reused = held[n] == dirty;
+            }
+            CHECK(zero, "XMemAlloc %#llx blocks are zeroed (dirty address reused: %s)",
+                  kinds[k], reused ? "yes" : "no");
+            while (n-- > 0)
+                if (held[n]) xfree(held[n], kinds[k]);
+        }
+    }
 
     /* memory_type field (bits 29-32) != 0 -> VirtualAlloc path */
     b = xalloc(1 << 20, 1ull << 29);
@@ -70,12 +95,12 @@ static void test_xmem(void)
      * disassembly here). Bink's fallback allocator asks for len + 64 with 0x05e50000, steps
      * the base forward 33-64 bytes to a 32-byte boundary, stores the step at [-1] and a tag
      * at [-2], and later frees base = user - step with the same word. Here: alignment 5
-     * (64 bytes), memory_type 0, so the heap path. */
+     * (32 bytes), memory_type 0, so the heap path. */
     {
         const ULONGLONG bink = 0x05e50000;
         BYTE *base = xalloc(1000 + 64, bink), *user;
 
-        CHECK(base && !((ULONG_PTR)base & 63), "XMemAlloc Bink attributes %#llx -> %p", bink, base);
+        CHECK(base && !((ULONG_PTR)base & 31), "XMemAlloc Bink attributes %#llx -> %p", bink, base);
         if (base)
         {
             user = base + 64 - ((ULONG_PTR)base & 31);
@@ -90,7 +115,7 @@ static void test_xmem(void)
 
     /* The AMD upscaler rounds sizes up to 256 and passes 0xa8004000 (its on-disk default),
      * then copies shader bytes in and hands the pointer to a compute PSO, so the GPU reads
-     * it. Here: alignment 8 (512 bytes), page_size 1, memory_type 5, so GPU-visible
+     * it. Here: alignment 8 (256 bytes, matching its rounding), page_size 1, memory_type 5, so GPU-visible
      * memory, which XMemVirtualQuery must report as GPU-accessible. */
     {
         const ULONGLONG amd = 0xa8004000;
@@ -98,7 +123,7 @@ static void test_xmem(void)
         BYTE *p = xalloc(0x1100, amd);
         xmem_info info;
 
-        CHECK(p && !((ULONG_PTR)p & 511), "XMemAlloc AMD attributes %#llx -> %p", amd, p);
+        CHECK(p && !((ULONG_PTR)p & 255), "XMemAlloc AMD attributes %#llx -> %p", amd, p);
         if (p)
         {
             memset(p, 0xa5, 0x1100);
