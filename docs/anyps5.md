@@ -1,6 +1,6 @@
 # Console shaders with AnyPS5: design
 
-Status: design for review, nothing implemented. Written 2026-11-21. Supersedes the translator choice
+Status: steps 1 and 2 implemented (see Order of work). Written 2026-11-21. Supersedes the translator choice
 in [shaders.md](shaders.md) (Leonida's contract); most of the plumbing there carries over, as listed
 below. Facts about AnyPS5 are from upstream `main` at `fc973e0189` and the user's
 `xsx-shader-lab` (`rdna-run`), which compiles 2,579 of the 2,620 PS09 compute shaders with the
@@ -29,13 +29,16 @@ Two consequences:
 
 AnyPS5 reads descriptors as the console wrote them (GFX10 layout). Our heaps hold what RADV writes
 for the 890M (GFX11 layout), so AnyPS5 would misread formats and dimensions. Instead of
-reinterpreting those, `d3d12_xs` keeps a **shadow heap** per shader-visible heap, in console
-format:
+reinterpreting those, `d3d12_xs` keeps a **shadow heap** per CBV/SRV/UAV and sampler heap, in
+console format (`shims/d3d12_xs/shadow.c`, encoders in `console_desc.c`):
 
-- On every descriptor write the title makes through the API (device slots 17-19, 22-24, already
-  hooked for the lookup table), `d3d12_xs` encodes the view as a GFX10 T#/V#/S# into the shadow at
-  the same index. The encoders follow Mesa's `ac_descriptors` (MIT): the D3D12 view description
-  gives format, dimension, mips, layers, and the resource's GPU address.
+- On every descriptor write the title makes through the API (device slots 17-19, 22-24),
+  `d3d12_xs` encodes the view as a GFX10 T#/V#/S# into the shadow at the same index, using the
+  field layout AnyPS5's decoders read. The D3D12 view description gives format, dimension, mips
+  and layers; buffers carry their GPU address, and textures (which have none here) a synthetic
+  address unique per resource, since the descriptor only has to identify the view.
+  `CopyDescriptors*` copy shadow bytes, so CPU-only heaps get shadows too. The stride is the
+  increment the title gets, so it needs at least 32 bytes (16 for samplers).
 - The address the title sees for a heap (heap slot 10, patch 1) becomes the shadow's address, in a
   32-bit range we choose. Descriptor-table pointers are truncated to 32 bits by the game's code,
   and AnyPS5 resolves them on the CPU through our read callback. So the RADV low-window patch is
@@ -44,8 +47,23 @@ format:
   the console. Turning those into vkd3d-proton views is the one case that needs decoding (later,
   only if the exe shows it).
 
-Mapping a binding back to a real descriptor uses the existing lookup table (patch 4), keyed on the
-shadow's console bytes: words → heap index → the vkd3d-proton descriptor at that index.
+Mapping a binding back to a real descriptor is a CPU hash over every shadow slot, keyed on its
+console words: `ReboxShadowFind(words)` → the vkd3d-proton CPU handle written alongside them
+(shader-visible heaps first). AnyPS5 binds by value at compile time, so this replaces the
+GPU-visible lookup table of patch 4, which `d3d12_xs` no longer fills.
+
+`d3d12_xs` exports, for the dispatch path and the tests: `ReboxShadowHeap(cpu_start, &title_va,
+&data, &stride, &count)`, `ReboxShadowRead(title_va, out, size)` (fails unless the range lies in
+one heap) and `ReboxShadowFind(words, word_count, sampler, &cpu)`. Shader-visible heaps get
+title addresses from `0x10000000`, 64 KiB aligned; their shadows sit in GPU-visible memory
+(`ReboxGpuAlloc`) so shaders could read them directly later.
+
+The smoke test checks the encoders field by field, then compiles a hand-assembled RDNA2 shader
+(`s_load` of a T#, V# and S# from two descriptor tables, `image_sample_lz`, `buffer_store`) through
+`rebox_anyps5.dll` with the shadow heaps as its memory: AnyPS5 binds a sampled 2D image, a
+storage buffer and a sampler whose words are the shadow's, and each maps back to the vkd3d-proton
+descriptor. AnyPS5 also adds a fourth binding, a storage buffer holding all three descriptors'
+words (16 dwords), which the dispatch path will have to fill.
 
 ## Runtime flow (compute first)
 
@@ -85,7 +103,7 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 | Patch 1, real heap addresses | kept; the address becomes the shadow heap's |
 | Patch 2, `SCSV` pipelines | replaced by deferred console pipelines compiled at dispatch |
 | Patch 3, SGPR packing | kept: the SGPR values are AnyPS5's user data |
-| Patch 4, lookup table | kept, keyed on shadow (console-format) bytes |
+| Patch 4, lookup table | replaced by a CPU lookup over the shadow heaps (`ReboxShadowFind`); `d3d12_xs` no longer sets a table |
 | RADV 32-bit low window | not needed (truncated pointers resolve through the CPU callback) |
 | `scsv_pack.py`, `translate-shaders.sh`, Leonida | retired |
 | `rdna-run`, lab patches | AnyPS5 build and patch set; its sweep stays the compiler's test bench |
@@ -104,8 +122,10 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    the `shims` package and `rebox-run` include the DLL, and `run-smoke.sh` compiles a shader
    through it. Still to do: fill the `SpirvTarget` from vkd3d-proton's physical device instead of
    fixed values.
-2. Shadow heap: GFX10 encoders for buffer and 2D views and samplers, and a smoke test that
-   AnyPS5's own decoders read them back to the view that was created.
+2. ~~Shadow heap~~ Done: GFX10 encoders for buffer and texture views and samplers, shadow heaps
+   with title addresses, the CPU lookup, and the AnyPS5 round trip in the smoke test (above).
+   The heap's slot 10 address and vkd3d-proton's SGPR packing still use the real heap VA; they
+   move to title addresses with step 3.
 3. Deferred compute pipelines and the dispatch path, with a hand-written compute shader whose
    descriptors are known (the smoke test's UAV write, as RDNA2 code assembled with `llvm-mc`).
 4. Real the target title compute shaders on the 890M.

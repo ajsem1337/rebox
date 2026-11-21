@@ -45,6 +45,7 @@ struct sa5_binding
     uint32_t set, binding, count;
     uint32_t word_count;        /* guest descriptor words: 4 (V#, S#) or 8 (T#) per element */
     const uint32_t *words;
+    int32_t image_shape;        /* ShaderRecompiler::DescriptorImageShape, or -1 */
 };
 
 struct sa5_result;

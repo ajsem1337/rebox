@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "../generated/test_shaders.h"
+#include "../anyps5/rebox_anyps5.h"
 
 static int failures;
 
@@ -1315,121 +1316,216 @@ done:
  * bound heap's lookup table. Entry 2 is written straight into the
  * shader-visible heap (slot 19), entry 3 copied in from a CPU heap (slot
  * 24). Needs descriptor buffers (RADV); elsewhere the shader reports a skip. */
-static void test_descriptor_lookup(void *dev, void *queue)
+/* RDNA2 compute shader for the shadow-heap round trip (llvm-mc -mcpu=gfx1030).
+ * s[0:1] points at a CBV/SRV/UAV descriptor table, s[2:3] at a sampler table;
+ * the s_load offsets (in dwords 1, 3 and 5) are patched to the heap increments.
+ *   s_load_dwordx8 s[4:11], s[0:1], 2*inc         ; T# at index 2
+ *   s_load_dwordx4 s[12:15], s[0:1], 1*inc        ; V# at index 1
+ *   s_load_dwordx4 s[16:19], s[2:3], 1*sampler_inc ; S# at index 1
+ *   s_waitcnt lgkmcnt(0)
+ *   v_mov_b32 v1, 0 ; v_mov_b32 v2, 0 ; v_mov_b32 v3, 0
+ *   image_sample_lz v[8:11], v[2:3], s[4:11], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+ *   s_waitcnt vmcnt(0)
+ *   buffer_store_dword v8, v0, s[12:15], 0 offen
+ *   s_endpgm */
+static const UINT32 rdna_shadow_round_trip[] = {
+    0xf40c0100, 0xfa000040, 0xf4080300, 0xfa000020, 0xf4080401, 0xfa000010, 0xbf8cc07f, 0x7e020280,
+    0x7e040280, 0x7e060280, 0xf09c0f08, 0x00810802, 0xbf8c3f70, 0xe0701000, 0x80030800, 0xbf810000,
+};
+
+/* Compiles rdna_shadow_round_trip with AnyPS5 against the shadow heaps and
+ * checks that its own descriptor decoders found the views written through the
+ * API, and that each binding maps back to vkd3d-proton's descriptor. */
+static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size, UINT inc, SIZE_T res_cpu,
+        UINT64 smp_va, const void *smp_data, UINT smp_size, UINT sinc, SIZE_T smp_cpu)
+{
+    HMODULE sa5 = LoadLibraryA("rebox_anyps5.dll");
+    BOOL (WINAPI *find)(const UINT32 *, UINT, BOOL, SIZE_T *) =
+            (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxShadowFind");
+    int (*compile)(const struct sa5_compute_request *, struct sa5_result **, char *, size_t);
+    UINT32 (*binding_count)(const struct sa5_result *);
+    int (*binding)(const struct sa5_result *, UINT32, struct sa5_binding *);
+    void (*result_free)(struct sa5_result *);
+    struct sa5_region regions[2] = { { res_va, res_data, res_size }, { smp_va, smp_data, smp_size } };
+    UINT32 code[ARRAYSIZE(rdna_shadow_round_trip)], user[4] = { (UINT32)res_va, 0, (UINT32)smp_va, 0 };
+    struct sa5_compute_request req = { code, ARRAYSIZE(code), 0x100000, 32, user, 4, { 1, 1, 1 },
+                                       0x00ac0000, 4 << 1 /* USER_SGPR */, regions, 2 };
+    const UINT32 *t = (const UINT32 *)((const BYTE *)res_data + 2 * inc);
+    const UINT32 *v = (const UINT32 *)((const BYTE *)res_data + inc);
+    const UINT32 *s = (const UINT32 *)((const BYTE *)smp_data + sinc);
+    BOOL found_t = FALSE, found_v = FALSE, found_s = FALSE;
+    struct sa5_result *result = NULL;
+    char error[512] = "";
+
+    if (!sa5)
+    {
+        printf("skip AnyPS5 round trip: no rebox_anyps5.dll\n");
+        return;
+    }
+    compile = (void *)GetProcAddress(sa5, "sa5_compile_compute");
+    binding_count = (void *)GetProcAddress(sa5, "sa5_result_binding_count");
+    binding = (void *)GetProcAddress(sa5, "sa5_result_binding");
+    result_free = (void *)GetProcAddress(sa5, "sa5_result_free");
+    memcpy(code, rdna_shadow_round_trip, sizeof(code));
+    /* OFFSET is bits 0-20 of the second dword; SOFFSET (null) stays. */
+    code[1] = (code[1] & ~0x1fffffu) | 2 * inc;
+    code[3] = (code[3] & ~0x1fffffu) | inc;
+    code[5] = (code[5] & ~0x1fffffu) | sinc;
+    if (compile(&req, &result, error, sizeof(error)))
+    {
+        CHECK(0, "AnyPS5 compiles the shadow-heap round-trip shader: %s", error);
+        return;
+    }
+    for (UINT32 i = 0; i < binding_count(result); i++)
+    {
+        struct sa5_binding b;
+        SIZE_T cpu = 0;
+
+        binding(result, i, &b);
+        printf("     binding %u: kind %u set %u binding %u count %u words %u shape %d:", i, b.kind, b.set, b.binding,
+               b.count, b.word_count, b.image_shape);
+        for (UINT32 w = 0; w < b.word_count; w++)
+            printf(" %08x", b.words[w]);
+        printf("\n");
+        if (b.kind == 4 /* SampledImage */ && b.word_count >= 8 && !memcmp(b.words, t, 32))
+        {
+            found_t = TRUE;
+            CHECK(b.image_shape == 1, "AnyPS5 reads the shadow T# as a 2D image (shape %d)", b.image_shape);
+            CHECK(find(b.words, 8, FALSE, &cpu) && cpu == res_cpu + 2 * inc,
+                  "the T# binding maps back to vkd3d-proton's descriptor 2 (%#Ix)", cpu);
+        }
+        else if (b.kind == 6 /* Sampler */ && b.word_count >= 4 && !memcmp(b.words, s, 16))
+        {
+            found_s = TRUE;
+            CHECK(find(b.words, 4, TRUE, &cpu) && cpu == smp_cpu + sinc,
+                  "the S# binding maps back to vkd3d-proton's sampler 1 (%#Ix)", cpu);
+        }
+        else if (b.kind <= 3 && b.word_count >= 4 && !memcmp(b.words, v, 16))
+        {
+            found_v = TRUE;
+            CHECK(find(b.words, 4, FALSE, &cpu) && cpu == res_cpu + inc,
+                  "the V# binding maps back to vkd3d-proton's descriptor 1 (%#Ix)", cpu);
+        }
+    }
+    CHECK(found_t, "AnyPS5 binds the T# written through CreateShaderResourceView");
+    CHECK(found_v, "AnyPS5 binds the V# copied in through CopyDescriptorsSimple");
+    CHECK(found_s, "AnyPS5 binds the S# written through CreateSampler");
+    result_free(result);
+}
+
+/* Console-format shadow heaps (shadow.c): views written through the API come
+ * out as RDNA2 descriptors, readable at the heap's title address, and map
+ * back to vkd3d-proton's descriptors. */
+static void test_shadow_heap(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
-    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
-            GetProcAddress(m, "D3D12SerializeRootSignature");
+    HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+            (void *)GetProcAddress(m, "ReboxShadowHeap");
+    BOOL (WINAPI *shadow_read)(UINT64, void *, SIZE_T) = (void *)GetProcAddress(m, "ReboxShadowRead");
+    BOOL (WINAPI *shadow_find)(const UINT32 *, UINT, BOOL, SIZE_T *) = (void *)GetProcAddress(m, "ReboxShadowFind");
     D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
     D3D12_DESCRIPTOR_HEAP_DESC cd_heap = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
-    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0 };
-    D3D12_ROOT_PARAMETER params[3] = {
-        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = { 0, 0 } },
-        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, 4 } },
-        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = { 1, &range } },
-    };
-    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, params };
+    D3D12_DESCRIPTOR_HEAP_DESC sd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
     D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
                                D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 32, 1, 3, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE };
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = { .Format = DXGI_FORMAT_R32_TYPELESS,
             .ViewDimension = D3D12_UAV_DIMENSION_BUFFER, .Buffer = { 0, 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW } };
-    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
-    void *heap = NULL, *cpu_heap = NULL, *rs = NULL, *pso = NULL, *list = NULL;
-    ID3D12CommandAllocator *alloc = NULL;
-    ID3D12Resource *out_buf = NULL, *a = NULL, *b = NULL;
-    ID3D12Fence *fence = NULL;
-    ID3D10Blob *blob = NULL;
-    UINT64 gpu;
-    SIZE_T cpu, cpu_only;
-    UINT inc, *out = NULL, c0[4] = { 0 }, c1[4] = { 4 };
+    D3D12_SAMPLER_DESC smp = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                               D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, 0, 1,
+                               D3D12_COMPARISON_FUNC_NEVER, { 0 }, 0, 8 };
+    void *heap = NULL, *cpu_heap = NULL, *smp_heap = NULL;
+    ID3D12Resource *buf = NULL, *tex = NULL;
+    UINT64 title_va = 0, smp_va = 0;
+    UINT32 *res, *sam, readback[8];
+    UINT inc, sinc, stride, count, scount;
+    SIZE_T cpu, cpu_only, scpu, found = 0;
     HRESULT hr;
 
+    CHECK(shadow_heap && shadow_read && shadow_find, "d3d12_xs exports the shadow heap functions");
+    if (!shadow_heap || !shadow_read || !shadow_find) return;
     hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
             &IID_ID3D12DescriptorHeap, &heap);
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cd_heap,
                 &IID_ID3D12DescriptorHeap, &cpu_heap);
-    if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
-        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
-                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
     if (SUCCEEDED(hr))
-    {
-        cd.pRootSignature = rs;
-        cd.CS = (D3D12_SHADER_BYTECODE){ test_console_lookup, sizeof(test_console_lookup) };
-        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
-                &IID_ID3D12PipelineState, &pso);
-    }
-    for (int i = 0; i < 3 && SUCCEEDED(hr); i++)
-    {
-        ID3D12Resource **r = i == 0 ? &out_buf : i == 1 ? &a : &b;
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &sd,
+                &IID_ID3D12DescriptorHeap, &smp_heap);
+    if (SUCCEEDED(hr))
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                 D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
-                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)r);
-    }
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&buf);
     if (SUCCEEDED(hr))
-        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &IID_ID3D12CommandAllocator, (void **)&alloc);
-    if (SUCCEEDED(hr))
-        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
-                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
-    if (SUCCEEDED(hr))
-        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
-                &IID_ID3D12Fence, (void **)&fence);
-    CHECK(SUCCEEDED(hr), "objects for the descriptor lookup test (%#lx)", hr);
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex);
+    CHECK(SUCCEEDED(hr), "objects for the shadow heap test (%#lx)", hr);
     if (FAILED(hr)) goto done;
 
     cpu = XSLOT(heap, 9, SIZE_T)(heap);
-    gpu = XSLOT(heap, 10, UINT64)(heap);
     cpu_only = XSLOT(cpu_heap, 9, SIZE_T)(cpu_heap);
+    scpu = XSLOT(smp_heap, 9, SIZE_T)(smp_heap);
     inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
-            a, NULL, &uav, cpu + 2 * inc);
-    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
-            b, NULL, &uav, cpu_only);
-    XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, 1, cpu + 3 * inc, cpu_only,
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-
-    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
-    XSLOT(list, 33, void, void *)(list, rs);
-    XSLOT(list, 25, void, void *)(list, pso);
-    XSLOT(list, 45, void, UINT, UINT64)(list, 0, ID3D12Resource_GetGPUVirtualAddress(out_buf));
-    XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 1, 4, c0, 0);
-    XSLOT(list, 35, void, UINT, UINT64)(list, 2, gpu + 2 * inc);
-    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
-    XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 1, 4, c1, 0);
-    XSLOT(list, 35, void, UINT, UINT64)(list, 2, gpu + 3 * inc);
-    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
-    hr = XSLOT(list, 9, HRESULT)(list);
-    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
-    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
-    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
-        Sleep(10);
-    if (FAILED(hr = ID3D12Resource_Map(out_buf, 0, NULL, (void **)&out)))
+    sinc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (FAILED(shadow_heap(cpu, &title_va, (void **)&res, &stride, &count)))
     {
-        CHECK(0, "map the lookup shader's output (%#lx)", hr);
+        printf("skip shadow heaps: none for this device (increments %u/%u too small?)\n", inc, sinc);
         goto done;
     }
-    if (out[0] == 0xfffffffe && out[4] == 0xfffffffe)
-        printf("skip descriptor lookup: no real heap addresses or lookup tables (no descriptor buffers)\n");
-    else
+    CHECK(stride == inc && count == 4 && title_va >= 0x10000000 && title_va < 0x100000000ull && !(title_va & 0xffff),
+          "shader-visible heap has a shadow: title address %#llx, stride %u, %u descriptors", (unsigned long long)title_va, stride, count);
+    CHECK(SUCCEEDED(shadow_heap(scpu, &smp_va, (void **)&sam, NULL, &scount)) && smp_va && smp_va != title_va,
+          "sampler heap has its own title address (%#llx)", (unsigned long long)smp_va);
     {
-        CHECK(out[0] == 2, "lookup finds the descriptor written into the heap: index %d (probes %u)", (int)out[0], out[1]);
-        CHECK(out[4] == 3, "lookup finds the descriptor copied into the heap: index %d (probes %u)", (int)out[4], out[5]);
+        UINT64 none = 1;
+        CHECK(SUCCEEDED(shadow_heap(cpu_only, &none, NULL, NULL, NULL)) && !none,
+              "a heap that isn't shader-visible has a shadow but no title address");
     }
-    ID3D12Resource_Unmap(out_buf, 0, NULL);
+
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, tex, NULL, cpu + 2 * inc);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            buf, NULL, &uav, cpu_only);
+    XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, 1, cpu + inc, cpu_only,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 22, void, const D3D12_SAMPLER_DESC *, SIZE_T)(dev, &smp, scpu + sinc);
+
+    {
+        const UINT32 *t = (const UINT32 *)((BYTE *)res + 2 * inc);
+        UINT width = ((t[1] >> 30) | (t[2] & 0xfff) << 2) + 1, height = ((t[2] >> 14) & 0x3fff) + 1;
+        CHECK(((t[1] >> 20) & 0x1ff) == 56 && width == 64 && height == 32 && (t[3] >> 28) == 9
+              && ((t[3] >> 12) & 0xf) == 0 && ((t[3] >> 16) & 0xf) == 2 && (t[3] & 0xfff) == 0xfac,
+              "SRV becomes a T#: 8_8_8_8 UNORM, %ux%u, 2D, mips 0-%u, swizzle %#x", width, height,
+              (t[3] >> 16) & 0xf, t[3] & 0xfff);
+    }
+    {
+        const UINT32 *v = (const UINT32 *)((BYTE *)res + inc);
+        UINT64 base = v[0] | (UINT64)(v[1] & 0xffff) << 32;
+        CHECK(base == ID3D12Resource_GetGPUVirtualAddress(buf) && ((v[1] >> 16) & 0x3fff) == 4 && v[2] == 64,
+              "UAV copied from a CPU heap becomes a V#: base %#llx, stride %u, %u records", base,
+              (v[1] >> 16) & 0x3fff, v[2]);
+    }
+    {
+        const UINT32 *s = (const UINT32 *)((BYTE *)sam + sinc);
+        CHECK((s[0] & 0x1ff) == (2 | 0 << 3 | 1 << 6) && ((s[2] >> 20) & 3) == 1 && ((s[2] >> 22) & 3) == 1
+              && ((s[2] >> 26) & 3) == 2 && ((s[1] >> 12) & 0xfff) == 8 * 256,
+              "sampler becomes an S#: clamp/wrap/mirror, linear filters, max LOD 8");
+    }
+    CHECK(shadow_read(title_va + 2 * inc, readback, 32) && !memcmp(readback, (BYTE *)res + 2 * inc, 32),
+          "ReboxShadowRead reads the T# at its title address");
+    CHECK(!shadow_read(title_va + 3 * inc, readback, 2 * inc), "ReboxShadowRead refuses a read past the heap");
+    CHECK(shadow_find((const UINT32 *)((BYTE *)res + inc), 4, FALSE, &found) && found == cpu + inc,
+          "the V# maps back to the shader-visible copy, not the CPU heap (%#Ix)", found);
+
+    anyps5_round_trip(title_va, res, 4 * inc, inc, cpu, smp_va, sam, scount * sinc, sinc, scpu);
 
 done:
-    if (fence) ID3D12Fence_Release(fence);
-    if (list) XSLOT(list, 2, ULONG)(list);
-    if (alloc) ID3D12CommandAllocator_Release(alloc);
-    if (out_buf) ID3D12Resource_Release(out_buf);
-    if (a) ID3D12Resource_Release(a);
-    if (b) ID3D12Resource_Release(b);
-    if (pso) XSLOT(pso, 2, ULONG)(pso);
-    if (rs) XSLOT(rs, 2, ULONG)(rs);
-    if (blob) ID3D10Blob_Release(blob);
+    if (buf) ID3D12Resource_Release(buf);
+    if (tex) ID3D12Resource_Release(tex);
+    if (smp_heap) XSLOT(smp_heap, 2, ULONG)(smp_heap);
     if (cpu_heap) XSLOT(cpu_heap, 2, ULONG)(cpu_heap);
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
@@ -1553,7 +1649,7 @@ static void test_xbox(void)
     test_real_heap_va(dev, queue);
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
-    test_descriptor_lookup(dev, queue);
+    test_shadow_heap(dev);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);

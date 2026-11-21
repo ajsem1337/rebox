@@ -100,7 +100,8 @@ There are two places this could live:
    order: one dword per 32-bit constant, two per root descriptor or descriptor table (its real
    VA). This is Leonida's default mapping. It is an assumption until the exe shows the real one;
    keep it table-driven so a measured map replaces it.
-4. **Descriptor lookup** (done: `d3d12_xs` `lookup.c`, `patches/vkd3d-proton/0003`). Each
+4. **Descriptor lookup** (done, then replaced by the shadow heaps' CPU lookup in
+   [anyps5.md](anyps5.md); `d3d12_xs` no longer fills these tables). Each
    shader-visible CBV/SRV/UAV or sampler heap gets a GPU-visible table mapping descriptor bytes to
    heap index. Layout, in dwords, as Leonida's translator reads it: `[0]` mask (capacity - 1), then
    entries `{ key[8], index, pad }` from dword 1, index `0xffffffff` when empty. The key is the

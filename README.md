@@ -143,9 +143,10 @@ down missing translations.
 ## Known gaps (ordered roughly by how soon they'll bite)
 
 - **Console shaders don't render** ([docs/shaders.md](docs/shaders.md)). The translators emit
-  SPIR-V that reads user SGPRs and raw hardware descriptors. Running it needs a patched
-  vkd3d-proton (real heap addresses, console pipelines, SGPR packing, a descriptor lookup table),
-  which isn't built yet. Every console PSO uses fallback shaders.
+  SPIR-V that reads user SGPRs and raw hardware descriptors. The plan is AnyPS5 compiling at
+  dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL and console-format shadow heaps
+  are done; compiling and binding at dispatch in vkd3d-proton is next. Until then every console
+  PSO uses fallback shaders.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified

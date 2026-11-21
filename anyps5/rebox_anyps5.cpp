@@ -127,6 +127,7 @@ SA5_API int sa5_result_binding(const sa5_result* result, std::uint32_t index, sa
     binding->count = b.count;
     binding->word_count = static_cast<std::uint32_t>(b.guestDescriptor.size());
     binding->words = b.guestDescriptor.data();
+    binding->image_shape = b.imageShape ? static_cast<std::int32_t>(*b.imageShape) : -1;
     return 0;
 }
 

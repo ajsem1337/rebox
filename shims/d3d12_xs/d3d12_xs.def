@@ -14,3 +14,6 @@ EXPORTS
     D3D12CreateVersionedRootSignatureDeserializer = d3d12.D3D12CreateVersionedRootSignatureDeserializer
     D3D12EnableExperimentalFeatures = d3d12.D3D12EnableExperimentalFeatures
     D3D12GetInterface = d3d12.D3D12GetInterface
+    ReboxShadowHeap
+    ReboxShadowRead
+    ReboxShadowFind
