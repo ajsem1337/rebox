@@ -1033,15 +1033,17 @@ static void *STDMETHODCALLTYPE list_AllocateEmbeddedX(struct proxy *p, UINT64 si
 
 /* ---------------------------------------------------------- descriptor heap */
 
-/* Real heap addresses. Console shaders dereference descriptor table
- * pointers, so with the patched vkd3d-proton (ReboxGetDescriptorHeapVA,
- * patches/vkd3d-proton/0001) shader-visible heaps report the real GPU address
- * of their descriptors. vkd3d-proton's own handles are virtual, so the
- * command-list slots that take a GPU handle map real addresses back.
- * REBOX_REAL_HEAP_VA=0 keeps the virtual handles (docs/shaders.md). */
+/* Heap addresses the title sees (heap slot 10). Console shaders, and titles
+ * that store descriptor-table pointers in memory, use them as addresses. By
+ * default a shader-visible heap reports its shadow's title address (shadow.c,
+ * docs/anyps5.md), which AnyPS5 resolves in the console-format copy.
+ * REBOX_HEAP_VA=real reports the real GPU address of vkd3d-proton's
+ * descriptors instead (patches/vkd3d-proton/0001, descriptor buffers only),
+ * and =virtual vkd3d-proton's own handles. Either way the command-list slots
+ * that take a GPU handle map the address back to vkd3d-proton's handle. */
 struct heap_range
 {
-    UINT64 real, virt, size;
+    UINT64 real, virt, size;  /* real: the address the title sees */
 };
 
 static SRWLOCK heap_ranges_lock = SRWLOCK_INIT;
@@ -1053,12 +1055,10 @@ static heap_va_fn heap_va_export;
 
 static BOOL CALLBACK find_heap_va_export(INIT_ONCE *once, void *param, void **ctx)
 {
-    char *env = rebox_getenv("REBOX_REAL_HEAP_VA");
     HMODULE core = GetModuleHandleA("d3d12core.dll");
 
-    if (!(env && env[0] == '0') && core)
+    if (shadow_heap_va_mode() == SHADOW_HEAP_VA_REAL && core)
         heap_va_export = (heap_va_fn)(void *)GetProcAddress(core, "ReboxGetDescriptorHeapVA");
-    free(env);
     return TRUE;
 }
 
@@ -1126,6 +1126,19 @@ static UINT64 STDMETHODCALLTYPE heap_GetGPUDescriptorHandleForHeapStart(struct p
 
     ((D3D12_GPU_DESCRIPTOR_HANDLE *(STDMETHODCALLTYPE *)(void *, D3D12_GPU_DESCRIPTOR_HANDLE *))
         PC_SLOT(p->inner, 10))(p->inner, &h);
+    if (shadow_heap_va_mode() == SHADOW_HEAP_VA_TITLE)
+    {
+        UINT64 title, size;
+        static LONG logged;
+
+        if (!h.ptr || !shadow_title(heap_GetCPUDescriptorHandleForHeapStart(p), &title, &size))
+            return h.ptr;
+        heap_range_add(title, h.ptr, size);
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: descriptor heaps report shadow-heap title addresses (first %#llx)",
+                         (unsigned long long)title);
+        return title;
+    }
     if (heap_va && SUCCEEDED(heap_va(INNER(p, ID3D12DescriptorHeap), &real, &stride)))
     {
         D3D12_DESCRIPTOR_HEAP_DESC desc;

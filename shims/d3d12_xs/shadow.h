@@ -20,3 +20,9 @@ UINT shadow_regions(struct shadow_region *out, UINT max);
 /* The slot of the heap starting at heap_cpu that holds these console words (4 or 8), allowing
  * the fields AnyPS5 rewrites in bound descriptors. */
 BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, UINT *index);
+
+/* What heap slot 10 reports (shadow.c). */
+enum shadow_heap_va { SHADOW_HEAP_VA_TITLE, SHADOW_HEAP_VA_REAL, SHADOW_HEAP_VA_VIRTUAL };
+enum shadow_heap_va shadow_heap_va_mode(void);
+/* The title address and byte size of the shader-visible heap whose descriptor 0 is at cpu_start. */
+BOOL shadow_title(SIZE_T cpu_start, UINT64 *title_va, UINT64 *size);

@@ -35,6 +35,11 @@ sed -n '/Wine smoke test through the layer/,$p' "$log" \
     | grep -E 'gpuva\]|identity-mapped|heap GPU start|descriptor table set|real GPU addresses|console shader|console SGPR|console VS/PS|shadow|T#|V#|S#|AnyPS5|binding [0-9]|maps back|deferred|bindless sets|compiled a variant|s0:s1|s2-s5|s6:s7|PresentX|presented frame|XMA2|XAudio2|xaudio2_9|FFX|ffx stub|upscale|R11G11B10|mesh|^== |^(FAIL|PASSED|FAILED)' | uniq
 echo "run-smoke.sh exit status: $smoke_status"
 
+section "heap slot 10 with REBOX_HEAP_VA=real (RADV descriptor buffers)"
+REBOX_HEAP_VA=real SMOKE_ONLY=fake.bin nixx develop -c tests/run-smoke.sh >> "$log" 2>&1
+echo "run-smoke.sh (real heap addresses) exit status: $?"
+sed -n '/REBOX_HEAP_VA=real/,$p' "$log" | grep -E 'heap GPU start|report real|SGPR table|descriptor table set|^(FAIL|PASSED|FAILED)' | uniq
+
 # Translated game shaders (tools/scsv_pack.py output, local only): can the
 # driver create compute pipelines from them?
 if [ -d build/console-shaders ]; then

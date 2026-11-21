@@ -1075,7 +1075,7 @@ done:
  * SPIR-V shader under an SCSV header gets its user SGPRs packed from the root
  * parameters at dispatch. It writes s0-s31 and a marker to the address in
  * s0:s1, root parameter 0 (a root UAV). Expected packing: s0:s1 the UAV's GPU
- * VA, s2-s5 the four root constants, s6:s7 the table's real heap address
+ * VA, s2-s5 the four root constants, s6:s7 the table's address as heap slot 10 reports it
  * (0 without descriptor buffers, as on lavapipe). */
 static void test_console_shader(void *dev, void *queue)
 {
@@ -1161,9 +1161,10 @@ static void test_console_shader(void *dev, void *queue)
           (unsigned long long)va, out[1], out[0]);
     CHECK(!memcmp(out + 2, constants, sizeof(constants)), "s2-s5 = root constants (%#x %#x %#x %#x)",
           out[2], out[3], out[4], out[5]);
-    CHECK(table == 0 || table == gpu + 2 * inc, "s6:s7 = descriptor table at the heap's real address %#llx (got %#llx)",
+    CHECK(table == 0 || table == gpu + 2 * inc, "s6:s7 = descriptor table at the heap's slot-10 address %#llx (got %#llx)",
           (unsigned long long)(gpu + 2 * inc), (unsigned long long)table);
-    printf("info console SGPR table address: %s\n", table ? "real heap address" : "0 (no descriptor buffers)");
+    printf("info console SGPR table address: %s\n", !table ? "0 (no title or real heap addresses)"
+           : table < 0x100000000ull ? "shadow-heap title address" : "real heap address");
     ID3D12Resource_Unmap(buf, 0, NULL);
 
 done:

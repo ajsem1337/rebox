@@ -75,7 +75,7 @@ There are two places this could live:
    descriptors (descriptor buffers), which RADV uses but lavapipe doesn't. `d3d12_xs`'s heap slot
    10 returns that address and records the range. The command-list slots that take a GPU handle map
    it back to vkd3d-proton's handle: root descriptor tables (Xbox 35/36) and UAV clears (Xbox 53/54).
-   `REBOX_REAL_HEAP_VA=0` keeps the virtual handles. Whether the address equals the CPU pointer
+   `REBOX_HEAP_VA=real` selects this now; the default is the shadow heap's title address ([anyps5.md](anyps5.md)), and `virtual` keeps the virtual handles. Whether the address equals the CPU pointer
    (`heap_base = 0`) depends on the layer identity-mapping the descriptor heap's memory type.
 2. **Console pipelines** (compute and graphics done, `patches/vkd3d-proton/0002`). A translated
    shader reaches vkd3d-proton as an `SCSV` blob in place of DXBC: a 44-byte header (magic `SCSV`,

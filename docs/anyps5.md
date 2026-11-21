@@ -39,8 +39,9 @@ console format (`shims/d3d12_xs/shadow.c`, encoders in `console_desc.c`):
   address unique per resource, since the descriptor only has to identify the view.
   `CopyDescriptors*` copy shadow bytes, so CPU-only heaps get shadows too. The stride is the
   increment the title gets, so it needs at least 32 bytes (16 for samplers).
-- The address the title sees for a heap (heap slot 10, patch 1) becomes the shadow's address, in a
-  32-bit range we choose. Descriptor-table pointers are truncated to 32 bits by the game's code,
+- The address the title sees for a heap (heap slot 10) is the shadow's title address, in a
+  32-bit range we choose (default since 2026-11-21; `REBOX_HEAP_VA=real` gives patch 1's real
+  address). vkd3d-proton packs console SGPRs from the same base. Descriptor-table pointers are truncated to 32 bits by the game's code,
   and AnyPS5 resolves them on the CPU through our read callback. So the RADV low-window patch is
   not needed on this path: the shadow only has to look like it is below 4 GiB to the callback.
 - Descriptors a title writes into heap memory itself land in the shadow in console format, as on
@@ -152,8 +153,8 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    move to title addresses with step 3.
 3. ~~Deferred compute pipelines and the dispatch path~~ Done (above): patch 0005,
    `console_compile.c`, `sa5_finalize`, and the end-to-end smoke test. Still to do before real
-   shaders: `SCRD` blobs from the game's containers with the `FLAT_SCRATCH` prologue NOPed. Then
-   heap slot 10 returning title addresses, for pointers the title stores in memory itself. Then
+   shaders: `SCRD` blobs from the game's containers with the `FLAT_SCRATCH` prologue NOPed. Heap
+   slot 10 now returns title addresses, for pointers the title stores in memory itself. Then
    guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
    roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.
 4. Real the target title compute shaders on the 890M.

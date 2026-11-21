@@ -11,6 +11,9 @@
  * Shader-visible heaps also get a title address: a 32-bit address of our
  * choosing (from 0x10000000, 64 KiB aligned) that descriptor-table pointers
  * are built from, and that ReboxShadowRead resolves for the recompiler.
+ * Heap slot 10 reports it (proxy.c), and vkd3d-proton packs console SGPRs
+ * with it. REBOX_HEAP_VA=real or virtual turns title addresses off; the
+ * shadows are still kept.
  * Their shadows live in GPU-visible memory (ReboxGpuAlloc) so shaders can
  * later read them directly; other heaps' shadows are plain memory.
  *
@@ -58,6 +61,52 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static struct shadow_heap *heaps;
 static struct entry *buckets[BUCKETS];
 static UINT64 next_title_va = TITLE_BASE;
+
+/* REBOX_HEAP_VA: title (default), real or virtual; REBOX_REAL_HEAP_VA=0
+ * is the older spelling of virtual. */
+static BOOL CALLBACK read_heap_va_mode(INIT_ONCE *once, void *param, void **ctx)
+{
+    char *mode = rebox_getenv("REBOX_HEAP_VA"), *legacy = rebox_getenv("REBOX_REAL_HEAP_VA");
+    enum shadow_heap_va *out = param;
+
+    *out = SHADOW_HEAP_VA_TITLE;
+    if (legacy && legacy[0] == '0')
+        *out = SHADOW_HEAP_VA_VIRTUAL;
+    if (mode && !strcmp(mode, "real"))
+        *out = SHADOW_HEAP_VA_REAL;
+    else if (mode && !strcmp(mode, "virtual"))
+        *out = SHADOW_HEAP_VA_VIRTUAL;
+    else if (mode && !strcmp(mode, "title"))
+        *out = SHADOW_HEAP_VA_TITLE;
+    free(mode);
+    free(legacy);
+    return TRUE;
+}
+
+enum shadow_heap_va shadow_heap_va_mode(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static enum shadow_heap_va mode;
+
+    InitOnceExecuteOnce(&once, read_heap_va_mode, &mode, NULL);
+    return mode;
+}
+
+BOOL shadow_title(SIZE_T cpu_start, UINT64 *title_va, UINT64 *size)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h && !found; h = h->next)
+        if (h->cpu_start == cpu_start && h->title_va)
+        {
+            *title_va = h->title_va;
+            *size = (UINT64)h->count * h->stride;
+            found = TRUE;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
 
 static UINT desc_size(const struct shadow_heap *h)
 {
@@ -204,7 +253,7 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
         else
             p = &h->next;
     }
-    if (heap->shader_visible)
+    if (heap->shader_visible && shadow_heap_va_mode() == SHADOW_HEAP_VA_TITLE)
     {
         heap->title_va = next_title_va;
         next_title_va = (next_title_va + size + TITLE_ALIGN - 1) & ~(TITLE_ALIGN - 1);

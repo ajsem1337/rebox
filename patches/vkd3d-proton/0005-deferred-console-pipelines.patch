@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index f7e7b50..f0b44c8 100644
+index f7e7b50..be9f25c 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -7395,11 +7395,13 @@ static bool d3d12_command_list_update_rendering_info(struct d3d12_command_list *
@@ -39,17 +39,16 @@ index f7e7b50..f0b44c8 100644
      if (list->command_buffer_pipeline != list->state->compute.vk_pipeline)
      {
          VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer,
-@@ -8142,36 +8159,37 @@ static void d3d12_command_list_check_pre_compute_barrier(
- 
+@@ -8143,35 +8160,37 @@ static void d3d12_command_list_check_pre_compute_barrier(
  /* rebox: a console shader's user SGPRs. Default mapping (Leonida's,
   * unmeasured): root parameters in order, one dword per 32-bit constant, two
-- * (a 64-bit GPU address) per root descriptor or descriptor table. Tables point
+  * (a 64-bit GPU address) per root descriptor or descriptor table. Tables point
 - * at the real descriptor address in the bound heap (embedded mutable
 - * descriptors only; otherwise 0). heap_base and code_base stay 0. */
-+ * (a 64-bit GPU address) per root descriptor or descriptor table. For SCSV
-+ * shaders tables point at the real descriptor address in the bound heap
-+ * (embedded mutable descriptors only; otherwise 0); for deferred shaders at
-+ * the shadow heap's title address (d3d12_xs). heap_base and code_base stay 0. */
++ * where heap slot 10 says the heap is: its shadow's title address (d3d12_xs,
++ * the default), or else the real descriptor address in the bound heap
++ * (embedded mutable descriptors only; otherwise 0). heap_base and code_base
++ * stay 0. */
  static uint64_t d3d12_command_list_rebox_table_va(struct d3d12_command_list *list,
          const struct vkd3d_shader_root_parameter *p, uint32_t index)
  {
@@ -63,8 +62,8 @@ index f7e7b50..f0b44c8 100644
 -    /* Same base the title got from GetGPUDescriptorHandleForHeapStart. */
 -    base = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? list->descriptor_heap.buffers.rebox_sampler_base
 -            : list->descriptor_heap.buffers.rebox_resource_base;
-+    if (list->state && list->state->rebox_deferred)
-+        base = list->rebox.title_base[type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER];
++    if ((base = list->rebox.title_base[type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER]))
++        ;
 +    else if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
 +        return 0;
 +    else /* Same base the title got from GetGPUDescriptorHandleForHeapStart. */
@@ -90,7 +89,7 @@ index f7e7b50..f0b44c8 100644
      for (i = 0; rs && i < rs->parameter_count && n < 32; i++)
      {
          const struct vkd3d_shader_root_parameter *p = &rs->parameters[i];
-@@ -8195,9 +8213,28 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+@@ -8195,9 +8214,28 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
          if (n < 32)
              data[n++] = (uint32_t)(va >> 32);
      }
@@ -122,7 +121,7 @@ index f7e7b50..f0b44c8 100644
  
      VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, layout->vk_pipeline_layout,
              layout->vk_push_stages, 0, sizeof(data), data));
-@@ -8205,6 +8242,56 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+@@ -8205,6 +8243,56 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
      d3d12_command_list_invalidate_root_parameters(list, bindings, false, NULL);
  }
  
@@ -179,7 +178,7 @@ index f7e7b50..f0b44c8 100644
  static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
  {
      d3d12_command_list_end_current_render_pass(list, false);
-@@ -13606,6 +13693,40 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+@@ -13606,6 +13694,40 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
      vkd3d_pipeline_bindings_set_dirty_sets(&list->compute_bindings, dirty_mask);
  }
  
@@ -220,7 +219,7 @@ index f7e7b50..f0b44c8 100644
  static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_command_list_iface *iface,
          UINT heap_count, ID3D12DescriptorHeap *const *heaps)
  {
-@@ -13620,6 +13741,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
+@@ -13620,6 +13742,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
          d3d12_command_list_set_descriptor_heaps_buffers(list, heap_count, heaps);
      else
          d3d12_command_list_set_descriptor_heaps_sets(list, heap_count, heaps);
