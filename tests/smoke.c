@@ -398,6 +398,21 @@ static void test_d3d12(const char *fake_path, BOOL expect_hit)
         if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
     }
 
+    /* A CachedPSO blob vkd3d-proton didn't make (as a console PSO cache entry
+     * would be) must not fail creation: d3d12_xs retries without it. */
+    {
+        static const BYTE foreign_blob[64] = { 'P', 'S', '0', '9' };
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cached_desc = cdesc;
+
+        cached_desc.CS.pShaderBytecode = test_empty_cs;
+        cached_desc.CS.BytecodeLength = sizeof(test_empty_cs);
+        cached_desc.CachedPSO.pCachedBlob = foreign_blob;
+        cached_desc.CachedPSO.CachedBlobSizeInBytes = sizeof(foreign_blob);
+        hr = ID3D12Device2_CreateComputePipelineState(device, &cached_desc, &IID_ID3D12PipelineState, (void **)&pso);
+        CHECK(SUCCEEDED(hr), "compute PSO with a foreign CachedPSO blob is created without it (%#lx)", hr);
+        if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+    }
+
     /* A mesh pipeline from untranslated console AS/MS/PS gets the mesh
      * fallbacks (when the device has mesh shaders and fallbacks are on). */
     {

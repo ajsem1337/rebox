@@ -153,14 +153,35 @@ static void note_fallback(const char *kind)
                      kind, n);
 }
 
+/* A CachedPSO blob vkd3d-proton didn't make (a console PSO cache entry, say)
+ * fails creation as a cache mismatch; retry once without it. */
+static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *cached)
+{
+    static LONG logged;
+
+    if (SUCCEEDED(hr) || !cached->pCachedBlob || !cached->CachedBlobSizeInBytes)
+        return FALSE;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: PSO creation with a %zu-byte CachedPSO blob failed (%#lx); retrying without it",
+                     (size_t)cached->CachedBlobSizeInBytes, hr);
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC copy;
     BOOL miss = FALSE;
 
+    HRESULT hr;
+
     if (!desc)
         return orig_create_graphics(device, desc, riid, pso);
+    {
+        static const char *const names[] = { "vs", "ps", "ds", "hs", "gs" };
+        const D3D12_SHADER_BYTECODE stages[] = { desc->VS, desc->PS, desc->DS, desc->HS, desc->GS };
+        shader_cache_census("graphics", names, stages, 5, &desc->CachedPSO);
+    }
     copy = *desc;
     miss |= shader_cache_substitute(&desc->VS, &copy.VS, "vs") == SHADER_MISS;
     miss |= shader_cache_substitute(&desc->PS, &copy.PS, "ps") == SHADER_MISS;
@@ -177,30 +198,47 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
             copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         note_fallback("graphics");
     }
-    return orig_create_graphics(device, &copy, riid, pso);
+    hr = orig_create_graphics(device, &copy, riid, pso);
+    if (retry_without_cache(hr, &copy.CachedPSO))
+    {
+        memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
+        hr = orig_create_graphics(device, &copy, riid, pso);
+    }
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_COMPUTE_PIPELINE_STATE_DESC copy;
+    static const char *const names[] = { "cs" };
+    HRESULT hr;
 
     if (!desc)
         return orig_create_compute(device, desc, riid, pso);
+    shader_cache_census("compute", names, &desc->CS, 1, &desc->CachedPSO);
     copy = *desc;
     if (shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS && fallback_enabled())
     {
         copy.CS = fallback_cs_bc;
         note_fallback("compute");
     }
-    return orig_create_compute(device, &copy, riid, pso);
+    hr = orig_create_compute(device, &copy, riid, pso);
+    if (retry_without_cache(hr, &copy.CachedPSO))
+    {
+        memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
+        hr = orig_create_compute(device, &copy, riid, pso);
+    }
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_PIPELINE_STATE_STREAM_DESC copy;
-    SIZE_T offset = 0, stages[16], topology = 0, stream_output = 0;
+    SIZE_T offset = 0, stages[16], topology = 0, stream_output = 0, cached_pso = 0;
+    const char *census_names[16] = { 0 };
+    D3D12_SHADER_BYTECODE census_bc[16] = { 0 };
     UINT stage_count = 0;
     BOOL miss = FALSE;
     BYTE *stream;
@@ -226,6 +264,11 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         if (subobj_layouts[type].stage)
         {
             D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + offset + subobj_layouts[type].offset);
+            if (stage_count < ARRAYSIZE(stages))
+            {
+                census_names[stage_count] = subobj_layouts[type].stage;
+                census_bc[stage_count] = *bc;
+            }
             miss |= shader_cache_substitute(bc, bc, subobj_layouts[type].stage) == SHADER_MISS;
             if (stage_count < ARRAYSIZE(stages))
                 stages[stage_count++] = offset;
@@ -234,8 +277,12 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
             topology = offset + subobj_layouts[type].offset;
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT)
             stream_output = offset + subobj_layouts[type].offset;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO)
+            cached_pso = offset + subobj_layouts[type].offset;
         offset += subobj_layouts[type].size;
     }
+    shader_cache_census("stream", census_names, census_bc, stage_count,
+                        cached_pso ? (const D3D12_CACHED_PIPELINE_STATE *)(stream + cached_pso) : NULL);
 
     if (miss && fallback_enabled())
     {
@@ -267,6 +314,11 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     copy.SizeInBytes = desc->SizeInBytes;
     copy.pPipelineStateSubobjectStream = stream;
     hr = orig_create_pipeline(device, &copy, riid, pso);
+    if (cached_pso && retry_without_cache(hr, (D3D12_CACHED_PIPELINE_STATE *)(stream + cached_pso)))
+    {
+        memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
+        hr = orig_create_pipeline(device, &copy, riid, pso);
+    }
     free(stream);
     return hr;
 }

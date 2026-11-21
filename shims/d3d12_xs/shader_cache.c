@@ -153,6 +153,66 @@ static void record_miss(UINT64 hash, const D3D12_SHADER_BYTECODE *in, const char
     }
 }
 
+static void describe_bytecode(const D3D12_SHADER_BYTECODE *bc, char *out, size_t len)
+{
+    const BYTE *d = bc->pShaderBytecode;
+
+    if (!d || !bc->BytecodeLength)
+        snprintf(out, len, "none");
+    else if (bc->BytecodeLength >= 36 && !memcmp(d, "SCSV", 4))
+        snprintf(out, len, "scsv %zu B", (size_t)bc->BytecodeLength);
+    else if (bc->BytecodeLength >= 4 && !memcmp(d, "DXBC", 4))
+        snprintf(out, len, "%s %zu B", is_pc_bytecode(d, bc->BytecodeLength) ? "pc-dxbc" : "console-dxbc",
+                 (size_t)bc->BytecodeLength);
+    else if (bc->BytecodeLength >= 4)
+        snprintf(out, len, "magic %02x%02x%02x%02x %zu B", d[0], d[1], d[2], d[3], (size_t)bc->BytecodeLength);
+    else
+        snprintf(out, len, "%zu B", (size_t)bc->BytecodeLength);
+}
+
+void shader_cache_census(const char *kind, const char *const *names, const D3D12_SHADER_BYTECODE *stages,
+                         UINT count, const D3D12_CACHED_PIPELINE_STATE *cached)
+{
+    static LONG psos;
+    LONG n = InterlockedIncrement(&psos);
+    char line[512], part[96];
+    size_t used;
+
+    InitOnceExecuteOnce(&config_once, config_init, NULL, NULL);
+    if (n > 8 && (n & (n - 1)))
+        return;
+    used = snprintf(line, sizeof(line), "d3d12_xs: PSO #%ld (%s):", n, kind);
+    for (UINT i = 0; i < count && used < sizeof(line); i++)
+    {
+        if (!stages[i].BytecodeLength)
+            continue;
+        describe_bytecode(&stages[i], part, sizeof(part));
+        used += snprintf(line + used, sizeof(line) - used, " %s %s;", names[i], part);
+    }
+    if (cached && cached->pCachedBlob && cached->CachedBlobSizeInBytes && used < sizeof(line))
+    {
+        D3D12_SHADER_BYTECODE blob = { cached->pCachedBlob, cached->CachedBlobSizeInBytes };
+        describe_bytecode(&blob, part, sizeof(part));
+        snprintf(line + used, sizeof(line) - used, " CachedPSO %s", part);
+        if (dump_shaders && cache_dir)
+        {
+            char path[MAX_PATH];
+            FILE *f;
+
+            snprintf(path, sizeof(path), "%s\\dump", cache_dir);
+            CreateDirectoryA(path, NULL);
+            snprintf(path, sizeof(path), "%s\\dump\\%016llx.cachedpso.bin", cache_dir,
+                     (unsigned long long)shader_hash(blob.pShaderBytecode, blob.BytecodeLength));
+            if ((f = fopen(path, "wb")))
+            {
+                fwrite(blob.pShaderBytecode, 1, blob.BytecodeLength, f);
+                fclose(f);
+            }
+        }
+    }
+    rebox_log("%s", line);
+}
+
 enum shader_lookup shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTECODE *out,
                                            const char *stage)
 {

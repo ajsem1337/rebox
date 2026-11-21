@@ -104,7 +104,10 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 ## Open questions
 
 - **What does the game pass at PSO creation: the FSSM container or a PS09 cache blob?**
-  `d3d12_xs` should log both. PS09 entries carry the `RSRC1`/`RSRC2` AnyPS5 needs; for FSSM they come
+  `d3d12_xs` logs it (the PSO census: each stage's bytecode kind and the `CachedPSO` blob's size and
+  first bytes, for the first PSOs and then at powers of two; `REBOX_DUMP_SHADERS=1` also dumps
+  the blobs). A blob vkd3d-proton didn't make fails creation as a cache mismatch, so `d3d12_xs`
+  retries once without it. PS09 entries carry the `RSRC1`/`RSRC2` AnyPS5 needs; for FSSM they come
   from the container's header.
 - **Compile latency at first use.** Each new descriptor combination can mean a compile. AnyPS5's
   variant cache and memo patches limit this; the pipeline cache should persist across runs.
