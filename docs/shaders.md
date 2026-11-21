@@ -73,14 +73,22 @@ There are two places this could live:
    it back to vkd3d-proton's handle: root descriptor tables (Xbox 35/36) and UAV clears (Xbox 53/54).
    `REBOX_REAL_HEAP_VA=0` keeps the virtual handles. Whether the address equals the CPU pointer
    (`heap_base = 0`) depends on the layer identity-mapping the descriptor heap's memory type.
-2. **Console pipelines.** At PSO creation, a blob whose DXIL part is a NOBC stub around FSSM is a
-   console shader:
+2. **Console pipelines** (compute done, `patches/vkd3d-proton/0002`). A translated shader reaches
+   vkd3d-proton as an `SCSV` blob in place of DXBC: a 36-byte header (magic `SCSV`, version 1,
+   Vulkan stage bit, wave size 0/32/64, workgroup size, SPIR-V offset and size) followed by the
+   SPIR-V. vkd3d-proton uses that SPIR-V as is (entry point `main`) and requests the wave size.
+   Every root signature's push-constant range is widened to at least 144 bytes. Console pipelines
+   therefore share the root signature's layout and stay compatible with its descriptor sets.
+   `d3d12_xs` passes `SCSV` blobs through its shader cache unchanged. Still to do: graphics
+   (vkd3d-proton takes stage I/O signatures from DXBC, which `SCSV` lacks), and producing `SCSV`
+   from translator output in the cache. Originally planned:
    - look up `<stage>/<fssm hash>.spv` in the shader directory;
    - build the pipeline with the root signature's layout plus a console push-constant block
      (s0-s31, `heap_base`, `code_base`) and the bindless sets the contract names;
    - set the required subgroup size from the shader's wave mode;
    - with no translation, fall back as `d3d12_xs` does today.
-3. **SGPR packing at draw and dispatch.** From vkd3d's root-parameter state, write s0-s31 in root
+3. **SGPR packing at draw and dispatch** (dispatch done, in 0002; the push follows vkd3d's own and
+   invalidates it so ordinary pipelines get their data back). From vkd3d's root-parameter state, write s0-s31 in root
    order: one dword per 32-bit constant, two per root descriptor or descriptor table (its real
    VA). This is Leonida's default mapping. It is an assumption until the exe shows the real one;
    keep it table-driven so a measured map replaces it.
@@ -96,7 +104,7 @@ There are two places this could live:
 | Real root-signature to SGPR map (register vs memory ABI, spills) | patch 3 | yes: trace a draw |
 | Does the game write descriptor bytes itself, in console GFX10.3 format? | if so, the bytes in the heap aren't RADV's, and the hash keys and V# decoding see console layouts | yes |
 | GFX10.3 vs GFX11 descriptor differences (formats, MIP fields, V# swizzle bit) | the 890M writes GFX11 descriptors, while translated shaders decode V#s with console field positions | partly; RADV source has both layouts |
-| Heaps below 4 GiB | Leonida reports shaders that zero a pointer's high dword. Our GPU window is at 0x200000000000 | yes; may need a second window below 4 GiB |
+| Heaps below 4 GiB (on RADV, heaps sit at `0xffff8000_xxxxxxxx`: low dword varies, high dword is RADV's 32-bit range) | Leonida reports shaders that zero a pointer's high dword. Our GPU window is at 0x200000000000 | yes; may need a second window below 4 GiB |
 | Do PSOs carry the same DXBC as `the shader archive`? | the lookup key | yes |
 | Wave mode per shader | 21,545 shaders are wave64. RADV runs wave64 for compute and pixel shaders by default, but vertex shaders vary | no; FSSM header |
 | BVH builder shaders (Xbox DXIL with `@xbox.*` intrinsics) | a separate lowering, not FSSM | no |
@@ -109,8 +117,10 @@ There are two places this could live:
 2. ~~Patch 1 with a test~~ Done: a compute shader writes through a UAV in a descriptor table set from
    heap slot 10's address. On lavapipe this covers the virtual-handle fallback; the real-address
    path runs on RADV (`tests/manual-test.sh`).
-3. Patch 2 and 3 with a hand-written SPIR-V "console" shader that writes its s0-s31 to a UAV, to
-   check the packing against root parameters.
+3. ~~Patch 2 and 3 with a hand-written SPIR-V "console" shader~~ Done for compute: the shader
+   (GLSL in `tools/gen_fallback_shaders.sh`) writes s0-s31 to the root UAV in s0:s1. The smoke test
+   checks the UAV address, the root constants, and the table's real heap address (0 on lavapipe,
+   the real address on RADV). Graphics next.
 4. Patch 4 and a translated compute shader from Leonida's output (needs the user's `the shader archive`;
    run on the 890M with `tests/manual-test.sh`).
 5. With the exe: measure the open questions above, then graphics.

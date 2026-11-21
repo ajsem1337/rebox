@@ -1054,6 +1054,112 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* Console compute pipelines (vkd3d-proton patch 0002, docs/shaders.md): a
+ * SPIR-V shader under an SCSV header gets its user SGPRs packed from the root
+ * parameters at dispatch. It writes s0-s31 and a marker to the address in
+ * s0:s1, root parameter 0 (a root UAV). Expected packing: s0:s1 the UAV's GPU
+ * VA, s2-s5 the four root constants, s6:s7 the table's real heap address
+ * (0 without descriptor buffers, as on lavapipe). */
+static void test_console_shader(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    static const UINT constants[4] = { 0x11111111, 0x22222222, 0x33333333, 0x44444444 };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0 };
+    D3D12_ROOT_PARAMETER params[3] = {
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = { 0, 0 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, 4 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = { 1, &range } },
+    };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, params };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    void *heap = NULL, *rs = NULL, *pso = NULL, *list = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *buf = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D10Blob *blob = NULL;
+    UINT64 gpu, va, table;
+    UINT inc, *out = NULL;
+    HRESULT hr;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+    if (SUCCEEDED(hr))
+    {
+        cd.pRootSignature = rs;
+        cd.CS.pShaderBytecode = test_console_cs;
+        cd.CS.BytecodeLength = sizeof(test_console_cs);
+        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12PipelineState, &pso);
+        CHECK(SUCCEEDED(hr), "compute PSO from SCSV SPIR-V (patched vkd3d-proton) %#lx", hr);
+    }
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    if (FAILED(hr)) goto done;
+
+    gpu = XSLOT(heap, 10, UINT64)(heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    va = ID3D12Resource_GetGPUVirtualAddress(buf);
+
+    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+    XSLOT(list, 33, void, void *)(list, rs);
+    XSLOT(list, 25, void, void *)(list, pso);
+    XSLOT(list, 45, void, UINT, UINT64)(list, 0, va);                                 /* PC 41 */
+    XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 1, 4, constants, 0);  /* PC 35 */
+    XSLOT(list, 35, void, UINT, UINT64)(list, 2, gpu + 2 * inc);                      /* PC 31 */
+    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (FAILED(hr = ID3D12Resource_Map(buf, 0, NULL, (void **)&out)))
+    {
+        CHECK(0, "map the console shader's output (%#lx)", hr);
+        goto done;
+    }
+    table = out[6] | (UINT64)out[7] << 32;
+    CHECK(out[32] == 0x5ca7c0de, "console shader ran (marker %#x)", out[32]);
+    CHECK((out[0] | (UINT64)out[1] << 32) == va, "s0:s1 = root UAV address %#llx (got %#x:%#x)",
+          (unsigned long long)va, out[1], out[0]);
+    CHECK(!memcmp(out + 2, constants, sizeof(constants)), "s2-s5 = root constants (%#x %#x %#x %#x)",
+          out[2], out[3], out[4], out[5]);
+    CHECK(table == 0 || table == gpu + 2 * inc, "s6:s7 = descriptor table at the heap's real address %#llx (got %#llx)",
+          (unsigned long long)(gpu + 2 * inc), (unsigned long long)table);
+    printf("info console SGPR table address: %s\n", table ? "real heap address" : "0 (no descriptor buffers)");
+    ID3D12Resource_Unmap(buf, 0, NULL);
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (blob) ID3D10Blob_Release(blob);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -1171,6 +1277,7 @@ static void test_xbox(void)
 
     test_pacing(dev);
     test_real_heap_va(dev, queue);
+    test_console_shader(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);

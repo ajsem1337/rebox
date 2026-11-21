@@ -49,6 +49,10 @@ static BOOL is_pc_bytecode(const BYTE *data, SIZE_T size)
 {
     UINT32 count, i;
 
+    /* Translated console SPIR-V for the patched vkd3d-proton (patches/
+     * vkd3d-proton/0002, docs/shaders.md) goes through unchanged. */
+    if (size >= 36 && !memcmp(data, "SCSV", 4))
+        return TRUE;
     if (size < 0x20 || memcmp(data, "DXBC", 4))
         return FALSE;
     count = read_u32(data + 0x1c);

@@ -1,0 +1,209 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 84976e6..349d699 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8140,6 +8140,75 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+ static void d3d12_command_list_check_pre_compute_barrier(
+         struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage);
+ 
++/* rebox: a console shader's user SGPRs. Default mapping (Leonida's,
++ * unmeasured): root parameters in order, one dword per 32-bit constant, two
++ * (a 64-bit GPU address) per root descriptor or descriptor table. Tables point
++ * at the real descriptor address in the bound heap (embedded mutable
++ * descriptors only; otherwise 0). heap_base and code_base stay 0. */
++static uint64_t d3d12_command_list_rebox_table_va(struct d3d12_command_list *list,
++        const struct vkd3d_shader_root_parameter *p, uint32_t index)
++{
++    struct vkd3d_bindless_state *bindless = &list->device->bindless_state;
++    D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    VkDeviceAddress base;
++    unsigned int j;
++
++    if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
++        return 0;
++    if (p->descriptor_table.binding_count && p->descriptor_table.first_binding->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER)
++        type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
++    base = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? list->descriptor_heap.buffers.heap_va_sampler
++            : list->descriptor_heap.buffers.heap_va_resource;
++    if (!base)
++        return 0;
++    for (j = 0; j < bindless->set_count; j++)
++        if (bindless->set_info[j].heap_type == type)
++        {
++            base += list->descriptor_heap.buffers.vk_offsets[j];
++            break;
++        }
++    return base + (uint64_t)index * d3d12_device_get_descriptor_handle_increment_size(list->device, type);
++}
++
++static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
++        struct vkd3d_pipeline_bindings *bindings, const struct d3d12_bind_point_layout *layout)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    const struct d3d12_root_signature *rs = bindings->root_signature;
++    uint32_t data[VKD3D_REBOX_CONSOLE_PUSH_SIZE / sizeof(uint32_t)];
++    unsigned int i, k, n = 0;
++
++    memset(data, 0, sizeof(data));
++    for (i = 0; rs && i < rs->parameter_count && n < 32; i++)
++    {
++        const struct vkd3d_shader_root_parameter *p = &rs->parameters[i];
++        uint64_t va = 0;
++
++        switch (p->parameter_type)
++        {
++            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
++                for (k = 0; k < p->constant.constant_count && n < 32; k++)
++                    data[n++] = bindings->root_constants[p->constant.constant_index + k];
++                continue;
++            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
++                va = d3d12_command_list_rebox_table_va(list, p, bindings->descriptor_tables[i]);
++                break;
++            default:
++                if (rs->root_descriptor_raw_va_mask & (1ull << i))
++                    va = bindings->root_descriptors[i].info.va;
++                break;
++        }
++        data[n++] = (uint32_t)va;
++        if (n < 32)
++            data[n++] = (uint32_t)(va >> 32);
++    }
++
++    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, layout->vk_pipeline_layout,
++            layout->vk_push_stages, 0, sizeof(data), data));
++    /* That overwrote vkd3d's own push data: have it pushed again next time. */
++    d3d12_command_list_invalidate_root_parameters(list, bindings, false, NULL);
++}
++
+ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
+ {
+     d3d12_command_list_end_current_render_pass(list, false);
+@@ -8149,6 +8218,9 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
+ 
+     d3d12_command_list_check_pre_compute_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+     d3d12_command_list_update_descriptors(list);
++    if (list->state && list->state->rebox_console && list->compute_bindings.root_signature)
++        d3d12_command_list_rebox_push(list, &list->compute_bindings,
++                &list->compute_bindings.root_signature->compute);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index ce7f54e..e71da14 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -370,6 +370,18 @@ static HRESULT vkd3d_create_pipeline_layout_for_stage_mask(struct d3d12_device *
+     range.offset = push_constants->offset;
+     range.size = push_constants->size;
+ 
++    /* rebox: room for a console shader's SGPR block in every layout,
++     * so console pipelines share the root signature's layout (and so stay
++     * compatible with its descriptor bindings). Only declared, never used by
++     * ordinary shaders. */
++    if (range.size < VKD3D_REBOX_CONSOLE_PUSH_SIZE && VKD3D_REBOX_CONSOLE_PUSH_SIZE <=
++            device->device_info.properties2.properties.limits.maxPushConstantsSize)
++    {
++        range.stageFlags = stages;
++        range.offset = 0;
++        range.size = VKD3D_REBOX_CONSOLE_PUSH_SIZE;
++    }
++
+     bind_point_layout->vk_push_stages = range.stageFlags;
+     return vkd3d_create_pipeline_layout(device, set_layout_count, set_layouts,
+             range.stageFlags ? 1 : 0, &range,
+@@ -2817,6 +2829,41 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
+         return S_OK;
+ }
+ 
++const struct vkd3d_rebox_console_shader *vkd3d_rebox_console_shader(const D3D12_SHADER_BYTECODE *code)
++{
++    const struct vkd3d_rebox_console_shader *h = code->pShaderBytecode;
++
++    if (!h || code->BytecodeLength < sizeof(*h) || h->magic != VKD3D_REBOX_CONSOLE_MAGIC || h->version != 1
++            || (h->spirv_offset & 3) || h->spirv_offset < sizeof(*h) || h->spirv_size < 20
++            || h->spirv_offset > code->BytecodeLength || h->spirv_size > code->BytecodeLength - h->spirv_offset)
++        return NULL;
++    return h;
++}
++
++/* The console shader's SPIR-V is used as is: no DXBC to convert. */
++static HRESULT vkd3d_rebox_load_console_shader(const struct vkd3d_rebox_console_shader *h,
++        struct vkd3d_shader_code *spirv_code)
++{
++    void *code;
++
++    if (!(code = vkd3d_malloc(h->spirv_size)))
++        return E_OUTOFMEMORY;
++    memcpy(code, (const uint8_t *)h + h->spirv_offset, h->spirv_size);
++    memset(spirv_code, 0, sizeof(*spirv_code));
++    spirv_code->code = code;
++    spirv_code->size = h->spirv_size;
++    spirv_code->meta.hash = vkd3d_shader_hash(spirv_code);
++    memcpy(spirv_code->meta.cs_workgroup_size, h->workgroup_size, sizeof(h->workgroup_size));
++    if (h->wave_size)
++    {
++        spirv_code->meta.flags |= VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS;
++        spirv_code->meta.cs_wave_size_min = h->wave_size;
++        spirv_code->meta.cs_wave_size_max = h->wave_size;
++        spirv_code->meta.cs_wave_size_preferred = h->wave_size;
++    }
++    return S_OK;
++}
++
+ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
+         VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code,
+         struct vkd3d_shader_code *spirv_code, struct vkd3d_shader_code_debug *spirv_code_debug)
+@@ -2835,6 +2882,9 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+         memset(spirv_code, 0, sizeof(*spirv_code));
+     }
+ 
++    if (!spirv_code->code && vkd3d_rebox_console_shader(code))
++        return vkd3d_rebox_load_console_shader(vkd3d_rebox_console_shader(code), spirv_code);
++
+     if (!spirv_code->code)
+     {
+         TRACE("Calling vkd3d_shader_compile_dxbc.\n");
+@@ -3214,6 +3264,7 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+     HRESULT hr;
+ 
+     state->pipeline_type = VKD3D_PIPELINE_TYPE_COMPUTE;
++    state->rebox_console = !!vkd3d_rebox_console_shader(&desc->cs);
+     d3d12_pipeline_state_init_shader_interface(state, device,
+             VK_SHADER_STAGE_COMPUTE_BIT, &shader_interface);
+     shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 63154f9..e587ff8 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2265,11 +2265,31 @@ struct vkd3d_pipeline_cache_compatibility
+ };
+ 
+ /* ID3D12PipelineState */
++/* rebox: translated console shaders (docs/shaders.md in
++ * rebox). The D3D12.X layer hands them over in place of DXBC as
++ * this header followed by SPIR-V. They get their user SGPRs from a push
++ * constant block packed at dispatch from the root parameters: s0-s31, then
++ * heap_base and code_base (both 64-bit). */
++#define VKD3D_REBOX_CONSOLE_MAGIC 0x56534353u /* "SCSV" */
++#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 144u
++struct vkd3d_rebox_console_shader
++{
++    uint32_t magic;
++    uint32_t version;       /* 1 */
++    uint32_t stage;         /* VkShaderStageFlagBits */
++    uint32_t wave_size;     /* 0 (driver's choice), 32 or 64 */
++    uint32_t workgroup_size[3];
++    uint32_t spirv_offset;  /* from the start of the header, 4-aligned */
++    uint32_t spirv_size;
++};
++const struct vkd3d_rebox_console_shader *vkd3d_rebox_console_shader(const D3D12_SHADER_BYTECODE *code);
++
+ struct d3d12_pipeline_state
+ {
+     ID3D12PipelineState ID3D12PipelineState_iface;
+     LONG refcount;
+     LONG internal_refcount;
++    bool rebox_console; /* uses a vkd3d_rebox_console_shader */
+ 
+     union
+     {
