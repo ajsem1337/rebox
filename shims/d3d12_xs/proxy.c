@@ -30,6 +30,7 @@
 
 #include "../common/rebox_log.h"
 #include "gpu_memory.h"
+#include "lookup.h"
 #include "pacing.h"
 #include "present.h"
 #include "proxy.h"
@@ -557,7 +558,60 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
     HRESULT hr = ID3D12Device_CreateDescriptorHeap(INNER(p, ID3D12Device), desc, &IID_ID3D12DescriptorHeap,
                                                    (void **)&heap);
 
+    if (SUCCEEDED(hr))
+        lookup_heap_created(heap, desc);
     return wrap_result(hr, (IUnknown *)heap, &heap_class, out);
+}
+
+/* Descriptor writes (slots 17-19, 22-24, as on PC) also update the
+ * shader-visible heaps' lookup tables (lookup.c). */
+static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    ID3D12Device_CreateConstantBufferView(INNER(p, ID3D12Device), desc, h);
+    lookup_descriptors_written(cpu, 1);
+}
+
+static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, ID3D12Resource *resource,
+        const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    ID3D12Device_CreateShaderResourceView(INNER(p, ID3D12Device), resource, desc, h);
+    lookup_descriptors_written(cpu, 1);
+}
+
+static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, ID3D12Resource *resource,
+        ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), resource, counter, desc, h);
+    lookup_descriptors_written(cpu, 1);
+}
+
+static void STDMETHODCALLTYPE device_CreateSampler(struct proxy *p, const D3D12_SAMPLER_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    ID3D12Device_CreateSampler(INNER(p, ID3D12Device), desc, h);
+    lookup_descriptors_written(cpu, 1);
+}
+
+static void STDMETHODCALLTYPE device_CopyDescriptors(struct proxy *p, UINT dst_count,
+        const D3D12_CPU_DESCRIPTOR_HANDLE *dst_starts, const UINT *dst_sizes, UINT src_count,
+        const D3D12_CPU_DESCRIPTOR_HANDLE *src_starts, const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type)
+{
+    ID3D12Device_CopyDescriptors(INNER(p, ID3D12Device), dst_count, dst_starts, dst_sizes, src_count, src_starts,
+                                 src_sizes, type);
+    for (UINT i = 0; i < dst_count; i++)
+        lookup_descriptors_written(dst_starts[i].ptr, dst_sizes ? dst_sizes[i] : 1);
+}
+
+static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT count, SIZE_T dst, SIZE_T src,
+        D3D12_DESCRIPTOR_HEAP_TYPE type)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE d = { dst }, s = { src };
+    ID3D12Device_CopyDescriptorsSimple(INNER(p, ID3D12Device), count, d, s, type);
+    lookup_descriptors_written(dst, count);
 }
 
 /* Slot 43. An 8-byte struct: the Xbox ABI returns those in RAX (see the
@@ -1197,6 +1251,12 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
+        FN(17, device_CreateConstantBufferView),
+        FN(18, device_CreateShaderResourceView),
+        FN(19, device_CreateUnorderedAccessView),
+        FN(22, device_CreateSampler),
+        FN(23, device_CopyDescriptors),
+        FN(24, device_CopyDescriptorsSimple),
         FN(25, device_GetResourceAllocationInfo),
         FN(27, device_CreateCommittedResource),
         FN(28, device_CreateHeap),

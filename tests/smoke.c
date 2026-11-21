@@ -1294,6 +1294,130 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* Descriptor lookup (patch 4): two dispatches of a console shader that reads
+ * the raw descriptor at its table address and finds its heap index in the
+ * bound heap's lookup table. Entry 2 is written straight into the
+ * shader-visible heap (slot 19), entry 3 copied in from a CPU heap (slot
+ * 24). Needs descriptor buffers (RADV); elsewhere the shader reports a skip. */
+static void test_descriptor_lookup(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC cd_heap = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0 };
+    D3D12_ROOT_PARAMETER params[3] = {
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = { 0, 0 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, 4 } },
+        { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = { 1, &range } },
+    };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 3, params };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = { .Format = DXGI_FORMAT_R32_TYPELESS,
+            .ViewDimension = D3D12_UAV_DIMENSION_BUFFER, .Buffer = { 0, 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW } };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    void *heap = NULL, *cpu_heap = NULL, *rs = NULL, *pso = NULL, *list = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *out_buf = NULL, *a = NULL, *b = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D10Blob *blob = NULL;
+    UINT64 gpu;
+    SIZE_T cpu, cpu_only;
+    UINT inc, *out = NULL, c0[4] = { 0 }, c1[4] = { 4 };
+    HRESULT hr;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cd_heap,
+                &IID_ID3D12DescriptorHeap, &cpu_heap);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+    if (SUCCEEDED(hr))
+    {
+        cd.pRootSignature = rs;
+        cd.CS = (D3D12_SHADER_BYTECODE){ test_console_lookup, sizeof(test_console_lookup) };
+        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12PipelineState, &pso);
+    }
+    for (int i = 0; i < 3 && SUCCEEDED(hr); i++)
+    {
+        ID3D12Resource **r = i == 0 ? &out_buf : i == 1 ? &a : &b;
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)r);
+    }
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    CHECK(SUCCEEDED(hr), "objects for the descriptor lookup test (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    gpu = XSLOT(heap, 10, UINT64)(heap);
+    cpu_only = XSLOT(cpu_heap, 9, SIZE_T)(cpu_heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            a, NULL, &uav, cpu + 2 * inc);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            b, NULL, &uav, cpu_only);
+    XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, 1, cpu + 3 * inc, cpu_only,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+    XSLOT(list, 33, void, void *)(list, rs);
+    XSLOT(list, 25, void, void *)(list, pso);
+    XSLOT(list, 45, void, UINT, UINT64)(list, 0, ID3D12Resource_GetGPUVirtualAddress(out_buf));
+    XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 1, 4, c0, 0);
+    XSLOT(list, 35, void, UINT, UINT64)(list, 2, gpu + 2 * inc);
+    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+    XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 1, 4, c1, 0);
+    XSLOT(list, 35, void, UINT, UINT64)(list, 2, gpu + 3 * inc);
+    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (FAILED(hr = ID3D12Resource_Map(out_buf, 0, NULL, (void **)&out)))
+    {
+        CHECK(0, "map the lookup shader's output (%#lx)", hr);
+        goto done;
+    }
+    if (out[0] == 0xfffffffe && out[4] == 0xfffffffe)
+        printf("skip descriptor lookup: no real heap addresses or lookup tables (no descriptor buffers)\n");
+    else
+    {
+        CHECK(out[0] == 2, "lookup finds the descriptor written into the heap: index %d (probes %u)", (int)out[0], out[1]);
+        CHECK(out[4] == 3, "lookup finds the descriptor copied into the heap: index %d (probes %u)", (int)out[4], out[5]);
+    }
+    ID3D12Resource_Unmap(out_buf, 0, NULL);
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (out_buf) ID3D12Resource_Release(out_buf);
+    if (a) ID3D12Resource_Release(a);
+    if (b) ID3D12Resource_Release(b);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (blob) ID3D10Blob_Release(blob);
+    if (cpu_heap) XSLOT(cpu_heap, 2, ULONG)(cpu_heap);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -1413,6 +1537,7 @@ static void test_xbox(void)
     test_real_heap_va(dev, queue);
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
+    test_descriptor_lookup(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);

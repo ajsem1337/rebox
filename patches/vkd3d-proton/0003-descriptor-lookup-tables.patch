@@ -1,0 +1,111 @@
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index e7a5353..6b75535 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -4,3 +4,4 @@ EXPORTS
+     D3D12GetInterface
+     D3D12SDKVersion DATA PRIVATE
+     ReboxGetDescriptorHeapVA
++    ReboxSetDescriptorHeapLookup
+diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
+index 3746011..8d68637 100644
+--- a/libs/d3d12core/main.c
++++ b/libs/d3d12core/main.c
+@@ -1350,6 +1350,13 @@ HRESULT WINAPI DLLEXPORT ReboxGetDescriptorHeapVA(ID3D12DescriptorHeap *heap,
+     return vkd3d_rebox_get_descriptor_heap_va(heap, gpu_va, stride);
+ }
+ 
++HRESULT vkd3d_rebox_set_descriptor_heap_lookup(ID3D12DescriptorHeap *iface, uint64_t table_va);
++
++HRESULT WINAPI DLLEXPORT ReboxSetDescriptorHeapLookup(ID3D12DescriptorHeap *heap, UINT64 table_va)
++{
++    return vkd3d_rebox_set_descriptor_heap_lookup(heap, table_va);
++}
++
+ HRESULT WINAPI DLLEXPORT D3D12GetInterface(REFCLSID rcslid, REFIID iid, void **debug)
+ {
+     return d3d12core_D3D12GetInterface(rcslid, iid, debug);
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 326898b..f7e7b50 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8195,6 +8195,9 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+         if (n < 32)
+             data[n++] = (uint32_t)(va >> 32);
+     }
++    /* heap_base and code_base (dwords 32-35) stay 0; lookup tables follow. */
++    memcpy(&data[36], &list->descriptor_heap.buffers.rebox_resource_lookup, sizeof(uint64_t));
++    memcpy(&data[38], &list->descriptor_heap.buffers.rebox_sampler_lookup, sizeof(uint64_t));
+ 
+     VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, layout->vk_pipeline_layout,
+             layout->vk_push_stages, 0, sizeof(data), data));
+@@ -13522,9 +13525,15 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
+             VkDeviceAddress base = heap->descriptor_buffer.va +
+                     ((const uint8_t *)heap->cpu_va.ptr - heap->descriptor_buffer.host_allocation);
+             if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++            {
+                 list->descriptor_heap.buffers.rebox_resource_base = base;
++                list->descriptor_heap.buffers.rebox_resource_lookup = heap->rebox_lookup_va;
++            }
+             else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
++            {
+                 list->descriptor_heap.buffers.rebox_sampler_base = base;
++                list->descriptor_heap.buffers.rebox_sampler_lookup = heap->rebox_lookup_va;
++            }
+         }
+ 
+         if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 09a0709..5cf2597 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -10074,3 +10074,13 @@ HRESULT vkd3d_rebox_get_descriptor_heap_va(ID3D12DescriptorHeap *iface, uint6
+     *stride = d3d12_device_get_descriptor_handle_increment_size(heap->device, heap->desc.Type);
+     return S_OK;
+ }
++
++/* rebox: where console shaders find this heap's descriptor lookup
++ * table; passed in their push block while the heap is bound. */
++HRESULT vkd3d_rebox_set_descriptor_heap_lookup(ID3D12DescriptorHeap *iface, uint64_t table_va)
++{
++    if (!iface || iface->lpVtbl != &d3d12_descriptor_heap_vtbl)
++        return E_INVALIDARG;
++    CONTAINING_RECORD(iface, struct d3d12_descriptor_heap, ID3D12DescriptorHeap_iface)->rebox_lookup_va = table_va;
++    return S_OK;
++}
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 111fbac..626ad9b 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1604,6 +1604,10 @@ struct d3d12_descriptor_heap
+ 
+     struct d3d12_null_descriptor_template null_descriptor_template;
+ 
++    /* rebox: GPU address of this heap's descriptor lookup table
++     * (kept by the D3D12.X layer), 0 if none. */
++    uint64_t rebox_lookup_va;
++
+     struct d3d12_device *device;
+ 
+     struct vkd3d_private_store private_store;
+@@ -2269,9 +2273,10 @@ struct vkd3d_pipeline_cache_compatibility
+  * rebox). The D3D12.X layer hands them over in place of DXBC as
+  * this header followed by SPIR-V. They get their user SGPRs from a push
+  * constant block packed at dispatch from the root parameters: s0-s31, then
+- * heap_base and code_base (both 64-bit). */
++ * heap_base and code_base, then the descriptor lookup tables of the bound
++ * resource and sampler heaps (all 64-bit). */
+ #define VKD3D_REBOX_CONSOLE_MAGIC 0x56534353u /* "SCSV" */
+-#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 144u
++#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 160u
+ struct vkd3d_rebox_console_shader
+ {
+     uint32_t magic;
+@@ -3046,6 +3051,7 @@ union vkd3d_descriptor_heap_state
+         /* rebox: GPU address of descriptor 0 in the bound heaps, as
+          * vkd3d_rebox_get_descriptor_heap_va reports it to the title. */
+         VkDeviceAddress rebox_resource_base, rebox_sampler_base;
++        VkDeviceAddress rebox_resource_lookup, rebox_sampler_lookup;
+     } buffers;
+ 
+     struct

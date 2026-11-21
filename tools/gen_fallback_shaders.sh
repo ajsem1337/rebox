@@ -148,12 +148,65 @@ void main()
     o.v[96] = 0x5ca7f4a9u;
 }
 GLSL
+# Descriptor lookup (patch 4): reads the raw descriptor at the table address
+# in s6:s7, finds it in the bound resource heap's lookup table (push dwords
+# 36-37), and writes the heap index and probe count at dword s2 of the root
+# UAV (0xfffffffe: no table address or lookup table; 0xffffffff: miss).
+cat > "$work/console.lookup" <<'GLSL'
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+layout(push_constant, std430) uniform Sgprs
+{
+    uint s[32];
+    uvec2 heap_base, code_base, resource_lookup, sampler_lookup;
+} pc;
+void main()
+{
+    if (pc.s[0] == 0u && pc.s[1] == 0u)
+        return;
+    Words o = Words(uvec2(pc.s[0], pc.s[1]));
+    uint at = pc.s[2];
+    if ((pc.s[6] | pc.s[7]) == 0u || (pc.resource_lookup.x | pc.resource_lookup.y) == 0u)
+    {
+        o.v[at] = 0xfffffffeu;
+        return;
+    }
+    Words d = Words(uvec2(pc.s[6], pc.s[7]));
+    Words t = Words(pc.resource_lookup);
+    uint key[8], h = 2166136261u;
+    for (int i = 0; i < 8; i++)
+    {
+        key[i] = d.v[i];
+        h = (h ^ key[i]) * 16777619u;
+    }
+    for (uint p = 0u; p < 8u; p++)
+    {
+        uint e = 4u + ((h + p) & t.v[0]) * 9u;
+        bool same = true;
+        for (int i = 0; i < 8; i++)
+            same = same && t.v[e + i] == key[i];
+        if (same)
+        {
+            o.v[at] = t.v[e + 8u];
+            o.v[at + 1u] = p;
+            return;
+        }
+        if (t.v[e + 8u] == 0xffffffffu)
+            break;
+    }
+    o.v[at] = 0xffffffffu;
+}
+GLSL
 printf 'float4 main(uint id : SV_VertexID) : SV_Position { return 0; }\n' > "$work/sig_vs.hlsl"
 printf 'float4 main(float4 p : SV_Position) : SV_Target { return 0; }\n' > "$work/sig_ps.hlsl"
 vkd3d-compiler -x hlsl -b dxbc-tpf -p vs_5_0 -o "$work/sig_vs.dxbc" "$work/sig_vs.hlsl"
 vkd3d-compiler -x hlsl -b dxbc-tpf -p ps_5_0 -o "$work/sig_ps.dxbc" "$work/sig_ps.hlsl"
-for s in comp vert frag; do
-    glslangValidator -V --target-env vulkan1.2 -o "$work/console_$s.spv" "$work/console.$s" >/dev/null
+for s in comp vert frag lookup; do
+    glslangValidator -V --target-env vulkan1.2 -S $( [ $s = lookup ] && echo comp || echo $s ) \
+        -o "$work/console_$s.spv" "$work/console.$s" >/dev/null
 done
 # Header (44 bytes): magic "SCSV", version 1, Vulkan stage bit, wave size (0:
 # driver's choice), workgroup size, SPIR-V offset and size, DXBC offset and size.
@@ -167,7 +220,8 @@ def scsv(stage, spv, dxbc=None, wg=(0, 0, 0)):
     return hdr + spv + dx
 for name, blob in (('comp', scsv(0x20, 'console_comp.spv', wg=(1, 1, 1))),
                    ('vert', scsv(0x01, 'console_vert.spv', 'sig_vs.dxbc')),
-                   ('frag', scsv(0x10, 'console_frag.spv', 'sig_ps.dxbc'))):
+                   ('frag', scsv(0x10, 'console_frag.spv', 'sig_ps.dxbc')),
+                   ('lookup', scsv(0x20, 'console_lookup.spv', wg=(1, 1, 1)))):
     open(f'{w}/console_{name}.scsv', 'wb').write(blob)
 PY
 {
@@ -176,7 +230,7 @@ PY
     echo "static const unsigned char test_uav_write_cs[] = {"
     od -An -v -tx1 "$work/uav.dxbc" | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1, /g; s/^/   /'
     echo "};"
-    for s in comp vert frag; do
+    for s in comp vert frag lookup; do
         echo "static const unsigned char test_console_${s}[] = {"
         od -An -v -tx1 "$work/console_$s.scsv" | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1, /g; s/^/   /'
         echo "};"

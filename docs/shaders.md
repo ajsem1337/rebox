@@ -96,10 +96,20 @@ There are two places this could live:
    order: one dword per 32-bit constant, two per root descriptor or descriptor table (its real
    VA). This is Leonida's default mapping. It is an assumption until the exe shows the real one;
    keep it table-driven so a measured map replaces it.
-4. **Image and sampler lookup.** Whenever a descriptor is written into a shader-visible heap
-   (`Create*View`, `CopyDescriptors`), insert its raw bytes into the contract's hash table with
-   the bindless index of the same entry. In vkd3d's heap that index is `offset / 32`, so the
-   bindless arrays are vkd3d's own mutable heap array and no second copy is needed.
+4. **Descriptor lookup** (done: `d3d12_xs` `lookup.c`, `patches/vkd3d-proton/0003`). Each
+   shader-visible CBV/SRV/UAV or sampler heap gets a GPU-visible table mapping descriptor bytes to
+   heap index. Layout, in dwords: `[0]` mask (capacity - 1), `[1]` entry size (9), `[2..3]`
+   reserved, then entries `{ key[8], index }` with index `0xffffffff` when empty. The key is the
+   descriptor as it sits in the heap: 32 bytes for CBV/SRV/UAV, or 16 bytes for samplers padded
+   with `0xffffffff`. Hash: FNV-1a over the 8 dwords (`h = 2166136261; h = (h ^ k) * 16777619`);
+   probe `(h + p) & mask` for p = 0..7. `d3d12_xs` adds entries after every descriptor write
+   through the API (device slots 17-19 and 22-24), reading the bytes back from the heap.
+   vkd3d-proton passes the bound heaps' table addresses in the push block after `code_base`:
+   resource table at dwords 36-37, sampler table at 38-39, 160 bytes in all. Not handled:
+   descriptor bytes a title writes into heap memory itself, which needs the exe to settle.
+   Because keys are RADV's own bytes, a translated shader that decodes descriptor fields (V#
+   base address, T# format) still sees GFX11 layouts, not the console's GFX10.3 (open question
+   below).
 
 ## Open questions, and which need the exe
 
@@ -128,8 +138,10 @@ There are two places this could live:
    writes its SGPRs, set through the graphics root slots. Verified on the Radeon 890M (RADV,
    2026-11-21): all three SGPR checks pass for dispatch and draw, with table addresses equal to
    heap slot 10's start plus the table offset.
-4. Patch 4 and a translated compute shader from Leonida's output (needs the user's `the shader archive`;
-   run on the 890M with `tests/manual-test.sh`).
+4. ~~Patch 4~~ Done: a console shader reads the raw descriptor at its table address and finds
+   its heap index through the lookup table, for a descriptor written straight into the heap and one
+   copied in (RADV only; lavapipe has no descriptor buffers and skips). Next: a translated compute
+   shader from Leonida's output (needs the user's `the shader archive`).
 5. With the exe: measure the open questions above, then graphics.
 
 Meanwhile `d3d12_xs` keeps its fallback shaders, so a title runs with effects missing rather than
