@@ -179,6 +179,16 @@ RADV patch so 32-bit allocations come from the kernel's low 32-bit VA range (no
 `AMDGPU_VA_RANGE_HIGH`) with `address32_hi = 0`. Heaps then sit below 4 GiB and `heap_base`
 stays 0.
 
+### Translating the game's shaders (`tools/translate-shaders.sh`)
+
+`tools/translate-shaders.sh [path/to/the shader archive]` runs the whole chain and writes
+`build/console-shaders` (local, git-ignored): carve, unpack FSSM, disassemble with LLVM 21,
+translate with Leonida's `rdna2spirv.py` (cloned into `build/shader-work/Leonida` at run time,
+latest `origin/main` unless `LEONIDA_REV` is set), then `scsv_pack.py`. Rerun it whenever
+Leonida's translator gets fixes; it records the revision it used in
+`build/console-shaders/LEONIDA_REV`. These shaders come from Leonida, not AnyPS5: AnyPS5's output
+(americas-recomp) resolves descriptors on the CPU per draw, a different runtime contract.
+
 ### Packing translated shaders (`tools/scsv_pack.py`)
 
 `scsv_pack.py --dxbc CARVE_DIR --spirv TRANSLATED_DIR --out CACHE [--stage cs] [--validate]`
