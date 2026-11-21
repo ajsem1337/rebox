@@ -1,6 +1,6 @@
 # Console shaders with AnyPS5: design
 
-Status: steps 1 and 2 implemented (see Order of work). Written 2026-11-21. Supersedes the translator choice
+Status: steps 1-3 implemented for compute (see Order of work). Written 2026-11-21. Supersedes the translator choice
 in [shaders.md](shaders.md) (Leonida's contract); most of the plumbing there carries over, as listed
 below. Facts about AnyPS5 are from upstream `main` at `fc973e0189` and the user's
 `xsx-shader-lab` (`rdna-run`), which compiles 2,579 of the 2,620 PS09 compute shaders with the
@@ -65,25 +65,49 @@ storage buffer and a sampler whose words are the shadow's, and each maps back to
 descriptor. AnyPS5 also adds a fourth binding, a storage buffer holding all three descriptors'
 words (16 dwords), which the dispatch path will have to fill.
 
-## Runtime flow (compute first)
+## Runtime flow (compute; implemented)
 
-1. **PSO creation** (`d3d12_xs`): a console shader (FSSM container) becomes a deferred console
-   pipeline: code extracted, the `FLAT_SCRATCH` prologue (`s_setreg_imm32_b32` to
-   `HW_REG_FLAT_SCR_LO/HI`, 34 PS09 shaders and much of the `the shader archive` form) overwritten with
-   same-size `s_nop`s, `RSRC1`/`RSRC2` and thread-group size from the container metadata.
-2. **Dispatch** (vkd3d-proton patch): pack user SGPRs from the root parameters (patch 3's code),
-   then ask `d3d12_xs` to compile: code, SGPRs, stage info, and a memory callback over the shadow
-   heaps and identity-mapped GPU memory. AnyPS5 returns (or patches a cached) result.
-3. **Bind**: a pipeline layout per console pipeline from AnyPS5's binding list (one set; its 65
-   bindings per stage). For each binding, the vkd3d-proton descriptor found through the lookup is
-   copied into a per-dispatch descriptor-buffer range. V# bindings can instead become buffer
-   addresses directly, since buffers are identity-mapped. ShaderData and push data are uploaded
-   from the result; the BDA page table is one identity range plus the shadow heaps.
-4. **Restore**: vkd3d-proton's own descriptor bindings and push data are re-applied for the next
-   ordinary pipeline (patch 3 already invalidates its root state after a console push).
+1. **PSO creation** (`d3d12_xs` → patch 0005). A deferred console shader is an `SCRD` blob
+   (`shims/d3d12_xs/console_compile.h`): header, `RSRC1`/`RSRC2`, wave size, thread-group size,
+   code address, then the RDNA code. vkd3d-proton keeps the blob with the PSO and creates no
+   pipeline. Only the smoke test makes `SCRD` blobs so far: turning the game's FSSM containers
+   (or PS09 cache entries) into them, NOPing the `FLAT_SCRATCH` prologue (`s_setreg_imm32_b32` to
+   `HW_REG_FLAT_SCR_LO/HI`) on the way, waits on the PSO census (open question 1).
+2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
+   from the root parameters as for SCSV shaders, except that descriptor tables point at the
+   shadow heaps' title addresses (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`).
+   vkd3d-proton calls `d3d12_xs`'s `ReboxConsoleCompile` with the blob, the SGPRs, the bound
+   heaps and, for each AnyPS5 descriptor kind, the bindless set and binding that holds it (as
+   `vkd3d_bindless_state_find_binding` numbers them).
+3. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps through its
+   in-memory cache, which parses the code once and makes a variant per new set of descriptors.
+   Each guest binding's elements are found in the bound heap's shadow (`shadow_find_index`),
+   which gives heap slots. `sa5_finalize` (`anyps5/spirv_remap.cpp`) then:
+   - freezes the specialization constants, which AnyPS5 also uses for descriptor indices;
+   - moves each guest descriptor array onto the bindless set as a runtime array indexed by
+     those slots;
+   - turns host buffers into BDA pointers read from push bytes 128-159.
+   It validates the module, which is then cached by AnyPS5's pipeline identity plus the slots.
+4. **Bind**. vkd3d-proton makes one pipeline per key, with the root signature's own layout, so
+   its bindless sets are already bound. After its descriptors are updated, it pushes the
+   160 bytes from the compile (AnyPS5's 128 bytes of push data, then the host-buffer addresses)
+   and marks its own root parameters dirty for the next ordinary pipeline.
 
-Graphics follows once compute works: the extra stage info comes from the PSO (input layout, render
-targets, export formats) and the container's signatures.
+What AnyPS5's driver would do and this host does instead, from its sources:
+
+| AnyPS5 binding role | Here |
+|---|---|
+| Guest buffers, images, samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at the slot where the shadow holds the same words. AnyPS5 may rewrite a T#'s `DST_SEL` (identity) and gives each sampler a point-filtered twin (`S#` word 2 filters changed), so those fields are ignored when matching |
+| FlattenedSrt (binding 61): every dword the shader's scalar loads read through user SGPRs | its words, in GPU memory shared by content |
+| BDA page table (59) | identity ranges for GPU memory, plus title address → GPU copy for each shadow heap |
+| Fault buffer (60), GDS (58) | zeroed GPU memory (faults are not read back yet) |
+| ShaderData (62) | its words, as FlattenedSrt (compute normally uses push data instead) |
+| Image and sampler tables, LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
+
+The smoke test runs this whole path on lavapipe. `test_console_dispatch` creates a deferred PSO from
+hand-assembled RDNA2 code that stores `0x1234abcd` through the V# at the start of its descriptor
+table (heap slot 1), dispatches it, and reads the value back. `REBOX_DUMP_SPIRV=DIR` writes each
+finalized module.
 
 ## Where AnyPS5 runs
 
@@ -101,7 +125,7 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 | Piece | On the AnyPS5 path |
 |---|---|
 | Patch 1, real heap addresses | kept; the address becomes the shadow heap's |
-| Patch 2, `SCSV` pipelines | replaced by deferred console pipelines compiled at dispatch |
+| Patch 2, `SCSV` pipelines | replaced by deferred console pipelines compiled at dispatch (patch 0005, which reuses its push range and SGPR packing) |
 | Patch 3, SGPR packing | kept: the SGPR values are AnyPS5's user data |
 | Patch 4, lookup table | replaced by a CPU lookup over the shadow heaps (`ReboxShadowFind`); `d3d12_xs` no longer sets a table |
 | RADV 32-bit low window | not needed (truncated pointers resolve through the CPU callback) |
@@ -126,8 +150,12 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    with title addresses, the CPU lookup, and the AnyPS5 round trip in the smoke test (above).
    The heap's slot 10 address and vkd3d-proton's SGPR packing still use the real heap VA; they
    move to title addresses with step 3.
-3. Deferred compute pipelines and the dispatch path, with a hand-written compute shader whose
-   descriptors are known (the smoke test's UAV write, as RDNA2 code assembled with `llvm-mc`).
+3. ~~Deferred compute pipelines and the dispatch path~~ Done (above): patch 0005,
+   `console_compile.c`, `sa5_finalize`, and the end-to-end smoke test. Still to do before real
+   shaders: `SCRD` blobs from the game's containers with the `FLAT_SCRATCH` prologue NOPed. Then
+   heap slot 10 returning title addresses, for pointers the title stores in memory itself. Then
+   guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
+   roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.
 4. Real the target title compute shaders on the 890M.
 5. Graphics stages, starting with a pixel shader.
 

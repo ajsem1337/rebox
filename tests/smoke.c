@@ -1587,6 +1587,127 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* RDNA2 compute shader for the deferred dispatch test (llvm-mc -mcpu=gfx1030): stores
+ * 0x1234abcd through the V# at the start of the descriptor table s[0:1] points at.
+ *   s_load_dwordx4 s[4:7], s[0:1], 0x0
+ *   s_waitcnt lgkmcnt(0)
+ *   v_mov_b32 v1, 0x1234abcd
+ *   v_mov_b32 v2, 0
+ *   buffer_store_dword v1, v2, s[4:7], 0 offen
+ *   s_endpgm */
+static const UINT32 rdna_uav_write[] = {
+    0xf4080100, 0xfa000000, 0xbf8cc07f, 0x7e0202ff, 0x1234abcd, 0x7e040280, 0xe0701000, 0x80010102, 0xbf810000,
+};
+
+/* A deferred console compute PSO (patch 0005, console_compile.c): vkd3d-proton keeps the RDNA
+ * code and, at dispatch, d3d12_xs compiles it with AnyPS5 against the shadow heaps and rebinds it
+ * onto vkd3d-proton's bindless sets. The table starts at heap slot 1, so a wrong slot shows. */
+static void test_console_dispatch(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    struct
+    {
+        UINT32 magic, version, size, stage, wave_size, workgroup_size[3], rsrc1, rsrc2, code_offset, code_dwords;
+        UINT64 code_address;
+        UINT32 code[ARRAYSIZE(rdna_uav_write)];
+    } blob = { 0x44524353, 1, sizeof(blob), 0x20 /* VK_SHADER_STAGE_COMPUTE_BIT */, 32, { 1, 1, 1 },
+               0x00ac0000, 2 << 1 /* two user SGPRs */, offsetof(typeof(blob), code), ARRAYSIZE(rdna_uav_write),
+               0x200000 };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER param = { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                                   .DescriptorTable = { 1, &range } };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &param };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = { .Format = DXGI_FORMAT_R32_TYPELESS,
+            .ViewDimension = D3D12_UAV_DIMENSION_BUFFER, .Buffer = { 0, 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW } };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    void *heap = NULL, *rs = NULL, *pso = NULL, *list = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *out_buf = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D10Blob *rs_blob = NULL;
+    UINT inc, *out = NULL;
+    SIZE_T cpu;
+    UINT64 gpu;
+    HRESULT hr;
+
+    memcpy(blob.code, rdna_uav_write, sizeof(blob.code));
+    if (!GetModuleHandleA("rebox_anyps5.dll") && !LoadLibraryA("rebox_anyps5.dll"))
+    {
+        printf("skip deferred console dispatch: no rebox_anyps5.dll\n");
+        return;
+    }
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, NULL)))
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(rs_blob), ID3D10Blob_GetBufferSize(rs_blob), &IID_ID3D12RootSignature, &rs);
+    if (SUCCEEDED(hr))
+    {
+        cd.pRootSignature = rs;
+        cd.CS = (D3D12_SHADER_BYTECODE){ &blob, sizeof(blob) };
+        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12PipelineState, &pso);
+        CHECK(SUCCEEDED(hr), "a deferred console compute PSO is created without compiling (%#lx)", hr);
+    }
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&out_buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    CHECK(SUCCEEDED(hr), "objects for the deferred dispatch test (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    gpu = XSLOT(heap, 10, UINT64)(heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            out_buf, NULL, &uav, cpu + inc);
+
+    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+    XSLOT(list, 33, void, void *)(list, rs);
+    XSLOT(list, 25, void, void *)(list, pso);
+    XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+    XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (FAILED(hr = ID3D12Resource_Map(out_buf, 0, NULL, (void **)&out)))
+    {
+        CHECK(0, "map the deferred shader's output (%#lx)", hr);
+        goto done;
+    }
+    CHECK(out[0] == 0x1234abcd, "the deferred console shader, compiled by AnyPS5 at dispatch, wrote %#x through "
+          "its V# (expected 0x1234abcd)", out[0]);
+    ID3D12Resource_Unmap(out_buf, 0, NULL);
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (out_buf) ID3D12Resource_Release(out_buf);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (rs_blob) ID3D10Blob_Release(rs_blob);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -1707,6 +1828,7 @@ static void test_xbox(void)
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);
+    test_console_dispatch(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);

@@ -32,7 +32,7 @@ section "Wine smoke test through the layer"
 nixx develop -c tests/run-smoke.sh >> "$log" 2>&1
 smoke_status=$?
 sed -n '/Wine smoke test through the layer/,$p' "$log" \
-    | grep -E 'gpuva\]|identity-mapped|heap GPU start|descriptor table set|real GPU addresses|console shader|console SGPR|console VS/PS|shadow|T#|V#|S#|AnyPS5|binding [0-9]|maps back|s0:s1|s2-s5|s6:s7|PresentX|presented frame|XMA2|XAudio2|xaudio2_9|FFX|ffx stub|upscale|R11G11B10|mesh|^== |^(FAIL|PASSED|FAILED)' | uniq
+    | grep -E 'gpuva\]|identity-mapped|heap GPU start|descriptor table set|real GPU addresses|console shader|console SGPR|console VS/PS|shadow|T#|V#|S#|AnyPS5|binding [0-9]|maps back|deferred|bindless sets|compiled a variant|s0:s1|s2-s5|s6:s7|PresentX|presented frame|XMA2|XAudio2|xaudio2_9|FFX|ffx stub|upscale|R11G11B10|mesh|^== |^(FAIL|PASSED|FAILED)' | uniq
 echo "run-smoke.sh exit status: $smoke_status"
 
 # Translated game shaders (tools/scsv_pack.py output, local only): can the

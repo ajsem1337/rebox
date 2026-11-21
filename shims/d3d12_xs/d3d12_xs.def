@@ -17,3 +17,4 @@ EXPORTS
     ReboxShadowHeap
     ReboxShadowRead
     ReboxShadowFind
+    ReboxConsoleCompile

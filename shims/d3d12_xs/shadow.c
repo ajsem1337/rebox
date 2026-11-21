@@ -327,6 +327,73 @@ void shadow_copy_ranges(UINT dst_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_s
     }
 }
 
+/* ------------------------------------------------- for console_compile.c */
+
+UINT shadow_regions(struct shadow_region *out, UINT max)
+{
+    UINT n = 0;
+
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h && n < max; h = h->next)
+        if (h->title_va)
+        {
+            out[n].title_va = h->title_va;
+            out[n].gpu_va = h->gpu_memory ? h->gpu_va : 0;
+            out[n].data = h->data;
+            out[n].size = (SIZE_T)h->count * h->stride;
+            n++;
+        }
+    ReleaseSRWLockShared(&lock);
+    return n;
+}
+
+/* Fields AnyPS5 may rewrite in the words it binds: a T#'s DST_SEL (word 3 bits 0-11, made
+ * identity when the view swizzle takes it over) and an S#'s filters (word 2 bits 20-27, for the
+ * point-filtered twin of each sampler). */
+static BOOL loose_match(const UINT32 *slot, const UINT32 *words, UINT n, BOOL sampler)
+{
+    for (UINT i = 0; i < n; i++)
+    {
+        UINT32 mask = ~0u;
+        if (sampler && i == 2)
+            mask = ~(0xffu << 20);
+        else if (!sampler && n == 8 && i == 3)
+            mask = ~0xfffu;
+        if ((slot[i] ^ words[i]) & mask)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, UINT *index)
+{
+    struct shadow_heap *heap = NULL;
+    UINT32 key[8];
+    BOOL found = FALSE;
+
+    if (!words || !n || n > 8)
+        return FALSE;
+    make_key(words, n, sampler, key);
+    AcquireSRWLockShared(&lock);
+    for (struct entry *e = buckets[hash_key(key)]; e && !found; e = e->next)
+        if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, key, sizeof(key)))
+        {
+            *index = e->index;
+            found = TRUE;
+        }
+    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
+        if (h->cpu_start == heap_cpu)
+            heap = h;
+    for (UINT i = 0; heap && !found && i < heap->count; i++)
+        if (loose_match((const UINT32 *)(heap->data + (SIZE_T)i * heap->stride), words, n, sampler))
+        {
+            *index = i;
+            found = TRUE;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 /* ------------------------------------------------------------- exports */
 
 /* The shadow of the heap whose descriptor 0 has vkd3d-proton CPU handle

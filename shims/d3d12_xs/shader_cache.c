@@ -53,6 +53,9 @@ static BOOL is_pc_bytecode(const BYTE *data, SIZE_T size)
      * vkd3d-proton/0002, docs/shaders.md) goes through unchanged. */
     if (size >= 36 && !memcmp(data, "SCSV", 4))
         return TRUE;
+    /* So do deferred console shaders (console_compile.h, patch 0005). */
+    if (size >= 64 && !memcmp(data, "SCRD", 4))
+        return TRUE;
     if (size < 0x20 || memcmp(data, "DXBC", 4))
         return FALSE;
     count = read_u32(data + 0x1c);
@@ -161,6 +164,8 @@ static void describe_bytecode(const D3D12_SHADER_BYTECODE *bc, char *out, size_t
         snprintf(out, len, "none");
     else if (bc->BytecodeLength >= 36 && !memcmp(d, "SCSV", 4))
         snprintf(out, len, "scsv %zu B", (size_t)bc->BytecodeLength);
+    else if (bc->BytecodeLength >= 64 && !memcmp(d, "SCRD", 4))
+        snprintf(out, len, "scrd %zu B", (size_t)bc->BytecodeLength);
     else if (bc->BytecodeLength >= 4 && !memcmp(d, "DXBC", 4))
         snprintf(out, len, "%s %zu B", is_pc_bytecode(d, bc->BytecodeLength) ? "pc-dxbc" : "console-dxbc",
                  (size_t)bc->BytecodeLength);

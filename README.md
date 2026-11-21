@@ -4,10 +4,11 @@ Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 
 - **WineGDK** for Wine itself and the GDK runtime (`xgameruntime`: XUser, XTaskQueue, XGameSave and so on)
 - **vkd3d-proton** for D3D12 on Vulkan, built from source with our patches (`.#vkd3d-proton-rebox`,
-  `patches/vkd3d-proton/`; none yet), plus **DXVK's `dxgi.dll`** for adapter enumeration
+  `patches/vkd3d-proton/`), plus **DXVK's `dxgi.dll`** for adapter enumeration
 - **shims for the console-only DLLs** WineGDK doesn't cover: `xmem.dll` and `d3d12_xs.dll` (D3D12.X)
-- **an offline RDNA2 → SPIR-V translator** for the console shaders; running them needs the patched
-  vkd3d-proton described in [docs/shaders.md](docs/shaders.md) (not done yet)
+- **AnyPS5's RDNA → SPIR-V recompiler** for the console shaders (`rebox_anyps5.dll`), run at
+  each dispatch against console-format shadow descriptor heaps ([docs/anyps5.md](docs/anyps5.md));
+  compute works end to end in the smoke test, real game shaders and graphics are next
 
 It's built for a layout like `../xsx`: loose files plus `MicrosoftGame.Config`. It needs the main
 `.exe`, which isn't in that dump yet.
@@ -144,9 +145,10 @@ down missing translations.
 
 - **Console shaders don't render** ([docs/shaders.md](docs/shaders.md)). The translators emit
   SPIR-V that reads user SGPRs and raw hardware descriptors. The plan is AnyPS5 compiling at
-  dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL and console-format shadow heaps
-  are done; compiling and binding at dispatch in vkd3d-proton is next. Until then every console
-  PSO uses fallback shaders.
+  dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL, console-format shadow heaps
+  and compute compile-and-bind at dispatch (vkd3d-proton patch 0005) work on a hand-written
+  shader. The game's own shader containers aren't turned into deferred PSOs yet, so every console
+  PSO still uses fallback shaders.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified

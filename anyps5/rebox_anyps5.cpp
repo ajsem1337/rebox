@@ -84,7 +84,7 @@ SA5_API int sa5_compile_compute(const sa5_compute_request* request, sa5_result**
             DefaultTarget(request->wave),
             {0, 0, 0, 128},
         };
-        compile.useCache = false;
+        compile.useCache = request->use_cache != 0;
 
         auto* result = new sa5_result{Recompile(compile), {}};
         const auto words = result->result.spirv.Words();
@@ -138,6 +138,24 @@ SA5_API const void* sa5_result_push_constants(const sa5_result* result, std::uin
 SA5_API std::uint32_t sa5_result_subgroup_size(const sa5_result* result)
 {
     return result ? result->result.hostSubgroupSize : 0u;
+}
+
+SA5_API void sa5_result_identity(const sa5_result* result, std::uint64_t identity[2])
+{
+    const auto id = result ? result->result.Identity() : PipelineIdentity{};
+    identity[0] = id.low;
+    identity[1] = id.high;
+}
+
+SA5_API std::uint32_t sa5_fault_buffer_bytes(void)
+{
+    return static_cast<std::uint32_t>(BdaAbi::FaultBufferBytes);
+}
+
+// Pm4::GdsBytes in AnyPS5's driver, which isn't built here.
+SA5_API std::uint32_t sa5_gds_bytes(void)
+{
+    return 0x10000u;
 }
 
 SA5_API void sa5_result_free(sa5_result* result)

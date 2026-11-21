@@ -36,6 +36,7 @@ struct sa5_compute_request
     uint32_t rsrc1, rsrc2;      /* COMPUTE_PGM_RSRC1/2: float mode, user SGPRs, TGID enables, LDS */
     const struct sa5_region *regions;
     uint32_t region_count;
+    uint32_t use_cache;         /* nonzero: AnyPS5's in-memory cache (parse once per code, compile per variant) */
 };
 
 /* One resource the compiled shader binds, as AnyPS5 resolved it. */
@@ -59,6 +60,11 @@ SA5_API uint32_t sa5_result_binding_count(const struct sa5_result *result);
 SA5_API int sa5_result_binding(const struct sa5_result *result, uint32_t index, struct sa5_binding *binding);
 SA5_API const void *sa5_result_push_constants(const struct sa5_result *result, uint32_t *size);
 SA5_API uint32_t sa5_result_subgroup_size(const struct sa5_result *result);
+/* AnyPS5's identity for the result's pipeline: SPIR-V hash, specialization and binding layout. */
+SA5_API void sa5_result_identity(const struct sa5_result *result, uint64_t identity[2]);
+/* Sizes of the host buffers AnyPS5's driver fills itself (roles FaultBuffer and Gds). */
+SA5_API uint32_t sa5_fault_buffer_bytes(void);
+SA5_API uint32_t sa5_gds_bytes(void);
 SA5_API void sa5_result_free(struct sa5_result *result);
 
 /* Fitting a result to vkd3d-proton's bindings (spirv_remap.cpp). Specialization constants are
