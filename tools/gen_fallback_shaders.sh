@@ -184,7 +184,7 @@ void main()
     }
     for (uint p = 0u; p < 8u; p++)
     {
-        uint e = 4u + ((h + p) & t.v[0]) * 9u;
+        uint e = 1u + ((h + p) & t.v[0]) * 10u;
         bool same = true;
         for (int i = 0; i < 8; i++)
             same = same && t.v[e + i] == key[i];

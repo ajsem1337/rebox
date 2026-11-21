@@ -251,6 +251,8 @@ static ULONG STDMETHODCALLTYPE proxy_Release(struct proxy *p)
         embedded_free_list(p->active);
         embedded_free_list(p->retired);
         present_queue_destroy(p->present);
+        if (p->cls == &heap_class)
+            lookup_heap_destroyed((ID3D12DescriptorHeap *)p->inner);
         IUnknown_Release(p->inner);
         free(p);
     }

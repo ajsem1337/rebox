@@ -98,8 +98,8 @@ There are two places this could live:
    keep it table-driven so a measured map replaces it.
 4. **Descriptor lookup** (done: `d3d12_xs` `lookup.c`, `patches/vkd3d-proton/0003`). Each
    shader-visible CBV/SRV/UAV or sampler heap gets a GPU-visible table mapping descriptor bytes to
-   heap index. Layout, in dwords: `[0]` mask (capacity - 1), `[1]` entry size (9), `[2..3]`
-   reserved, then entries `{ key[8], index }` with index `0xffffffff` when empty. The key is the
+   heap index. Layout, in dwords, as Leonida's translator reads it: `[0]` mask (capacity - 1), then
+   entries `{ key[8], index, pad }` from dword 1, index `0xffffffff` when empty. The key is the
    descriptor as it sits in the heap: 32 bytes for CBV/SRV/UAV, or 16 bytes for samplers padded
    with `0xffffffff`. Hash: FNV-1a over the 8 dwords (`h = 2166136261; h = (h ^ k) * 16777619`);
    probe `(h + p) & mask` for p = 0..7. `d3d12_xs` adds entries after every descriptor write

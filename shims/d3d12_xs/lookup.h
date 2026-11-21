@@ -5,4 +5,5 @@
 
 /* Descriptor lookup tables for console shaders; see lookup.c. */
 void lookup_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc);
+void lookup_heap_destroyed(ID3D12DescriptorHeap *inner);
 void lookup_descriptors_written(SIZE_T cpu, UINT count);
