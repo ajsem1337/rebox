@@ -13,6 +13,7 @@
 #include <winternl.h>
 
 #include "../common/rebox_log.h"
+#include "crash.h"
 
 typedef union
 {
@@ -185,6 +186,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
     {
         DisableThreadLibraryCalls(instance);
         reserve_gpu_window();
+        crash_report_install(0x200000000000ull, 0x10000000000ull);
     }
     return TRUE;
 }
@@ -299,7 +301,10 @@ BOOL WINAPI XMemVirtualQuery(HANDLE process, const void *address, XMEM_BASIC_INF
     SIZE_T size;
 
     if (!info)
+    {
+        SetLastError(ERROR_NOACCESS); /* as VirtualQueryEx (Xbox2Windows) */
         return FALSE;
+    }
     memset(info, 0, sizeof(*info));
     /* Wine doesn't know GPU memory is mapped (it sees the reserved window, or
      * nothing), so answer for it from d3d12_xs's table. */

@@ -38,6 +38,46 @@ static int hook_calls;
 static void *WINAPI my_alloc(SIZE_T size, ULONGLONG attr) { hook_calls++; return alloc_default(size, attr); }
 static void WINAPI my_free(void *p, ULONGLONG attr) { hook_calls++; free_default(p, attr); }
 
+/* Faults xmem's reporter should describe (crash.c): a read of 0x10, then one
+ * inside the GPU window. This handler runs after xmem's and skips the
+ * 2-byte "mov eax, [rax]" so the test continues; run-smoke.sh checks the
+ * report in the log. */
+static LONG CALLBACK skip_test_fault(EXCEPTION_POINTERS *ep)
+{
+    BYTE *rip = (BYTE *)ep->ContextRecord->Rip;
+
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rip[0] == 0x8b && rip[1] == 0x00
+        && (ep->ContextRecord->Rax == 0x10 || ep->ContextRecord->Rax == 0x20ff00000040ull))
+    {
+        ep->ContextRecord->Rip += 2;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void __attribute__((noinline)) fault_read(ULONG_PTR addr)
+{
+    __asm__ volatile("movl (%%rax), %%eax" : "+a"(addr) :: "memory");
+}
+
+static void test_crash_report(HMODULE xmem)
+{
+    typedef BOOL (WINAPI *vquery_fn2)(HANDLE, const void *, void *);
+    vquery_fn2 vquery = (vquery_fn2)(void *)GetProcAddress(xmem, "XMemVirtualQuery");
+    void *veh = AddVectoredExceptionHandler(0, skip_test_fault);
+    BOOL ok;
+
+    fault_read(0x10);
+    fault_read(0x20ff00000040ull);
+    RemoveVectoredExceptionHandler(veh);
+    printf("ok   resumed after two reported faults\n");
+
+    SetLastError(0);
+    ok = vquery(GetCurrentProcess(), &ok, NULL);
+    CHECK(!ok && GetLastError() == ERROR_NOACCESS, "XMemVirtualQuery with a null buffer fails with ERROR_NOACCESS (%lu)",
+          GetLastError());
+}
+
 static void test_xmem(void)
 {
     HMODULE m = LoadLibraryA("xmem.dll");
@@ -55,6 +95,7 @@ static void test_xmem(void)
     free_default = (free_fn)(void *)GetProcAddress(m, "XMemFreeDefault");
     CHECK(xalloc && xfree && set_hooks && alloc_default && free_default, "xmem exports present");
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
+    test_crash_report(m);
 
     /* alignment field (bits 24-28) = 7 -> 2^7 = 128-byte alignment, heap path */
     a = xalloc(100, 7ull << 24);

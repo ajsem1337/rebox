@@ -72,3 +72,8 @@ grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were 
 grep -Eq "slot stats GraphicsCommandList:.* 12=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
 grep -Eq "slot stats Device:.* 100T=1" <<<"$out" || { echo "FAIL slot stats lack the trapped device slot 100"; exit 1; }
 echo "ok   slot stats count forwarded, custom and trapped slots"
+# xmem's fault reporter (test_crash_report): module+RVA, target, GPU window, stack.
+grep -Eq "first-chance access violation \(0xc0000005\) at smoke.exe\+0x" <<<"$out" \
+    && grep -Eq "  reading 0x10\s*$" <<<"$out" && grep -q "reading 0x20ff00000040 (inside the GPU window" <<<"$out" \
+    && grep -Eq "  #1  smoke.exe\+0x" <<<"$out" || { echo "FAIL fault report missing or incomplete"; exit 1; }
+echo "ok   fault reports name module+RVA, the target, the GPU window and the stack"
