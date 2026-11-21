@@ -56,9 +56,11 @@ Once the exe is dumped:
    provides, that DLL gets a stub too, and the report names the forwarder (`via dll.symbol`).
    Import and export tables are read directly, so names pefile would drop (characters
    outside `._?@$()<>`) still count. `tests/run-stubgen.sh` checks all of this end to end.
-3. **Link the shader cache.** `nix run .#anyps5-cache -- link --originals <shaders extracted from
-   the shader archive> --translated <AnyPS5 output> --out ~/.local/share/rebox/7952987A/shader-cache`.
-   Files are paired by relative path, ignoring extension.
+3. **Shaders: not usable yet.** Console shaders translate to SPIR-V that expects console-style
+   resources, which vkd3d-proton can't take. [docs/shaders.md](docs/shaders.md) has the design
+   (patched vkd3d-proton, Leonida's runtime contract). Until then every console shader gets a
+   fallback, so the title runs with effects missing. `anyps5-cache link` still links PC-format
+   (DXBC/DXIL) translations into the cache.
 4. **Run, then iterate.** Read `misses.txt` in the cache dir (`anyps5-cache misses <cache>`). Set
    `REBOX_STUB_FATAL=1` to stop at the first unimplemented stub the title reaches.
 
@@ -136,6 +138,10 @@ down missing translations.
 
 ## Known gaps (ordered roughly by how soon they'll bite)
 
+- **Console shaders don't render** ([docs/shaders.md](docs/shaders.md)). The translators emit
+  SPIR-V that reads user SGPRs and raw hardware descriptors. Running it needs a patched
+  vkd3d-proton (real heap addresses, console pipelines, SGPR packing, a descriptor lookup table),
+  which isn't built yet. Every console PSO uses fallback shaders.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
