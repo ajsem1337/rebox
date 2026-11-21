@@ -1,0 +1,61 @@
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index abd56d6..e7a5353 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -3,3 +3,4 @@ LIBRARY d3d12core.dll
+ EXPORTS
+     D3D12GetInterface
+     D3D12SDKVersion DATA PRIVATE
++    ReboxGetDescriptorHeapVA
+diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
+index a8498bc..3746011 100644
+--- a/libs/d3d12core/main.c
++++ b/libs/d3d12core/main.c
+@@ -1342,6 +1342,14 @@ static HRESULT d3d12core_D3D12GetInterface(REFCLSID rcslid, REFIID iid, void **d
+     return E_NOINTERFACE;
+ }
+ 
++HRESULT vkd3d_rebox_get_descriptor_heap_va(ID3D12DescriptorHeap *iface, uint64_t *gpu_va, UINT *stride);
++
++/* rebox: see vkd3d_rebox_get_descriptor_heap_va (resource.c). */
++HRESULT WINAPI DLLEXPORT ReboxGetDescriptorHeapVA(ID3D12DescriptorHeap *heap, UINT64 *gpu_va, UINT *stride)
++{
++    return vkd3d_rebox_get_descriptor_heap_va(heap, gpu_va, stride);
++}
++
+ HRESULT WINAPI DLLEXPORT D3D12GetInterface(REFCLSID rcslid, REFIID iid, void **debug)
+ {
+     return d3d12core_D3D12GetInterface(rcslid, iid, debug);
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 0fa8fb1..09a0709 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -10049,3 +10049,28 @@ void vkd3d_global_descriptor_buffer_cleanup(struct vkd3d_global_descriptor_buffe
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->resource.device_allocation);
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->sampler.device_allocation);
+ }
++
++/* rebox: the real GPU address of a shader-visible heap's descriptors.
++ * Console shaders dereference descriptor table pointers, so the D3D12.X layer
++ * hands titles real heap addresses instead of the virtual handles above, and
++ * translates them back where D3D12 takes a GPU handle. Only meaningful with
++ * embedded mutable descriptors, where the CPU handle is the mapped descriptor
++ * buffer and the increment equals the descriptor stride. */
++HRESULT vkd3d_rebox_get_descriptor_heap_va(ID3D12DescriptorHeap *iface, uint64_t *gpu_va, UINT *stride)
++{
++    struct d3d12_descriptor_heap *heap;
++    size_t offset;
++
++    if (!iface || iface->lpVtbl != &d3d12_descriptor_heap_vtbl || !gpu_va || !stride)
++        return E_INVALIDARG;
++    heap = CONTAINING_RECORD(iface, struct d3d12_descriptor_heap, ID3D12DescriptorHeap_iface);
++    if (!(heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || !heap->descriptor_buffer.va
++            || !d3d12_device_use_embedded_mutable_descriptors(heap->device)
++            || (heap->desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
++                    && heap->desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
++        return E_NOTIMPL;
++    offset = (const uint8_t *)heap->cpu_va.ptr - heap->descriptor_buffer.host_allocation;
++    *gpu_va = heap->descriptor_buffer.va + offset;
++    *stride = d3d12_device_get_descriptor_handle_increment_size(heap->device, heap->desc.Type);
++    return S_OK;
++}

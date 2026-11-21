@@ -46,7 +46,8 @@ static void describe(ULONG_PTR addr, char *out, size_t len)
     HMODULE module;
     char path[MAX_PATH], *name;
 
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    /* Wine maps address 0 to the main module; nothing lives in the first 64 KiB. */
+    if (addr >= 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (const char *)addr, &module)
         && GetModuleFileNameA(module, path, sizeof(path)))
     {

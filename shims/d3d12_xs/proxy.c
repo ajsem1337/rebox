@@ -817,6 +817,8 @@ static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, co
 
 /* ---------------------------------------------------------- command list */
 
+static UINT64 heap_handle_to_vkd3d(UINT64 handle);
+
 static void STDMETHODCALLTYPE list_SetDescriptorHeaps(struct proxy *p, UINT count, ID3D12DescriptorHeap *const *heaps)
 {
     ID3D12DescriptorHeap *raw[8];
@@ -828,6 +830,37 @@ static void STDMETHODCALLTYPE list_SetDescriptorHeaps(struct proxy *p, UINT coun
     p->heap_count = count < 2 ? count : 2;
     memcpy(p->heaps, raw, p->heap_count * sizeof(*raw));
     ID3D12GraphicsCommandList_SetDescriptorHeaps(INNER(p, ID3D12GraphicsCommandList), count, raw);
+}
+
+/* GPU descriptor handles may be real heap addresses (heap_handle_to_vkd3d). */
+static void STDMETHODCALLTYPE list_SetComputeRootDescriptorTable(struct proxy *p, UINT index, UINT64 handle)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE h = { heap_handle_to_vkd3d(handle) };
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(INNER(p, ID3D12GraphicsCommandList), index, h);
+}
+
+static void STDMETHODCALLTYPE list_SetGraphicsRootDescriptorTable(struct proxy *p, UINT index, UINT64 handle)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE h = { heap_handle_to_vkd3d(handle) };
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(INNER(p, ID3D12GraphicsCommandList), index, h);
+}
+
+static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(struct proxy *p, UINT64 gpu, SIZE_T cpu,
+        ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE g = { heap_handle_to_vkd3d(gpu) };
+    D3D12_CPU_DESCRIPTOR_HANDLE c = { cpu };
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(INNER(p, ID3D12GraphicsCommandList), g, c, resource,
+            values, rect_count, rects);
+}
+
+static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(struct proxy *p, UINT64 gpu, SIZE_T cpu,
+        ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE g = { heap_handle_to_vkd3d(gpu) };
+    D3D12_CPU_DESCRIPTOR_HANDLE c = { cpu };
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(INNER(p, ID3D12GraphicsCommandList), g, c, resource,
+            values, rect_count, rects);
 }
 
 /* Barriers are forwarded and also feed PresentX's resource-state tracking:
@@ -929,6 +962,80 @@ static void *STDMETHODCALLTYPE list_AllocateEmbeddedX(struct proxy *p, UINT64 si
 
 /* ---------------------------------------------------------- descriptor heap */
 
+/* Real heap addresses. Console shaders dereference descriptor table
+ * pointers, so with the patched vkd3d-proton (ReboxGetDescriptorHeapVA,
+ * patches/vkd3d-proton/0001) shader-visible heaps report the real GPU address
+ * of their descriptors. vkd3d-proton's own handles are virtual, so the
+ * command-list slots that take a GPU handle map real addresses back.
+ * REBOX_REAL_HEAP_VA=0 keeps the virtual handles (docs/shaders.md). */
+struct heap_range
+{
+    UINT64 real, virt, size;
+};
+
+static SRWLOCK heap_ranges_lock = SRWLOCK_INIT;
+static struct heap_range heap_ranges[256];
+static UINT heap_range_count;
+
+typedef HRESULT (WINAPI *heap_va_fn)(ID3D12DescriptorHeap *, UINT64 *, UINT *);
+static heap_va_fn heap_va_export;
+
+static BOOL CALLBACK find_heap_va_export(INIT_ONCE *once, void *param, void **ctx)
+{
+    char *env = rebox_getenv("REBOX_REAL_HEAP_VA");
+    HMODULE core = GetModuleHandleA("d3d12core.dll");
+
+    if (!(env && env[0] == '0') && core)
+        heap_va_export = (heap_va_fn)(void *)GetProcAddress(core, "ReboxGetDescriptorHeapVA");
+    free(env);
+    return TRUE;
+}
+
+static heap_va_fn real_heap_va(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+
+    InitOnceExecuteOnce(&once, find_heap_va_export, NULL, NULL);
+    return heap_va_export;
+}
+
+static void heap_range_add(UINT64 real, UINT64 virt, UINT64 size)
+{
+    UINT i;
+
+    AcquireSRWLockExclusive(&heap_ranges_lock);
+    /* A freed heap's range may be reused by a new one: drop overlaps. */
+    for (i = 0; i < heap_range_count;)
+    {
+        struct heap_range *r = &heap_ranges[i];
+        if ((real < r->real + r->size && r->real < real + size) || r->virt == virt)
+            *r = heap_ranges[--heap_range_count];
+        else
+            i++;
+    }
+    if (heap_range_count < ARRAYSIZE(heap_ranges))
+        heap_ranges[heap_range_count++] = (struct heap_range){ real, virt, size };
+    else
+        rebox_log("d3d12_xs: too many shader-visible heaps for real addresses");
+    ReleaseSRWLockExclusive(&heap_ranges_lock);
+}
+
+/* Real heap address -> vkd3d-proton handle; anything else is returned as is. */
+static UINT64 heap_handle_to_vkd3d(UINT64 handle)
+{
+    UINT64 out = handle;
+
+    AcquireSRWLockShared(&heap_ranges_lock);
+    for (UINT i = 0; i < heap_range_count; i++)
+        if (handle - heap_ranges[i].real < heap_ranges[i].size)
+        {
+            out = heap_ranges[i].virt + (handle - heap_ranges[i].real);
+            break;
+        }
+    ReleaseSRWLockShared(&heap_ranges_lock);
+    return out;
+}
+
 /* Slots 9 and 10 return the handle in RAX on Xbox (ScarlettX, verified in a
  * retail title); vkd3d-proton uses the MSVC hidden return pointer. */
 static SIZE_T STDMETHODCALLTYPE heap_GetCPUDescriptorHandleForHeapStart(struct proxy *p)
@@ -942,8 +1049,25 @@ static SIZE_T STDMETHODCALLTYPE heap_GetCPUDescriptorHandleForHeapStart(struct p
 static UINT64 STDMETHODCALLTYPE heap_GetGPUDescriptorHandleForHeapStart(struct proxy *p)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE h = { 0 };
+    heap_va_fn heap_va = real_heap_va();
+    UINT64 real;
+    UINT stride;
+
     ((D3D12_GPU_DESCRIPTOR_HANDLE *(STDMETHODCALLTYPE *)(void *, D3D12_GPU_DESCRIPTOR_HANDLE *))
         PC_SLOT(p->inner, 10))(p->inner, &h);
+    if (heap_va && SUCCEEDED(heap_va(INNER(p, ID3D12DescriptorHeap), &real, &stride)))
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        static LONG logged;
+
+        ((D3D12_DESCRIPTOR_HEAP_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_DESCRIPTOR_HEAP_DESC *))
+            PC_SLOT(p->inner, 8))(p->inner, &desc);
+        heap_range_add(real, h.ptr, (UINT64)desc.NumDescriptors * stride);
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: descriptor heaps report real GPU addresses (first %#llx, stride %u)",
+                         (unsigned long long)real, stride);
+        return real;
+    }
     return h.ptr;
 }
 
@@ -1087,6 +1211,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
+        FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
+        FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
+        FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
+        FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
         FN(83, list_CopyTextureRegionX),
         FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
@@ -1104,12 +1232,21 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(9, heap_GetCPUDescriptorHandleForHeapStart),
         FN(10, heap_GetGPUDescriptorHandleForHeapStart),
     };
-    unsigned n = 7;
+    unsigned n = 0, customs;
 
     if (slot_stats_interval())
         atexit(log_slot_stats_at_exit);
+    while (n < ARRAYSIZE(list_slots) && list_slots[n].custom)
+        n++;
+    customs = n;
     for (unsigned x = 33; x <= 62; x++)
-        list_slots[n++] = (struct slot)FWD(x, x - 4);
+    {
+        BOOL taken = FALSE;
+        for (unsigned j = 0; j < customs; j++)
+            taken |= list_slots[j].xbox == x;
+        if (!taken)
+            list_slots[n++] = (struct slot)FWD(x, x - 4);
+    }
 
     build(&device_class, 44, device_slots, ARRAYSIZE(device_slots));
     build(&queue_class, 19, queue_slots, ARRAYSIZE(queue_slots));

@@ -63,11 +63,16 @@ There are two places this could live:
 
 ### The patches
 
-1. **Real heap addresses.** `GetGPUDescriptorHandleForHeapStart` returns a fake handle
-   (`unique << 33`). Console shaders dereference descriptor table pointers. In console mode, return
-   the descriptor buffer's real GPU VA, and accept such VAs wherever handles are taken. With our
-   layer that address is also the CPU pointer, so `heap_base = 0` and the shader's loads go straight
-   to the heap.
+1. **Real heap addresses** (done). `GetGPUDescriptorHandleForHeapStart` returns a fake handle
+   (`unique << 33`). Console shaders dereference descriptor table pointers, so the title must see
+   the descriptor buffer's real GPU VA. Rather than change vkd3d-proton's handle encoding,
+   `patches/vkd3d-proton/0001` only exports `ReboxGetDescriptorHeapVA` from `d3d12core.dll`:
+   the real address and stride of a shader-visible heap. That works only with embedded mutable
+   descriptors (descriptor buffers), which RADV uses but lavapipe doesn't. `d3d12_xs`'s heap slot
+   10 returns that address and records the range. The command-list slots that take a GPU handle map
+   it back to vkd3d-proton's handle: root descriptor tables (Xbox 35/36) and UAV clears (Xbox 53/54).
+   `REBOX_REAL_HEAP_VA=0` keeps the virtual handles. Whether the address equals the CPU pointer
+   (`heap_base = 0`) depends on the layer identity-mapping the descriptor heap's memory type.
 2. **Console pipelines.** At PSO creation, a blob whose DXIL part is a NOBC stub around FSSM is a
    console shader:
    - look up `<stage>/<fssm hash>.spv` in the shader directory;
@@ -101,7 +106,9 @@ There are two places this could live:
 1. ~~Build vkd3d-proton from source in the flake (`.#vkd3d-proton-rebox`), unpatched, and switch
    `rebox-run` to it.~~ Done: v3.0.1 cross-built with mingw (static winpthreads); the smoke test
    passes unchanged on it.
-2. Patch 1 with a test: a shader reads a descriptor through the table VA it was given.
+2. ~~Patch 1 with a test~~ Done: a compute shader writes through a UAV in a descriptor table set from
+   heap slot 10's address. On lavapipe this covers the virtual-handle fallback; the real-address
+   path runs on RADV (`tests/manual-test.sh`).
 3. Patch 2 and 3 with a hand-written SPIR-V "console" shader that writes its s0-s31 to a UAV, to
    check the packing against root parameters.
 4. Patch 4 and a translated compute shader from Leonida's output (needs the user's `the shader archive`;
