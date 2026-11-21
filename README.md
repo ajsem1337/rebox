@@ -66,6 +66,10 @@ Once the exe is dumped:
 | `REBOX_GPUVA_WINDOW` | `BASE:SIZE` (hex) for identity-mapped GPU memory; default `200000000000:10000000000`; `off` stops xmem reserving it |
 | `REBOX_GPU_MEMORY=0` | Give GPU-visible `XMemAlloc` types plain `VirtualAlloc` memory instead of D3D12 heaps |
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
+| `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
+| `REBOX_VSYNC=N` | `PresentX` sync interval, default 1 (frame pacing calls are otherwise no-ops) |
+| `REBOX_DUMP_FRAMES=DIR` | Write presented frames to `DIR/frame_<n>.bmp` (8-bit RGBA/BGRA planes) or `.bin` |
+| `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 
 The cache key is the 64-bit FNV-1a hash of the bytecode exactly as the title passes it to
 `Create*PipelineState`. **Not yet verified:** whether that matches the raw shader bytes in
@@ -90,6 +94,9 @@ GFX10.3 code), is looked up in the cache.
   disassembly here.
 - `XMemVirtualQuery` takes `(process, address, info)` with a 0x40-byte info struct, as
   XboxBvhBuilder.dll calls it, and the smoke test covers that call.
+- `PresentX` presents a cleared render target recorded through Xbox slots. Both plane-param
+  layouts work (resource, or pointer to it), and the dumped frame has the cleared pixels. This
+  was checked headless; the window and swapchain need a display.
 - The smoke test drives the Xbox proxies by slot number, as title code does. It creates the
   device, queue, list and heap, records through the shifted command-list slots, executes and
   waits on a fence, and checks the zeroed inline fields, the RAX-returning heap starts and the
@@ -104,9 +111,11 @@ GFX10.3 code), is looked up in the cache.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
-  log and return `E_NOTIMPL`; `REBOX_STUB_FATAL=1` stops at the first one. Not done yet:
-  - `PresentX` accepts frames but shows nothing (no swapchain);
-  - frame pacing calls are no-ops;
+  log and return `E_NOTIMPL`; `REBOX_STUB_FATAL=1` stops at the first one. `PresentX` shows
+  plane 0 in a window through a DXGI swapchain. Not done yet:
+  - planes in formats a swapchain can't take (e.g. R11G11B10) need a shader blit, and only
+    plane 0 is shown;
+  - frame pacing calls are no-ops (vsync paces instead);
   - `GetDevice` on unproxied objects (resources, PSOs) returns vkd3d-proton's PC device.
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from

@@ -44,6 +44,9 @@ install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "
 install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$sys32"/
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n"
 export REBOX_SHADER_CACHE="Z:${work//\//\\}\\cache"
+# PresentX frame dumps, checked by the smoke test.
+mkdir -p "$work/frames"
+export REBOX_DUMP_FRAMES="Z:${work//\//\\}\\frames" REBOX_DUMP_FRAMES_AT=1,2
 
 for f in fake.bin console.dxbc translated.dxbc; do
     echo "== $f"

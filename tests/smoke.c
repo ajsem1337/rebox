@@ -335,6 +335,106 @@ static void test_gpu_memory(HMODULE m)
     gfree(cpu);
 }
 
+/* Reads pixel (0,0) of a 32-bit BMP written by PresentX's frame dump. */
+static BOOL read_dump_pixel(const char *dir, int frame, BYTE bgra[4])
+{
+    char path[MAX_PATH];
+    BYTE header[58];
+    FILE *f;
+    BOOL ok;
+
+    snprintf(path, sizeof(path), "%s\\frame_%d.bmp", dir, frame);
+    if (!(f = fopen(path, "rb")))
+        return FALSE;
+    ok = fread(header, 1, sizeof(header), f) == sizeof(header) && header[0] == 'B' && header[1] == 'M';
+    fclose(f);
+    if (ok)
+        memcpy(bgra, header + 54, 4);
+    return ok;
+}
+
+/* Render a cleared target through Xbox slots, then PresentX it (queue slot
+ * 30), once with the resource in the plane params and once with a pointer
+ * to it. The frame dumps (run-smoke.sh sets REBOX_DUMP_FRAMES) show
+ * whether the right pixels were copied out; a window is shown only if
+ * there's a display. */
+static void test_present(void *dev, void *queue)
+{
+    const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 48, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                 { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    D3D12_CLEAR_VALUE clear = { DXGI_FORMAT_R8G8B8A8_UNORM, { { 1.0f, 0.5f, 0.25f, 1.0f } } };
+    D3D12_RESOURCE_BARRIER to_present = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *tex = NULL;
+    void *rtv_heap = NULL, *list = NULL;
+    UINT64 plane_params[6] = { 0 };
+    SIZE_T rtv;
+    BYTE px[4];
+    HRESULT hr;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &rtv_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, &IID_ID3D12Resource,
+                (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    CHECK(SUCCEEDED(hr), "render target, RTV heap and list for PresentX (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+
+    /* CreateRenderTargetView (device slot 20), ClearRenderTargetView (list
+     * slot 52 = PC 48), ResourceBarrier (slot 26) to PRESENT. */
+    rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
+    XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, tex, NULL, rtv);
+    XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, clear.Color, 0, NULL);
+    to_present.Transition.pResource = tex;
+    to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, &to_present);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    CHECK(SUCCEEDED(hr), "clear recorded through Xbox slots (%#lx)", hr);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+
+    plane_params[1] = 1;
+    plane_params[2] = (UINT64)(ULONG_PTR)tex;
+    hr = XSLOT(queue, 30, HRESULT, UINT, const void *, const void *)(queue, 1, plane_params, NULL);
+    CHECK(hr == S_OK, "PresentX with the plane resource in the params (%#lx)", hr);
+    plane_params[2] = (UINT64)(ULONG_PTR)&tex;
+    hr = XSLOT(queue, 30, HRESULT, UINT, const void *, const void *)(queue, 1, plane_params, NULL);
+    CHECK(hr == S_OK, "PresentX with a pointer to the plane resource (%#lx)", hr);
+
+    if (!dump_dir)
+    {
+        printf("skip frame dump checks (REBOX_DUMP_FRAMES not set)\n");
+        goto done;
+    }
+    /* Clear colour (1, 0.5, 0.25) is RGB 255/128/64; BMP stores BGRA. */
+    for (int frame = 1; frame <= 2; frame++)
+    {
+        BOOL found = read_dump_pixel(dump_dir, frame, px);
+        CHECK(found && px[2] == 255 && abs(px[1] - 128) <= 1 && abs(px[0] - 64) <= 1,
+              "presented frame %d has the cleared pixels (RGB %u %u %u)", frame, found ? px[2] : 0,
+              found ? px[1] : 0, found ? px[0] : 0);
+    }
+
+done:
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (tex) ID3D12Resource_Release(tex);
+    if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -437,6 +537,8 @@ static void test_xbox(void)
 
     hr = XSLOT(dev, 100, HRESULT, UINT_PTR, UINT_PTR, UINT_PTR)(dev, 1, 2, 3);
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
+
+    test_present(dev, queue);
 
     if (fence) ID3D12Fence_Release(fence);
     if (rs) XSLOT(rs, 2, ULONG)(rs);

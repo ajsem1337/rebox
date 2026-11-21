@@ -32,7 +32,7 @@ section "Wine smoke test through the layer"
 nixx develop -c tests/run-smoke.sh >> "$log" 2>&1
 smoke_status=$?
 sed -n '/Wine smoke test through the layer/,$p' "$log" \
-    | grep -E 'gpuva\]|identity-mapped|^== |^(FAIL|PASSED|FAILED)' | uniq
+    | grep -E 'gpuva\]|identity-mapped|PresentX|presented frame|^== |^(FAIL|PASSED|FAILED)' | uniq
 echo "run-smoke.sh exit status: $smoke_status"
 
 echo

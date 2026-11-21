@@ -71,6 +71,10 @@ export REBOX_SHADER_CACHE="Z:${cache//\//\\}"
 if [[ ${REBOX_LOG:-} == /* ]]; then
     export REBOX_LOG="Z:${REBOX_LOG//\//\\}"
 fi
+if [[ ${REBOX_DUMP_FRAMES:-} == /* ]]; then
+    mkdir -p "$REBOX_DUMP_FRAMES"
+    export REBOX_DUMP_FRAMES="Z:${REBOX_DUMP_FRAMES//\//\\}"
+fi
 
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;xmem,d3d12_xs=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 

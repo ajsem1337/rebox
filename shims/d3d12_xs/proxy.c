@@ -28,6 +28,7 @@
 
 #include "../common/rebox_log.h"
 #include "gpu_memory.h"
+#include "present.h"
 #include "proxy.h"
 
 #define INNER_OFFSET 0x1000
@@ -59,6 +60,7 @@ struct proxy
     LONG refs;
     struct embedded *active, *retired;
     unsigned resets;
+    struct present_queue *present; /* queues that have presented */
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -240,6 +242,7 @@ static ULONG STDMETHODCALLTYPE proxy_Release(struct proxy *p)
     {
         embedded_free_list(p->active);
         embedded_free_list(p->retired);
+        present_queue_destroy(p->present);
         IUnknown_Release(p->inner);
         free(p);
     }
@@ -350,6 +353,38 @@ static LUID STDMETHODCALLTYPE device_GetAdapterLuid(struct proxy *p)
     return luid;
 }
 
+/* Resource creation (slots 27, 29, 30): forwarded, recording the initial
+ * state for PresentX's copy out of the plane. */
+static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p, const D3D12_HEAP_PROPERTIES *props,
+        D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state,
+        const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
+{
+    HRESULT hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear,
+                                                      riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        present_track_state(*out, state);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID3D12Heap *heap, UINT64 offset,
+        const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
+        void **out)
+{
+    HRESULT hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, desc, state, clear, riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        present_track_state(*out, state);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, const D3D12_RESOURCE_DESC *desc,
+        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
+{
+    HRESULT hr = ID3D12Device_CreateReservedResource(INNER(p, ID3D12Device), desc, state, clear, riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        present_track_state(*out, state);
+    return hr;
+}
+
 /* Slot 62 (XboxBvhBuilder.dll 0x18000c4e1): CreateComputePipelineState with
  * two extra arguments, zero at the only call seen. */
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy *p,
@@ -381,7 +416,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceX(struct proxy *p
     if (!InterlockedExchange(&once, 1))
         rebox_log("d3d12_xs: Xbox resource desc fields ignored: +0x34 %#x, +0x38 %#llx",
                      *(const UINT *)(desc_x + 0x34), *(const unsigned long long *)(desc_x + 0x38));
-    return ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, &desc, state, clear, riid, out);
+    return device_CreateCommittedResource(p, props, flags, &desc, state, clear, riid, out);
 }
 
 /* Slots 68, 69, 78-80 (ScarlettX, traced from a retail title): settings and
@@ -438,14 +473,11 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
 }
 
 /* Slot 30 (ScarlettX): PresentX(plane count, plane params, present params).
- * Nothing is shown yet: this needs a swapchain. */
+ * See present.c. */
 static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, const void *plane_params,
         const void *params)
 {
-    static LONG once;
-    if (!InterlockedExchange(&once, 1))
-        rebox_log("d3d12_xs: PresentX(%u planes) accepted but not displayed (no swapchain yet)", planes);
-    return S_OK;
+    return present_x(INNER(p, ID3D12CommandQueue), &p->present, planes, plane_params, params);
 }
 
 /* ---------------------------------------------------------- command list */
@@ -459,6 +491,22 @@ static void STDMETHODCALLTYPE list_SetDescriptorHeaps(struct proxy *p, UINT coun
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(heaps[i]);
     ID3D12GraphicsCommandList_SetDescriptorHeaps(INNER(p, ID3D12GraphicsCommandList), count, raw);
+}
+
+/* Barriers are forwarded and also feed PresentX's resource-state tracking:
+ * graphics slot 26 / copy slot 15 (PC 26), and enhanced barriers at slot 146
+ * (PC 80, ID3D12GraphicsCommandList7::Barrier). */
+static void STDMETHODCALLTYPE list_ResourceBarrier(struct proxy *p, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    present_track_barriers(count, barriers);
+    ID3D12GraphicsCommandList_ResourceBarrier(INNER(p, ID3D12GraphicsCommandList), count, barriers);
+}
+
+static void STDMETHODCALLTYPE list_Barrier(struct proxy *p, UINT32 count, const D3D12_BARRIER_GROUP *groups)
+{
+    present_track_enhanced(count, groups);
+    ((void (STDMETHODCALLTYPE *)(void *, UINT32, const D3D12_BARRIER_GROUP *))PC_SLOT(p->inner, 80))(p->inner,
+            count, groups);
 }
 
 /* Slot 83 (ScarlettX): CopyTextureRegion plus a trailing dword, 0 at every
@@ -595,6 +643,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(8, device_CreateCommandQueue),
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
+        FN(27, device_CreateCommittedResource),
+        FN(29, device_CreatePlacedResource),
+        FN(30, device_CreateReservedResource),
         FN(43, device_GetAdapterLuid),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(62, device_CreateComputePipelineStateX),
@@ -617,9 +668,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static struct slot list_slots[64] = {
         FN(7, child_GetDevice),
         FN(10, list_Reset),
+        FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
         FN(83, list_CopyTextureRegionX),
-        FWD(146, 80), /* Barrier */
+        FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
     };
     /* Copy-queue lists have their own short layout (ScarlettX). */
@@ -628,14 +680,14 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(10, list_Reset),
         FWD(11, 15), /* CopyBufferRegion */
         FWD(12, 16), /* CopyTextureRegion */
-        FWD(15, 26), /* ResourceBarrier */
+        FN(15, list_ResourceBarrier),
     };
     static const struct slot heap_slots[] = {
         FN(7, child_GetDevice),
         FN(9, heap_GetCPUDescriptorHandleForHeapStart),
         FN(10, heap_GetGPUDescriptorHandleForHeapStart),
     };
-    unsigned n = 6;
+    unsigned n = 7;
 
     for (unsigned x = 33; x <= 62; x++)
         list_slots[n++] = (struct slot)FWD(x, x - 4);
