@@ -30,6 +30,7 @@
 
 #include "../common/rebox_log.h"
 #include "gpu_memory.h"
+#include "pacing.h"
 #include "present.h"
 #include "proxy.h"
 
@@ -779,22 +780,18 @@ static HRESULT STDMETHODCALLTYPE device_Slot69(struct proxy *p, UINT_PTR id, UIN
 
 static HRESULT STDMETHODCALLTYPE device_SetFrameIntervalX(struct proxy *p, void *output, UINT interval_us, UINT period)
 {
-    rebox_log("d3d12_xs: SetFrameIntervalX(%u us, period %u) ignored", interval_us, period);
-    return S_OK;
+    return pacing_set_interval(interval_us, period);
 }
 
-static HRESULT STDMETHODCALLTYPE device_ScheduleFrameEventX(struct proxy *p, UINT type, UINT_PTR offset, void *event)
+static HRESULT STDMETHODCALLTYPE device_ScheduleFrameEventX(struct proxy *p, UINT type, UINT_PTR offset_us, HANDLE event)
 {
-    return S_OK;
+    return pacing_schedule(type, offset_us, event);
 }
 
-static HRESULT STDMETHODCALLTYPE device_WaitFrameEventX(struct proxy *p, UINT type, UINT timeout, void *event,
+static HRESULT STDMETHODCALLTYPE device_WaitFrameEventX(struct proxy *p, UINT type, UINT timeout_ms, void *event,
         UINT flags, UINT64 *token)
 {
-    static LONG64 next_token;
-    if (token)
-        *token = InterlockedIncrement64(&next_token);
-    return S_OK;
+    return pacing_wait(type, timeout_ms, token);
 }
 
 /* ------------------------------------------------------------------ queue */

@@ -77,7 +77,8 @@ Once the exe is dumped:
 | `REBOX_GPU_MEMORY=0` | Give GPU-visible `XMemAlloc` types plain `VirtualAlloc` memory instead of D3D12 heaps |
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
 | `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
-| `REBOX_VSYNC=N` | `PresentX` sync interval, default 1 (frame pacing calls are otherwise no-ops) |
+| `REBOX_VSYNC=N` | `PresentX` sync interval, default 1 |
+| `REBOX_FRAME_PACING=0` | Make `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX` no-ops, so the title runs as fast as `PresentX` allows |
 | `REBOX_DUMP_FRAMES=DIR` | Write presented frames to `DIR/frame_<n>.bmp` (8-bit RGBA/BGRA planes) or `.bin` |
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 
@@ -138,7 +139,9 @@ down missing translations.
   plane 0 in a window through a DXGI swapchain. Not done yet:
   - only plane 0 is shown (no HUD-plane composition yet). Planes in formats a swapchain can't
     take, such as R11G11B10, are converted to RGBA8 with a blit: HDR is clamped, not tone-mapped;
-  - frame pacing calls are no-ops (vsync paces instead);
+  - frame events come from a CPU clock, not the display: `WaitFrameEventX` follows the period the
+    title sets, but isn't locked to the monitor's vblank, so with vsync on a mismatched refresh
+    rate can judder;
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
   CPU-visible D3D12 heaps. `rebox-run` loads `VK_LAYER_REBOX_gpuva_identity` and, on AMD,

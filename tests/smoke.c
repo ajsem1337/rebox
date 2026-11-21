@@ -772,6 +772,67 @@ done:
     if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
 }
 
+/* Frame pacing through device slots 78-80, as the traced retail title uses
+ * them: SetFrameIntervalX, then WaitFrameEventX(ORIGIN, INFINITE) per frame. */
+static double ms_since(LARGE_INTEGER a)
+{
+    LARGE_INTEGER b, f;
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+}
+
+static void test_pacing(void *dev)
+{
+    typedef HRESULT (STDMETHODCALLTYPE *wait_fn)(void *, UINT, UINT, void *, UINT, UINT64 *);
+    wait_fn wait = (wait_fn)(*(void ***)dev)[80];
+    UINT64 tok[6] = { 0 }, late = 0;
+    LARGE_INTEGER t0;
+    HANDLE event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    HRESULT hr;
+    double ms;
+    BOOL ok = TRUE;
+    int i;
+
+    /* 10 ms x period 2: an origin every 20 ms. */
+    hr = XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 10000, 2);
+    CHECK(SUCCEEDED(hr), "SetFrameIntervalX (slot 78) %#lx", hr);
+    wait(dev, 0, INFINITE, NULL, 0, &tok[0]);
+    QueryPerformanceCounter(&t0);
+    for (i = 1; i < 6; i++)
+    {
+        hr = wait(dev, 0, INFINITE, NULL, 0, &tok[i]);
+        ok &= SUCCEEDED(hr) && tok[i] == tok[i - 1] + 1;
+    }
+    ms = ms_since(t0);
+    CHECK(ok && ms > 90 && ms < 200, "WaitFrameEventX (slot 80) paces 5 frames at 20 ms: %.1f ms, tokens %llu..%llu",
+          ms, (unsigned long long)tok[0], (unsigned long long)tok[5]);
+
+    /* A late title gets the newest missed frame at once, not a burst. */
+    Sleep(70);
+    QueryPerformanceCounter(&t0);
+    wait(dev, 0, INFINITE, NULL, 0, &late);
+    ms = ms_since(t0);
+    CHECK(ms < 10 && late >= tok[5] + 3, "late WaitFrameEventX returns at once (%.1f ms) and skips to frame %llu",
+          ms, (unsigned long long)late);
+
+    hr = wait(dev, 0, 0, NULL, 0, &late);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT), "WaitFrameEventX with timeout 0 between frames times out (%#lx)", hr);
+
+    /* An event scheduled 5 ms after the origin is set once per frame. */
+    hr = XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, HANDLE)(dev, 1, 5000, event);
+    ok = SUCCEEDED(hr);
+    QueryPerformanceCounter(&t0);
+    for (i = 0; i < 3; i++)
+        ok &= WaitForSingleObject(event, 200) == WAIT_OBJECT_0;
+    ms = ms_since(t0);
+    CHECK(ok && ms > 25 && ms < 120, "ScheduleFrameEventX (slot 79) sets its event each frame: 3 in %.1f ms", ms);
+
+    XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, HANDLE)(dev, 1, 0, NULL);
+    XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 16667, 1);
+    CloseHandle(event);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -887,6 +948,7 @@ static void test_xbox(void)
     hr = XSLOT(dev, 100, HRESULT, UINT_PTR, UINT_PTR, UINT_PTR)(dev, 1, 2, 3);
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
 
+    test_pacing(dev);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);
