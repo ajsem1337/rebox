@@ -142,11 +142,14 @@ down missing translations.
   heaps, and DEFAULT heaps that hold only buffers, are made CPU-visible (custom `WRITE_BACK`/`L0`),
   so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out). Textures and mixed
   heaps keep ordinary GPU addresses.
-- **Audio: XMA2 is silent.** Under WineGDK, FAudio sends XMA2 to Wine's WMA decoder, which
-  accepts only WMA formats, so creating an XMA2 source voice fails. `shims/xaudio2_9` wraps Wine's
-  `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM voices fed silence of about the
-  buffer's length, so voice creation, `OnBufferEnd` and `GetState` work. Decoding XMA2 for real
-  (e.g. FFmpeg's `xma2` decoder) is still to do. Bink's audio is decoded to PCM by Bink and is
+- **Audio: XMA2 decoding is untested on real data.** Under WineGDK, FAudio sends XMA2 to Wine's
+  WMA decoder, which accepts only WMA formats, so creating an XMA2 source voice fails.
+  `shims/xaudio2_9` wraps Wine's `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM
+  voices. Each XMA2 buffer is decoded at submission by FFmpeg's `xma2` decoder: the flake's
+  `ffmpeg-xma2`, a static mingw libavcodec with only that decoder. If decoding fails, or the DLL is
+  built without `FFMPEG_XMA2`, the voice plays silence of about the buffer's length. A callback
+  between the voice and the title keeps callback contexts intact and frees the PCM.
+  FFmpeg has no XMA2 encoder, so no test feeds it real XMA2. Bink's audio is decoded to PCM by Bink and is
   unaffected. Wine also reports a mastering voice as created when there's no audio device, after
   which FAudio crashes on the first source voice; that only matters on machines without audio.
 - **Upscaling is bilinear.** The console FidelityFX upscaler runs precompiled-ISA shaders, which

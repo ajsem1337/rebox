@@ -6,8 +6,9 @@
  * Wine's xaudio2_8.dll (the same FAudio code built as 2.8; the 2.8/2.9 ABI is
  * identical apart from an XAPO helper), except XMA2 source voices: those
  * become PCM voices with the same rate and channels, and every XMA2 buffer
- * is replaced by silence of about the same length. Playback is silent but
- * timing, OnBufferEnd/OnStreamEnd callbacks and GetState keep working.
+ * is decoded with FFmpeg's xma2 decoder (static, from the flake's
+ * ffmpeg-xma2) or, built without it or when decoding fails, replaced by
+ * silence of about the same length. Callbacks and GetState keep working.
  *
  * Exports are by ordinal, as on the console (Bink imports ordinal 1). */
 
@@ -114,19 +115,112 @@ static void *forward_thunk(unsigned slot)
     return t;
 }
 
-/* ---------------------------------------------------------- silent voices */
+/* ------------------------------------------------------------- XMA2 voices
+ *
+ * An XMA2 voice is a PCM voice of the same rate and channels. Each XMA2
+ * buffer is decoded at submission (FFmpeg's xma2 decoder, when built with
+ * FFMPEG_XMA2) or, failing that, replaced by silence of about its length.
+ * Buffers go to the PCM voice with a record as their context; our callback
+ * forwards every notification to the title's callback with the title's own
+ * context, and frees decoded PCM once the voice is done with it. */
+
+#ifdef HAVE_FFMPEG_XMA2
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/log.h>
+#endif
+
+struct record
+{
+    void *title_context;
+    BYTE *pcm; /* decoded data we own, or NULL for shared silence */
+};
 
 struct xma_voice
 {
     void **vtbl;
     IXAudio2SourceVoice *inner; /* +8, used by the forward thunks */
+    IXAudio2VoiceCallback callback; /* ours, given to the PCM voice */
+    IXAudio2VoiceCallback *title_callback;
     UINT32 channels, rate;
     double samples_per_byte;
+#ifdef HAVE_FFMPEG_XMA2
+    AVCodecContext *decoder;
+    AVPacket *packet;
+    AVFrame *frame;
+#endif
 };
 
 C_ASSERT(offsetof(struct xma_voice, inner) == 8);
 
 static void **xma_voice_vtbl;
+
+static struct xma_voice *voice_from_callback(IXAudio2VoiceCallback *cb)
+{
+    return CONTAINING_RECORD(cb, struct xma_voice, callback);
+}
+
+static void STDMETHODCALLTYPE cb_pass_start(IXAudio2VoiceCallback *cb, UINT32 bytes)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnVoiceProcessingPassStart(v->title_callback, bytes);
+}
+
+static void STDMETHODCALLTYPE cb_pass_end(IXAudio2VoiceCallback *cb)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnVoiceProcessingPassEnd(v->title_callback);
+}
+
+static void STDMETHODCALLTYPE cb_stream_end(IXAudio2VoiceCallback *cb)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnStreamEnd(v->title_callback);
+}
+
+static void STDMETHODCALLTYPE cb_buffer_start(IXAudio2VoiceCallback *cb, void *context)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    struct record *r = context;
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnBufferStart(v->title_callback, r ? r->title_context : NULL);
+}
+
+static void STDMETHODCALLTYPE cb_buffer_end(IXAudio2VoiceCallback *cb, void *context)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    struct record *r = context;
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnBufferEnd(v->title_callback, r ? r->title_context : NULL);
+    if (r)
+    {
+        free(r->pcm);
+        free(r);
+    }
+}
+
+static void STDMETHODCALLTYPE cb_loop_end(IXAudio2VoiceCallback *cb, void *context)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    struct record *r = context;
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnLoopEnd(v->title_callback, r ? r->title_context : NULL);
+}
+
+static void STDMETHODCALLTYPE cb_error(IXAudio2VoiceCallback *cb, void *context, HRESULT hr)
+{
+    struct xma_voice *v = voice_from_callback(cb);
+    struct record *r = context;
+    if (v->title_callback)
+        IXAudio2VoiceCallback_OnVoiceError(v->title_callback, r ? r->title_context : NULL, hr);
+}
+
+static IXAudio2VoiceCallbackVtbl callback_vtbl = {
+    cb_pass_start, cb_pass_end, cb_stream_end, cb_buffer_start, cb_buffer_end, cb_loop_end, cb_error,
+};
 
 /* One zero-filled block shared by every silent buffer. It only ever grows;
  * older blocks stay allocated because queued buffers may still point at
@@ -154,35 +248,180 @@ static const BYTE *silence(SIZE_T bytes)
     return p;
 }
 
+#ifdef HAVE_FFMPEG_XMA2
+static BOOL decoder_open(struct xma_voice *v, const WAVEFORMATEX *fmt)
+{
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
+    AVCodecContext *c;
+
+    av_log_set_level(AV_LOG_ERROR);
+    if (!codec || fmt->wFormatTag != WAVE_FORMAT_XMA2 || !(c = avcodec_alloc_context3(codec)))
+        return FALSE;
+    c->sample_rate = fmt->nSamplesPerSec;
+    av_channel_layout_default(&c->ch_layout, fmt->nChannels);
+    c->block_align = fmt->nBlockAlign ? fmt->nBlockAlign : 2048;
+    /* The XMA2WAVEFORMATEX fields after WAVEFORMATEX, as in a RIFF file. */
+    if (fmt->cbSize && (c->extradata = av_mallocz(fmt->cbSize + AV_INPUT_BUFFER_PADDING_SIZE)))
+    {
+        memcpy(c->extradata, (const BYTE *)fmt + sizeof(WAVEFORMATEX), fmt->cbSize);
+        c->extradata_size = fmt->cbSize;
+    }
+    if (avcodec_open2(c, codec, NULL) < 0)
+    {
+        avcodec_free_context(&c);
+        return FALSE;
+    }
+    v->decoder = c;
+    v->packet = av_packet_alloc();
+    v->frame = av_frame_alloc();
+    return v->packet && v->frame;
+}
+
+static void decoder_close(struct xma_voice *v)
+{
+    av_frame_free(&v->frame);
+    av_packet_free(&v->packet);
+    avcodec_free_context(&v->decoder);
+}
+
+static BOOL append_frames(struct xma_voice *v, BYTE **pcm, SIZE_T *size, SIZE_T *cap)
+{
+    while (avcodec_receive_frame(v->decoder, v->frame) >= 0)
+    {
+        AVFrame *f = v->frame;
+        UINT32 ch = v->channels, n = f->nb_samples;
+        SIZE_T need = *size + (SIZE_T)n * ch * 2;
+        INT16 *out;
+
+        if (need > *cap)
+        {
+            SIZE_T c = *cap ? *cap : 1 << 16;
+            BYTE *p;
+            while (c < need)
+                c *= 2;
+            if (!(p = realloc(*pcm, c)))
+                return FALSE;
+            *pcm = p;
+            *cap = c;
+        }
+        out = (INT16 *)(*pcm + *size);
+        for (UINT32 i = 0; i < n; i++)
+            for (UINT32 k = 0; k < ch; k++)
+            {
+                float s = 0.0f;
+                if (k < (UINT32)f->ch_layout.nb_channels)
+                {
+                    if (f->format == AV_SAMPLE_FMT_FLTP)
+                        s = ((const float *)f->extended_data[k])[i];
+                    else if (f->format == AV_SAMPLE_FMT_FLT)
+                        s = ((const float *)f->extended_data[0])[i * f->ch_layout.nb_channels + k];
+                }
+                s = s < -1.0f ? -1.0f : s > 1.0f ? 1.0f : s;
+                *out++ = (INT16)(s * 32767.0f);
+            }
+        *size = need;
+        av_frame_unref(f);
+    }
+    return TRUE;
+}
+
+/* Decodes one XAudio2 buffer of whole XMA2 packets. The decoder carries
+ * over between buffers of a stream and is drained at END_OF_STREAM. */
+static BYTE *decode(struct xma_voice *v, const XAUDIO2_BUFFER *buf, UINT32 *bytes)
+{
+    UINT32 block = v->decoder->block_align;
+    BYTE *pcm = NULL, padded[2048 + AV_INPUT_BUFFER_PADDING_SIZE];
+    SIZE_T size = 0, cap = 0;
+
+    for (UINT32 off = 0; off + block <= buf->AudioBytes && block <= 2048; off += block)
+    {
+        memset(padded + block, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        memcpy(padded, buf->pAudioData + off, block);
+        v->packet->data = padded;
+        v->packet->size = block;
+        if (avcodec_send_packet(v->decoder, v->packet) < 0 || !append_frames(v, &pcm, &size, &cap))
+            break;
+    }
+    if (buf->Flags & XAUDIO2_END_OF_STREAM)
+    {
+        avcodec_send_packet(v->decoder, NULL);
+        append_frames(v, &pcm, &size, &cap);
+        avcodec_flush_buffers(v->decoder);
+    }
+    if (!size || size > 0xffffffffu)
+    {
+        free(pcm);
+        return NULL;
+    }
+    *bytes = (UINT32)size;
+    return pcm;
+}
+#endif
+
 static HRESULT STDMETHODCALLTYPE xma_SubmitSourceBuffer(struct xma_voice *v, const XAUDIO2_BUFFER *buf,
         const XAUDIO2_BUFFER_WMA *wma)
 {
     XAUDIO2_BUFFER pcm;
+    struct record *r;
     UINT64 samples;
+    HRESULT hr;
 
     if (!buf)
         return E_POINTER;
-    pcm = *buf;
-    /* XMA2 is compressed and we don't decode it: estimate the length from
-     * the bytes, and make sure the play and loop regions fit. */
-    samples = (UINT64)(buf->AudioBytes * v->samples_per_byte);
-    if (buf->PlayLength && buf->PlayBegin + (UINT64)buf->PlayLength > samples)
-        samples = buf->PlayBegin + (UINT64)buf->PlayLength;
-    if (buf->LoopLength && buf->LoopBegin + (UINT64)buf->LoopLength > samples)
-        samples = buf->LoopBegin + (UINT64)buf->LoopLength;
-    if (!samples)
-        samples = 1;
-    if (samples > 0x10000000)
-        samples = 0x10000000;
-    pcm.AudioBytes = (UINT32)(samples * v->channels * 2);
-    if (!(pcm.pAudioData = silence(pcm.AudioBytes)))
+    if (!(r = calloc(1, sizeof(*r))))
         return E_OUTOFMEMORY;
-    return IXAudio2SourceVoice_SubmitSourceBuffer(v->inner, &pcm, NULL);
+    pcm = *buf;
+    r->title_context = buf->pContext;
+    pcm.pContext = r;
+#ifdef HAVE_FFMPEG_XMA2
+    if (v->decoder && (r->pcm = decode(v, buf, &pcm.AudioBytes)))
+    {
+        pcm.pAudioData = r->pcm;
+        samples = pcm.AudioBytes / (v->channels * 2);
+        /* Play/loop regions are in samples; keep them inside what decoded. */
+        if (pcm.PlayBegin >= samples)
+            pcm.PlayBegin = pcm.PlayLength = 0;
+        else if (pcm.PlayLength && pcm.PlayBegin + (UINT64)pcm.PlayLength > samples)
+            pcm.PlayLength = (UINT32)(samples - pcm.PlayBegin);
+        if (pcm.LoopCount && (pcm.LoopBegin >= samples || pcm.LoopBegin + (UINT64)pcm.LoopLength > samples))
+            pcm.LoopBegin = pcm.LoopLength = pcm.LoopCount = 0;
+    }
+    else
+#endif
+    {
+        /* Silence of about the buffer's length: estimate the sample count
+         * from the bytes, and make sure the play and loop regions fit. */
+        samples = (UINT64)(buf->AudioBytes * v->samples_per_byte);
+        if (buf->PlayLength && buf->PlayBegin + (UINT64)buf->PlayLength > samples)
+            samples = buf->PlayBegin + (UINT64)buf->PlayLength;
+        if (buf->LoopLength && buf->LoopBegin + (UINT64)buf->LoopLength > samples)
+            samples = buf->LoopBegin + (UINT64)buf->LoopLength;
+        if (!samples)
+            samples = 1;
+        if (samples > 0x10000000)
+            samples = 0x10000000;
+        pcm.AudioBytes = (UINT32)(samples * v->channels * 2);
+        if (!(pcm.pAudioData = silence(pcm.AudioBytes)))
+        {
+            free(r);
+            return E_OUTOFMEMORY;
+        }
+    }
+    if (FAILED(hr = IXAudio2SourceVoice_SubmitSourceBuffer(v->inner, &pcm, NULL)))
+    {
+        free(r->pcm);
+        free(r);
+    }
+    return hr;
 }
 
 static void STDMETHODCALLTYPE xma_DestroyVoice(struct xma_voice *v)
 {
     IXAudio2SourceVoice_DestroyVoice(v->inner);
+#ifdef HAVE_FFMPEG_XMA2
+    if (v->decoder)
+        decoder_close(v);
+#endif
     free(v);
 }
 
@@ -235,15 +474,13 @@ static HRESULT STDMETHODCALLTYPE engine_CreateSourceVoice(struct engine *e, IXAu
     const XMA2WAVEFORMATEX *xma = (const XMA2WAVEFORMATEX *)fmt;
     WAVEFORMATEX pcm;
     struct xma_voice *v;
+    BOOL decoded = FALSE;
     HRESULT hr;
     static LONG logged;
 
     if (!fmt || (fmt->wFormatTag != WAVE_FORMAT_XMA2 && fmt->wFormatTag != WAVE_FORMAT_XMA))
         return IXAudio2_CreateSourceVoice(e->inner, out, fmt, flags, max_ratio, callback, sends, effects);
 
-    if (!InterlockedExchange(&logged, 1))
-        rebox_log("xaudio2_9: XMA2 source voice (%u Hz, %u channels): playing silence, XMA2 isn't decoded yet",
-                     (unsigned)fmt->nSamplesPerSec, fmt->nChannels);
     if (!out)
         return E_POINTER;
     pcm.wFormatTag = WAVE_FORMAT_PCM;
@@ -256,6 +493,8 @@ static HRESULT STDMETHODCALLTYPE engine_CreateSourceVoice(struct engine *e, IXAu
 
     v = calloc(1, sizeof(*v));
     v->vtbl = xma_voice_vtbl;
+    v->callback.lpVtbl = &callback_vtbl;
+    v->title_callback = callback;
     v->channels = pcm.nChannels;
     v->rate = pcm.nSamplesPerSec;
     /* Samples per compressed byte: from the header when it says how much it
@@ -266,9 +505,19 @@ static HRESULT STDMETHODCALLTYPE engine_CreateSourceVoice(struct engine *e, IXAu
     else
         v->samples_per_byte = 1.0 / pcm.nChannels;
 
-    if (FAILED(hr = IXAudio2_CreateSourceVoice(e->inner, &v->inner, &pcm, flags, max_ratio, callback, sends,
+#ifdef HAVE_FFMPEG_XMA2
+    decoded = decoder_open(v, fmt);
+#endif
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("xaudio2_9: XMA2 source voice (%u Hz, %u channels): %s", (unsigned)fmt->nSamplesPerSec,
+                     fmt->nChannels, decoded ? "decoding with FFmpeg" : "playing silence (no XMA2 decoder)");
+    if (FAILED(hr = IXAudio2_CreateSourceVoice(e->inner, &v->inner, &pcm, flags, max_ratio, &v->callback, sends,
                                                effects)))
     {
+#ifdef HAVE_FFMPEG_XMA2
+        if (v->decoder)
+            decoder_close(v);
+#endif
         free(v);
         return hr;
     }

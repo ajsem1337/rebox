@@ -14,11 +14,18 @@ COMMON  := shims/common/rebox_log.c
 
 all: $(SHIMS:%=$(BUILD)/%.dll)
 
+# XMA2 decoding in xaudio2_9 needs FFMPEG_XMA2 (the flake's ffmpeg-xma2:
+# static mingw libavcodec/libavutil); without it XMA2 plays as silence.
+ifneq ($(FFMPEG_XMA2),)
+CFLAGS_xaudio2_9 := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
+LIBS_xaudio2_9 := -L$(FFMPEG_XMA2)/lib -lavcodec -lavutil -lbcrypt
+endif
+
 .SECONDEXPANSION:
 $(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
 	@mkdir -p $(BUILD)
 	cat shims/$*/$*.def $(wildcard $(GEN)/$*_stubs.def) > $(BUILD)/$*.def
-	$(MINGW_CC) $(CFLAGS) -o $@ $(wildcard shims/$*/*.c) $(wildcard $(GEN)/$*_stubs.c) $(COMMON) $(BUILD)/$*.def $(LDFLAGS)
+	$(MINGW_CC) $(CFLAGS) $(CFLAGS_$*) -o $@ $(wildcard shims/$*/*.c) $(wildcard $(GEN)/$*_stubs.c) $(COMMON) $(BUILD)/$*.def $(LDFLAGS) $(LIBS_$*)
 
 # Smoke test executable, run under Wine by tests/run-smoke.sh.
 $(BUILD)/smoke.exe: tests/smoke.c

@@ -51,6 +51,23 @@
         # Use with VK_ICD_FILENAMES=$out/share/vulkan/icd.d/radeon_icd.x86_64.json.
         # Host Vulkan layer that maps host-visible memory at identical GPU
         # and CPU addresses (layers/gpuva_identity.c).
+        # Static mingw libavcodec/libavutil with only FFmpeg's XMA2 decoder,
+        # linked into shims/xaudio2_9 (nixpkgs' mingw FFmpeg is marked broken).
+        ffmpeg-xma2 = pkgs.stdenv.mkDerivation {
+          pname = "ffmpeg-xma2-mingw";
+          inherit (pkgs.ffmpeg) version src;
+          nativeBuildInputs = [ mingwCC pkgs.nasm pkgs.pkg-config pkgs.perl ];
+          dontAddPrefix = true;
+          dontStrip = true; # native strip on mingw archives
+          configurePhase = ''
+            ./configure --prefix=$out --target-os=mingw32 --arch=x86_64 --enable-cross-compile \
+              --cross-prefix=x86_64-w64-mingw32- --disable-everything --enable-decoder=xma2 \
+              --disable-programs --disable-doc --disable-avdevice --disable-avformat --disable-swscale \
+              --disable-swresample --disable-avfilter --disable-network --disable-debug \
+              --enable-static --disable-shared --disable-autodetect --disable-asm
+          '';
+        };
+
         gpuva-layer = pkgs.stdenv.mkDerivation {
           name = "rebox-gpuva-layer";
           src = lib.fileset.toSource { root = ./.; fileset = ./layers; };
@@ -100,7 +117,7 @@
             ];
           };
           nativeBuildInputs = [ mingwCC ];
-          makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" ];
+          makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "FFMPEG_XMA2=${ffmpeg-xma2}" ];
           installPhase = "mkdir -p $out && cp build/*.dll $out/";
         };
 
@@ -140,6 +157,7 @@
           export VKD3D_PROTON_DIR=${self.packages.${system}.vkd3d-proton-win}/x64
           export DXVK_DIR=${self.packages.${system}.dxvk-win}/x64
           export REBOX_SHIMS_DIR=$PWD/build
+          export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
           export WINE_DLL_DIR=${pkgs.wineWow64Packages.unstable}/lib/wine/x86_64-windows
           # Software Vulkan only for machines (or sandboxes) without a GPU;
           # otherwise the system's drivers (e.g. RADV) are used.
