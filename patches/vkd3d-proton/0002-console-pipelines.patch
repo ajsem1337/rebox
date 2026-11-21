@@ -1,8 +1,8 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index 84976e6..e977892 100644
+index 84976e6..326898b 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
-@@ -8140,6 +8140,75 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
+@@ -8140,6 +8140,68 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
  static void d3d12_command_list_check_pre_compute_barrier(
          struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage);
  
@@ -14,25 +14,18 @@ index 84976e6..e977892 100644
 +static uint64_t d3d12_command_list_rebox_table_va(struct d3d12_command_list *list,
 +        const struct vkd3d_shader_root_parameter *p, uint32_t index)
 +{
-+    struct vkd3d_bindless_state *bindless = &list->device->bindless_state;
 +    D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 +    VkDeviceAddress base;
-+    unsigned int j;
 +
 +    if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
 +        return 0;
 +    if (p->descriptor_table.binding_count && p->descriptor_table.first_binding->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER)
 +        type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-+    base = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? list->descriptor_heap.buffers.heap_va_sampler
-+            : list->descriptor_heap.buffers.heap_va_resource;
++    /* Same base the title got from GetGPUDescriptorHandleForHeapStart. */
++    base = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? list->descriptor_heap.buffers.rebox_sampler_base
++            : list->descriptor_heap.buffers.rebox_resource_base;
 +    if (!base)
 +        return 0;
-+    for (j = 0; j < bindless->set_count; j++)
-+        if (bindless->set_info[j].heap_type == type)
-+        {
-+            base += list->descriptor_heap.buffers.vk_offsets[j];
-+            break;
-+        }
 +    return base + (uint64_t)index * d3d12_device_get_descriptor_handle_increment_size(list->device, type);
 +}
 +
@@ -78,7 +71,7 @@ index 84976e6..e977892 100644
  static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
  {
      d3d12_command_list_end_current_render_pass(list, false);
-@@ -8149,6 +8218,9 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
+@@ -8149,6 +8211,9 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
  
      d3d12_command_list_check_pre_compute_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
      d3d12_command_list_update_descriptors(list);
@@ -88,7 +81,7 @@ index 84976e6..e977892 100644
  
  #ifdef VKD3D_ENABLE_PROFILING
      vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
-@@ -8673,6 +8745,12 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+@@ -8673,6 +8738,12 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
              d3d12_command_list_update_dynamic_state(list);
  
          d3d12_command_list_update_descriptors(list);
@@ -101,6 +94,23 @@ index 84976e6..e977892 100644
      }
  
      if (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE)
+@@ -13446,6 +13517,16 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
+         if (!heap)
+             continue;
+ 
++        if (heap->descriptor_buffer.va && heap->descriptor_buffer.host_allocation)
++        {
++            VkDeviceAddress base = heap->descriptor_buffer.va +
++                    ((const uint8_t *)heap->cpu_va.ptr - heap->descriptor_buffer.host_allocation);
++            if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++                list->descriptor_heap.buffers.rebox_resource_base = base;
++            else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
++                list->descriptor_heap.buffers.rebox_sampler_base = base;
++        }
++
+         if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+         {
+             list->descriptor_heap.buffers.heap_va_resource = heap->descriptor_buffer.va;
 diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
 index ce7f54e..722c8b4 100644
 --- a/libs/vkd3d/state.c
@@ -224,7 +234,7 @@ index ce7f54e..722c8b4 100644
          memset(&io_input_signature, 0, sizeof(io_input_signature));
  
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 63154f9..fb70090 100644
+index 63154f9..111fbac 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -2265,11 +2265,36 @@ struct vkd3d_pipeline_cache_compatibility
@@ -264,3 +274,13 @@ index 63154f9..fb70090 100644
  
      union
      {
+@@ -3018,6 +3043,9 @@ union vkd3d_descriptor_heap_state
+         bool heap_dirty;
+ 
+         VkDeviceSize vk_offsets[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
++        /* rebox: GPU address of descriptor 0 in the bound heaps, as
++         * vkd3d_rebox_get_descriptor_heap_va reports it to the title. */
++        VkDeviceAddress rebox_resource_base, rebox_sampler_base;
+     } buffers;
+ 
+     struct
