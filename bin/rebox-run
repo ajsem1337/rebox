@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Run a dumped Xbox Series (Scarlett) GDK title under WineGDK + vkd3d-proton,
+# with the xmem/d3d12_xs shims and an AnyPS5 shader cache.
+#
+#   rebox-run [--scan] GAME_DIR [-- GAME_ARGS...]
+#
+# Environment (the flake wrapper sets the first five):
+#   WINE                  wine binary (WineGDK build)
+#   VKD3D_PROTON_DIR      directory holding vkd3d-proton's x64 d3d12.dll/d3d12core.dll
+#   DXVK_DIR              directory holding DXVK's x64 dxgi.dll
+#   REBOX_SHIMS_DIR    directory holding built xmem.dll/d3d12_xs.dll
+#   REBOX_SCAN         scan_imports.py command (used by --scan)
+#   WINEPREFIX            default: ~/.local/share/rebox/<TitleId>
+#   REBOX_SHADER_CACHE Unix path to the AnyPS5 cache; default: $WINEPREFIX/shader-cache
+#   REBOX_GPUVA_LAYER_DIR  directory holding VK_LAYER_REBOX_gpuva_identity's manifest (flake sets it)
+#   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
+#                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
+#   REBOX_DUMP_SHADERS, REBOX_STUB_FATAL, REBOX_LOG: see README
+set -euo pipefail
+
+die() { echo "rebox-run: $*" >&2; exit 1; }
+
+scan=0
+if [[ ${1:-} == --scan ]]; then scan=1; shift; fi
+[[ $# -ge 1 ]] || die "usage: rebox-run [--scan] GAME_DIR [-- GAME_ARGS...]"
+game_dir=$(realpath "$1"); shift
+[[ ${1:-} == -- ]] && shift
+
+config="$game_dir/MicrosoftGame.Config"
+[[ -f $config ]] || die "no MicrosoftGame.Config in $game_dir"
+
+# First <Executable Name="..."> and the TitleId; good enough for MicrosoftGame.Config.
+exe=$(grep -o '<Executable [^>]*' "$config" | head -1 | sed -n 's/.* Name="\([^"]*\)".*/\1/p')
+title_id=$(sed -n 's:.*<TitleId>\([^<]*\)</TitleId>.*:\1:p' "$config" | head -1)
+[[ -n $exe ]] || die "no <Executable> in $config"
+title_id=${title_id:-unknown}
+
+: "${WINE:?set WINE to a WineGDK wine binary (or use the flake wrapper)}"
+: "${VKD3D_PROTON_DIR:?set VKD3D_PROTON_DIR}"
+: "${DXVK_DIR:?set DXVK_DIR}"
+: "${REBOX_SHIMS_DIR:?set REBOX_SHIMS_DIR}"
+wine_dlls="$(dirname "$(realpath "$(command -v "$WINE")")")/../lib/wine/x86_64-windows"
+
+if (( scan )); then
+    exec ${REBOX_SCAN:-scan_imports.py} "$game_dir" \
+        --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" --provider "$wine_dlls"
+fi
+
+[[ -f $game_dir/$exe ]] || die "$exe is listed in MicrosoftGame.Config but missing from $game_dir (not dumped/decrypted yet?)"
+
+export WINEPREFIX=${WINEPREFIX:-$HOME/.local/share/rebox/$title_id}
+export WINEARCH=win64
+if [[ ! -d $WINEPREFIX/drive_c ]]; then
+    echo "rebox-run: creating prefix $WINEPREFIX" >&2
+    mkdir -p "$WINEPREFIX"
+    "$WINE" wineboot -i >/dev/null 2>&1 || die "wineboot failed for $WINEPREFIX"
+fi
+
+# Copy rather than symlink so the prefix survives nix garbage collection.
+sys32="$WINEPREFIX/drive_c/windows/system32"
+install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
+install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$sys32"/
+
+# Mount the package as G: too, for titles that assume a package drive.
+ln -sfn "$game_dir" "$WINEPREFIX/dosdevices/g:"
+
+cache=${REBOX_SHADER_CACHE:-$WINEPREFIX/shader-cache}
+mkdir -p "$cache"
+cache=$(realpath "$cache")
+export REBOX_SHADER_CACHE="Z:${cache//\//\\}"
+if [[ ${REBOX_LOG:-} == /* ]]; then
+    export REBOX_LOG="Z:${REBOX_LOG//\//\\}"
+fi
+
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;xmem,d3d12_xs=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+
+# Unified memory (docs/d3d12x.md): GPU VA == CPU address needs the identity
+# layer and, on AMD, a RADV that accepts lower-half device addresses. The
+# layer passes allocations through on drivers that can't do it.
+if [[ -n ${REBOX_GPUVA_LAYER_DIR:-} ]]; then
+    export VK_ADD_LAYER_PATH="$REBOX_GPUVA_LAYER_DIR${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
+    export VK_INSTANCE_LAYERS="VK_LAYER_REBOX_gpuva_identity${VK_INSTANCE_LAYERS:+:$VK_INSTANCE_LAYERS}"
+fi
+if [[ -z ${VK_ICD_FILENAMES:-} && -n ${REBOX_RADV_ICD:-} && ${REBOX_STOCK_VULKAN:-0} != 1 ]] \
+    && grep -qs 0x1002 /sys/class/drm/card*/device/vendor; then
+    export VK_ICD_FILENAMES=$REBOX_RADV_ICD
+    echo "rebox-run: using patched RADV ($REBOX_RADV_ICD)" >&2
+fi
+
+echo "rebox-run: $exe (title $title_id), prefix $WINEPREFIX, shader cache $cache" >&2
+cd "$game_dir"
+exec "$WINE" "$game_dir/$exe" "$@"

@@ -1,0 +1,335 @@
+/* GPU-visible memory for xmem.dll and for command-list embedded data.
+ *
+ * Memory comes from CPU-visible custom heaps (WRITE_BACK, L0) on the shared
+ * device, each spanned by one UAV-capable buffer, so vkd3d-proton knows the
+ * whole range as a resource and resolves raw GPU VAs inside it. Small
+ * requests are suballocated from 64 MiB chunks.
+ *
+ * Whether the returned CPU pointer equals its GPU VA depends on the Vulkan
+ * driver and VK_LAYER_REBOX_gpuva_identity (docs/d3d12x.md). It is checked
+ * once per chunk and logged. */
+
+#define COBJMACROS
+#include <windows.h>
+#include <d3d12.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../common/rebox_log.h"
+#include "gpu_memory.h"
+
+#define CHUNK_SIZE (64u << 20)
+#define DEDICATED_THRESHOLD (16u << 20)
+#define HEAP_ALIGN (64u << 10)
+
+struct range { UINT64 start, end; };
+
+struct chunk
+{
+    ID3D12Heap *heap;
+    ID3D12Resource *buffer;
+    BYTE *cpu;
+    UINT64 gpu, size, used;
+    BOOL dedicated;
+    struct range *free;
+    size_t free_count, free_cap;
+    struct chunk *next;
+};
+
+struct allocation
+{
+    BYTE *cpu;
+    struct chunk *chunk;
+    UINT64 offset, size;
+    struct allocation *next;
+};
+
+#define BUCKETS 4096
+
+static SRWLOCK lock = SRWLOCK_INIT;
+static struct chunk *chunks;
+static UINT64 bytes_in_use;
+static struct allocation *table[BUCKETS];
+
+static unsigned bucket(const void *p)
+{
+    ULONG_PTR h = (ULONG_PTR)p >> 6;
+    return (unsigned)((h ^ (h >> 13)) % BUCKETS);
+}
+
+/* --------------------------------------------------------------- ranges */
+
+/* Alignment applies to the CPU address (and so to the GPU VA when they are
+ * equal), not just the offset: without the layer, mappings may only be
+ * page-aligned. */
+static BOOL range_alloc(struct chunk *c, UINT64 size, UINT64 align, UINT64 *out)
+{
+    const UINT64 base = (ULONG_PTR)c->cpu;
+
+    for (size_t i = 0; i < c->free_count; i++)
+    {
+        struct range *r = &c->free[i];
+        UINT64 start = ((base + r->start + align - 1) & ~(align - 1)) - base;
+
+        if (start + size > r->end)
+            continue;
+        if (start > r->start && start + size < r->end)
+        {
+            if (c->free_count == c->free_cap)
+                c->free = realloc(c->free, (c->free_cap *= 2) * sizeof(*c->free));
+            r = &c->free[i];
+            memmove(&c->free[i + 2], &c->free[i + 1], (c->free_count - i - 1) * sizeof(*c->free));
+            c->free[i + 1] = (struct range){ start + size, r->end };
+            r->end = start;
+            c->free_count++;
+        }
+        else if (start > r->start)
+            r->end = start;
+        else if (start + size < r->end)
+            r->start = start + size;
+        else
+        {
+            memmove(&c->free[i], &c->free[i + 1], (c->free_count - i - 1) * sizeof(*c->free));
+            c->free_count--;
+        }
+        *out = start;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void range_free(struct chunk *c, UINT64 start, UINT64 size)
+{
+    UINT64 end = start + size;
+    size_t i;
+
+    for (i = 0; i < c->free_count && c->free[i].start < start; i++)
+        ;
+    if (i > 0 && c->free[i - 1].end == start)
+    {
+        c->free[i - 1].end = end;
+        if (i < c->free_count && c->free[i].start == end)
+        {
+            c->free[i - 1].end = c->free[i].end;
+            memmove(&c->free[i], &c->free[i + 1], (c->free_count - i - 1) * sizeof(*c->free));
+            c->free_count--;
+        }
+        return;
+    }
+    if (i < c->free_count && c->free[i].start == end)
+    {
+        c->free[i].start = start;
+        return;
+    }
+    if (c->free_count == c->free_cap)
+        c->free = realloc(c->free, (c->free_cap *= 2) * sizeof(*c->free));
+    memmove(&c->free[i + 1], &c->free[i], (c->free_count - i) * sizeof(*c->free));
+    c->free[i] = (struct range){ start, end };
+    c->free_count++;
+}
+
+/* --------------------------------------------------------------- chunks */
+
+static struct chunk *chunk_create(ID3D12Device *device, UINT64 size, BOOL dedicated)
+{
+    D3D12_HEAP_DESC hd = {
+        .SizeInBytes = size,
+        .Properties = { D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 0, 0 },
+        .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+        .Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+    };
+    D3D12_RESOURCE_DESC rd = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER, .Width = size, .Height = 1, .DepthOrArraySize = 1,
+        .MipLevels = 1, .Format = DXGI_FORMAT_UNKNOWN, .SampleDesc = { 1, 0 },
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR, .Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    };
+    D3D12_RANGE none = { 0, 0 };
+    struct chunk *c = calloc(1, sizeof(*c));
+    static LONG reported;
+    HRESULT hr;
+
+    if (FAILED(hr = ID3D12Device_CreateHeap(device, &hd, &IID_ID3D12Heap, (void **)&c->heap)))
+    {
+        rebox_log("d3d12_xs: CreateHeap(%#llx) for GPU memory failed: %#lx", (unsigned long long)size, hr);
+        goto fail;
+    }
+    if (FAILED(hr = ID3D12Device_CreatePlacedResource(device, c->heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                      NULL, &IID_ID3D12Resource, (void **)&c->buffer)))
+    {
+        rebox_log("d3d12_xs: CreatePlacedResource(%#llx) for GPU memory failed: %#lx", (unsigned long long)size, hr);
+        goto fail;
+    }
+    if (FAILED(hr = ID3D12Resource_Map(c->buffer, 0, &none, (void **)&c->cpu)))
+    {
+        rebox_log("d3d12_xs: Map of GPU memory failed: %#lx", hr);
+        goto fail;
+    }
+    c->gpu = ID3D12Resource_GetGPUVirtualAddress(c->buffer);
+    c->size = size;
+    c->dedicated = dedicated;
+    c->free_cap = 8;
+    c->free = calloc(c->free_cap, sizeof(*c->free));
+    c->free[0] = (struct range){ 0, size };
+    c->free_count = 1;
+
+    if ((UINT64)(ULONG_PTR)c->cpu != c->gpu)
+    {
+        if (!InterlockedExchange(&reported, 1))
+            rebox_log("d3d12_xs: GPU memory is NOT identity-mapped (CPU %p, GPU VA %#llx): titles that use "
+                         "GPU VAs as pointers will fault. Use .#radv-rebox and VK_LAYER_REBOX_gpuva_identity.",
+                         c->cpu, (unsigned long long)c->gpu);
+    }
+    else if (!InterlockedExchange(&reported, 1))
+        rebox_log("d3d12_xs: GPU memory is identity-mapped (first chunk at %p)", c->cpu);
+    return c;
+
+fail:
+    if (c->buffer)
+        ID3D12Resource_Release(c->buffer);
+    if (c->heap)
+        ID3D12Heap_Release(c->heap);
+    free(c);
+    return NULL;
+}
+
+static void chunk_destroy(struct chunk *c)
+{
+    ID3D12Resource_Unmap(c->buffer, 0, NULL);
+    ID3D12Resource_Release(c->buffer);
+    ID3D12Heap_Release(c->heap);
+    free(c->free);
+    free(c);
+}
+
+/* ---------------------------------------------------------------- API */
+
+HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *gpu)
+{
+    ID3D12Device *device = rebox_shared_device();
+    struct allocation *a;
+    struct chunk *c;
+    UINT64 offset = 0;
+
+    if (!cpu)
+        return E_INVALIDARG;
+    *cpu = NULL;
+    if (!device)
+        return E_FAIL;
+    if (!size)
+        size = 1;
+    if (alignment < 256)
+        alignment = 256; /* D3D12 constant-buffer alignment; cheap to always give */
+    if (alignment & (alignment - 1))
+        return E_INVALIDARG;
+
+    AcquireSRWLockExclusive(&lock);
+    if (size > DEDICATED_THRESHOLD || alignment > HEAP_ALIGN)
+    {
+        UINT64 chunk_size = (size + alignment + HEAP_ALIGN - 1) & ~(UINT64)(HEAP_ALIGN - 1);
+        if ((c = chunk_create(device, chunk_size, TRUE)) && range_alloc(c, size, alignment, &offset))
+        {
+            c->next = chunks;
+            chunks = c;
+        }
+        else if (c)
+        {
+            chunk_destroy(c);
+            c = NULL;
+        }
+    }
+    else
+    {
+        for (c = chunks; c; c = c->next)
+            if (!c->dedicated && range_alloc(c, size, alignment, &offset))
+                break;
+        if (!c && (c = chunk_create(device, CHUNK_SIZE, FALSE)))
+        {
+            range_alloc(c, size, alignment, &offset);
+            c->next = chunks;
+            chunks = c;
+        }
+    }
+    if (!c)
+    {
+        ReleaseSRWLockExclusive(&lock);
+        return E_OUTOFMEMORY;
+    }
+    a = calloc(1, sizeof(*a));
+    a->cpu = c->cpu + offset;
+    a->chunk = c;
+    a->offset = offset;
+    a->size = size;
+    a->next = table[bucket(a->cpu)];
+    table[bucket(a->cpu)] = a;
+    c->used += size;
+    bytes_in_use += size;
+    ReleaseSRWLockExclusive(&lock);
+
+    *cpu = a->cpu;
+    if (gpu)
+        *gpu = c->gpu + offset;
+    return S_OK;
+}
+
+void WINAPI ReboxGpuFree(void *cpu)
+{
+    struct allocation **p, *a;
+    struct chunk *c, **cp;
+
+    if (!cpu)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    for (p = &table[bucket(cpu)]; *p && (*p)->cpu != cpu; p = &(*p)->next)
+        ;
+    if (!(a = *p))
+    {
+        ReleaseSRWLockExclusive(&lock);
+        rebox_log("d3d12_xs: ReboxGpuFree(%p): not a GPU allocation", cpu);
+        return;
+    }
+    *p = a->next;
+    c = a->chunk;
+    range_free(c, a->offset, a->size);
+    c->used -= a->size;
+    bytes_in_use -= a->size;
+    free(a);
+    if (c->dedicated && !c->used)
+    {
+        for (cp = &chunks; *cp != c; cp = &(*cp)->next)
+            ;
+        *cp = c->next;
+        chunk_destroy(c);
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size)
+{
+    const BYTE *p = address;
+    struct chunk *c;
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (c = chunks; c; c = c->next)
+        if (p >= c->cpu && p < c->cpu + c->size)
+        {
+            if (base)
+                *base = c->cpu;
+            if (size)
+                *size = c->size;
+            found = TRUE;
+            break;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+UINT64 WINAPI ReboxGpuBytesInUse(void)
+{
+    UINT64 n;
+
+    AcquireSRWLockShared(&lock);
+    n = bytes_in_use;
+    ReleaseSRWLockShared(&lock);
+    return n;
+}

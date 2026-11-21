@@ -1,0 +1,9 @@
+LIBRARY xmem.dll
+EXPORTS
+    XMemAlloc
+    XMemFree
+    XMemAllocDefault
+    XMemFreeDefault
+    XMemSetAllocationHooks
+    XMemVirtualQuery
+    XMemGetWorkingSetStatistics

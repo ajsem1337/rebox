@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Report which imports of a dumped console title are unresolved under Wine,
+and optionally generate logging stubs for the shim DLLs.
+
+    scan_imports.py GAME_DIR --provider DIR [--provider DIR ...]
+                    [--shims SHIM_SRC_DIR --gen-stubs OUT_DIR]
+
+Providers are directories of PE DLLs that will be loadable at runtime: Wine's
+lib/wine/x86_64-windows, vkd3d-proton's x64 dir, the built shims. DLLs in
+GAME_DIR itself count as providers too.
+
+api-ms-win-*/ext-ms-* imports are resolved against the union of Wine's core
+DLLs, which is roughly what Wine's apiset schema forwards to.
+"""
+
+import argparse
+import collections
+import pathlib
+import re
+import sys
+
+import pefile
+
+APISET_HOSTS = [
+    "ntdll", "kernelbase", "kernel32", "ucrtbase", "msvcrt", "combase", "ole32",
+    "oleaut32", "advapi32", "sechost", "user32", "gdi32", "shcore", "ws2_32",
+    "bcrypt", "crypt32", "shell32", "shlwapi", "rpcrt4", "winhttp", "iphlpapi",
+    "powrprof", "version", "dbghelp", "mswsock", "cfgmgr32", "setupapi", "xinput1_4",
+    "windows.storage", "twinapi.appcore", "wintypes",
+]
+
+
+def pe_exports(path):
+    try:
+        pe = pefile.PE(str(path), fast_load=True)
+        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+    except pefile.PEFormatError:
+        return None
+    names, ordinals = set(), set()
+    for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []):
+        if sym.name:
+            names.add(sym.name.decode())
+        ordinals.add(sym.ordinal)
+    return names, ordinals
+
+
+def pe_imports(path):
+    pe = pefile.PE(str(path), fast_load=True)
+    pe.parse_data_directories(directories=[
+        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
+    ])
+    out = collections.defaultdict(set)
+    for attr in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT"):
+        for entry in getattr(pe, attr, []):
+            dll = entry.dll.decode().lower()
+            for imp in entry.imports:
+                out[dll].add(imp.name.decode() if imp.name else imp.ordinal)
+    return out
+
+
+def load_providers(dirs):
+    providers = {}
+    for d in dirs:
+        for p in sorted(pathlib.Path(d).glob("*.dll")):
+            key = p.name.lower()
+            if key in providers:
+                continue  # earlier providers win, like a search path
+            exp = pe_exports(p)
+            if exp:
+                providers[key] = (exp, str(p))
+    return providers
+
+
+def def_names(path):
+    """Export names already declared in a hand-written .def file."""
+    names = set()
+    in_exports = False
+    for line in pathlib.Path(path).read_text().splitlines():
+        line = line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.upper() == "EXPORTS":
+            in_exports = True
+            continue
+        if in_exports:
+            names.add(re.split(r"[\s=@]", line, maxsplit=1)[0].strip('"'))
+    return names
+
+
+def is_apiset(dll):
+    return dll.startswith(("api-ms-win-", "ext-ms-"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("game_dir")
+    ap.add_argument("--provider", action="append", default=[])
+    ap.add_argument("--shims", help="shim source dir (shims/), enables stub generation targets")
+    ap.add_argument("--gen-stubs", metavar="OUT_DIR")
+    ap.add_argument("--all", action="store_true", help="list every imported DLL, not just problems")
+    args = ap.parse_args()
+
+    game = pathlib.Path(args.game_dir)
+    targets = sorted(p for p in game.iterdir() if p.suffix.lower() in (".exe", ".dll"))
+    if not any(p.suffix.lower() == ".exe" for p in targets):
+        print(f"note: no .exe in {game}; scanning the DLLs only", file=sys.stderr)
+
+    providers = load_providers(args.provider + [str(game)])
+    apiset_names = set()
+    for host in APISET_HOSTS:
+        if host + ".dll" in providers:
+            apiset_names |= providers[host + ".dll"][0][0]
+
+    shim_names = set()
+    if args.shims:
+        shim_names = {p.name for p in pathlib.Path(args.shims).iterdir() if (p / f"{p.name}.def").exists()}
+
+    # dll -> symbol -> set of importing modules
+    wanted = collections.defaultdict(lambda: collections.defaultdict(set))
+    for t in targets:
+        for dll, syms in pe_imports(t).items():
+            for s in syms:
+                wanted[dll][s].add(t.name)
+
+    problems = 0
+    stubs = collections.defaultdict(set)
+    for dll in sorted(wanted):
+        syms = wanted[dll]
+        base = dll[:-4] if dll.endswith(".dll") else dll
+        if is_apiset(dll):
+            missing = {s for s in syms if not isinstance(s, str) or s not in apiset_names}
+            where = "apiset"
+        elif dll in providers:
+            (names, ordinals), where = providers[dll]
+            missing = {s for s in syms if (s not in names if isinstance(s, str) else s not in ordinals)}
+        else:
+            missing, where = set(syms), None
+
+        if base in shim_names:
+            stubs[base] |= missing
+        status = "MISSING DLL" if where is None else ("ok" if not missing else f"{len(missing)} missing")
+        if where is None or missing or args.all:
+            if where is None or missing:
+                problems += 1
+            users = sorted({u for s in syms for u in syms[s]})
+            print(f"{dll:55} {len(syms):4} imported  {status:12} {where or ''}")
+            print(f"    used by: {', '.join(users)}")
+            for s in sorted(missing, key=str)[:60]:
+                print(f"    - {s if isinstance(s, str) else '#%d' % s}")
+            if len(missing) > 60:
+                print(f"    ... {len(missing) - 60} more")
+
+    if args.gen_stubs:
+        out = pathlib.Path(args.gen_stubs)
+        out.mkdir(parents=True, exist_ok=True)
+        for base in sorted(shim_names):
+            handwritten = def_names(pathlib.Path(args.shims) / base / f"{base}.def")
+            syms = sorted((s for s in stubs.get(base, ()) if s not in handwritten), key=str)
+            c = [f"/* Generated by tools/scan_imports.py; do not edit. */",
+                 '#include "../shims/common/rebox_log.h"', ""]
+            d = []
+            for i, s in enumerate(syms):
+                ident = f"{base}_{i:04d}"
+                label = s if isinstance(s, str) else f"#{s}"
+                c.append(f"REBOX_STUB({base}, {ident}, \"{label}\")")
+                if isinstance(s, str):
+                    d.append(f'    "{s}" = stub_{ident}')
+                else:
+                    d.append(f"    ord{s} = stub_{ident} @{s} NONAME")
+            (out / f"{base}_stubs.c").write_text("\n".join(c) + "\n")
+            (out / f"{base}_stubs.def").write_text("\n".join(d) + "\n")
+            print(f"generated {len(syms)} stubs for {base}.dll", file=sys.stderr)
+
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
