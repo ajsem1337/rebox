@@ -178,3 +178,20 @@ Leonida adds it to every address, absolute buffer addresses included. Proposed f
 RADV patch so 32-bit allocations come from the kernel's low 32-bit VA range (no
 `AMDGPU_VA_RANGE_HIGH`) with `address32_hi = 0`. Heaps then sit below 4 GiB and `heap_base`
 stays 0.
+
+### Packing translated shaders (`tools/scsv_pack.py`)
+
+`scsv_pack.py --dxbc CARVE_DIR --spirv TRANSLATED_DIR --out CACHE [--stage cs] [--validate]`
+retargets the translator's SPIR-V to this contract and writes `<fnv1a64 of the DXBC>.scsv`,
+which `d3d12_xs` looks up before `.dxil`:
+
+- set 0 binding 1 (samplers) stays (sampler heap); every other set 0 binding except 2 becomes
+  binding 0 (CBV/SRV/UAV heap, aliased); vkd3d-proton 0004 maps both to its real sets;
+- binding 2, the hash table, becomes a pointer built from two new push-constant members at bytes
+  144/148 (the resource heap's lookup table), so its loads are PhysicalStorageBuffer loads;
+- wave size 64 only where the translator says wave64 is not emulated.
+
+All 2,689 compute shaders pack and pass `spirv-val`. `tests/run-pso-check.sh CACHE` (through
+`smoke.exe --pso-check`) creates a compute PSO from each with an empty root signature: on
+lavapipe 147 of the first 200 succeed, and the other 53 need 64-wide subgroups (lavapipe has 8).
+`tests/manual-test.sh` runs it on the 890M when `build/console-shaders/` exists (local only).

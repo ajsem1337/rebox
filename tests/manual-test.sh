@@ -35,5 +35,14 @@ sed -n '/Wine smoke test through the layer/,$p' "$log" \
     | grep -E 'gpuva\]|identity-mapped|heap GPU start|descriptor table set|real GPU addresses|console shader|console SGPR|console VS/PS|descriptor lookup|lookup finds|s0:s1|s2-s5|s6:s7|PresentX|presented frame|XMA2|XAudio2|xaudio2_9|FFX|ffx stub|upscale|R11G11B10|mesh|^== |^(FAIL|PASSED|FAILED)' | uniq
 echo "run-smoke.sh exit status: $smoke_status"
 
+# Translated game shaders (tools/scsv_pack.py output, local only): can the
+# driver create compute pipelines from them?
+if [ -d build/console-shaders ]; then
+    section "compute PSOs from translated game shaders"
+    nixx develop -c tests/run-pso-check.sh build/console-shaders >> "$log" 2>&1 || true
+    sed -n '/compute PSOs from translated game shaders/,$p' "$log" | grep -E 'pso-check|:err:' \
+        | sed -E 's/^[0-9.]+:[0-9a-f]+:[0-9a-f]+://; s/0x[0-9a-f]+/X/g' | sort | uniq -c | sort -rn | head -12
+fi
+
 echo
 echo "Full output: $log"

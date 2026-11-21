@@ -1736,8 +1736,80 @@ static void test_xaudio2(void)
     IXAudio2_Release(xa);
 }
 
+/* smoke.exe --pso-check DIR: create a compute PSO from every compute .scsv
+ * in DIR (translated game shaders from tools/scsv_pack.py; never part of the
+ * repo) through the d3d12_xs device, with an empty root signature: console
+ * shaders use only the push block and the bindless heaps. Reports how many
+ * vkd3d-proton and the driver accept. */
+static int pso_check(const char *dir)
+{
+    HMODULE m = LoadLibraryA("d3d12_xs.dll");
+    xbox_create_fn create = m ? (xbox_create_fn)(void *)GetProcAddress(m, "D3D12XboxCreateDevice") : NULL;
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = m ? (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature") : NULL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 0 };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    char pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    void *dev = NULL, *rs = NULL;
+    ID3D10Blob *blob = NULL;
+    int ok = 0, failed = 0, other = 0;
+    HANDLE find;
+    HRESULT hr;
+
+    if (!create || FAILED(create(NULL, NULL, &IID_ID3D12Device, &dev))
+            || FAILED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL))
+            || FAILED(XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs)))
+    {
+        printf("FAIL pso-check: no device or root signature\n");
+        return 1;
+    }
+    cd.pRootSignature = rs;
+    snprintf(pattern, sizeof(pattern), "%s\\*.scsv", dir);
+    if ((find = FindFirstFileA(pattern, &fd)) == INVALID_HANDLE_VALUE)
+    {
+        printf("FAIL pso-check: no .scsv files in %s\n", dir);
+        return 1;
+    }
+    do
+    {
+        SIZE_T size;
+        BYTE *data;
+        void *pso = NULL;
+
+        snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+        if (!(data = read_file(path, &size)))
+            continue;
+        if (size < 44 || *(UINT *)(data + 8) != 0x20 /* compute */)
+        {
+            other++;
+            free(data);
+            continue;
+        }
+        cd.CS.pShaderBytecode = data;
+        cd.CS.BytecodeLength = size;
+        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12PipelineState, &pso);
+        if (SUCCEEDED(hr))
+        {
+            ok++;
+            XSLOT(pso, 2, ULONG)(pso);
+        }
+        else if (failed++ < 10)
+            printf("info pso-check: %s failed %#lx\n", fd.cFileName, hr);
+        free(data);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    printf("%s pso-check: %d of %d compute PSOs created from translated shaders (%d other stages skipped)\n",
+           failed ? "FAIL" : "ok  ", ok, ok + failed, other);
+    return failed != 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "--pso-check"))
+        return pso_check(argv[2]);
     test_xmem();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));

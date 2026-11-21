@@ -186,8 +186,15 @@ enum shader_lookup shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D1
         if (!(e = find(hash)) && (e = calloc(1, sizeof(*e))))
         {
             e->hash = hash;
-            snprintf(path, sizeof(path), "%s\\%016llx.dxil", cache_dir, (unsigned long long)hash);
+            /* A translated console shader for the patched vkd3d-proton
+             * (tools/scsv_pack.py, docs/shaders.md), else a PC-format one. */
+            snprintf(path, sizeof(path), "%s\\%016llx.scsv", cache_dir, (unsigned long long)hash);
             if (!(e->data = read_file(path, &e->size)))
+            {
+                snprintf(path, sizeof(path), "%s\\%016llx.dxil", cache_dir, (unsigned long long)hash);
+                e->data = read_file(path, &e->size);
+            }
+            if (!e->data)
             {
                 InterlockedIncrement(&misses);
                 rebox_log("d3d12_xs: no translation for %s shader %016llx (%zu bytes)",
