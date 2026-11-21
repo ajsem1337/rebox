@@ -18,6 +18,7 @@ shims/xmem/               xmem.dll: XMemAlloc/Free(+Default), allocation hooks, 
                           GPU-visible memory types come from d3d12_xs
 shims/d3d12_xs/           d3d12_xs.dll: Xbox device/queue/command-list/descriptor-heap proxies (proxy.c),
                           GPU memory (gpu_memory.c), shader substitution, forwards to vkd3d-proton
+shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA2 voices played as silence
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
 patches/                  Mesa patch letting RADV place memory at lower-half device addresses
@@ -132,10 +133,13 @@ down missing translations.
   `.#radv-rebox`, which together make those heaps identity-mapped. Without them,
   `d3d12_xs` logs that GPU memory is not identity-mapped. Resources the title creates itself in
   default heaps still get ordinary (non-identity) GPU addresses.
-- **Audio: XMA2 doesn't play.** Under WineGDK, FAudio sends XMA2 to Wine's WMA decoder, which
-  accepts only WMA formats, so creating an XMA2 source voice fails, with or without GStreamer.
-  Planned mitigation: an `xaudio2_9.dll` wrapper that turns XMA2 voices into silent PCM voices with
-  the same timing. Bink's audio is decoded to PCM by Bink and is unaffected.
+- **Audio: XMA2 is silent.** Under WineGDK, FAudio sends XMA2 to Wine's WMA decoder, which
+  accepts only WMA formats, so creating an XMA2 source voice fails. `shims/xaudio2_9` wraps Wine's
+  `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM voices fed silence of about the
+  buffer's length, so voice creation, `OnBufferEnd` and `GetState` work. Decoding XMA2 for real
+  (e.g. FFmpeg's `xma2` decoder) is still to do. Bink's audio is decoded to PCM by Bink and is
+  unaffected. Wine also reports a mastering voice as created when there's no audio device, after
+  which FAudio crashes on the first source voice; that only matters on machines without audio.
 - **Textures written through their GPU VA** get scratch memory (see docs/d3d12x.md): no crash,
   but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root

@@ -41,8 +41,8 @@ export WINEPREFIX="$work/prefix" WINEARCH=win64 WINEDEBUG=${WINEDEBUG:--all}
 "$WINE" wineboot -i >/dev/null 2>&1
 sys32="$WINEPREFIX/drive_c/windows/system32"
 install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
-install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$sys32"/
-export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n"
+install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REBOX_SHIMS_DIR"/xaudio2_9.dll "$sys32"/
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9=n"
 export REBOX_SHADER_CACHE="Z:${work//\//\\}\\cache"
 # PresentX frame dumps, checked by the smoke test.
 mkdir -p "$work/frames"

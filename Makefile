@@ -9,7 +9,7 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -Wall -Wno-unused-function -std=gnu11 -D__USE_MINGW_ANSI_STDIO=1
 LDFLAGS += -shared -static-libgcc -Wl,--enable-stdcall-fixup
 
-SHIMS   := xmem d3d12_xs
+SHIMS   := xmem d3d12_xs xaudio2_9
 COMMON  := shims/common/rebox_log.c
 
 all: $(SHIMS:%=$(BUILD)/%.dll)

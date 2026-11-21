@@ -59,7 +59,7 @@ fi
 # Copy rather than symlink so the prefix survives nix garbage collection.
 sys32="$WINEPREFIX/drive_c/windows/system32"
 install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
-install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$sys32"/
+install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REBOX_SHIMS_DIR"/xaudio2_9.dll "$sys32"/
 
 # Mount the package as G: too, for titles that assume a package drive.
 ln -sfn "$game_dir" "$WINEPREFIX/dosdevices/g:"
@@ -76,7 +76,7 @@ if [[ ${REBOX_DUMP_FRAMES:-} == /* ]]; then
     export REBOX_DUMP_FRAMES="Z:${REBOX_DUMP_FRAMES//\//\\}"
 fi
 
-export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;xmem,d3d12_xs=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;xmem,d3d12_xs,xaudio2_9=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 
 # Unified memory (docs/d3d12x.md): GPU VA == CPU address needs the identity
 # layer and, on AMD, a RADV that accepts lower-half device addresses. The

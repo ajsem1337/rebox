@@ -10,6 +10,8 @@
 #include <initguid.h>
 #include <windows.h>
 #include <d3d12.h>
+#include <xaudio2.h>
+#include <mmdeviceapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -651,12 +653,109 @@ static void test_xbox(void)
     ID3D12CommandAllocator_Release(alloc);
 }
 
+/* XAudio2 via the xaudio2_9.dll shim: XMA2 voices must be creatable (plain
+ * Wine fails them) and play out as silence with callbacks on time. */
+#pragma pack(push, 1)
+typedef struct
+{
+    WAVEFORMATEX wfx;
+    WORD NumStreams;
+    DWORD ChannelMask, SamplesEncoded, BytesPerBlock, PlayBegin, PlayLength, LoopBegin, LoopLength;
+    BYTE LoopCount, EncoderVersion;
+    WORD BlockCount;
+} xma2_format;
+#pragma pack(pop)
+
+static LONG xma_buffers_ended;
+
+static void STDMETHODCALLTYPE cb_pass_start(IXAudio2VoiceCallback *cb, UINT32 bytes) {}
+static void STDMETHODCALLTYPE cb_void(IXAudio2VoiceCallback *cb) {}
+static void STDMETHODCALLTYPE cb_ctx(IXAudio2VoiceCallback *cb, void *ctx) {}
+static void STDMETHODCALLTYPE cb_buffer_end(IXAudio2VoiceCallback *cb, void *ctx)
+{
+    if (ctx == (void *)0x1234)
+        InterlockedIncrement(&xma_buffers_ended);
+}
+static void STDMETHODCALLTYPE cb_error(IXAudio2VoiceCallback *cb, void *ctx, HRESULT hr) {}
+
+static IXAudio2VoiceCallbackVtbl cb_vtbl = { cb_pass_start, cb_void, cb_void, cb_ctx, cb_buffer_end, cb_ctx, cb_error };
+static IXAudio2VoiceCallback voice_cb = { &cb_vtbl };
+
+/* Wine's CreateMasteringVoice reports success even without an audio device,
+ * so ask mmdevapi whether there is a render endpoint. */
+static BOOL have_audio_device(void)
+{
+    HMODULE ole32 = LoadLibraryA("ole32.dll");
+    HRESULT (WINAPI *co_init)(void *, DWORD) = (void *)GetProcAddress(ole32, "CoInitializeEx");
+    HRESULT (WINAPI *co_create)(REFCLSID, IUnknown *, DWORD, REFIID, void **) =
+            (void *)GetProcAddress(ole32, "CoCreateInstance");
+    IMMDeviceEnumerator *e = NULL;
+    IMMDevice *dev = NULL;
+    BOOL ok = FALSE;
+
+    co_init(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(co_create(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator,
+                            (void **)&e)))
+    {
+        ok = SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(e, eRender, eConsole, &dev));
+        if (dev) IMMDevice_Release(dev);
+        IMMDeviceEnumerator_Release(e);
+    }
+    return ok;
+}
+
+static void test_xaudio2(void)
+{
+    HMODULE m = LoadLibraryA("xaudio2_9.dll");
+    HRESULT (WINAPI *create)(IXAudio2 **, UINT32, UINT32) = m ? (void *)GetProcAddress(m, MAKEINTRESOURCEA(1)) : NULL;
+    xma2_format fmt = { { 0x166, 2, 48000, 48000 * 4, 2048, 16, sizeof(xma2_format) - sizeof(WAVEFORMATEX) },
+                        1, 3, 48000, 65536, 0, 0, 0, 0, 0, 2, 1 };
+    static BYTE xma_data[2048];
+    XAUDIO2_BUFFER buf = { XAUDIO2_END_OF_STREAM, sizeof(xma_data), xma_data, 0, 4800, 0, 0, 0, (void *)0x1234 };
+    IXAudio2MasteringVoice *master = NULL;
+    IXAudio2SourceVoice *voice = NULL;
+    IXAudio2 *xa = NULL;
+    HRESULT hr;
+
+    CHECK(create != NULL, "xaudio2_9 exports XAudio2Create at ordinal 1");
+    if (!create) return;
+    hr = create(&xa, 0, 0);
+    CHECK(SUCCEEDED(hr) && xa, "XAudio2Create (%#lx)", hr);
+    if (FAILED(hr)) return;
+
+    if (!have_audio_device() || FAILED(hr = IXAudio2_CreateMasteringVoice(xa, &master, 0, 0, 0, NULL, NULL,
+                                                                           AudioCategory_GameEffects)))
+    {
+        /* No audio device (sandbox): FAudio can't create any source voice
+         * then (it reads the missing mastering voice), so the XMA2 path is
+         * only checked on machines with audio (tests/manual-test.sh). */
+        printf("skip XMA2 voice checks: no audio device (%#lx)\n", hr);
+        IXAudio2_Release(xa);
+        return;
+    }
+    hr = IXAudio2_CreateSourceVoice(xa, &voice, &fmt.wfx, 0, 2.0f, &voice_cb, NULL, NULL);
+    CHECK(SUCCEEDED(hr) && voice, "XMA2 source voice (%#lx)", hr);
+    if (voice)
+    {
+        hr = IXAudio2SourceVoice_SubmitSourceBuffer(voice, &buf, NULL);
+        CHECK(SUCCEEDED(hr), "XMA2 buffer submitted (%#lx)", hr);
+        IXAudio2SourceVoice_Start(voice, 0, 0);
+        for (int i = 0; i < 300 && !xma_buffers_ended; i++)
+            Sleep(10);
+        CHECK(xma_buffers_ended == 1, "XMA2 buffer played out as silence: OnBufferEnd with its context");
+        IXAudio2SourceVoice_DestroyVoice(voice);
+    }
+    IXAudio2MasteringVoice_DestroyVoice(master);
+    IXAudio2_Release(xa);
+}
+
 int main(int argc, char **argv)
 {
     test_xmem();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();
+    test_xaudio2();
     printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures != 0;
 }
