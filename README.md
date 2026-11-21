@@ -179,8 +179,8 @@ down missing translations.
   because its size is unknown.
 - **XALLOC_ATTRIBUTES** decoding follows [SlimEra](https://github.com/XWine1/SlimEra)'s Xbox One
   ERA definition (alignment 2^n, at least 16 bytes), which matches the 32-byte alignment Bink relies
-  on. Scarlett's header hasn't been seen, so page sizes and the meaning of graphics memory types
-  beyond "GPU-visible" are unconfirmed. `XMemAlloc` memory is always zeroed, including blocks
+  on. Allocations with 64 KiB or 4 MiB pages start on that boundary. Scarlett's header hasn't been
+  seen, so the meaning of graphics memory types beyond "GPU-visible" is unconfirmed. `XMemAlloc` memory is always zeroed, including blocks
   reused from freed ones.
 - **WineGDK was archived 2026-11-13.** Its successors are
   [xodus-gaming/wine](https://github.com/xodus-gaming/wine) and

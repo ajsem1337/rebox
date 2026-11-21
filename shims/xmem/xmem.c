@@ -45,6 +45,38 @@ static SIZE_T attr_alignment(XALLOC_ATTRIBUTES attr)
     return (SIZE_T)1 << shift;
 }
 
+/* XALLOC_PAGESIZE_4KB, _64KB, _4MB (SlimEra). Allocations made of larger
+ * pages start on a page boundary, as on the console; D3D12 placement of
+ * resources at such addresses relies on 64 KiB alignment. */
+static SIZE_T attr_page_bytes(XALLOC_ATTRIBUTES attr)
+{
+    switch (attr.s.page_size)
+    {
+    case 1: return 64 << 10;
+    case 2: return 4 << 20;
+    default: return 4096;
+    }
+}
+
+/* VirtualAlloc only guarantees 64 KiB: reserve extra, then re-reserve the
+ * aligned part (another thread can take it in between, so retry). */
+static void *virtual_alloc_aligned(SIZE_T size, SIZE_T alignment)
+{
+    if (alignment <= (64 << 10))
+        return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    for (int i = 0; i < 8; i++)
+    {
+        BYTE *probe = VirtualAlloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS), *p;
+        if (!probe)
+            return NULL;
+        p = (BYTE *)(((ULONG_PTR)probe + alignment - 1) & ~(ULONG_PTR)(alignment - 1));
+        VirtualFree(probe, 0, MEM_RELEASE);
+        if ((p = VirtualAlloc(p, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+            return p;
+    }
+    return NULL;
+}
+
 static BOOL wants_pages(XALLOC_ATTRIBUTES attr)
 {
     /* Non-4K page sizes and very large alignments get their own VirtualAlloc
@@ -174,14 +206,22 @@ void *WINAPI XMemAllocDefault(SIZE_T size, ULONGLONG attributes)
     log_memtype(attr);
     if (attr.s.memory_type)
     {
-        /* At least VirtualAlloc's granularity for larger blocks, as before. */
+        /* At least the page size, and VirtualAlloc's granularity for larger
+         * blocks, as before. */
         SIZE_T alignment = attr_alignment(attr), floor = size >= (64 << 10) ? (64 << 10) : 4096;
-        void *p = alloc_gpu(size, alignment < floor ? floor : alignment);
+        void *p;
+
+        if (floor < attr_page_bytes(attr))
+            floor = attr_page_bytes(attr);
+        p = alloc_gpu(size, alignment < floor ? floor : alignment);
         if (p)
             return p;
     }
     if (wants_pages(attr))
-        return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    {
+        SIZE_T alignment = attr_alignment(attr);
+        return virtual_alloc_aligned(size, alignment > attr_page_bytes(attr) ? alignment : attr_page_bytes(attr));
+    }
     /* Zeroed like the console's: pages are, and SlimEra and Xbox2Windows'
      * stand-ins zero heap blocks too, so titles may rely on it. */
     {

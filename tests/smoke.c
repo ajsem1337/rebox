@@ -115,15 +115,16 @@ static void test_xmem(void)
 
     /* The AMD upscaler rounds sizes up to 256 and passes 0xa8004000 (its on-disk default),
      * then copies shader bytes in and hands the pointer to a compute PSO, so the GPU reads
-     * it. Here: alignment 8 (256 bytes, matching its rounding), page_size 1, memory_type 5, so GPU-visible
-     * memory, which XMemVirtualQuery must report as GPU-accessible. */
+     * it. Here: alignment 8 (256 bytes, matching its rounding), page_size 1 (64 KiB pages, so a
+     * 64 KiB boundary, as Xbox2Windows' xmem.dll gives), memory_type 5, so GPU-visible memory,
+     * which XMemVirtualQuery must report as GPU-accessible. */
     {
         const ULONGLONG amd = 0xa8004000;
         vquery_fn vquery = (vquery_fn)(void *)GetProcAddress(m, "XMemVirtualQuery");
         BYTE *p = xalloc(0x1100, amd);
         xmem_info info;
 
-        CHECK(p && !((ULONG_PTR)p & 255), "XMemAlloc AMD attributes %#llx -> %p", amd, p);
+        CHECK(p && !((ULONG_PTR)p & 0xffff), "XMemAlloc AMD attributes %#llx -> %p", amd, p);
         if (p)
         {
             memset(p, 0xa5, 0x1100);
@@ -133,6 +134,18 @@ static void test_xmem(void)
                   "AMD allocation is committed and GPU-accessible (state %#lx gpu_access %#lx)",
                   info.mbi.State, info.gpu_access);
             xfree(p, amd);
+        }
+    }
+
+    /* 4 MiB pages (page_size 2) start on a 4 MiB boundary, GPU-visible
+     * (memory_type 1) and CPU heap pages alike. */
+    {
+        static const ULONGLONG words[] = { (1ull << 29) | (2ull << 14), 2ull << 14 };
+        for (int k = 0; k < 2; k++)
+        {
+            BYTE *p = xalloc(100 << 10, words[k]);
+            CHECK(p && !((ULONG_PTR)p & ((4 << 20) - 1)), "XMemAlloc 4 MiB pages %#llx -> %p", words[k], p);
+            if (p) { p[0] = p[(100 << 10) - 1] = 1; xfree(p, words[k]); }
         }
     }
 
