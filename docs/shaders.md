@@ -1,5 +1,9 @@
 # Console shaders: design
 
+> **Superseded translator choice.** The project uses AnyPS5 for shader compilation; see
+> [anyps5.md](anyps5.md). The vkd3d-proton patches below (real heap addresses, SGPR packing,
+> lookup table) carry over; the Leonida contract, `SCSV` packing and `translate-shaders.sh` do not.
+
 Status: design, nothing below is implemented yet. Written 2026-11-21 after reading the two projects
 that translate the target title's own shaders, [Leonida](https://github.com/ItsNotRexed/Leonida) (GPLv3) and
 [americas-recomp](https://github.com/realdody/americas-recomp/tree/xbox-series) (GPLv2, an AnyPS5

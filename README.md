@@ -58,8 +58,8 @@ Once the exe is dumped:
    provides, that DLL gets a stub too, and the report names the forwarder (`via dll.symbol`).
    Import and export tables are read directly, so names pefile would drop (characters
    outside `._?@$()<>`) still count. `tests/run-stubgen.sh` checks all of this end to end.
-3. **Shaders: translate, but not usable yet.** `tools/translate-shaders.sh` turns `the shader archive` into
-   `build/console-shaders` (rerun it when the translator gets fixes). Console shaders translate to SPIR-V that expects console-style
+3. **Shaders: not usable yet.** The plan is AnyPS5, compiling at first use inside the runner
+   ([docs/anyps5.md](docs/anyps5.md)). Console shaders translate to SPIR-V that expects console-style
    resources, which vkd3d-proton can't take. [docs/shaders.md](docs/shaders.md) has the design
    (patched vkd3d-proton, Leonida's runtime contract). Until then every console shader gets a
    fallback, so the title runs with effects missing. `anyps5-cache link` still links PC-format
