@@ -205,5 +205,10 @@ if [[ ${REBOX_BCPACK:-1} != 0 && -n ${REBOX_BCPACK_SCRIPT:-} && -n ${LEONIDA_SRC
     fi
 fi
 
+# Everything the title's process prints (shim logs, crash reports, Wine's errors) is also kept in
+# the prefix: last-run.log, and the run before it in last-run.log.1.
+run_log="$WINEPREFIX/last-run.log"
+[[ -f $run_log ]] && mv -f "$run_log" "$run_log.1"
+echo "rebox-run: logging to $run_log" >&2
 cd "$shadow"
-exec "$WINE" "$shadow/$exe" "$@"
+exec "$WINE" "$shadow/$exe" "$@" 2> >(tee "$run_log" >&2)

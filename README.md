@@ -78,6 +78,11 @@ Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launc
    missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
    ([docs/d3d12x.md](docs/d3d12x.md)).
 
+The prefix keeps what a run leaves behind: `imports.txt` (the scan), `last-run.log` (everything
+the title's process printed: shim logs, crash reports with module+RVA, Wine's errors; the run
+before is `last-run.log.1`), `xgameruntime.log` and `bcpack-helper.log`. Those four files are
+what to look at, or send, after a run.
+
 Then iterate: `REBOX_LOG=/path` keeps the shim log, `REBOX_STUB_FATAL=1` stops at the first
 unimplemented stub the title reaches, and `xgameruntime.log` lists any Gaming Runtime interface or
 method the title asked for that isn't implemented.
