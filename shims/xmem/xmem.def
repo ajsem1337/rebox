@@ -7,3 +7,12 @@ EXPORTS
     XMemSetAllocationHooks
     XMemVirtualQuery
     XMemGetWorkingSetStatistics
+    XMemVirtualAlloc
+    XMemVirtualFree
+    XMemAllocatePhysicalPages
+    XMemFreePhysicalPages
+    XMemMapPhysicalPages
+    XMemTransferMemory
+    XMemMakeTag
+    XMemIsToolsMemAvailable
+    XMemGetAllocationHysteresis

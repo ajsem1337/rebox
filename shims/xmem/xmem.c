@@ -364,3 +364,108 @@ BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
     *(ULONGLONG *)((BYTE *)stats + 8) = pmc.PagefileUsage + (gpu_usage ? gpu_usage() : 0);
     return TRUE;
 }
+
+/* ------------------------------------------------------- virtual memory and physical pages */
+
+#ifndef MEM_4MB_PAGES
+#define MEM_4MB_PAGES 0x80000000
+#endif
+#define CONSOLE_PAGE_FLAGS (MEM_LARGE_PAGES | MEM_4MB_PAGES)
+
+/* VirtualAlloc with the XMem flags inserted before the protection (ScarlettX checked the order
+ * against the console's xmem.dll and a title's calls; XValkyrie agrees). The flags only matter
+ * to the console's allocator. The page-size flags go too: they need a privilege on Windows, and
+ * our Wine patch drops them anyway. */
+void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
+{
+    return VirtualAlloc(address, size, type & ~CONSOLE_PAGE_FLAGS, protect);
+}
+
+BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
+{
+    return VirtualFree(address, size, type);
+}
+
+/* Physical pages. A title allocates page numbers, then maps them into a range it reserved,
+ * and unmaps them (a null page list) to reuse the range. A process here can't own physical
+ * pages, so the page numbers are tokens and mapping commits ordinary memory at the address:
+ * a page can't be mapped at two addresses at once, and its contents don't survive unmapping.
+ * Signatures as XValkyrie and TomBox read them: no process argument, BOOL results. Bit 62 of a
+ * token records a 4 MiB page (MEM_4MB_PAGES); others are 64 KiB (MEM_LARGE_PAGES, the default). */
+#define PAGE_TOKEN_4MB (1ull << 62)
+static LONG64 next_page_token = 0x100000;
+
+static SIZE_T token_page_size(ULONG_PTR token)
+{
+    return token & PAGE_TOKEN_4MB ? 4u << 20 : 64u << 10;
+}
+
+BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_PTR *pages)
+{
+    ULONG_PTR kind = (flags & MEM_4MB_PAGES) ? PAGE_TOKEN_4MB : 0;
+    LONG64 first;
+
+    if (!count || !pages)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    first = InterlockedExchangeAdd64(&next_page_token, *count);
+    for (ULONG_PTR i = 0; i < *count; i++)
+        pages[i] = kind | (ULONG_PTR)(first + i);
+    return TRUE;
+}
+
+BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
+{
+    return TRUE;
+}
+
+BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *pages)
+{
+    static LONG logged;
+    SIZE_T size;
+
+    if (!address || !count)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!pages)
+    {
+        /* Unmapping: the page size isn't passed, so 64 KiB pages are assumed. */
+        VirtualFree(address, count * (64u << 10), MEM_DECOMMIT);
+        return TRUE;
+    }
+    size = count * token_page_size(pages[0]);
+    /* The range is normally reserved already; if not, reserve it too. */
+    if (VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE)
+            || VirtualAlloc(address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+        return TRUE;
+    if (InterlockedIncrement(&logged) <= 8)
+        rebox_log("xmem: XMemMapPhysicalPages(%p, %lu pages of %lu KiB) failed (error %lu)", address,
+                     (unsigned long)count, (unsigned long)(token_page_size(pages[0]) >> 10), GetLastError());
+    return FALSE;
+}
+
+/* Moves memory between the title's and the system's budgets, which aren't kept apart here. */
+BOOL WINAPI XMemTransferMemory(UINT direction, SIZE_T size)
+{
+    return TRUE;
+}
+
+ULONGLONG WINAPI XMemMakeTag(UINT32 tag)
+{
+    return (ULONGLONG)tag << 32;
+}
+
+BOOL WINAPI XMemIsToolsMemAvailable(void)
+{
+    return FALSE;
+}
+
+SIZE_T WINAPI XMemGetAllocationHysteresis(void)
+{
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return (SIZE_T)-1;
+}

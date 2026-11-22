@@ -254,6 +254,43 @@ static void test_xmem(void)
                   "XMemGetWorkingSetStatistics rejects unknown selector");
         }
     }
+
+    /* XMemVirtualAlloc (flags before the protection) and physical pages: allocate tokens, map
+     * them into a reserved range, write through it, unmap. */
+    {
+        typedef void *(WINAPI *valloc_fn)(void *, SIZE_T, DWORD, ULONGLONG, DWORD);
+        typedef BOOL (WINAPI *palloc_fn)(ULONGLONG, ULONG_PTR *, ULONG_PTR *);
+        typedef BOOL (WINAPI *pmap_fn)(void *, ULONG_PTR, ULONG_PTR *);
+        typedef BOOL (WINAPI *pfree_fn)(ULONG_PTR, ULONG_PTR *);
+        valloc_fn valloc = (valloc_fn)(void *)GetProcAddress(m, "XMemVirtualAlloc");
+        palloc_fn palloc = (palloc_fn)(void *)GetProcAddress(m, "XMemAllocatePhysicalPages");
+        pmap_fn pmap = (pmap_fn)(void *)GetProcAddress(m, "XMemMapPhysicalPages");
+        pfree_fn pfree = (pfree_fn)(void *)GetProcAddress(m, "XMemFreePhysicalPages");
+        ULONG_PTR pages[16], count = 16;
+        BYTE *range, *v;
+
+        CHECK(valloc && palloc && pmap && pfree, "xmem virtual and physical page exports present");
+        if (valloc && palloc && pmap && pfree)
+        {
+            v = valloc(NULL, 1 << 20, MEM_RESERVE | MEM_COMMIT | 0x20000000 /* MEM_LARGE_PAGES */,
+                       0x1234567800000000ull, PAGE_READWRITE);
+            CHECK(v != NULL, "XMemVirtualAlloc with large pages and XMem flags -> %p", v);
+            if (v) { v[(1 << 20) - 1] = 1; VirtualFree(v, 0, MEM_RELEASE); }
+            range = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
+            CHECK(palloc(0x20000000, &count, pages) && count == 16 && pages[0] != pages[15],
+                  "XMemAllocatePhysicalPages hands out 16 distinct pages");
+            CHECK(range && pmap(range, 16, pages), "XMemMapPhysicalPages maps them into a reserved range");
+            if (range)
+            {
+                range[0] = 0x5a;
+                range[(16 << 16) - 1] = 0xa5;
+                CHECK(range[0] == 0x5a && range[(16 << 16) - 1] == 0xa5, "mapped physical pages are writable");
+                CHECK(pmap(range, 16, NULL), "XMemMapPhysicalPages with no pages unmaps");
+                VirtualFree(range, 0, MEM_RELEASE);
+            }
+            CHECK(pfree(16, pages), "XMemFreePhysicalPages");
+        }
+    }
 }
 
 static BYTE *read_file(const char *path, SIZE_T *size)
