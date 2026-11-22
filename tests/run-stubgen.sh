@@ -138,3 +138,37 @@ if "$WINE" "$work/game/fixup.exe"; then
 else
     fail "xmem's import fixup"
 fi
+
+# The same for a DLL loaded later with LoadLibrary, before its DllMain runs.
+cat > "$work/late.c" <<'C'
+#include <windows.h>
+__declspec(dllimport) LONG_PTR XHostedButMissing(void);
+LONG_PTR late_result;
+__declspec(dllexport) LONG_PTR late_call(void) { return XHostedButMissing(); }
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, void *r)
+{
+    if (reason == DLL_PROCESS_ATTACH) late_result = XHostedButMissing();
+    return TRUE;
+}
+C
+x86_64-w64-mingw32-gcc -O1 -shared -o "$work/game/late.dll" "$work/late.c" "$work/libhosted.a"
+cat > "$work/lateload.c" <<'C'
+#include <stdio.h>
+#include <windows.h>
+__declspec(dllimport) void *XMemAlloc(SIZE_T, ULONGLONG);
+int main(void)
+{
+    void *volatile keep = XMemAlloc;
+    HMODULE m = LoadLibraryA("late.dll");
+    LONG_PTR (*call)(void) = m ? (void *)GetProcAddress(m, "late_call") : NULL;
+    LONG_PTR r = call ? call() : 0;
+    printf("late.dll XHostedButMissing -> %#llx\n", (unsigned long long)r);
+    return keep && (ULONG)r == 0x80004001u ? 0 : 1;
+}
+C
+x86_64-w64-mingw32-gcc -O1 -o "$work/game/lateload.exe" "$work/lateload.c" "$work/libxmem.a"
+if "$WINE" "$work/game/lateload.exe"; then
+    echo "ok   the same holds for a DLL loaded later, including calls from its DllMain"
+else
+    fail "xmem's import fixup for a DLL loaded later"
+fi

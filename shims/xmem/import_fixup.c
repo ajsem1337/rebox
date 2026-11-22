@@ -5,10 +5,12 @@
  * when called, and a DLL of the set's name can't take its place: the schema wins. scan_imports
  * only reports these. So at load, after the title's imports are bound, every IAT entry pointing at
  * one of Wine's stubs is pointed at our own, which logs the name once and returns E_NOTIMPL, like
- * the generated stubs. */
+ * the generated stubs. DLLs loaded later (LoadLibrary of the package's Bink, BVH builder or
+ * FidelityFX DLLs) are fixed up from a loader notification, before their DllMain runs. */
 
 #include <windows.h>
 #include <psapi.h>
+#include <winternl.h>
 #include <string.h>
 
 #include "../common/rebox_log.h"
@@ -132,13 +134,45 @@ static UINT fix_module(HMODULE module)
     return fixed;
 }
 
+/* ntdll's DLL load notifications (not in mingw's headers). */
+typedef struct
+{
+    ULONG Flags;
+    const UNICODE_STRING *FullDllName;
+    const UNICODE_STRING *BaseDllName;
+    void *DllBase;
+    ULONG SizeOfImage;
+} DLL_LOADED_DATA;
+
+#define DLL_NOTIFICATION_LOADED 1
+
+static CRITICAL_SECTION stub_lock;
+
+static void CALLBACK dll_loaded(ULONG reason, const DLL_LOADED_DATA *data, void *context)
+{
+    if (reason != DLL_NOTIFICATION_LOADED)
+        return;
+    EnterCriticalSection(&stub_lock);
+    fix_module(data->DllBase);
+    LeaveCriticalSection(&stub_lock);
+}
+
 void import_fixup_run(void)
 {
+    NTSTATUS (WINAPI *register_notification)(ULONG, void *, void *, void **);
+    static void *cookie;
+
     HMODULE modules[512];
     DWORD bytes;
 
+    InitializeCriticalSection(&stub_lock);
+    register_notification = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
+    if (!register_notification || register_notification(0, dll_loaded, NULL, &cookie))
+        rebox_log("import fixup: no DLL load notifications; DLLs loaded later keep Wine's stubs");
     if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
         return;
+    EnterCriticalSection(&stub_lock);
     for (DWORD i = 0; i < bytes / sizeof(*modules) && i < ARRAYSIZE(modules); i++)
         fix_module(modules[i]);
+    LeaveCriticalSection(&stub_lock);
 }
