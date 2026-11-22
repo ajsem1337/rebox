@@ -650,6 +650,17 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
     }
 }
 
+SA5_API int sa5_validate(const uint32_t* words, uint32_t word_count, char* error, size_t error_size)
+{
+    try {
+        Validate(std::vector<std::uint32_t>(words, words + word_count));
+        return 0;
+    } catch (const std::exception& e) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
+        return -1;
+    }
+}
+
 SA5_API void sa5_free_words(uint32_t* words)
 {
     delete[] words;

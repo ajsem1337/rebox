@@ -5,6 +5,7 @@
 #include "BdaAbi.hpp"
 #include "Recompiler.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -90,6 +91,77 @@ SA5_API int sa5_compile_compute(const sa5_compute_request* request, sa5_result**
             DefaultTarget(request->wave),
             {0, 0, 0, 128},
         };
+        compile.useCache = request->use_cache != 0;
+
+        auto* result = new sa5_result{Recompile(compile), {}};
+        const auto words = result->result.spirv.Words();
+        result->spirv.assign(words.begin(), words.end());
+        *out = result;
+        return 0;
+    } catch (const std::exception& e) {
+        SetError(error, error_size, e.what());
+        return -1;
+    } catch (...) {
+        SetError(error, error_size, "unknown exception");
+        return -1;
+    }
+}
+
+SA5_API int sa5_compile_pixel(const sa5_pixel_request* request, sa5_result** out, char* error, std::size_t error_size)
+{
+    if (!request || !out || !request->code || !request->code_dwords) {
+        SetError(error, error_size, "bad request");
+        return -1;
+    }
+    *out = nullptr;
+    try {
+        std::vector<MemoryRegion> regions;
+        for (std::uint32_t i = 0; i < request->region_count; i++)
+            regions.push_back({request->regions[i].address,
+                               std::span<const std::byte>(static_cast<const std::byte*>(request->regions[i].data),
+                                                          request->regions[i].size)});
+        // Built like americas-recomp's tools/xbox/driver.cpp (GPL-2.0), with the PSO's register
+        // state in place of its defaults.
+        ShaderPixelStageInfo px{};
+        const std::uint32_t ena = request->input_ena;
+        const auto has = [&](PixelInput input) { return (ena & PixelInputBit(input)) != 0; };
+        px.interpolatorCount = std::min<std::uint32_t>(request->interpolator_count, 32u);
+        for (std::uint32_t i = 0; i < px.interpolatorCount; i++) px.interpolatorSettings[i] = request->interpolator_settings[i];
+        px.wave32 = request->wave != 64u;
+        px.inputAddr = ena;
+        px.hasPerspectiveCenterVgpr = has(PixelInput::PerspectiveCenter);
+        px.perspectiveCentroid = has(PixelInput::PerspectiveCentroid);
+        px.noPerspective = has(PixelInput::LinearCenter);
+        px.linearCentroid = has(PixelInput::LinearCentroid);
+        px.posX = has(PixelInput::PositionX);
+        px.posY = has(PixelInput::PositionY);
+        px.posZ = has(PixelInput::PositionZ);
+        px.posW = has(PixelInput::PositionW);
+        px.frontFace = has(PixelInput::FrontFace);
+        px.ancillary = has(PixelInput::Ancillary);
+        px.depthExportEnable = request->depth_export != 0;
+        for (std::uint32_t i = 0; i < 8; i++) {
+            px.targetOutputMode[i] = static_cast<std::uint8_t>((request->col_format >> (4 * i)) & 0xfu);
+            px.targetExportMapping[i] = 0xe4;  // identity swizzle
+            px.targetExportPacking[i] = ColorExportPacking::None;
+        }
+        // SPI_SHADER_PGM_RSRC1_PS: FLOAT_MODE bits 12-19, DX10_CLAMP 21, IEEE_MODE 23.
+        ShaderFloatMode floatMode;
+        floatMode.floatMode = (request->rsrc1 >> 12u) & 0xffu;
+        floatMode.dx10Clamp = ((request->rsrc1 >> 21u) & 1u) != 0u;
+        floatMode.ieeeMode = ((request->rsrc1 >> 23u) & 1u) != 0u;
+
+        RecompileRequest compile{};
+        compile.shader = {ShaderStage::Fragment, request->code_address,
+                          std::span<const std::uint32_t>(request->code, request->code_dwords), 0, {}};
+        compile.context.waveSize = request->wave ? request->wave : 64u;
+        compile.context.userDataBaseRegister = 0;
+        compile.context.userData = std::span<const std::uint32_t>(request->user_data, request->user_data_count);
+        compile.context.pixel = px;
+        compile.context.memory = MemoryRegionView(std::span<const MemoryRegion>(regions));
+        compile.context.floatMode = floatMode;
+        compile.target = DefaultTarget(compile.context.waveSize);
+        compile.layout = {0, 0, 0, 128};
         compile.useCache = request->use_cache != 0;
 
         auto* result = new sa5_result{Recompile(compile), {}};

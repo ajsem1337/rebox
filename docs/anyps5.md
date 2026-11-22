@@ -287,6 +287,7 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   | 28 | `SPI_SHADER_COL_FORMAT` (a nibble per target; 4 = FP16, matching `compr` exports) | 1,155 |
   | 30 | `CB_SHADER_MASK` | 1,141 |
   | 52-59 | `CB_BLENDn_CONTROL` (0x80000000 = no blend) | by value |
+  | last 3 + n, padded to even | `SPI_PS_INPUT_CNTL_0..n-1` (n = `NUM_INTERP`): offset, `FLAT_SHADE` (bit 10), `FP16_INTERP_MODE` (19), `ATTR0/1_VALID` (24, 25) | block size = base + these words in every PSO (380 + 8 per 2 interpolants; 464 in the NGG family) |
   | 64-71 | `SX_MRTn_BLEND_OPT` | by value |
 
   Stage slots: 0 is the pixel shader, 1 the vertex shader, 2 the NGG (mesh/primitive) shader.
@@ -298,7 +299,10 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
     what the earlier stage outputs, so it can exceed what the PS reads; equality holds where they
     match, e.g. 1,491 of 1,542 472-byte blocks. The size differences come after word 49.
 
-  Next: the variable section in the NGG family, then building AnyPS5's `ShaderPixelStageInfo`
-  (and the NGG `MeshConfiguration`) from these words at PSO creation. The PS input table at
-  FSSM 0x138 gives per-interpolant flags.
+  `sa5_compile_pixel` (`rebox_anyps5.dll`) builds AnyPS5's `ShaderPixelStageInfo` from these
+  words. `tools/ps-plan.py` reads them for every dumped PS, and `sa5_check ps PLAN` compiles each
+  and runs `spirv-val`. The sweep doesn't give AnyPS5 guest memory, so shaders that walk
+  descriptors fail there; a dispatch-time compile has the memory. Still from the code, not
+  registers: the wave size (`sa5_analyse`) and depth export (an `mrtz` export). Next: the NGG
+  `MeshConfiguration`, then graphics pipelines at draw time.
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.

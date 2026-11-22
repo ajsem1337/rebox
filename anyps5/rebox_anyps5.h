@@ -50,7 +50,31 @@ struct sa5_binding
     uint32_t role;              /* ShaderRecompiler::DescriptorRole: 0-2 guest buffers/images/samplers */
 };
 
+/* A pixel shader with the register state the console's PSO gives it (docs/anyps5.md: the target title's PS09
+ * register blocks). */
+struct sa5_pixel_request
+{
+    const uint32_t *code;
+    uint32_t code_dwords;
+    uint64_t code_address;
+    uint32_t wave;                    /* 32 or 64 */
+    const uint32_t *user_data;
+    uint32_t user_data_count;
+    uint32_t rsrc1, rsrc2;            /* SPI_SHADER_PGM_RSRC1/2_PS */
+    uint32_t input_ena;               /* SPI_PS_INPUT_ENA (the VGPR inputs, as AnyPS5's PixelInput bits) */
+    uint32_t interpolator_count;      /* SPI_PS_IN_CONTROL.NUM_INTERP */
+    uint32_t interpolator_settings[32]; /* SPI_PS_INPUT_CNTL_n */
+    uint32_t col_format;              /* SPI_SHADER_COL_FORMAT: a nibble per render target */
+    uint32_t depth_export;            /* the shader exports depth (mrtz) */
+    const struct sa5_region *regions;
+    uint32_t region_count;
+    uint32_t use_cache;
+};
+
 struct sa5_result;
+
+SA5_API int sa5_compile_pixel(const struct sa5_pixel_request *request, struct sa5_result **result,
+                              char *error, size_t error_size);
 
 /* Returns 0 on success; on failure, the recompiler's message in error. */
 SA5_API int sa5_compile_compute(const struct sa5_compute_request *request, struct sa5_result **result,
@@ -97,6 +121,8 @@ SA5_API int sa5_finalize(const struct sa5_result *result, const struct sa5_remap
                          const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t **out,
                          uint32_t *out_count, char *error, size_t error_size);
 SA5_API void sa5_free_words(uint32_t *words);
+/* spirv-val for Vulkan 1.2 (scalar block layout): 0, or -1 and the validator's messages. */
+SA5_API int sa5_validate(const uint32_t *words, uint32_t word_count, char *error, size_t error_size);
 
 /* The descriptor tables a compute shader reads, inferred from its code (layout.cpp, moved from
  * xsx-shader-lab's rdna-run): which user SGPRs hold 32-bit table pointers, and what each table

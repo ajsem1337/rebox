@@ -2,7 +2,10 @@
  *   sa5_check                                  built-in s_endpgm shader
  *   sa5_check CODE.bin SKIP RSRC1 RSRC2 X,Y,Z  a dumped shader (e.g. a PS09
  *                                              entry, SKIP = 36), compile only,
- *                                              with no guest memory */
+ *                                              with no guest memory
+ *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (tools/ps-plan.py) with
+ *                                              their PSO register state, compile only, no guest
+ *                                              memory; one "ps NAME ok|FAIL ..." line each */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +48,123 @@ static int compile(const uint32_t *code, uint32_t dwords, uint32_t rsrc1, uint32
     return 0;
 }
 
+static uint8_t *read_all(const char *path, long *size)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *data;
+
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = malloc(*size);
+    if (data && fread(data, 1, *size, f) != (size_t)*size)
+    {
+        free(data);
+        data = NULL;
+    }
+    fclose(f);
+    return data;
+}
+
+static int pixel_sweep(const char *plan, int first, int count)
+{
+    FILE *f = fopen(plan, "r");
+    char line[4096];
+    int index = 0, ok = 0, failed = 0, unreadable = 0, valid_count = 0;
+    static struct sa5_slot slots[1];
+
+    if (!f)
+    {
+        printf("FAIL open %s\n", plan);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), f) && (count <= 0 || ok + failed + unreadable < count))
+    {
+        char name[64], path[1024], winpath[1100];
+        unsigned skip, rsrc1, rsrc2, ena, ninterp, col, depth;
+        char cntl[1024];
+        struct sa5_pixel_request req = { 0 };
+        struct sa5_result *result = NULL;
+        struct sa5_layout layout;
+        uint32_t user_data[32] = { 0 }, words = 0;
+        char error[600], ignored[64];
+        uint8_t *data;
+        long size;
+
+        if (line[0] == '#' || sscanf(line, "%63s %1023s %u %x %x %x %u %x %u %1023s", name, path, &skip, &rsrc1, &rsrc2,
+                                     &ena, &ninterp, &col, &depth, cntl) != 10)
+            continue;
+        if (index++ < first)
+            continue;
+        snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+        for (char *p = winpath; *p; p++)
+            if (*p == '/') *p = '\\';
+        if (!(data = read_all(winpath, &size)) || size <= (long)skip)
+        {
+            printf("ps %s FAIL unreadable\n", name);
+            unreadable++;
+            free(data);
+            continue;
+        }
+        req.code = (const uint32_t *)(data + skip);
+        req.code_dwords = (uint32_t)((size - skip) / 4);
+        req.code_address = 0x10000000;
+        req.user_data = user_data;
+        req.user_data_count = (rsrc2 >> 1) & 0x1f;
+        req.rsrc1 = rsrc1;
+        req.rsrc2 = rsrc2;
+        req.input_ena = ena;
+        req.interpolator_count = ninterp;
+        /* SPI_PS_INPUT_CNTL_n from the PSO, comma-separated hex ("-" for none). */
+        {
+            char *p = cntl;
+            for (unsigned i = 0; i < 32 && *p && *p != '-'; i++)
+            {
+                req.interpolator_settings[i] = (uint32_t)strtoul(p, &p, 16);
+                if (*p == ',')
+                    p++;
+            }
+        }
+        req.col_format = col;
+        req.depth_export = depth;
+        req.wave = !sa5_analyse(req.code, req.code_dwords, req.user_data_count, &layout, slots, 0, ignored,
+                                sizeof(ignored)) ? layout.wave : 64;
+        if (sa5_compile_pixel(&req, &result, error, sizeof(error)))
+        {
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("ps %s FAIL %.400s\n", name, error);
+            failed++;
+        }
+        else
+        {
+            const uint32_t *spirv = sa5_result_spirv(result, &words);
+            int valid = !sa5_validate(spirv, words, error, sizeof(error));
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("ps %s ok %u words, wave%u, %u bindings, %s%.300s\n", name, words, req.wave,
+                   sa5_result_binding_count(result), valid ? "valid" : "INVALID: ", valid ? "" : error);
+            valid_count += valid;
+            sa5_result_free(result);
+            ok++;
+        }
+        fflush(stdout);
+        free(data);
+    }
+    fclose(f);
+    printf("%s ps-check: %d of %d pixel shaders compile with their PSO register state, %d of those pass spirv-val "
+           "(%d unreadable)\n", failed || unreadable ? "info" : "ok  ", ok, ok + failed + unreadable, valid_count,
+           unreadable);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "ps"))
+        return pixel_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
+
     static const uint32_t endpgm[] = { 0xbf810000u };
     uint32_t threads[3] = { 1, 1, 1 };
 
