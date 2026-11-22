@@ -34,7 +34,15 @@
 #define MAX_BINDINGS 64
 #define MAX_ELEMENTS 4096
 
-enum role { ROLE_GDS = 3, ROLE_BDA_PAGETABLE = 4, ROLE_FAULT_BUFFER = 5, ROLE_FLATTENED_SRT = 6, ROLE_SHADER_DATA = 7 };
+enum role { ROLE_GDS = 3, ROLE_BDA_PAGETABLE = 4, ROLE_FAULT_BUFFER = 5, ROLE_FLATTENED_SRT = 6, ROLE_SHADER_DATA = 7,
+            ROLE_IMAGE_TABLE = 8, ROLE_SAMPLER_TABLE = 9, ROLE_IMAGE_TABLE_MAP = 10, ROLE_IMAGE_STORAGE_TABLE = 11 };
+
+/* Roles whose elements are guest descriptors bound like guest images and samplers: AnyPS5's
+ * tables for T#s and S#s that a shader indexes at run time (from a table in memory). */
+static BOOL guest_descriptor_role(UINT32 role)
+{
+    return role <= 2 || role == ROLE_IMAGE_TABLE || role == ROLE_SAMPLER_TABLE || role == ROLE_IMAGE_STORAGE_TABLE;
+}
 
 static struct
 {
@@ -618,14 +626,24 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
         }
-        else if (b.role <= 2)
+        else if (guest_descriptor_role(b.role) && b.role >= ROLE_IMAGE_TABLE && !b.count)
+        {
+            /* AnyPS5 fills image tables with the T#s it finds by walking tables in guest memory;
+             * none found (as with synthetic inputs) leaves nothing to bind. */
+            log_failure(h, "an image table AnyPS5 found no descriptors for", NULL);
+            goto done;
+        }
+        else if (guest_descriptor_role(b.role))
         {
             BOOL sampler = b.kind == 6;
             UINT32 per = b.count ? b.word_count / b.count : 0;
             if (remap_count == MAX_BINDINGS || index_count + b.count > MAX_ELEMENTS || b.kind > 6
                     || in->bindless[b.kind][0] == ~0u || !in->heap_cpu[sampler] || (per != 4 && per != 8))
             {
-                log_failure(h, "a guest binding has no bindless set or heap here", NULL);
+                char detail[128];
+                snprintf(detail, sizeof(detail), "role %u kind %u binding %u: %u elements of %u words", b.role,
+                         b.kind, b.binding, b.count, per);
+                log_failure(h, "a guest binding has no bindless set or heap here", detail);
                 goto done;
             }
             for (UINT32 e = 0; e < b.count; e++)
@@ -684,6 +702,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             }
             switch (b.role)
             {
+            case ROLE_IMAGE_TABLE_MAP: /* the image tables' map (ImageTableAbi.hpp), host data like the SRT */
             case ROLE_FLATTENED_SRT:
             case ROLE_SHADER_DATA:
                 va = b.word_count ? host_buffer(b.words, bytes) : zero_buffer(bytes = 16);

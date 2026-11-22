@@ -46,11 +46,14 @@ sed -n '/REBOX_HEAP_VA=real/,$p' "$log" | grep -E 'heap GPU start|report real|SG
 shader_dump=${REBOX_SHADER_DUMP:-../xsx-shader-lab/dump}
 if [ -f "$shader_dump/ps09.bin" ]; then
     section "game compute shaders through AnyPS5 at dispatch"
-    nixx develop -c tests/run-console-cs.sh "$shader_dump" 0 "${REBOX_CONSOLE_CS_COUNT:-0}" \
-        > build/console-cs.log 2>&1 || true
-    grep -E '^(ok|FAIL) +console-cs' build/console-cs.log || tail -5 build/console-cs.log
-    grep '^cs ' build/console-cs.log | grep -v ' dispatched:' | sed -E 's/^cs [^ ]+ //; s/[0-9]+/N/g' \
-        | sort | uniq -c | sort -rn | head -12
+    cs_log=build/console-cs.log
+    rm -f "$cs_log" 2>/dev/null
+    nixx develop -c tests/run-console-cs.sh "$shader_dump" 0 "${REBOX_CONSOLE_CS_COUNT:-0}" > "$cs_log" 2>&1
+    echo "run-console-cs.sh exit status: $?" | tee -a "$log"
+    { grep -E '^(ok|FAIL) +console-cs' "$cs_log" || tail -5 "$cs_log"
+      grep '^cs ' "$cs_log" | grep -v ' dispatched:' | sed -E 's/^cs [^ ]+ //; s/[0-9]+/N/g' \
+          | sort | uniq -c | sort -rn | head -12
+      grep -c 'AnyPS5 reported a fault' "$cs_log" | sed 's/^/shaders with AnyPS5 faults: /'; } 2>&1 | tee -a "$log"
     echo "(per-shader lines: build/console-cs.log)"
 fi
 

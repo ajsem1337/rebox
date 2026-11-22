@@ -129,7 +129,8 @@ What AnyPS5's driver would do and this host does instead, from its sources:
 | BDA page table (59) | only memory that exists: `ReboxGpuAlloc` chunks and the buffers the title made views of, at their GPU VAs, plus each shadow heap's title address mapped to its GPU copy. A stray address then becomes an AnyPS5 fault record ("unmapped address") instead of a GPU page fault. AnyPS5 checks the table's length in words is exactly 4 + 8 × count |
 | Fault buffer (60), GDS (58) | one of each for the process, zeroed GPU memory as AnyPS5's driver keeps them. The fault record and the SRT guard word (set when a speculated descriptor turns out wrong at run time) are read at each compile, logged (the first 20 of each) and cleared. Faults come from earlier dispatches, so the log doesn't name the shader |
 | ShaderData (62) | its words, as FlattenedSrt (compute normally uses push data instead) |
-| Image and sampler tables, LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
+| Image and sampler tables (261/260/63): T#s and S#s a shader indexes at run time, which AnyPS5 finds by walking tables in guest memory | bound like guest images and samplers, each element at the heap slot holding its words; the map (64) is host data like the flattened SRT. Untested with real entries: with the lab's synthetic inputs AnyPS5 finds none, and an empty table is refused with a message |
+| LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
 
 Guest memory matters beyond descriptors. americas-recomp found that user-data pointers into
 memory the recompiler can't read make the SRT walk throw. Backing them took its the target title sample
