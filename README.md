@@ -109,6 +109,8 @@ method the title asked for that isn't implemented.
 | `REBOX_KEYBOARD_PAD=0` | Don't drive the gamepad from the keyboard when no controller is connected (`shims/gameinput`: WASD/arrows sticks, Space A, Left Ctrl B, R X, F Y, Q/E shoulders, Z/C triggers, Enter menu, Tab view, IJKL D-pad) |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_TEXTURE_ARRAYS=slice-major` | Read placed 2D array textures a slice (its whole mip chain) at a time, addrlib's order, instead of a mip (all its slices) at a time as the target title's pools store them |
+| `REBOX_CONSOLE_DLLS` | Console system DLLs taken from the dump's system partition (`EmbeddedXvd/Windows/System32`, next to or inside the game directory) instead of being stubbed; default `xg_xs.dll` (the texture-layout library, pure computation). Empty uses none |
+| `REBOX_CONSOLE_SYSTEM=DIR` | Where that system partition is, if not found next to the game |
 | `REBOX_GAME_ALIAS=0` | Leave out the `GAME:` link in the package directory, which makes console `GAME:\...` paths resolve to the package (the package is also drive `G:`) |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
@@ -213,7 +215,10 @@ down missing translations.
   `ffmpeg-xma2`, a static mingw libavcodec with only that decoder. If decoding fails, or the DLL is
   built without `FFMPEG_XMA2`, the voice plays silence of about the buffer's length. A callback
   between the voice and the title keeps callback contexts intact and frees the PCM.
-  FFmpeg has no XMA2 encoder, so no test feeds it real XMA2. Bink's audio is decoded to PCM by Bink and is
+  FFmpeg has no XMA2 encoder, so no test feeds it real XMA2. Without an audio output device the
+  mastering voice fails as on Windows (Wine would report success and FAudio crash later); Unreal
+  titles treat that as fatal, so a machine without a sound card needs a sound server, e.g. a
+  PulseAudio null sink. Bink's audio is decoded to PCM by Bink and is
   unaffected. Wine also reports a mastering voice as created when there's no audio device, after
   which FAudio crashes on the first source voice; that only matters on machines without audio.
 - **Upscaling is bilinear.** The console FidelityFX upscaler runs precompiled-ISA shaders, which
