@@ -42,6 +42,7 @@ struct title_texture
     UINT subresources;
     BOOL dirty;
     BOOL unreadable;            /* memory not committed yet: rechecked with backoff */
+    BOOL chunk;                 /* in our GPU memory chunks, which stay mapped */
     UINT check_at, backoff;     /* in submissions */
     UINT64 fingerprint;
     UINT callback;
@@ -103,6 +104,24 @@ static void recheck(struct title_texture *t)
     InterlockedIncrement(&dirty_count);
 }
 
+/* Called with the lock held: memory outside our chunks can be decommitted or remapped after the
+ * texture was registered (a UE5 title remaps title pages), so it is checked before it is read; gone,
+ * the texture waits for it again like one placed on uncommitted memory. */
+static BOOL still_readable(struct title_texture *t)
+{
+    if (t->chunk || readable((UINT64)(ULONG_PTR)t->cpu, t->size))
+        return TRUE;
+    t->unreadable = TRUE;
+    t->check_at = submissions + 1;
+    t->backoff = 1;
+    if (t->dirty)
+    {
+        t->dirty = FALSE;
+        InterlockedDecrement(&dirty_count);
+    }
+    return FALSE;
+}
+
 /* Called with the lock held. */
 static void watch(void)
 {
@@ -117,7 +136,7 @@ static void watch(void)
     for (; t && checked < WATCH_BUDGET; t = t->next, checked++)
         if (t->unreadable)
             recheck(t);
-        else if (sample && !t->dirty && fingerprint(t) != t->fingerprint)
+        else if (sample && !t->dirty && still_readable(t) && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
             InterlockedIncrement(&dirty_count);
@@ -287,6 +306,7 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     {
         BOOL chunk;
         t->cpu = cpu_address(address, t->size, &chunk);
+        t->chunk = chunk;
         if (t->size && !chunk && !readable((UINT64)(ULONG_PTR)t->cpu, t->size))
         {
             static LONG logged;
@@ -500,7 +520,7 @@ void title_textures_upload(ID3D12CommandQueue *queue)
      * submission, the rest the next time. */
     AcquireSRWLockExclusive(&lock);
     for (t = textures; t && b->count < ARRAYSIZE(b->buffers); t = t->next)
-        if (t->dirty)
+        if (t->dirty && still_readable(t))
         {
             t->dirty = FALSE;
             InterlockedDecrement(&dirty_count);

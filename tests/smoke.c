@@ -2514,6 +2514,18 @@ done:
     CHECK(out && !memcmp(out, linear, sizeof(linear)),
           "a texture placed on reserved memory is filled once the memory is committed and written (%#lx)", hr);
     if (out) ID3D12Resource_Unmap(buf, 0, NULL);
+    /* The title takes the memory away again (a UE5 title remaps pages): submissions go on without
+     * reading it. */
+    if (out && list)
+    {
+        VirtualFree(reserved, 65536, MEM_DECOMMIT);
+        for (int i = 0; i < 4; i++)
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+        for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
+            Sleep(10);
+        CHECK(TRUE, "submissions go on after a placed texture's memory is decommitted");
+    }
     if (list) XSLOT(list, 2, ULONG)(list);
     if (fence) ID3D12Fence_Release(fence);
     if (alloc) ID3D12CommandAllocator_Release(alloc);
