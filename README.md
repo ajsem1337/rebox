@@ -183,7 +183,10 @@ down missing translations.
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
   log and return `E_NOTIMPL`; `REBOX_STUB_FATAL=1` stops at the first one. `PresentX` shows
   plane 0 in a window through a DXGI swapchain. Not done yet:
-  - only plane 0 is shown (no HUD-plane composition yet). Planes in formats a swapchain can't
+  - only plane 0 is shown. In Microsoft's public samples a second plane is an SDR copy for
+    GameDVR next to an HDR plane 0, and the runtime stand-in reports HDR off, so a title should
+    present one SDR plane; if it presents two, the log says so, and plane 0 may be HDR10 shown
+    as SDR. Planes in formats a swapchain can't
     take, such as R11G11B10, are converted to RGBA8 with a blit: HDR is clamped, not tone-mapped;
   - frame events come from a CPU clock, not the display: `WaitFrameEventX` follows the period the
     title sets, but isn't locked to the monitor's vblank, so with vsync on a mismatched refresh

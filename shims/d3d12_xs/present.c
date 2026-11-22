@@ -613,7 +613,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     {
         static LONG once;
         if (!InterlockedExchange(&once, 1))
-            rebox_log("d3d12_xs: PresentX with %u planes: only plane 0 is shown", planes);
+            rebox_log("d3d12_xs: PresentX with %u planes: only plane 0 is shown (an HDR plane, if the second is its SDR GameDVR copy)", planes);
     }
 
     desc = ID3D12Resource_GetDesc(plane);
