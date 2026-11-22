@@ -72,8 +72,10 @@ words (16 dwords), which the dispatch path will have to fill.
    (`shims/d3d12_xs/console_compile.h`): header, `RSRC1`/`RSRC2`, wave size, thread-group size,
    code address, then the RDNA code. vkd3d-proton keeps the blob with the PSO and creates no
    pipeline. Only the smoke test makes `SCRD` blobs so far: turning the game's FSSM containers
-   (or PS09 cache entries) into them, NOPing the `FLAT_SCRATCH` prologue (`s_setreg_imm32_b32` to
-   `HW_REG_FLAT_SCR_LO/HI`) on the way, waits on the PSO census (open question 1).
+   (or PS09 cache entries) into them waits on the PSO census (open question 1). The
+   `FLAT_SCRATCH` setup many console shaders open with (`s_setreg_imm32_b32` or `s_setreg_b32`
+   to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size `s_nop`s before each compile; only the leading
+   run is touched, and the first time is logged.
 2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
    from the root parameters as for SCSV shaders, except that descriptor tables point at the
    shadow heaps' title addresses (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`).
@@ -161,7 +163,8 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    move to title addresses with step 3.
 3. ~~Deferred compute pipelines and the dispatch path~~ Done (above): patch 0005,
    `console_compile.c`, `sa5_finalize`, and the end-to-end smoke test. Still to do before real
-   shaders: `SCRD` blobs from the game's containers with the `FLAT_SCRATCH` prologue NOPed. Heap
+   shaders: `SCRD` blobs from the game's containers (the `FLAT_SCRATCH` prologue is already
+   NOPed at compile). Heap
    slot 10 now returns title addresses, for pointers the title stores in memory itself. Then
    guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
    roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.

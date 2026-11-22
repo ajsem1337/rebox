@@ -207,6 +207,32 @@ static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT3
 
 /* -------------------------------------------------------------- compiling */
 
+/* Console shaders often start by setting FLAT_SCRATCH with s_setreg_imm32_b32 (SOPK top 9 bits
+ * 0x175, a literal follows) or s_setreg_b32 (0x173) to HW_REG_FLAT_SCR_LO/HI (hwreg ids 20/21).
+ * Scratch is the host's business here, so the leading run of those becomes s_nops of the same
+ * size. Only the run at the start is touched: further in, a literal could look like one.
+ * Returns how many instructions were replaced. */
+#define S_NOP 0xbf800000u
+static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
+{
+    UINT i = 0, count = 0;
+
+    while (i < dwords)
+    {
+        UINT32 w = code[i], op = w >> 23, id = w & 0x3f;
+        if ((op == 0x175 || op == 0x173) && (id == 20 || id == 21))
+        {
+            code[i++] = S_NOP;
+            if (op == 0x175 && i < dwords)
+                code[i++] = S_NOP;
+            count++;
+        }
+        else
+            break;
+    }
+    return count;
+}
+
 /* Logs a shader's first failure only (keyed by its code). */
 static void log_failure(const struct rebox_deferred_shader *h, const char *what, const char *detail)
 {
@@ -244,6 +270,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     struct module *module;
     char error[1024] = "";
     HRESULT hr = E_FAIL;
+    UINT32 *code, nops;
     UINT32 push_size;
 
     if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC || h->version != 1
@@ -283,8 +310,17 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
         }
     }
+    if (!(code = malloc(h->code_dwords * 4u)))
+        return E_OUTOFMEMORY;
+    memcpy(code, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+    if ((nops = nop_flat_scratch_setup(code, h->code_dwords)))
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: console shaders: NOPed %u FLAT_SCRATCH setup instruction(s) (first seen)", nops);
+    }
     memset(&req, 0, sizeof(req));
-    req.code = (const UINT32 *)((const BYTE *)h + h->code_offset);
+    req.code = code;
     req.code_dwords = h->code_dwords;
     req.code_address = h->code_address;
     req.wave = h->wave_size;
@@ -428,5 +464,6 @@ done:
     }
     if (result)
         sa5.result_free(result);
+    free(code);
     return hr;
 }

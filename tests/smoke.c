@@ -1589,7 +1589,10 @@ done:
 }
 
 /* RDNA2 compute shader for the deferred dispatch test (llvm-mc -mcpu=gfx1030): stores
- * 0x1234abcd through the V# at the start of the descriptor table s[0:1] points at.
+ * 0x1234abcd through the V# at the start of the descriptor table s[0:1] points at. It opens with
+ * the FLAT_SCRATCH setup console shaders have, which d3d12_xs NOPs out.
+ *   s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x1000
+ *   s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI, 0, 16), 2
  *   s_load_dwordx4 s[4:7], s[0:1], 0x0
  *   s_waitcnt lgkmcnt(0)
  *   v_mov_b32 v1, 0x1234abcd
@@ -1597,7 +1600,7 @@ done:
  *   buffer_store_dword v1, v2, s[4:7], 0 offen
  *   s_endpgm */
 static const UINT32 rdna_uav_write[] = {
-    0xf4080100, 0xfa000000, 0xbf8cc07f, 0x7e0202ff, 0x1234abcd, 0x7e040280, 0xe0701000, 0x80010102, 0xbf810000,
+    0xba80f814, 0x00001000, 0xba807815, 0x00000002, 0xf4080100, 0xfa000000, 0xbf8cc07f, 0x7e0202ff, 0x1234abcd, 0x7e040280, 0xe0701000, 0x80010102, 0xbf810000,
 };
 
 /* A deferred console compute PSO (patch 0005, console_compile.c): vkd3d-proton keeps the RDNA
