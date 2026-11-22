@@ -20,17 +20,17 @@
     "leonida-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1795346723,
-        "narHash": "sha256-jVFSfX5gi8s6Nk7teBPu0ack8M9a3c+MqoZQThAHjXk=",
+        "lastModified": 1795376786,
+        "narHash": "sha256-APKIBdTqiZXJ5ZRyolPHgPQcLiUM/qekk+xmxGyd1jg=",
         "owner": "ItsNotRexed",
         "repo": "Leonida",
-        "rev": "bb2e18421dac527374eb837c88b5063c5d96f81f",
+        "rev": "f847748cc76bd3777f9c070c4034eb2fc1c04e64",
         "type": "github"
       },
       "original": {
         "owner": "ItsNotRexed",
         "repo": "Leonida",
-        "rev": "bb2e18421dac527374eb837c88b5063c5d96f81f",
+        "rev": "f847748cc76bd3777f9c070c4034eb2fc1c04e64",
         "type": "github"
       }
     },

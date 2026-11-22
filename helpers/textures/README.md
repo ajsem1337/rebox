@@ -15,13 +15,13 @@ For each sampled texture of a pool (`.ttpf`):
    also writes both as PNGs (mip 0 of the first slice) to look at.
 
 It runs Leonida's tools (GPLv3), so like `helpers/bcpack` it is GPL-3.0-or-later and a separate
-program; nothing of Leonida's is copied here. It needs a Leonida checkout with the array and
-cubemap layouts (newer than the flake's `leonida-src` pin).
+program; nothing of Leonida's is copied here. The dev shell's `LEONIDA_SRC` (the flake's
+`leonida-src` pin) is used unless `--leonida` names another checkout.
 
 ```sh
 nix develop -c make build/texcheck.exe
-nix develop -c python3 helpers/textures/texcheck.py --leonida ~/Leonida ../xsx/data/ttdb
-nix develop -c python3 helpers/textures/texcheck.py --leonida ~/Leonida --shape 2d_array --limit 20 ../xsx/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py ../xsx/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py --shape 2d_array --limit 20 ../xsx/data/ttdb
 ```
 
 `--every N` and `--limit N` sample each pool, `--max-bytes` skips large textures (Leonida's

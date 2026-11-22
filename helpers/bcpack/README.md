@@ -48,6 +48,20 @@ tables are fitted from local data and not in its repository. The helper allows t
 `REBOX_BCPACK_STRICT=1` refuses provisional chunks. `REBOX_BCPACK=0` doesn't start the
 helper.
 
+### Calibrating BC6H and BC7 from your own pools
+
+Leonida's `tools/bcpack_history_calib.py` fits the history tables from the pools themselves
+(BC6H/BC7 by default; exact entries too, given reference DDS files). The output is local data, so
+it stays out of the repository:
+
+```sh
+nix develop -c bash -c 'python3 -I $LEONIDA_SRC/tools/bcpack_history_calib.py --out ~/bcpack-history ../xsx/data/ttdb'
+REBOX_BCPACK_HISTORY=$HOME/bcpack-history nix run . -- ../xsx
+```
+
+Its self-calibrated entries are still provisional (Leonida's term), so they're used as long as
+`REBOX_BCPACK_STRICT` isn't set.
+
 ## Test
 
 `tests/run-bcpack.sh` (dev shell): `make-vector.py` builds a synthetic BC4 chunk with the encoder

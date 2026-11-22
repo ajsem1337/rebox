@@ -18,7 +18,7 @@
     # Leonida's clean-room BCPack decoder (GPLv3), run by helpers/bcpack as a separate process
     # (it can't share a process with AnyPS5, GPL-2.0-only).
     leonida-src = {
-      url = "github:ItsNotRexed/Leonida/bb2e18421dac527374eb837c88b5063c5d96f81f";
+      url = "github:ItsNotRexed/Leonida/f847748cc76bd3777f9c070c4034eb2fc1c04e64";
       flake = false;
     };
     # bcpack-rs (MIT OR Apache-2.0): the BC1 decoder behind helpers/bcpack/bcpack-serve.rs.
