@@ -2389,6 +2389,36 @@ static void test_xbox(void)
             Sleep(10);
         CHECK(SUCCEEDED(hr) && fence4 && ID3D12Fence_GetCompletedValue(fence4) == 7,
               "SDK 0x20004 queue: Signal at slot 16 (%#lx)", hr);
+        /* ... and the later command-list layout: markers at 57/58, PC 62 (OMSetDepthBounds)
+         * at 109, then Close and execute on that queue. */
+        {
+            ID3D12CommandAllocator *alloc4 = NULL;
+            void *list4 = NULL;
+            hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&alloc4);
+            if (SUCCEEDED(hr))
+                hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                        REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc4, NULL, &IID_ID3D12GraphicsCommandList,
+                        &list4);
+            if (SUCCEEDED(hr))
+            {
+                XSLOT(list4, 57, void, UINT, const void *, UINT)(list4, 0, NULL, 0);
+                XSLOT(list4, 109, void, FLOAT, FLOAT)(list4, 0.0f, 1.0f);
+                XSLOT(list4, 58, void)(list4);
+                hr = XSLOT(list4, 9, HRESULT)(list4);
+            }
+            if (SUCCEEDED(hr))
+            {
+                XSLOT(queue4, 10, void, UINT, void *const *)(queue4, 1, &list4);
+                hr = XSLOT(queue4, 16, HRESULT, ID3D12Fence *, UINT64)(queue4, fence4, 8);
+            }
+            for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 8; i++)
+                Sleep(10);
+            CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence4) == 8,
+                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, executed (%#lx)", hr);
+            if (list4) XSLOT(list4, 2, ULONG)(list4);
+            if (alloc4) ID3D12CommandAllocator_Release(alloc4);
+        }
         if (fence4) ID3D12Fence_Release(fence4);
         if (queue4) XSLOT(queue4, 2, ULONG)(queue4);
         if (dev4) XSLOT(dev4, 2, ULONG)(dev4);

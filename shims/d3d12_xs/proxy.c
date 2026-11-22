@@ -78,10 +78,12 @@ static struct proxy_class device_class = { "Device", 128 };
 static struct proxy_class queue_class = { "CommandQueue", 64 };
 static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", 64 };
 static struct proxy_class list_class = { "GraphicsCommandList", MAX_SLOTS };
+static struct proxy_class list_v4_class = { "GraphicsCommandList (SDK 0x20004)", MAX_SLOTS };
 static struct proxy_class copy_list_class = { "CopyCommandList", 64 };
 static struct proxy_class heap_class = { "DescriptorHeap", 16 };
 
-static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &copy_list_class,
+static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &list_v4_class,
+                                               &copy_list_class,
                                                &heap_class };
 
 /* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
@@ -545,7 +547,8 @@ static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *a
     HRESULT hr = ID3D12Device_CreateCommandList(INNER(p, ID3D12Device), 0, t, alloc, pso,
                                                 &IID_ID3D12GraphicsCommandList, (void **)&list);
 
-    return wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class : &list_class, out);
+    return wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class
+                       : sdk_version >= 0x20004 ? &list_v4_class : &list_class, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandList(struct proxy *p, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -1425,6 +1428,28 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
     };
+    /* Graphics list for titles built against SDK 0x20004 or later (ScarlettX 1e5473d): two
+     * methods were added at 59 and 60, so every method from 61 on is the 0x20001 one two slots
+     * later. The 0x20001 positions are XValkyrie's (a June 2020 kit's header tables): 56-59 PC
+     * 56-59, 69-90 console memory writes and waits, 83 CopyTextureRegionX, 105-121 PC 60-76,
+     * 124/125 shading rate, 127 DispatchMesh. the target title's own DLLs fit this layout: FSR's
+     * ExecuteIndirect at 61, the BVH builder's write/wait calls at 71, 73 and 90, and 141-148
+     * past the end of the older table. docs/d3d12x.md. */
+    static struct slot list_v4_slots[96] = {
+        FN(7, child_GetDevice),
+        FN(10, list_Reset),
+        FN(26, list_ResourceBarrier),
+        FN(32, list_SetDescriptorHeaps),
+        FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
+        FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
+        FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
+        FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
+        FWD(56, 56), FWD(57, 57), FWD(58, 58),        /* SetMarker, BeginEvent, EndEvent */
+        FN(61, list_Slot61),                          /* ExecuteIndirect (PC 59) */
+        FN(85, list_CopyTextureRegionX),
+        FN(146, list_Barrier),
+        FN(148, list_AllocateEmbeddedX),
+    };
     /* Copy-queue lists have their own short layout (ScarlettX). */
     static const struct slot copy_slots[] = {
         FN(7, child_GetDevice),
@@ -1459,6 +1484,25 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     build(&queue_class, 19, queue_slots, ARRAYSIZE(queue_slots));
     build(&queue_v4_class, 11, queue_v4_slots, ARRAYSIZE(queue_v4_slots));
     build(&list_class, 27, list_slots, n);
+
+    n = 0;
+    while (n < ARRAYSIZE(list_v4_slots) && list_v4_slots[n].xbox)
+        n++;
+    customs = n;
+    for (unsigned x = 33; x <= 55; x++)
+    {
+        BOOL taken = FALSE;
+        for (unsigned j = 0; j < customs; j++)
+            taken |= list_v4_slots[j].xbox == x;
+        if (!taken)
+            list_v4_slots[n++] = (struct slot)FWD(x, x - 4);
+    }
+    for (unsigned pc = 60; pc <= 76; pc++)          /* PC 60-76: 105-121 before, 107-123 here */
+        list_v4_slots[n++] = (struct slot)FWD(pc + 47, pc);
+    list_v4_slots[n++] = (struct slot)FWD(126, 77); /* RSSetShadingRate */
+    list_v4_slots[n++] = (struct slot)FWD(127, 78); /* RSSetShadingRateImage */
+    list_v4_slots[n++] = (struct slot)FWD(129, 79); /* DispatchMesh */
+    build(&list_v4_class, 27, list_v4_slots, n);
     build(&copy_list_class, 11, copy_slots, ARRAYSIZE(copy_slots));
     build(&heap_class, 9, heap_slots, ARRAYSIZE(heap_slots));
     return TRUE;
@@ -1471,7 +1515,7 @@ ID3D12GraphicsCommandList *proxy_list(void *list, ID3D12DescriptorHeap **heaps, 
     *heap_count = 0;
     if (!is_proxy(list))
         return list;
-    if (p->cls != &list_class && p->cls != &copy_list_class)
+    if (p->cls != &list_class && p->cls != &list_v4_class && p->cls != &copy_list_class)
         return NULL;
     *heap_count = p->heap_count;
     memcpy(heaps, p->heaps, p->heap_count * sizeof(*heaps));
