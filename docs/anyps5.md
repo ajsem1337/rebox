@@ -91,6 +91,18 @@ words (16 dwords), which the dispatch path will have to fill.
    isn't there either; the SCRD says 0 and the compile infers it with `sa5_analyse`. zlib comes
    from zlib's `contrib/puff` (zlib licence, `shims/d3d12_xs/puff.c`).
 
+   Pixel-shader containers (facts from Leonida, GPLv3, `docs/design.md` rows "Pixel-shader
+   interpolants" and "PS interpolation modes", 2026-11-22; our own check agrees on the code): code
+   also starts at the u32 at 0xC0 plus 0x28. From 0x138, 8-byte input records run while their first
+   byte is 6; a record's position is the `v_interp` attribute number, bits 0-1 of byte 7 are the
+   mode (1 flat, 2 perspective-centre; 0 and 3 never occur) and bit 4 marks a 16-bit interpolant.
+   That gives `SPI_PS_INPUT_CNTL` (offset = position, `FLAT_SHADE`, `FP16_INTERP_MODE`). There is no
+   `SPI_PS_INPUT_ENA` word: every interpolated input is `PERSP_CENTER`, so the enable comes from the
+   code. Graphics containers don't carry the PS09 shader ID at 0x150 (only CS and RT matched, 2,676),
+   and PS09's PS code is the driver's recompile, so the dump's bytes don't sit at that offset; a
+   deferred PS built from the container uses the container's own code. RSRC1/2 for PS aren't
+   located yet.
+
    `smoke.exe --fssm-check DIR` converts every compute container in a carve: all 2,573 in
    `the shader archive` convert. Whether the exe passes these containers at PSO creation, or PS09 cache
    blobs, is still open question 1. The `FLAT_SCRATCH` setup many console shaders open with
