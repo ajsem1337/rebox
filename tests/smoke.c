@@ -2738,13 +2738,15 @@ static void test_xbox(void)
      * bytes get fallbacks unless REBOX_SHADER_FALLBACK=0. */
     if (rs)
     {
-        static const char vs_bytes[] = "REBOX-FAKE-CONSOLE-VS60", ps_bytes[] = "REBOX-FAKE-CONSOLE-PS60";
+        static const char vs_src[] = "REBOX-FAKE-CONSOLE-VS60", ps_bytes[] = "REBOX-FAKE-CONSOLE-PS60";
+        char vs_bytes[sizeof(vs_src)];
         const char *fb = getenv("REBOX_SHADER_FALLBACK");
         BOOL strict = fb && *fb == '0';
         D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
         BYTE ext[0x40] = { 0 };
         void *pso = NULL;
 
+        memcpy(vs_bytes, vs_src, sizeof(vs_src));
         gd.pRootSignature = rs;
         gd.VS = (D3D12_SHADER_BYTECODE){ vs_bytes, sizeof(vs_bytes) };
         gd.PS = (D3D12_SHADER_BYTECODE){ ps_bytes, sizeof(ps_bytes) };
@@ -2761,6 +2763,40 @@ static void test_xbox(void)
                 dev, &gd, 1, ext, &IID_ID3D12PipelineState, &pso);
         CHECK(SUCCEEDED(hr) != strict, "graphics PSO through slot 60 with an extension %s (%#lx)",
               strict ? "rejected in strict mode" : "gets fallbacks", hr);
+
+        /* Slot 55 derives variants from it (TomBox): 0x14C-byte patches, a tag and the state at
+         * +4. The title's desc and shader bytes may be gone by then. */
+        if (pso)
+        {
+            BYTE patches[6][0x14C] = { { 0 } };
+            D3D12_RASTERIZER_DESC raster = gd.RasterizerState;
+            D3D12_BLEND_DESC blend = gd.BlendState;
+            D3D12_DEPTH_STENCIL_DESC depth = { 0 };
+            void *derived = NULL, *bogus = NULL;
+            UINT mask = 1;
+
+            memset(vs_bytes, 0, sizeof(vs_bytes));
+            raster.CullMode = D3D12_CULL_MODE_BACK;
+            blend.RenderTarget[0].BlendEnable = TRUE;
+            blend.RenderTarget[0].SrcBlend = blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.RenderTarget[0].DestBlend = blend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+            blend.RenderTarget[0].BlendOp = blend.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            *(UINT *)patches[0] = 0, memcpy(patches[0] + 4, &depth, sizeof(depth));
+            *(UINT *)patches[1] = 1, memcpy(patches[1] + 4, &raster, sizeof(raster));
+            *(UINT *)patches[2] = 2, memcpy(patches[2] + 4, &blend, sizeof(blend));
+            *(UINT *)patches[3] = 3, memcpy(patches[3] + 4, &mask, sizeof(mask));
+            *(UINT *)patches[4] = 5;
+            *(UINT *)patches[5] = 9;
+            hr = XSLOT(dev, 55, HRESULT, void *, UINT, const void *, REFIID, void **)(
+                    dev, pso, 6, patches, &IID_ID3D12PipelineState, &derived);
+            CHECK(SUCCEEDED(hr) && derived && derived != pso,
+                  "derived PSO (slot 55) with depth, rasterizer, blend, sample-mask, console and unknown patches (%#lx)", hr);
+            hr = XSLOT(dev, 55, HRESULT, void *, UINT, const void *, REFIID, void **)(
+                    dev, (void *)&gd, 1, patches, &IID_ID3D12PipelineState, &bogus);
+            CHECK(FAILED(hr) && !bogus, "deriving from something that isn't a PSO fails (%#lx)", hr);
+            if (derived) XSLOT(derived, 2, ULONG)(derived);
+        }
         if (pso) XSLOT(pso, 2, ULONG)(pso);
     }
 

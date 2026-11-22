@@ -36,6 +36,7 @@
 #include "proxy.h"
 #include "title_textures.h"
 #include "dxgi_device.h"
+#include "derived_pso.h"
 
 #define INNER_OFFSET 0x1000
 #define DEVICE_OUT_OF_LINE_FLAG 0x18
@@ -865,7 +866,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy
 {
     HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(INNER(p, ID3D12Device), desc, riid, out);
     if (SUCCEEDED(hr) && out)
+    {
         patch_child(*out);
+        derived_pso_record(*out, desc);
+    }
     return hr;
 }
 
@@ -907,6 +911,21 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineStateX(struct prox
             rebox_log("d3d12_xs: Xbox CreateGraphicsPipelineStateX: %u extension structs ignored", ext_count);
     }
     return device_CreateGraphicsPipelineState(p, desc, riid, out);
+}
+
+/* Slot 55: a graphics PSO derived from another with state patches (TomBox, a UE5 title):
+ * (base, patch count, patches, riid, out); see derived_pso.c. */
+static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy *p, void *base, UINT count,
+        const void *patches, REFIID riid, void **out)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+    HRESULT hr;
+
+    if (out)
+        *out = NULL;
+    if (FAILED(hr = derived_pso_desc(base, count, patches, &desc)))
+        return hr;
+    return device_CreateGraphicsPipelineState(p, &desc, riid, out);
 }
 
 /* Slot 44: CreatePlacedResourceX(address, desc, state, clear, iid, out) (ScarlettX, XValkyrie):
@@ -1519,6 +1538,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
+        FN(55, device_CreateDerivedPipelineStateX),
         FN(60, device_CreateGraphicsPipelineStateX),
         FN(61, device_CreateSamplerX),
         FN(62, device_CreateComputePipelineStateX),
