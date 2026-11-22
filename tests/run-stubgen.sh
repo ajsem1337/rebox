@@ -26,6 +26,7 @@ EXPORTS
     IsDebuggerPresent
     XFakeOrdinal @7 NONAME
     XOdd == "X-Odd"
+    IID_IFakeConsoleThing DATA
 DEF
 x86_64-w64-mingw32-dlltool -d "$work/fake.def" -l "$work/libfakexbox.a"
 
@@ -57,6 +58,7 @@ __declspec(dllimport) LONG_PTR XFakeOrdinal(void);
 __declspec(dllimport) LONG_PTR XOdd(void);
 __declspec(dllimport) LONG_PTR XFwdName(void);
 __declspec(dllimport) LONG_PTR XFwdOrdinal(void);
+__declspec(dllimport) extern const GUID IID_IFakeConsoleThing;
 __declspec(dllimport) LONG_PTR XSetFake(void);
 __declspec(dllimport) DWORD XGetTickCount(void);
 int main(void)
@@ -66,6 +68,11 @@ int main(void)
     DWORD ticks = XGetTickCount();
     printf("GetTickCount through the API set -> %lu\n", ticks);
     ok &= ticks != 0 && ticks - GetTickCount() < 1000u;
+    {
+        static const GUID zero;
+        printf("IID_IFakeConsoleThing is %s\n", memcmp(&IID_IFakeConsoleThing, &zero, sizeof(zero)) ? "not zero" : "a zero GUID");
+        ok &= !memcmp(&IID_IFakeConsoleThing, &zero, sizeof(zero));
+    }
     for (int i = 0; i < 6; i++)
     {
         printf("call %d -> %#llx\n", i, (unsigned long long)r[i]);

@@ -33,11 +33,20 @@ if [[ ${1:-} == --scan ]]; then scan=1; shift; fi
 game_dir=$(realpath "$1"); shift
 [[ ${1:-} == -- ]] && shift
 
-config="$game_dir/MicrosoftGame.Config"
+# Packages spell it MicrosoftGame.Config or MicrosoftGame.config.
+config=$(find "$game_dir" -maxdepth 1 -iname MicrosoftGame.config -print -quit)
 [[ -f $config ]] || die "no MicrosoftGame.Config in $game_dir"
 
-# First <Executable Name="..."> and the TitleId; good enough for MicrosoftGame.Config.
-exe=$(grep -o '<Executable [^>]*' "$config" | head -1 | sed -n 's/.* Name="\([^"]*\)".*/\1/p')
+# First <Executable Name="..."> and the TitleId; good enough for MicrosoftGame.Config. The name
+# can be a path in the package (a UE5 title: TitleGame\Binaries\XSX\...), matched without case.
+exe=$(grep -o '<Executable [^>]*' "$config" | head -1 | sed -n 's/.* Name="\([^"]*\)".*/\1/p' | tr '\\' /)
+if [[ -n $exe && ! -e $game_dir/$exe ]]; then
+    found=$(find "$game_dir" -ipath "$game_dir/$exe" -print -quit)
+    [[ -n $found ]] && exe=${found#"$game_dir"/}
+fi
+# Where the exe is: Wine looks for its DLLs there first, so that is what the scan reads and where
+# DLLs standing in for the package's go.
+exe_dir=$(dirname "$exe")
 title_id=$(sed -n 's:.*<TitleId>\([^<]*\)</TitleId>.*:\1:p' "$config" | head -1)
 [[ -n $exe ]] || die "no <Executable> in $config"
 title_id=${title_id:-unknown}
@@ -49,7 +58,7 @@ title_id=${title_id:-unknown}
 wine_dlls="$(dirname "$(realpath "$(command -v "$WINE")")")/../lib/wine/x86_64-windows"
 
 if (( scan )); then
-    exec ${REBOX_SCAN:-scan_imports.py} "$game_dir" \
+    exec ${REBOX_SCAN:-scan_imports.py} "$game_dir/$exe_dir" \
         --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" --provider "$DXVK_DIR" --provider "$wine_dlls"
 fi
 
@@ -81,7 +90,7 @@ fi
 if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
     gen="$WINEPREFIX/generated-stubs"
     rm -rf "$gen"
-    "${REBOX_SCAN:-scan_imports.py}" "$game_dir" --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" \
+    "${REBOX_SCAN:-scan_imports.py}" "$game_dir/$exe_dir" --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" \
         --provider "$DXVK_DIR" --provider "$wine_dlls" --shims "$REBOX_SRC/shims" --gen-stubs "$gen" \
         $(command -v x86_64-w64-mingw32-gcc >/dev/null && echo --prototypes-from x86_64-w64-mingw32-gcc) \
         > "$WINEPREFIX/imports.txt" 2>&1 || true  # exits 1 when it found gaps
@@ -121,17 +130,29 @@ install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "
 shadow="$WINEPREFIX/package"
 rm -rf "$shadow"
 mkdir -p "$shadow"
-for entry in "$game_dir"/* "$game_dir"/.[!.]*; do
-    [[ -e $entry ]] && ln -s "$entry" "$shadow/"
-done
+# Mirrored down to the exe's directory with real directories (everything else symlinked), so
+# replacement DLLs can go next to the exe without touching the package.
+mirror() {
+    local from=$1 to=$2 rest=$3 next=${3%%/*} entry
+    mkdir -p "$to"
+    for entry in "$from"/* "$from"/.[!.]*; do
+        [[ -e $entry ]] || continue
+        if [[ $rest != . && $(basename "$entry") == "$next" ]]; then
+            [[ $rest == */* ]] && mirror "$entry" "$to/$next" "${rest#*/}" || mirror "$entry" "$to/$next" .
+        else
+            ln -s "$entry" "$to/"
+        fi
+    done
+}
+mirror "$game_dir" "$shadow" "$exe_dir"
 overrides="d3d12,d3d12core,dxgi=n"
 for dll in "$REBOX_SHIMS_DIR"/*.dll "$REBOX_SHIMS_DIR"/stub/*.dll; do
     [[ -f $dll ]] || continue
     name=$(basename "$dll")
-    if [[ -e $shadow/$name ]]; then
+    if [[ -e $shadow/$exe_dir/$name ]]; then
         [[ $name == amd_fidelityfx_loader_xbox.dll && ${REBOX_FFX_STUB:-1} == 0 ]] && continue
-        rm -f "$shadow/$name"
-        install -m 644 "$dll" "$shadow/$name"
+        rm -f "$shadow/$exe_dir/$name"
+        install -m 644 "$dll" "$shadow/$exe_dir/$name"
         echo "rebox-run: using our $name instead of the package's" >&2
     else
         install -m 644 "$dll" "$sys32/"

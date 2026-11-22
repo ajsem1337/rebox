@@ -190,6 +190,18 @@ def load_prototypes(cc):
             _returns.setdefault(name[:-1], kind)
 
 
+def is_data_import(name):
+    """Interface IDs and similar GUIDs are imported as data: a stub must be a GUID, not code."""
+    return isinstance(name, str) and name.startswith(("IID_", "CLSID_", "WKPDID_", "GUID_"))
+
+
+def data_stub(c, d, ident, name):
+    """A zeroed GUID exported as data, for an interface ID nothing provides (the title will
+    match nothing against it, rather than read code bytes as a GUID)."""
+    c.append(f"const unsigned char data_{ident}[16] = {{ 0 }}; /* {name}: unknown GUID */")
+    d.append(f'    "{name}" = data_{ident} DATA')
+
+
 def stub_macro(name):
     kind = _returns.get(name) if isinstance(name, str) else None
     return {"zero": "REBOX_STUB_ZERO", "void": "REBOX_STUB_VOID"}.get(kind, "REBOX_STUB")
@@ -210,6 +222,9 @@ def write_stub_dll(directory, base, syms, forwards=None):
     for i, s in enumerate(sorted((s for s in syms if s not in forwards), key=str)):
         ident = f"{ident_base}_{i:04d}"
         label = s if isinstance(s, str) else f"#{s}"
+        if is_data_import(s):
+            data_stub(c, d, ident, s)
+            continue
         c.append(f"{stub_macro(s)}({base}, {ident}, \"{label}\")")
         if isinstance(s, str):
             d.append(f'    "{s}" = stub_{ident}')
@@ -377,6 +392,9 @@ def main():
             for i, s in enumerate(syms):
                 ident = f"{base}_{i:04d}"
                 label = s if isinstance(s, str) else f"#{s}"
+                if is_data_import(s):
+                    data_stub(c, d, ident, s)
+                    continue
                 c.append(f"{stub_macro(s)}({base}, {ident}, \"{label}\")")
                 if isinstance(s, str):
                     d.append(f'    "{s}" = stub_{ident}')
