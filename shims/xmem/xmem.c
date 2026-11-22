@@ -411,23 +411,23 @@ BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
  * against the console's xmem.dll and a title's calls; XValkyrie agrees). The flags only matter
  * to the console's allocator. The page-size flags go too: they need a privilege on Windows, and
  * our Wine patch drops them anyway. */
-/* Console-only bits Windows rejects (a UE5 title: type 0x20401000, protect 0x2404):
- *   type     MEM_PHYSICAL (0x400000) next to MEM_COMMIT: the console maps title pages there;
- *   protect  0x800-0x4000 (PAGE_GRAPHICS_* in the console's winnt.h: GPU access to the pages),
- *            PAGE_WRITECOMBINE (0x400) and PAGE_NOCACHE (0x200), cache behaviour.
+/* Console-only bits Windows rejects (a UE5 title: type 0x20401000 / protect 0x2404 to commit,
+ * type 0x20402000 / protect 0x10404 to reserve 112 MiB for physical pages):
+ *   type     MEM_PHYSICAL (0x400000): a range the title maps physical pages into. Here that's an
+ *            ordinary reservation, which XMemMapPhysicalPages commits;
+ *   protect  everything above the base protection and PAGE_GUARD: 0x800-0x4000 and 0x10000 (GPU
+ *            access in the console's winnt.h), PAGE_WRITECOMBINE (0x400) and PAGE_NOCACHE (0x200).
  * The pages become plain CPU memory: GPU access at a title-chosen address is unified memory's
  * business (docs/d3d12x.md). */
-#define CONSOLE_PROTECT_BITS 0xfe00
+#define HOST_PROTECT_BITS 0x1ff
 
 void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
 {
-    DWORD host_type = type & ~CONSOLE_PAGE_FLAGS, host_protect = protect & ~CONSOLE_PROTECT_BITS;
+    DWORD host_type = type & ~(CONSOLE_PAGE_FLAGS | MEM_PHYSICAL), host_protect = protect & HOST_PROTECT_BITS;
     void *p;
     static LONG calls, failures, graphics;
 
-    if (host_type & MEM_COMMIT)
-        host_type &= ~MEM_PHYSICAL;
-    if ((protect & 0x7800) && !InterlockedExchange(&graphics, 1))
+    if ((protect & ~HOST_PROTECT_BITS & ~0x600) && !InterlockedExchange(&graphics, 1))
         rebox_log("xmem: XMemVirtualAlloc with GPU access bits (protect %#lx): plain CPU memory here", protect);
     p = VirtualAlloc(address, size, host_type, host_protect);
 

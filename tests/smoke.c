@@ -276,6 +276,17 @@ static void test_xmem(void)
                        0x1234567800000000ull, PAGE_READWRITE);
             CHECK(v != NULL, "XMemVirtualAlloc with large pages and XMem flags -> %p", v);
             if (v) { v[(1 << 20) - 1] = 1; VirtualFree(v, 0, MEM_RELEASE); }
+            /* a UE5 title's two calls: reserve 112 MiB for physical pages with console protection
+             * bits, then commit 64 KiB of it the same way. */
+            v = valloc(NULL, 0x7000000, 0x20402000, 0x23, 0x10404);
+            CHECK(v != NULL, "XMemVirtualAlloc reserving for physical pages (MEM_PHYSICAL, protect 0x10404) -> %p", v);
+            if (v)
+            {
+                BYTE *c = valloc(v + 0x10000, 0x10000, 0x20401000, 0x3, 0x2404);
+                CHECK(c == v + 0x10000, "XMemVirtualAlloc committing in it (MEM_PHYSICAL, protect 0x2404) -> %p", c);
+                if (c) c[0xffff] = 1;
+                VirtualFree(v, 0, MEM_RELEASE);
+            }
             range = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
             CHECK(palloc(0x20000000, &count, pages) && count == 16 && pages[0] != pages[15],
                   "XMemAllocatePhysicalPages hands out 16 distinct pages");
