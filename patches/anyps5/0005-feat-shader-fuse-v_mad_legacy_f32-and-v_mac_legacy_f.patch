@@ -1,0 +1,57 @@
+From 2f09e2960debbb6b227dba72dee886875fcd2ddb Mon Sep 17 00:00:00 2001
+From: aboodaj <aljabiriabdullah@gmail.com>
+Date: Sun, 22 Nov 2026 08:17:58 +0000
+Subject: [PATCH] feat(shader): fuse v_mad_legacy_f32 and v_mac_legacy_f32 as
+ on RDNA2
+
+From americas-recomp 6c4f4ba70d (GPL-2.0). On gfx1031 (boykopovar/AnyPS5#1281)
+VOP3 0x140 is v_fma_legacy_f32, bit-exact with v_fma_f32 after the zero rule
+and denormal flush; gfx1010 rounds the product first. Xbox Series shaders are
+RDNA2. XBOX_NO_FUSED_LEGACY_MAD=1 restores the gfx1010 rounding.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../recompiler/Translation/src/FloatInstructions.cpp       | 7 +++++++
+ docs/dev/debt/changes/xbox-fused-legacy-mad.md             | 5 +++++
+ 2 files changed, 12 insertions(+)
+ create mode 100644 docs/dev/debt/changes/xbox-fused-legacy-mad.md
+
+diff --git a/core/shader/recompiler/Translation/src/FloatInstructions.cpp b/core/shader/recompiler/Translation/src/FloatInstructions.cpp
+index eecb644ab9..c287f40432 100644
+--- a/core/shader/recompiler/Translation/src/FloatInstructions.cpp
++++ b/core/shader/recompiler/Translation/src/FloatInstructions.cpp
+@@ -1,6 +1,7 @@
+ #include "Translation/TranslationContext.hpp"
+ #include <array>
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ShaderRecompiler {
+@@ -816,6 +817,12 @@ bool TranslationContext::vFmaLegacyF32(const RdnaInstruction& inst, bool accumul
+     const auto factor = [&](IrValue* value) { return &ir.Emit(IrOpcode::SelectF32, IrType::F32, {&zero.Value(), &ir.ConstantF32(0.0f), value}); };
+     IrValue* lhsFactor = factor(lhs);
+     IrValue* rhsFactor = factor(rhs);
++    static const bool fused = std::getenv("XBOX_NO_FUSED_LEGACY_MAD") == nullptr;
++    if (fused) {
++        IrValue* sum = &ir.Emit(IrOpcode::FPFma32, IrType::F32, {lhsFactor, rhsFactor, addend});
++        writeOperand(inst.destination, nanResultF32({lhsFactor, rhsFactor, addend}, sum, &invalidProductF32(lhsFactor, rhsFactor)));
++        return true;
++    }
+     IrValue* product = &flushTinyProduct(lhsFactor, rhsFactor, &ir.Emit(IrOpcode::FPMul32, IrType::F32, {lhsFactor, rhsFactor}), nullptr, false).Value();
+     const IrU1 zeroSum(ir.LogicalAnd(isZero(product).Value(), isZero(addend).Value()));
+     IrValue& zeroSumBits = ir.BitwiseAnd(ir.BitwiseAnd(ir.BitCastU32(*product), ir.BitCastU32(*addend)), ir.Constant(0x80000000u));
+diff --git a/docs/dev/debt/changes/xbox-fused-legacy-mad.md b/docs/dev/debt/changes/xbox-fused-legacy-mad.md
+new file mode 100644
+index 0000000000..1cb30fe956
+--- /dev/null
++++ b/docs/dev/debt/changes/xbox-fused-legacy-mad.md
+@@ -0,0 +1,5 @@
++# shader
++
++## change [v_mad_legacy_f32 and v_mac_legacy_f32]
++
++- [v_mad_legacy_f32 and v_mac_legacy_f32](../../../core/shader/recompiler/Translation/src/FloatInstructions.cpp) (VOP3 0x140, VOP2 0x06) are fused for the Xbox Series guest, but the Series X GPU is not measured: on gfx1031 (RX 6700 XT, boykopovar/AnyPS5#1281) 0x140 is `v_fma_legacy_f32`, bit-exact with `v_fma_f32` in every IEEE/denorm mode. VOP2 0x06, NaN results and a product below the f32 range with a zero addend have no RDNA2 rows. `XBOX_NO_FUSED_LEGACY_MAD=1` restores the gfx1010 rounding of the product before the add (RX 5700 XT, boykopovar/AnyPS5#1281 and #1290). Both give a +0 product for a zero factor and flush f32 denormal sources and results (gfx1010 also the product) to a zero of the same sign in every mode, an exception to [f32DenormalFlushFor](../../../core/shader/recompiler/Translation/src/VectorInstructions.cpp).
+-- 
+2.55.0
+
