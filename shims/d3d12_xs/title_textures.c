@@ -1,0 +1,356 @@
+/* Textures a title placed at its own GPU addresses (CreatePlacedResourceX, slot 44).
+ *
+ * On the console the texture is the memory at that address, in a Gfx10 tiled layout, and the
+ * title fills it there: DirectStorage writes texture pools into it (already tiled, docs/d3d12x.md
+ * "Texture tiling"). Here the texture has its own memory, because vkd3d-proton can't place an
+ * image in the buffer-only GPU memory chunks. So each such texture is registered with its
+ * address and swizzle mode, writes the shims see (ReboxTitleMemoryWritten: DirectStorage
+ * requests) mark it dirty, and before a queue runs the title's command lists every dirty texture
+ * is detiled from title memory (detile.cpp, addrlib) into an upload buffer and copied in. A new
+ * texture starts dirty, for data written before it was created. Writes nothing reports (the CPU,
+ * or GPU copies to the address) aren't seen.
+ *
+ * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
+ * picks: "auto" (default: ROW_MAJOR descs linear; otherwise SW_64KB_D when mip 0 is at least
+ * 1 MiB and SW_4KB_S below, the split the target title's texture pools show), "64KB_D", "4KB_S", "linear",
+ * or "off" (no uploads). Each distinct console layout is logged once with what it got. */
+
+#define COBJMACROS
+#define WIDL_C_INLINE_WRAPPERS
+#include <windows.h>
+#include <d3d12.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../common/rebox_log.h"
+#include "detile.h"
+#include "gpu_memory.h"
+#include "title_textures.h"
+
+struct title_texture
+{
+    ID3D12Resource *resource;   /* not a reference: removed when it is destroyed */
+    UINT64 address, size;       /* the title's (GPU) address */
+    const BYTE *cpu;            /* where the CPU reads it */
+    struct detile_surface surface;
+    D3D12_RESOURCE_STATES state;
+    UINT subresources;
+    BOOL dirty;
+    UINT callback;
+    struct title_texture *next;
+};
+
+static SRWLOCK lock = SRWLOCK_INIT;
+static struct title_texture *textures;
+static volatile LONG dirty_count;
+
+static int mode_setting(void)
+{
+    static int setting = -2;
+    if (setting == -2)
+    {
+        char *v = rebox_getenv("REBOX_TEXTURE_SWIZZLE");
+        setting = !v || !strcmp(v, "auto") ? -1 : !strcmp(v, "off") ? -3 : !strcmp(v, "64KB_D") ? DETILE_64KB_D
+                : !strcmp(v, "4KB_S") ? DETILE_4KB_S : !strcmp(v, "linear") ? DETILE_LINEAR : -1;
+        free(v);
+    }
+    return setting;
+}
+
+static void WINAPI destroyed(void *data)
+{
+    struct title_texture *t = data, **p;
+
+    AcquireSRWLockExclusive(&lock);
+    for (p = &textures; *p; p = &(*p)->next)
+        if (*p == t)
+        {
+            *p = t->next;
+            if (t->dirty)
+                InterlockedDecrement(&dirty_count);
+            free(t);
+            break;
+        }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* The CPU address of a title GPU address: through GPU memory's mapping when it is in one of its
+ * chunks (identity-mapped or not; *chunk set), else the same address (memory the title allocated
+ * itself). */
+static const BYTE *cpu_address(UINT64 address, UINT64 size, BOOL *chunk)
+{
+    struct gpu_memory_region r[64];
+    UINT n = gpu_memory_regions(r, ARRAYSIZE(r));
+
+    *chunk = FALSE;
+    for (UINT i = 0; i < n; i++)
+        if (address >= r[i].gpu && address + size <= r[i].gpu + r[i].size)
+        {
+            *chunk = TRUE;
+            return (const BYTE *)r[i].cpu + (address - r[i].gpu);
+        }
+    return (const BYTE *)(ULONG_PTR)address;
+}
+
+/* Whether [address, address + size) is committed, readable memory. Not for GPU memory chunks:
+ * Wine's VirtualQuery doesn't know the Vulkan driver's mappings and reports them free. */
+static BOOL readable(UINT64 address, UINT64 size)
+{
+    UINT64 at = address, end = address + size;
+
+    while (at < end)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
+                || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mbi.Protect)
+            return FALSE;
+        at = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return TRUE;
+}
+
+void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D12_RESOURCE_DESC *console_desc,
+                            const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state)
+{
+    static struct { UINT layout, x34; } seen[32];
+    static LONG seen_count;
+    struct title_texture *t;
+    ID3DDestructionNotifier *notifier;
+    int setting = mode_setting();
+    UINT block, bytes, x34 = *(const UINT *)((const BYTE *)console_desc + 0x34);
+    BOOL logged = FALSE;
+
+    if (setting == -3 || !resource || !desc || desc->Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc->SampleDesc.Count > 1 || !(bytes = detile_element(desc->Format, &block)))
+        return;
+    if (!(t = calloc(1, sizeof(*t))))
+        return;
+    t->resource = resource;
+    t->address = address;
+    t->state = state;
+    t->surface.format = desc->Format;
+    t->surface.width = (UINT)desc->Width;
+    t->surface.height = desc->Height;
+    t->surface.layers = desc->DepthOrArraySize;
+    t->surface.volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    t->surface.mips = desc->MipLevels ? desc->MipLevels : 1;
+    if (setting >= 0)
+        t->surface.mode = setting;
+    else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+        t->surface.mode = DETILE_LINEAR;
+    else
+        t->surface.mode = (UINT64)((t->surface.width + block - 1) / block) * ((t->surface.height + block - 1) / block)
+                * bytes >= (1u << 20) ? DETILE_64KB_D : DETILE_4KB_S;
+    t->subresources = t->surface.mips * (t->surface.volume ? 1 : t->surface.layers);
+    t->size = detile_size(&t->surface);
+
+    for (LONG i = 0; i < seen_count && !logged; i++)
+        logged = seen[i].layout == (UINT)console_desc->Layout && seen[i].x34 == x34;
+    if (!logged && seen_count < (LONG)ARRAYSIZE(seen))
+    {
+        LONG i = InterlockedIncrement(&seen_count) - 1;
+        if (i < (LONG)ARRAYSIZE(seen))
+            seen[i].layout = console_desc->Layout, seen[i].x34 = x34;
+        rebox_log("d3d12_xs: placed texture layout %#x (+0x34 %#x, +0x38 %#llx), %ux%u x%u, %u mips, format %u: "
+                     "%s, %llu bytes at %#llx", console_desc->Layout, x34,
+                     *(const unsigned long long *)((const BYTE *)console_desc + 0x38), t->surface.width,
+                     t->surface.height, t->surface.layers, t->surface.mips, desc->Format,
+                     t->surface.mode == DETILE_64KB_D ? "SW_64KB_D" : t->surface.mode == DETILE_4KB_S ? "SW_4KB_S" : "linear",
+                     (unsigned long long)t->size, (unsigned long long)address);
+    }
+    {
+        BOOL chunk;
+        t->cpu = cpu_address(address, t->size, &chunk);
+        if (t->size && !chunk && !readable((UINT64)(ULONG_PTR)t->cpu, t->size))
+            t->size = 0;
+    }
+    if (!t->size)
+    {
+        static LONG warned;
+        if (!InterlockedExchange(&warned, 1))
+            rebox_log("d3d12_xs: placed texture at %#llx: no layout for it or its memory isn't readable; "
+                         "it stays as created", (unsigned long long)address);
+        free(t);
+        return;
+    }
+    if (FAILED(ID3D12Resource_QueryInterface(resource, &IID_ID3DDestructionNotifier, (void **)&notifier)))
+    {
+        free(t);
+        return;
+    }
+    ID3DDestructionNotifier_RegisterDestructionCallback(notifier, destroyed, t, &t->callback);
+    ID3DDestructionNotifier_Release(notifier);
+    t->dirty = TRUE;
+    AcquireSRWLockExclusive(&lock);
+    t->next = textures;
+    textures = t;
+    InterlockedIncrement(&dirty_count);
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* A range the title's memory changed in, by CPU or GPU address. */
+void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size)
+{
+    if (!textures)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    for (struct title_texture *t = textures; t; t = t->next)
+        if (!t->dirty && ((address < t->address + t->size && t->address < address + size)
+                          || (address < (UINT64)(ULONG_PTR)t->cpu + t->size && (UINT64)(ULONG_PTR)t->cpu < address + size)))
+        {
+            t->dirty = TRUE;
+            InterlockedIncrement(&dirty_count);
+        }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* Uploads one texture through an upload buffer: detile each subresource into its copyable
+ * footprint, then copy. Returns the buffer, which must live until the copy has run. */
+static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommandList *list, struct title_texture *t)
+{
+    D3D12_RESOURCE_DESC desc;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp;
+    UINT *rows;
+    D3D12_HEAP_PROPERTIES upload = { D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 0, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_RESOURCE_BARRIER barrier = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+    ID3D12Resource *buffer = NULL;
+    UINT64 total = 0;
+    BYTE *mapped;
+    BOOL ok = TRUE;
+
+    desc = ID3D12Resource_GetDesc(t->resource);
+    fp = calloc(t->subresources, sizeof(*fp));
+    rows = calloc(t->subresources, sizeof(*rows));
+    if (!fp || !rows)
+    {
+        free(fp);
+        free(rows);
+        return NULL;
+    }
+    ID3D12Device_GetCopyableFootprints(device, &desc, 0, t->subresources, 0, fp, rows, NULL, &total);
+    bd.Width = total;
+    if (FAILED(ID3D12Device_CreateCommittedResource(device, &upload, D3D12_HEAP_FLAG_NONE, &bd,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+                                                    (void **)&buffer))
+            || FAILED(ID3D12Resource_Map(buffer, 0, NULL, (void **)&mapped)))
+    {
+        if (buffer)
+            ID3D12Resource_Release(buffer);
+        free(fp);
+        free(rows);
+        return NULL;
+    }
+    for (UINT i = 0; i < t->subresources && ok; i++)
+    {
+        UINT mip = i % t->surface.mips, layer = i / t->surface.mips;
+        /* rows: rows of pixels, or of 4x4 blocks for BC formats; a 3D slice is that many rows. */
+        ok = detile_to_linear(&t->surface, t->cpu, mip, layer, mapped + fp[i].Offset,
+                              fp[i].Footprint.RowPitch, (UINT64)fp[i].Footprint.RowPitch * rows[i]);
+    }
+    ID3D12Resource_Unmap(buffer, 0, NULL);
+    if (!ok)
+    {
+        static LONG warned;
+        if (!InterlockedExchange(&warned, 1))
+            rebox_log("d3d12_xs: detiling a placed texture failed (format %u, %ux%u)", t->surface.format,
+                         t->surface.width, t->surface.height);
+        ID3D12Resource_Release(buffer);
+        free(fp);
+        free(rows);
+        return NULL;
+    }
+    barrier.Transition.pResource = t->resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = t->state;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (t->state != D3D12_RESOURCE_STATE_COPY_DEST)
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+    for (UINT i = 0; i < t->subresources; i++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = { t->resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = i } };
+        D3D12_TEXTURE_COPY_LOCATION src = { buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, { .PlacedFootprint = fp[i] } };
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = t->state;
+    if (t->state != D3D12_RESOURCE_STATE_COPY_DEST)
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+    free(fp);
+    free(rows);
+    return buffer;
+}
+
+void title_textures_upload(ID3D12CommandQueue *queue)
+{
+    ID3D12Resource *buffers[64];
+    struct title_texture *t;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D12Device *device = NULL;
+    D3D12_COMMAND_QUEUE_DESC qd;
+    UINT n = 0;
+
+    if (!dirty_count)
+        return;
+    qd = ID3D12CommandQueue_GetDesc(queue);
+    if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && qd.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        return;
+    if (FAILED(ID3D12CommandQueue_GetDevice(queue, &IID_ID3D12Device, (void **)&device)))
+        return;
+    if (FAILED(ID3D12Device_CreateCommandAllocator(device, qd.Type, &IID_ID3D12CommandAllocator, (void **)&alloc))
+            || FAILED(ID3D12Device_CreateCommandList(device, 0, qd.Type, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                                                     (void **)&list))
+            || FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)))
+        goto done;
+
+    /* Under the lock so a texture can't be destroyed while its upload is recorded; up to 64 a
+     * submission, the rest the next time. */
+    AcquireSRWLockExclusive(&lock);
+    for (t = textures; t && n < ARRAYSIZE(buffers); t = t->next)
+        if (t->dirty)
+        {
+            t->dirty = FALSE;
+            InterlockedDecrement(&dirty_count);
+            if ((buffers[n] = record_upload(device, list, t)))
+                n++;
+        }
+    ReleaseSRWLockExclusive(&lock);
+    if (FAILED(ID3D12GraphicsCommandList_Close(list)) || !n)
+        goto done;
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+    /* Waited for here, before the title's lists: simple, and uploads are rare. */
+    if (SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, 1)))
+        for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+            Sleep(1);
+    {
+        static LONG uploads;
+        if (InterlockedIncrement(&uploads) <= 8)
+            rebox_log("d3d12_xs: uploaded %u placed texture(s) from title memory", n);
+    }
+
+done:
+    while (n)
+    {
+        n--;
+        ID3D12Resource_Release(buffers[n]);
+    }
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (device) ID3D12Device_Release(device);
+}
+
+/* For tests and tools: the size of a surface in title memory, and tiling linear data into it. */
+UINT64 WINAPI ReboxDetileSize(const struct detile_surface *s)
+{
+    return detile_size(s);
+}
+
+BOOL WINAPI ReboxTile(const struct detile_surface *s, void *surface, UINT mip, UINT layer, const void *linear,
+                         UINT64 row_pitch, UINT64 slice_pitch)
+{
+    return detile_from_linear(s, surface, mip, layer, linear, row_pitch, slice_pitch);
+}

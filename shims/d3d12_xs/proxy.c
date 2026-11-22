@@ -34,6 +34,7 @@
 #include "pacing.h"
 #include "present.h"
 #include "proxy.h"
+#include "title_textures.h"
 
 #define INNER_OFFSET 0x1000
 #define DEVICE_OUT_OF_LINE_FLAG 0x18
@@ -940,8 +941,13 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     if (!InterlockedExchange(&logged[why], 1))
         rebox_log("d3d12_xs: CreatePlacedResourceX(%#llx, dimension %u, %llu bytes): %s; it gets its own memory",
                      (unsigned long long)address, d->Dimension, (unsigned long long)d->Width,
-                     why == 0 ? "a texture" : why == 1 ? "not in GPU memory" : "the heap refused the placement");
-    return device_CreateCommittedResource(p, &own, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+                     why == 0 ? "a texture, uploaded from title memory when that changes"
+                     : why == 1 ? "not in GPU memory" : "the heap refused the placement");
+    hr = device_CreateCommittedResource(p, &own, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+    /* A texture is the memory at its address on the console: keep it filled from there. */
+    if (SUCCEEDED(hr) && why == 0 && *out)
+        title_texture_register(*out, address, desc, d, state);
+    return hr;
 }
 
 /* Slot 61: CreateSamplerX(desc, handle) (ScarlettX's retail trace; layout from XValkyrie): a
@@ -1083,6 +1089,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
 
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(lists[i]);
+    /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
+    title_textures_upload(INNER(p, ID3D12CommandQueue));
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
     if (raw != stack)
         free(raw);

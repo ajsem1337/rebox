@@ -60,6 +60,29 @@ endif
 # The DirectStorage shim talks to the BCPack helper over a localhost socket.
 LIBS_xcrdapi := -lws2_32
 
+# d3d12_xs detiles console textures with AMD's addrlib (Mesa, MIT): ADDRLIB is Mesa's
+# src/amd/addrlib, which the flake sets. Without it detile.cpp builds as stubs.
+ifneq ($(ADDRLIB),)
+ADDRLIB_SRC := $(shell find $(ADDRLIB)/src -name '*.cpp')
+ADDRLIB_OBJ := $(patsubst %.cpp,$(BUILD)/addrlib/%.o,$(notdir $(ADDRLIB_SRC)))
+ADDRLIB_FLAGS := -std=c++17 -O2 -mbmi -DADDR_FASTCALL= -DLITTLEENDIAN_CPU -DDEBUG=0 -I$(ADDRLIB)/inc \
+	-I$(ADDRLIB)/src -I$(ADDRLIB)/src/core $(patsubst %,-I$(ADDRLIB)/src/chip/%,gfx9 gfx10 gfx11 gfx12 r800) \
+	-I$(ADDRLIB)/../common
+vpath %.cpp $(sort $(dir $(ADDRLIB_SRC)))
+$(BUILD)/addrlib/%.o: %.cpp
+	@mkdir -p $(BUILD)/addrlib
+	$(MINGW_CXX) $(ADDRLIB_FLAGS) -c $< -o $@
+DETILE_FLAGS := -DREBOX_ADDRLIB $(ADDRLIB_FLAGS)
+else
+ADDRLIB_OBJ :=
+DETILE_FLAGS := -std=c++17 -O2
+endif
+$(BUILD)/detile.o: shims/d3d12_xs/detile.cpp shims/d3d12_xs/detile.h
+	@mkdir -p $(BUILD)
+	$(MINGW_CXX) $(DETILE_FLAGS) -c $< -o $@
+LIBS_d3d12_xs := $(BUILD)/detile.o $(ADDRLIB_OBJ) -static -lstdc++
+$(BUILD)/d3d12_xs.dll: $(BUILD)/detile.o $(ADDRLIB_OBJ)
+
 .SECONDEXPANSION:
 $(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
 	@mkdir -p $(BUILD)

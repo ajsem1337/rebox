@@ -55,7 +55,7 @@
         '';
       };
       shimsMakeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "MINGW_CXX=x86_64-w64-mingw32-g++" "FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}"
-                         "XODUS_IDL=${xodus-xgameruntime}/include" ];
+                         "XODUS_IDL=${xodus-xgameruntime}/include" "ADDRLIB=${pkgs.mesa.src}/src/amd/addrlib" ];
 
       pyTool = name: file: pkgs.runCommand name { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
         makeWrapper ${python}/bin/python3 $out/bin/${name} --add-flags ${file} \
@@ -279,6 +279,8 @@
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
           export XODUS_IDL=${xodus-xgameruntime}/include
           export LEONIDA_SRC=${leonida-src}
+          # AMD's addrlib (Mesa, MIT), for detiling console textures in d3d12_xs.
+          export ADDRLIB=${pkgs.mesa.src}/src/amd/addrlib
           export REBOX_ANYPS5_DIR=${self.packages.${system}.rebox-anyps5}
           export WINE_DLL_DIR=${pkgs.wineWow64Packages.unstable}/lib/wine/x86_64-windows
           # Software Vulkan only for machines (or sandboxes) without a GPU;

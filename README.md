@@ -206,8 +206,14 @@ down missing translations.
   Leonida doesn't ship, so those use its provisional entries unless calibrated tables are given
   (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page addresses in DirectStorage
   requests aren't supported.
-- **Textures written through their GPU VA** get scratch memory (see docs/d3d12x.md): no crash,
-  but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
+- **Textures placed at title addresses are copies.** On the console a texture placed with
+  `CreatePlacedResourceX` is the memory at its address, in a Gfx10 tiled layout. Here it has its
+  own memory, filled from the title's: `d3d12_xs` detiles it with AMD's addrlib (Mesa, MIT) when
+  it is created and whenever DirectStorage reports writing there, before the next submission.
+  Writes nothing reports (the CPU, GPU copies to the address) aren't seen. Which console layout
+  means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) uses
+  `SW_64KB_D` from 1 MiB of mip 0 and `SW_4KB_S` below, as the target title's texture pools do, and each
+  distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
   ignores them, and the smoke test checks that it still does. Their meaning is unknown. Pipeline

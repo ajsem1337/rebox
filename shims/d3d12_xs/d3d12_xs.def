@@ -22,3 +22,6 @@ EXPORTS
     ReboxConsoleFaults
     ReboxConsoleFromContainer
     ReboxConsoleFree
+    ReboxTitleMemoryWritten
+    ReboxDetileSize
+    ReboxTile

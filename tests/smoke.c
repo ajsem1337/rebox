@@ -1478,7 +1478,7 @@ done:
  * bound heap's lookup table. Entry 2 is written straight into the
  * shader-visible heap (slot 19), entry 3 copied in from a CPU heap (slot
  * 24). Needs descriptor buffers (RADV); elsewhere the shader reports a skip. */
-/* RDNA2 compute shader for the shadow-heap round trip (llvm-mc -mcpu=gfx1030).
+/* RDNA2 compute shader for the shadow-heap pass trip (llvm-mc -mcpu=gfx1030).
  * s[0:1] points at a CBV/SRV/UAV descriptor table, s[2:3] at a sampler table;
  * the s_load offsets (in dwords 1, 3 and 5) are patched to the heap increments.
  *   s_load_dwordx8 s[4:11], s[0:1], 2*inc         ; T# at index 2
@@ -1521,7 +1521,7 @@ static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size
 
     if (!sa5)
     {
-        printf("skip AnyPS5 round trip: no rebox_anyps5.dll\n");
+        printf("skip AnyPS5 pass trip: no rebox_anyps5.dll\n");
         return;
     }
     compile = (void *)GetProcAddress(sa5, "sa5_compile_compute");
@@ -1535,7 +1535,7 @@ static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size
     code[5] = (code[5] & ~0x1fffffu) | sinc;
     if (compile(&req, &result, error, sizeof(error)))
     {
-        CHECK(0, "AnyPS5 compiles the shadow-heap round-trip shader: %s", error);
+        CHECK(0, "AnyPS5 compiles the shadow-heap pass-trip shader: %s", error);
         return;
     }
     if (getenv("SMOKE_DUMP_SPIRV"))
@@ -2365,6 +2365,114 @@ static void test_gameinput(void)
               && !none, "GameInput has no keyboard readings");
 }
 
+/* A texture placed at a title address (slot 44) is filled from the tiled memory there: at first
+ * use, and again after a reported write (DirectStorage reports its writes the same way). */
+static void test_placed_texture(void *dev, void *queue)
+{
+    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume; } surface =
+            { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE };
+    typedef HRESULT (WINAPI *gpu_alloc_fn)(SIZE_T, SIZE_T, void **, UINT64 *);
+    typedef UINT64 (WINAPI *size_fn)(const void *);
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    typedef void (WINAPI *written_fn)(UINT64, UINT64);
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    gpu_alloc_fn gpu_alloc = (gpu_alloc_fn)(void *)GetProcAddress(m, "ReboxGpuAlloc");
+    size_fn surface_size = (size_fn)(void *)GetProcAddress(m, "ReboxDetileSize");
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(m, "ReboxTile");
+    written_fn written = (written_fn)(void *)GetProcAddress(m, "ReboxTitleMemoryWritten");
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256 * 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    ID3D12Resource *tex = NULL, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *list = NULL, *cpu = NULL;
+    UINT32 linear[64 * 64];
+    UINT64 gpu = 0, size;
+    HRESULT hr;
+
+    if (!gpu_alloc || !surface_size || !tile || !written)
+    {
+        CHECK(FALSE, "d3d12_xs exports the placed-texture functions");
+        return;
+    }
+    size = surface_size(&surface);
+    if (!size)
+    {
+        printf("skip placed textures: d3d12_xs built without addrlib\n");
+        return;
+    }
+    CHECK(size == 16384, "a 64x64 RGBA8 texture in SW_4KB_S takes 16 KiB (%llu)", (unsigned long long)size);
+    if (FAILED(gpu_alloc(1 << 20, 65536, &cpu, &gpu)))
+    {
+        printf("skip placed textures: no GPU memory\n");
+        return;
+    }
+    for (int i = 0; i < 64 * 64; i++)
+        linear[i] = i * 2654435761u;
+    tile(&surface, cpu, 0, 0, linear, 256, 256 * 64);
+    hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *,
+               REFIID, void **)(dev, gpu, &td, D3D12_RESOURCE_STATE_COPY_SOURCE, NULL, &IID_ID3D12Resource,
+               (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    for (int pass = 0; pass < 2 && SUCCEEDED(hr); pass++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+        D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                            { .PlacedFootprint = { 0, { DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 } } } };
+        UINT32 *out = NULL;
+        BOOL same;
+
+        if (pass == 1)
+        {
+            /* Rewrite the texture's memory and report it, as a DirectStorage request does. */
+            for (int i = 0; i < 64 * 64; i++)
+                linear[i] = ~linear[i] + i;
+            tile(&surface, cpu, 0, 0, linear, 256, 256 * 64);
+            written(gpu, size);
+            ID3D12CommandAllocator_Reset(alloc);
+        }
+        if (!list)
+            hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                       REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                       &IID_ID3D12GraphicsCommandList, &list);
+        else
+            hr = XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        if (FAILED(hr))
+            break;
+        XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+              const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, pass + 1);
+        for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < (UINT64)pass + 1; i++)
+            Sleep(10);
+        ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+        same = out && !memcmp(out, linear, sizeof(linear));
+        if (out) ID3D12Resource_Unmap(buf, 0, NULL);
+        if (pass)
+            CHECK(same, "a reported write to the title memory is uploaded at the next submission");
+        else
+            CHECK(same, "a texture placed at a title address is filled from its tiled memory (SW_4KB_S)");
+    }
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (tex) ID3D12Resource_Release(tex);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -2578,6 +2686,7 @@ static void test_xbox(void)
     test_pacing(dev);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
+    test_placed_texture(dev, queue);
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);

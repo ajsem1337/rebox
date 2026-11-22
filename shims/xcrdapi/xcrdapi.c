@@ -424,6 +424,27 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     return hr;
 }
 
+typedef void (WINAPI *written_fn)(UINT64, UINT64);
+
+static BOOL CALLBACK find_written(INIT_ONCE *once, void *param, void **out)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    *out = m ? (void *)GetProcAddress(m, "ReboxTitleMemoryWritten") : NULL;
+    return TRUE;
+}
+
+/* d3d12_xs uploads textures placed at title addresses when their memory changes: tell it what
+ * each request wrote (title_textures.c). */
+static void report_written(void *address, UINT32 size)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    written_fn written;
+
+    InitOnceExecuteOnce(&once, find_written, NULL, (void **)&written);
+    if (written && address && size)
+        written((UINT64)(ULONG_PTR)address, size);
+}
+
 static void release_entry(const struct entry *e)
 {
     if (e->file)
@@ -463,6 +484,8 @@ static DWORD WINAPI queue_worker(void *param)
         else
         {
             HRESULT hr = run_request(q, &e);
+            if (SUCCEEDED(hr))
+                report_written(e.request.destination, e.request.destination_size);
             if (FAILED(hr))
             {
                 static LONG logged;
