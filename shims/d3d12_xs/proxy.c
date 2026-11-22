@@ -36,6 +36,7 @@
 #include "proxy.h"
 
 #define INNER_OFFSET 0x1000
+#define DEVICE_OUT_OF_LINE_FLAG 0x18
 #define MAX_SLOTS 160
 
 struct proxy_class
@@ -1466,6 +1467,12 @@ HRESULT proxy_query_device(ID3D12Device *inner, REFIID riid, void **out)
     {
         ID3D12Device_AddRef(inner);
         device_proxy = proxy_create((IUnknown *)inner, &device_class);
+        /* The console device's flags byte at +0x18 (XValkyrie, docs/research/d3d12x.md; Xbox One
+         * and Series): when it's zero, title code writes CBV descriptors and copies
+         * CBV_SRV_UAV/RTV/DSV descriptors itself, 16 bytes at a time, into the CPU handle. Ours
+         * are vkd3d-proton's, so those writes would corrupt its heaps and skip the shadow heaps;
+         * nonzero makes titles call slots 17 and 24. */
+        ((BYTE *)device_proxy)[DEVICE_OUT_OF_LINE_FLAG] = 1;
         patch_child_classes(inner);
     }
     ReleaseSRWLockExclusive(&lock);

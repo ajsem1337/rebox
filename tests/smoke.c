@@ -2212,6 +2212,9 @@ static void test_xbox(void)
     }
     hr = create(NULL, NULL, &IID_ID3D12Device2, &dev2);
     CHECK(SUCCEEDED(hr) && dev2 == dev, "D3D12XboxCreateDevice returns one device (%p, %p)", dev, dev2);
+    /* Titles test this byte to decide whether to call CreateConstantBufferView and
+     * CopyDescriptorsSimple or to write descriptors themselves (proxy.c). */
+    CHECK(((const BYTE *)dev)[0x18] != 0, "device flags byte at +0x18 asks titles to call the descriptor methods");
     hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &IID_ID3D12Device5, &dev5);
     CHECK(SUCCEEDED(hr) && dev5 == dev, "QueryInterface for another device version returns the proxy");
 
