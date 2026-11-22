@@ -143,6 +143,12 @@ done
 # Mount the package as G: too, for titles that assume a package drive.
 ln -sfn "$shadow" "$WINEPREFIX/dosdevices/g:"
 
+# Console titles may name the package "GAME:\..." (ivall/xcl, via Leonida's docs/runtime_imports.md).
+# Wine takes that for a path relative to the working directory, where a "GAME:" link to the package
+# resolves it in any case and with either slash. It lists as a directory reparse point (0x410);
+# REBOX_GAME_ALIAS=0 drops it for a title whose own directory walk trips over it.
+[[ ${REBOX_GAME_ALIAS:-1} == 0 ]] || ln -sfn . "$shadow/GAME:"
+
 cache=${REBOX_SHADER_CACHE:-$WINEPREFIX/shader-cache}
 mkdir -p "$cache"
 cache=$(realpath "$cache")
