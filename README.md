@@ -63,6 +63,10 @@ Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launc
    call and returns `E_NOTIMPL`, or 0 (FALSE, NULL) with `ERROR_CALL_NOT_IMPLEMENTED` when mingw's
    Windows headers declare the name returning something other than an HRESULT; the shims are then rebuilt in
    `$WINEPREFIX/shim-build` (only when the stubs change; `REBOX_AUTO_STUBS=0` turns this off).
+   An API set (`api-ms-win-*`) that Wine's schema doesn't host, such as an Xbox-only one, would
+   stop the exe loading; it gets a DLL of its own that forwards the names Wine's core DLLs export
+   and stubs the rest. Wine's own sets missing a name are fine: Wine binds a stub that fails only
+   when called.
    Forwarded exports in package DLLs are followed. `nix run . -- --scan ../xsx` prints the report
    without running. To make an entry point real, implement it in `shims/<dll>/` and add it to that
    DLL's `.def`. `tests/run-stubgen.sh` checks the stub generation end to end.

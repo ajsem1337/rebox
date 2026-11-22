@@ -4,8 +4,11 @@
 #     pefile would drop ("X-Odd");
 #   - pkgfwd.dll, a "package" DLL whose exports forward to missingx.dll (by
 #     name and by ordinal), which nobody provides either.
-# The scan must generate stub DLLs for fakexbox and missingx; once built,
-# the exe must load and get E_NOTIMPL from every call.
+#   - api-ms-win-xbox-fake-l1-1-0.dll, an API set Wine's schema doesn't
+#     host: GetTickCount (which kernelbase has) and XSetFake (nobody has).
+# The scan must generate stub DLLs for fakexbox, missingx and the API set
+# (forwarding GetTickCount to kernelbase); once built, the exe must load,
+# get E_NOTIMPL from every stub and the real GetTickCount.
 # Needs: WINE, WINE_DLL_DIR, x86_64-w64-mingw32-gcc/dlltool (nix develop).
 set -euo pipefail
 
@@ -25,6 +28,14 @@ EXPORTS
     XOdd == "X-Odd"
 DEF
 x86_64-w64-mingw32-dlltool -d "$work/fake.def" -l "$work/libfakexbox.a"
+
+cat > "$work/apiset.def" <<'DEF'
+LIBRARY api-ms-win-xbox-fake-l1-1-0.dll
+EXPORTS
+    XSetFake
+    XGetTickCount == GetTickCount
+DEF
+x86_64-w64-mingw32-dlltool -d "$work/apiset.def" -l "$work/libapiset.a"
 
 # The package DLL: two forwarders, built for real so the scan reads them.
 cat > "$work/pkgfwd.def" <<'DEF'
@@ -46,11 +57,16 @@ __declspec(dllimport) LONG_PTR XFakeOrdinal(void);
 __declspec(dllimport) LONG_PTR XOdd(void);
 __declspec(dllimport) LONG_PTR XFwdName(void);
 __declspec(dllimport) LONG_PTR XFwdOrdinal(void);
+__declspec(dllimport) LONG_PTR XSetFake(void);
+__declspec(dllimport) DWORD XGetTickCount(void);
 int main(void)
 {
-    LONG_PTR r[] = { XFakeCall(), XFakeOrdinal(), XOdd(), XFwdName(), XFwdOrdinal() };
+    LONG_PTR r[] = { XFakeCall(), XFakeOrdinal(), XOdd(), XFwdName(), XFwdOrdinal(), XSetFake() };
     int ok = 1;
-    for (int i = 0; i < 5; i++)
+    DWORD ticks = XGetTickCount();
+    printf("GetTickCount through the API set -> %lu\n", ticks);
+    ok &= ticks != 0 && ticks - GetTickCount() < 1000u;
+    for (int i = 0; i < 6; i++)
     {
         printf("call %d -> %#llx\n", i, (unsigned long long)r[i]);
         /* HRESULTs: callers look at the low 32 bits (EAX). */
@@ -62,7 +78,7 @@ int main(void)
     return ok ? 0 : 1;
 }
 C
-x86_64-w64-mingw32-gcc -O1 -o "$work/game/probe.exe" "$work/probe.c" "$work/libfakexbox.a" "$work/libpkgfwd.a"
+x86_64-w64-mingw32-gcc -O1 -o "$work/game/probe.exe" "$work/probe.c" "$work/libfakexbox.a" "$work/libpkgfwd.a" "$work/libapiset.a"
 
 python3 "$here/tools/scan_imports.py" "$work/game" --provider "$WINE_DLL_DIR" --shims "$here/shims" \
     --gen-stubs "$work/gen" --prototypes-from x86_64-w64-mingw32-gcc > "$work/scan.txt" 2>&1 || true
@@ -74,9 +90,15 @@ grep -q '"XRealName"' "$work/gen/dlls/missingx/missingx.def" 2>/dev/null && grep
     || { cat "$work/scan.txt"; fail "no stub DLL for the forwarders' target (by name and ordinal)"; }
 grep -q 'via pkgfwd.XFwdName' "$work/scan.txt" || { cat "$work/scan.txt"; fail "report doesn't name the forwarder"; }
 echo "ok   scan follows forwarders to a missing DLL and keeps names pefile drops"
+set=api-ms-win-xbox-fake-l1-1-0
+grep -q '"GetTickCount" = kernelbase.GetTickCount' "$work/gen/dlls/$set/$set.def" 2>/dev/null \
+    && grep -q '"XSetFake"' "$work/gen/dlls/$set/stubs.c" && grep -q 'UNKNOWN SET' "$work/scan.txt" \
+    || { cat "$work/scan.txt"; fail "an API set Wine doesn't host gets no DLL forwarding to kernelbase"; }
+echo "ok   an API set Wine's schema doesn't host gets a DLL: forwards where a core DLL has the name, stubs elsewhere"
 
-make -s -C "$here" GEN="$work/gen" BUILD="$work/build" "$work/build/stub/fakexbox.dll" "$work/build/stub/missingx.dll"
-cp "$work/build/stub/fakexbox.dll" "$work/build/stub/missingx.dll" "$work/game/"
+make -s -C "$here" GEN="$work/gen" BUILD="$work/build" "$work/build/stub/fakexbox.dll" "$work/build/stub/missingx.dll" \
+    "$work/build/stub/$set.dll"
+cp "$work/build/stub/fakexbox.dll" "$work/build/stub/missingx.dll" "$work/build/stub/$set.dll" "$work/game/"
 
 export WINEPREFIX="$work/prefix" WINEDEBUG=-all
 "$WINE" wineboot -i >/dev/null 2>&1
