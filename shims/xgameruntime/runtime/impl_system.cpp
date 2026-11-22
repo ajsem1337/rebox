@@ -403,7 +403,7 @@ const char* text_of(const std::optional<std::string>& text) { return text ? text
 
 HRESULT XGameUiShowMessageDialogAsync_impl(void*, task::AsyncBlock* async, const char* title, const char* content, const char* first,
                                            const char* second, const char* third, uint32_t defaultButton, uint32_t cancelButton) {
-  if (!async || !title || !content) return E_INVALIDARG;
+  if (!async || !title || !content || defaultButton > 2 || cancelButton > 2) return E_INVALIDARG;
   const void* identity = reinterpret_cast<const void*>(&XGameUiShowMessageDialogAsync_impl);
   ui::Callbacks callbacks = ui::title_callbacks();
   if (!callbacks.showMessageDialog) return begin_without_ui(async, identity, "XGameUiShowMessageDialogAsync");
@@ -467,11 +467,10 @@ HRESULT XGameUiShowAchievementsResult_impl(void*, task::AsyncBlock* async) {
 HRESULT XGameUiShowPlayerPickerAsync_impl(void*, task::AsyncBlock* async, void* user, const char* prompt, uint32_t selectFromCount,
                                           const uint64_t* selectFrom, uint32_t preSelectedCount, const uint64_t* preSelected, uint32_t minSelection,
                                           uint32_t maxSelection) {
-  if (!async || !user || !prompt || (selectFromCount && !selectFrom)) return E_INVALIDARG;
+  if (!async || !user || !prompt || (selectFromCount && !selectFrom) || (preSelectedCount && !preSelected)) return E_INVALIDARG;
   const void* identity = reinterpret_cast<const void*>(&XGameUiShowPlayerPickerAsync_impl);
   ui::Callbacks callbacks = ui::title_callbacks();
   if (!callbacks.showPlayerPicker) return begin_without_ui(async, identity, "XGameUiShowPlayerPickerAsync");
-  if (preSelectedCount && !preSelected) return E_INVALIDARG;
   auto show = [callbacks, user, prompt = std::string(prompt), selectFrom = std::vector<uint64_t>(selectFrom, selectFrom + selectFromCount),
                preSelected = std::vector<uint64_t>(preSelected, preSelected + preSelectedCount), minSelection,
                maxSelection](void* handle, task::Queue* queue) {

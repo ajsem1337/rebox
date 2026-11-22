@@ -4,7 +4,7 @@ Titles load `xgameruntime.dll` with `LoadLibrary` and get every Gaming Runtime A
 (XUser, XGameSave, XPackage, XStore, XTaskQueue, ...) as an interface from `QueryApiImpl`.
 WineGDK's runtime answers five of them, and its XUser is stubs. This directory is
 [americas-recomp](https://github.com/realdody/americas-recomp)'s replacement
-(`tools/xbox/platform/xgr` at 99cea85c1385bea66026e1d6e7586f437a96cac1, GPL-2.0-or-later), which
+(`tools/xbox/platform/xgr` at 7b8e3428fd633266ec8f34806e0fc29d633fa3a0, GPL-2.0-or-later), which
 vendors GrandTheftXbox's XTaskQueue/XAsync layer (MIT, `runtime/GTX_LICENSE.txt`). Its behaviour,
 offline answers and settings are described in `UPSTREAM-README.md`, with a summary below.
 

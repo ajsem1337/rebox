@@ -88,7 +88,9 @@ static const GUID kGameEvent = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0
 static const GUID kUser = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
 static const GUID kSystem3 = {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}};
 static const GUID kActivation = {0x2e4f76fe, 0x0fc7, 0x461e, {0xab, 0x4d, 0xa4, 0x49, 0x94, 0x34, 0xc3, 0xcf}};
+static const GUID kInvite = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
 static const GUID kInvite2 = {0x014d1cc3, 0xbcfe, 0x41ff, {0xb2, 0xf0, 0xe1, 0xef, 0x07, 0x15, 0x58, 0x28}};
+static const GUID kProtocol = {0x026b010c, 0x06c3, 0x4cdd, {0xbb, 0xcb, 0x43, 0xf2, 0x29, 0xdb, 0x1c, 0xff}};
 static const GUID kStore = {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
 static const GUID kError = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
 
@@ -426,7 +428,24 @@ static void CheckPendingInvites() {
   Api invite = Get("IXGameInviteImpl2", kInvite2);
   auto acceptInvite = invite.At<HRESULT (*)(void*, const char*)>(7, "XGameInviteAcceptPendingInvite");
   Check(acceptInvite(invite.self, "ms-xbl-0://invite") == kNotFound, "XGameInviteAcceptPendingInvite reports no such pending invite");
-  Check(acceptInvite(invite.self, nullptr) == E_INVALIDARG, "XGameInviteAcceptPendingInvite rejects a null invite URI");
+  Check(acceptInvite(invite.self, nullptr) == E_INVALIDARG && acceptInvite(invite.self, "") == E_INVALIDARG,
+        "XGameInviteAcceptPendingInvite rejects a null or empty invite URI");
+}
+
+static void CheckSilentUnregisters() {
+  Token never{};
+  Api activation = Get("IXGameActivationImpl", kActivation);
+  auto unActivation = activation.At<BOOLEAN (*)(void*, Token, BOOLEAN)>(4, "XGameActivationUnregisterForEvent");
+  Check(unActivation(activation.self, never, FALSE) && unActivation(activation.self, never, TRUE),
+        "XGameActivationUnregisterForEvent answers true for a token it never issued, with or without wait");
+  Api protocol = Get("IXGameProtocolImpl", kProtocol);
+  auto unProtocol = protocol.At<BOOLEAN (*)(void*, Token, BOOLEAN)>(4, "XGameProtocolUnregisterForActivation");
+  Check(unProtocol(protocol.self, never, FALSE) && unProtocol(protocol.self, never, TRUE),
+        "XGameProtocolUnregisterForActivation answers true for a token it never issued, with or without wait");
+  Api invite = Get("IXGameInviteImpl", kInvite);
+  auto unInvite = invite.At<BOOLEAN (*)(void*, Token, BOOLEAN)>(4, "XGameInviteUnregisterForEvent");
+  Check(unInvite(invite.self, never, FALSE) && unInvite(invite.self, never, TRUE),
+        "XGameInviteUnregisterForEvent answers true for a token it never issued, with or without wait");
 }
 
 int main() {
@@ -448,6 +467,7 @@ int main() {
   CheckGameEvent();
   CheckHandleTracking();
   CheckPendingInvites();
+  CheckSilentUnregisters();
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
   return g_failures ? 1 : 0;
 }

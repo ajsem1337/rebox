@@ -240,6 +240,7 @@ static void CheckFeatures() {
 }
 
 static void CheckActivation() {
+  int callsBefore = g_silent_calls;
   Api protocol = Get(kProtocol);
   CheckSilentEvent(protocol, 3, "XGameProtocolRegisterForActivation", 4, "XGameProtocolUnregisterForActivation");
   Api activation = Get(kActivation);
@@ -249,6 +250,16 @@ static void CheckActivation() {
   Api invite = Get(kInvite);
   CheckSilentEvent(invite, 3, "XGameInviteRegisterForEvent", 4, "XGameInviteUnregisterForEvent");
   CheckSilentEvent(invite, 5, "XGameInviteRegisterForPendingEvent", 6, "XGameInviteUnregisterForPendingEvent");
+  Check(g_silent_calls == callsBefore, "activation, protocol and invite registrations do not invoke the callback");
+  Token unknown{};
+  Check(protocol.At<UnregisterFn>(4, "XGameProtocolUnregisterForActivation")(protocol.self, unknown, FALSE),
+        "XGameProtocolUnregisterForActivation returns true for a token that was never registered");
+  Check(activation.At<UnregisterFn>(4, "XGameActivationUnregisterForEvent")(activation.self, unknown, FALSE),
+        "XGameActivationUnregisterForEvent returns true for a token that was never registered");
+  Check(invite.At<UnregisterFn>(4, "XGameInviteUnregisterForEvent")(invite.self, unknown, FALSE),
+        "XGameInviteUnregisterForEvent returns true for a token that was never registered");
+  Check(invite.At<UnregisterFn>(6, "XGameInviteUnregisterForPendingEvent")(invite.self, unknown, TRUE),
+        "XGameInviteUnregisterForPendingEvent returns true for a token that was never registered");
 }
 
 struct Blocking { HANDLE entered; HANDLE release; volatile LONG calls; };
@@ -470,6 +481,12 @@ static void CheckGameUi() {
     Check(ui.At<HRESULT (*)(void*, AsyncBlock*, const char*, const char*, const char*, const char*, const char*, uint32_t, uint32_t)>(3, "XGameUiShowMessageDialogAsync")(
               ui.self, &bad, nullptr, "Content", nullptr, nullptr, nullptr, 0, 0) == E_INVALIDARG,
           "XGameUiShowMessageDialogAsync rejects a null title");
+    Check(ui.At<HRESULT (*)(void*, AsyncBlock*, const char*, const char*, const char*, const char*, const char*, uint32_t, uint32_t)>(3, "XGameUiShowMessageDialogAsync")(
+              ui.self, &bad, "Title", "Content", nullptr, nullptr, nullptr, 3, 0) == E_INVALIDARG,
+          "XGameUiShowMessageDialogAsync rejects an out-of-range defaultButton");
+    Check(ui.At<HRESULT (*)(void*, AsyncBlock*, const char*, const char*, const char*, const char*, const char*, uint32_t, uint32_t)>(3, "XGameUiShowMessageDialogAsync")(
+              ui.self, &bad, "Title", "Content", nullptr, nullptr, nullptr, 0, 3) == E_INVALIDARG,
+          "XGameUiShowMessageDialogAsync rejects an out-of-range cancelButton");
   }
   {
     AsyncBlock b{};
@@ -505,6 +522,13 @@ static void CheckGameUi() {
     HRESULT result = ui.At<HRESULT (*)(void*, AsyncBlock*, uint32_t, uint64_t*, uint32_t*)>(13, "XGameUiShowPlayerPickerResult")(ui.self, &b, 2, out, nullptr);
     Check(countHr == E_ABORT, "XGameUiShowPlayerPickerResultCount reports E_ABORT");
     CheckAborted(begin, &b, result, "XGameUiShowPlayerPickerAsync");
+    auto picker = ui.At<HRESULT (*)(void*, AsyncBlock*, void*, const char*, uint32_t, const uint64_t*, uint32_t, const uint64_t*, uint32_t, uint32_t)>(
+        11, "XGameUiShowPlayerPickerAsync");
+    AsyncBlock bad{};
+    Check(picker(ui.self, &bad, handle, "Pick", 2, players, 1, nullptr, 1, 1) == E_INVALIDARG,
+          "XGameUiShowPlayerPickerAsync rejects a pre-selection count without a list, also with no UI callbacks set");
+    Check(picker(ui.self, &bad, handle, "Pick", 2, nullptr, 0, nullptr, 1, 1) == E_INVALIDARG,
+          "XGameUiShowPlayerPickerAsync rejects a select-from count without a list");
   }
   {
     AsyncBlock b{};

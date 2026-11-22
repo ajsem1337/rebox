@@ -84,6 +84,7 @@ static Api Get(const GUID& iid) {
 
 constexpr HRESULT kNotInitialized = static_cast<HRESULT>(0x89245400);
 constexpr HRESULT kClientNotConnected = static_cast<HRESULT>(0x89245401);
+constexpr HRESULT kNoData = static_cast<HRESULT>(0x89245402);
 constexpr HRESULT kNoDatacenter = static_cast<HRESULT>(0x89245403);
 constexpr HRESULT kNotStreamingController = static_cast<HRESULT>(0x89245404);
 constexpr uint64_t kSomeClient = 0x1234;
@@ -231,6 +232,10 @@ static void CheckConnectionState() {
   Sleep(50);
   Check(g_callback_calls == 0, "XGameStreamingRegisterConnectionStateChanged sends no initial callback (no client is connected)");
   Check(unreg(g_s1.self, first, FALSE) && unreg(g_s1.self, second, TRUE), "XGameStreamingUnregisterConnectionStateChanged unregisters");
+  Token unknown{};
+  unknown.value = 0xdeadbeef;
+  Check(!unreg(g_s1.self, unknown, FALSE) && !unreg(g_s1.self, first, TRUE) && !unreg(g_s1.self, second, FALSE),
+        "XGameStreamingUnregisterConnectionStateChanged answers false for a token it never issued or already revoked");
 }
 
 static void CheckClientProperties() {
@@ -297,7 +302,7 @@ static void CheckClientProperties() {
 static void CheckLatencyAndInput() {
   auto latency = g_s1.At<AddedLatencyFn>(14, "XGameStreamingGetStreamAddedLatency");
   uint32_t input = 0, output = 0, deviation = 0;
-  Check(latency(g_s1.self, kSomeClient, &input, &output, &deviation) == kClientNotConnected, "XGameStreamingGetStreamAddedLatency returns E_GAMESTREAMING_CLIENT_NOT_CONNECTED");
+  Check(latency(g_s1.self, kSomeClient, &input, &output, &deviation) == kNoData, "XGameStreamingGetStreamAddedLatency returns the documented E_GAMESTREAMING_NO_DATA (its page lists no CLIENT_NOT_CONNECTED)");
   Check(latency(g_s1.self, kSomeClient, &input, nullptr, &deviation) == E_INVALIDARG, "XGameStreamingGetStreamAddedLatency rejects a null output");
 
   uint64_t frame = 0;
@@ -369,8 +374,10 @@ static void CheckTouchControls() {
 
 static void CheckResolution() {
   auto set = g_s3.At<SetResolutionFn>(34, "XGameStreamingSetResolution");
-  Check(set(g_s3.self, 1920, 1080) == S_OK && set(g_s3.self, 1280, 720) == S_OK, "XGameStreamingSetResolution accepts the standard 720p and 1080p resolutions");
-  Check(set(g_s3.self, 2560, 1080) == E_INVALIDARG, "XGameStreamingSetResolution rejects a non-standard resolution outside a streaming server");
+  Check(set(g_s3.self, 1920, 1080) == S_OK && set(g_s3.self, 1280, 720) == S_OK && set(g_s3.self, 3840, 2160) == S_OK,
+        "XGameStreamingSetResolution accepts the standard 720p, 1080p and 4K resolutions");
+  Check(set(g_s3.self, 2560, 1080) == E_INVALIDARG && set(g_s3.self, 2560, 1440) == E_INVALIDARG,
+        "XGameStreamingSetResolution rejects a non-standard resolution outside a streaming server");
   bool rejects = set(g_s3.self, 632, 360) == E_INVALIDARG && set(g_s3.self, 640, 352) == E_INVALIDARG && set(g_s3.self, 1924, 1080) == E_INVALIDARG &&
                  set(g_s3.self, 1920, 1084) == E_INVALIDARG && set(g_s3.self, 0, 0) == E_INVALIDARG;
   Check(rejects, "XGameStreamingSetResolution rejects sizes below 640x360 or not divisible by 8");
@@ -381,6 +388,15 @@ static void CheckUninitialize() {
   Check(EveryHresultCallIs(kNotInitialized), "every HRESULT method returns E_GAMESTREAMING_NOT_INITIALIZED after XGameStreamingUninitialize");
   Check(Initialize() == S_OK && g_s1.At<GetClientsFn>(10, "XGameStreamingGetClients")(g_s1.self, 0, nullptr, nullptr) == S_OK,
         "XGameStreamingInitialize works again after XGameStreamingUninitialize");
+  auto reg = g_s1.At<RegisterConnectionFn>(12, "XGameStreamingRegisterConnectionStateChanged");
+  auto unreg = g_s1.At<UnregisterConnectionFn>(13, "XGameStreamingUnregisterConnectionStateChanged");
+  Token stale{}, fresh{};
+  Check(reg(g_s1.self, nullptr, nullptr, reinterpret_cast<void*>(&ConnectionCallback), &stale) == S_OK, "a registration before a second uninitialize is accepted");
+  Uninitialize();
+  Check(Initialize() == S_OK, "XGameStreamingInitialize works again a second time");
+  Check(reg(g_s1.self, nullptr, nullptr, reinterpret_cast<void*>(&ConnectionCallback), &fresh) == S_OK, "a registration after re-initialization is accepted");
+  Check(!unreg(g_s1.self, stale, FALSE) && unreg(g_s1.self, fresh, TRUE),
+        "XGameStreamingUninitialize drops its registrations: a token from before it answers false, a token issued after answers true");
   Uninitialize();
 }
 

@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
+#include <unordered_set>
 
 #include "xgr_internal.h"
 #include "xtask.h"
@@ -12,6 +14,7 @@ namespace {
 
 constexpr HRESULT kNotInitialized = static_cast<HRESULT>(0x89245400);
 constexpr HRESULT kClientNotConnected = static_cast<HRESULT>(0x89245401);
+constexpr HRESULT kNoData = static_cast<HRESULT>(0x89245402);
 constexpr HRESULT kNoDatacenter = static_cast<HRESULT>(0x89245403);
 constexpr HRESULT kNotStreamingController = static_cast<HRESULT>(0x89245404);
 
@@ -59,6 +62,8 @@ static_assert(sizeof(TouchControlsStateOperation) == 32, "XGameStreamingTouchCon
 
 std::atomic<bool> g_initialized{false};
 std::atomic<uint64_t> g_next_token{1};
+std::mutex g_tokens_mutex;
+std::unordered_set<uint64_t> g_live_tokens;
 
 bool initialized() { return g_initialized.load(); }
 
@@ -77,7 +82,11 @@ HRESULT XGameStreamingInitialize_impl(void*) {
   return S_OK;
 }
 
-void XGameStreamingUninitialize_impl(void*) { g_initialized = false; }
+void XGameStreamingUninitialize_impl(void*) {
+  g_initialized = false;
+  std::lock_guard<std::mutex> lock(g_tokens_mutex);
+  g_live_tokens.clear();
+}
 
 uint8_t XGameStreamingIsStreaming_impl(void*) { return 0; }
 
@@ -110,16 +119,23 @@ HRESULT XGameStreamingRegisterConnectionStateChanged_impl(void*, task::Queue*, v
   if (!initialized()) return kNotInitialized;
   if (!callback || !token) return E_INVALIDARG;
   token->token = g_next_token++;
+  {
+    std::lock_guard<std::mutex> lock(g_tokens_mutex);
+    g_live_tokens.insert(token->token);
+  }
   return S_OK;
 }
 
-uint8_t XGameStreamingUnregisterConnectionStateChanged_impl(void*, task::RegistrationToken, uint8_t) { return 1; }
+uint8_t XGameStreamingUnregisterConnectionStateChanged_impl(void*, task::RegistrationToken token, uint8_t) {
+  std::lock_guard<std::mutex> lock(g_tokens_mutex);
+  return g_live_tokens.erase(token.token) ? 1 : 0;
+}
 
 HRESULT XGameStreamingGetStreamAddedLatency_impl(void*, ClientId, uint32_t* averageInputLatencyUs, uint32_t* averageOutputLatencyUs,
                                                  uint32_t* standardDeviationUs) {
   if (!initialized()) return kNotInitialized;
   if (!averageInputLatencyUs || !averageOutputLatencyUs || !standardDeviationUs) return E_INVALIDARG;
-  return kClientNotConnected;
+  return kNoData;
 }
 
 size_t XGameStreamingGetServerLocationNameSize_impl(void*) { return 0; }
@@ -221,7 +237,7 @@ constexpr uint32_t kMinimumStreamHeight = 360;
 constexpr uint32_t kStreamDimensionAlignment = 8;
 
 bool is_standard_resolution(uint32_t width, uint32_t height) {
-  return (width == 1280 && height == 720) || (width == 1920 && height == 1080);
+  return (width == 1280 && height == 720) || (width == 1920 && height == 1080) || (width == 3840 && height == 2160);
 }
 
 HRESULT XGameStreamingSetResolution_impl(void*, uint32_t width, uint32_t height) {
