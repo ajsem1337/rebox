@@ -18,11 +18,28 @@ char *rebox_getenv(const char *name);
 #define REBOX_E_NOTIMPL ((ULONG_PTR)0x80004001)
 
 /* Generated stubs ignore their arguments (safe on x64: the caller owns the
- * stack) and return E_NOTIMPL. */
+ * stack). REBOX_STUB returns E_NOTIMPL, for HRESULT functions and ones
+ * whose prototype is unknown; REBOX_STUB_ZERO returns 0 (FALSE, NULL)
+ * with ERROR_CALL_NOT_IMPLEMENTED, for functions the headers declare
+ * returning anything else; REBOX_STUB_VOID returns nothing. */
 #define REBOX_STUB(dll, id, name)                         \
     ULONG_PTR WINAPI stub_##id(void)                         \
     {                                                        \
         static LONG once;                                    \
         rebox_unimpl(#dll, name, &once);                  \
         return REBOX_E_NOTIMPL;                           \
+    }
+#define REBOX_STUB_ZERO(dll, id, name)                    \
+    ULONG_PTR WINAPI stub_##id(void)                         \
+    {                                                        \
+        static LONG once;                                    \
+        rebox_unimpl(#dll, name, &once);                  \
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);            \
+        return 0;                                            \
+    }
+#define REBOX_STUB_VOID(dll, id, name)                    \
+    void WINAPI stub_##id(void)                              \
+    {                                                        \
+        static LONG once;                                    \
+        rebox_unimpl(#dll, name, &once);                  \
     }

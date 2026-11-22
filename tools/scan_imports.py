@@ -23,6 +23,7 @@ import argparse
 import collections
 import pathlib
 import re
+import subprocess
 import sys
 
 import pefile
@@ -141,6 +142,55 @@ def def_names(path):
     return names
 
 
+# Return classes of functions the Windows headers declare (--prototypes-from CC): a stub for an
+# HRESULT function, or one with no known prototype, returns E_NOTIMPL; one returning anything
+# else 0 (FALSE, NULL) with ERROR_CALL_NOT_IMPLEMENTED; a void one nothing. A pointer or handle
+# caller would take E_NOTIMPL for an address.
+_returns = {}
+_DECL = re.compile(r"(?:^|[;}])\s*(?:WINBASEAPI|WINUSERAPI|WINADVAPI|DECLSPEC_IMPORT|__declspec\(dllimport\)|"
+                   r"WINGDIAPI|STDAPI_?\(?|extern|WINAPI_INLINE|NTSYSAPI)?([\w\s\*]*?)\s*"
+                   r"(?:WINAPI|APIENTRY|NTAPI|__stdcall|STDAPICALLTYPE|CALLBACK)\s+(\w+)\s*\(", re.M)
+
+
+def load_prototypes(cc):
+    """Index the headers next to the compiler's windows.h: function name -> return class."""
+    try:
+        deps = subprocess.run([cc, "-M", "-x", "c", "-"], input="#include <windows.h>\n", capture_output=True,
+                              text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    header = next((p for p in re.split(r"[\s\\]+", deps) if p.endswith("/windows.h")), None)
+    if not header:
+        return
+    imported = {}
+    for path in sorted(pathlib.Path(header).parent.glob("*.h")):
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _DECL.finditer(text):
+            decl, ret, name = m.group(0), " ".join(m.group(1).split()), m.group(2)
+            if "virtual" in decl or "STDMETHOD" in decl:  # a COM method of the same name
+                continue
+            if "STDAPI" in decl and not ret:
+                ret = "HRESULT"
+            # An exported function's declaration beats a typedef or inline helper of that name.
+            marked = any(k in decl for k in ("WINBASEAPI", "WINUSERAPI", "WINADVAPI", "dllimport", "WINGDIAPI",
+                                              "STDAPI", "NTSYSAPI"))
+            if not ret or (name in _returns and (imported.get(name) or not marked)):
+                continue
+            _returns[name] = "hresult" if "HRESULT" in ret else "void" if ret in ("void", "VOID") else "zero"
+            imported[name] = marked
+    for name, kind in list(_returns.items()):  # A/W variants answer for the plain name
+        if name[-1:] in "AW":
+            _returns.setdefault(name[:-1], kind)
+
+
+def stub_macro(name):
+    kind = _returns.get(name) if isinstance(name, str) else None
+    return {"zero": "REBOX_STUB_ZERO", "void": "REBOX_STUB_VOID"}.get(kind, "REBOX_STUB")
+
+
 def write_stub_dll(directory, base, syms):
     """A complete DLL whose every export logs once and returns E_NOTIMPL."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -152,7 +202,7 @@ def write_stub_dll(directory, base, syms):
     for i, s in enumerate(sorted(syms, key=str)):
         ident = f"{ident_base}_{i:04d}"
         label = s if isinstance(s, str) else f"#{s}"
-        c.append(f"REBOX_STUB({base}, {ident}, \"{label}\")")
+        c.append(f"{stub_macro(s)}({base}, {ident}, \"{label}\")")
         if isinstance(s, str):
             d.append(f'    "{s}" = stub_{ident}')
         else:
@@ -171,6 +221,8 @@ def main():
     ap.add_argument("--provider", action="append", default=[])
     ap.add_argument("--shims", help="shim source dir (shims/), enables stub generation targets")
     ap.add_argument("--gen-stubs", metavar="OUT_DIR")
+    ap.add_argument("--prototypes-from", metavar="CC",
+                    help="mingw compiler whose Windows headers give generated stubs their return class")
     ap.add_argument("--all", action="store_true", help="list every imported DLL, not just problems")
     args = ap.parse_args()
 
@@ -271,6 +323,9 @@ def main():
                 print(f"    ... {len(missing) - 60} more")
 
     if args.gen_stubs:
+        if args.prototypes_from:
+            load_prototypes(args.prototypes_from)
+            print(f"{len(_returns)} prototypes from {args.prototypes_from}'s headers", file=sys.stderr)
         out = pathlib.Path(args.gen_stubs)
         out.mkdir(parents=True, exist_ok=True)
         for base in sorted(shim_names):
@@ -282,7 +337,7 @@ def main():
             for i, s in enumerate(syms):
                 ident = f"{base}_{i:04d}"
                 label = s if isinstance(s, str) else f"#{s}"
-                c.append(f"REBOX_STUB({base}, {ident}, \"{label}\")")
+                c.append(f"{stub_macro(s)}({base}, {ident}, \"{label}\")")
                 if isinstance(s, str):
                     d.append(f'    "{s}" = stub_{ident}')
                 else:

@@ -59,8 +59,9 @@ Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launc
 
 1. **Stubs what nothing provides.** `rebox-run` scans the exe and the package's DLLs against
    Wine, vkd3d-proton, DXVK and our shims (the report is `$WINEPREFIX/imports.txt`). A missing
-   export of one of our shims, or a DLL nobody provides at all (e.g. `pixevt.dll`), gets a stub
-   that logs its first call and returns `E_NOTIMPL`; the shims are then rebuilt in
+   export of one of our shims, or a DLL nobody provides at all, gets a stub that logs its first
+   call and returns `E_NOTIMPL`, or 0 (FALSE, NULL) with `ERROR_CALL_NOT_IMPLEMENTED` when mingw's
+   Windows headers declare the name returning something other than an HRESULT; the shims are then rebuilt in
    `$WINEPREFIX/shim-build` (only when the stubs change; `REBOX_AUTO_STUBS=0` turns this off).
    Forwarded exports in package DLLs are followed. `nix run . -- --scan ../xsx` prints the report
    without running. To make an entry point real, implement it in `shims/<dll>/` and add it to that

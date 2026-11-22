@@ -20,6 +20,7 @@ cat > "$work/fake.def" <<'DEF'
 LIBRARY fakexbox.dll
 EXPORTS
     XFakeCall
+    IsDebuggerPresent
     XFakeOrdinal @7 NONAME
     XOdd == "X-Odd"
 DEF
@@ -40,6 +41,7 @@ cat > "$work/probe.c" <<'C'
 #include <stdio.h>
 #include <windows.h>
 __declspec(dllimport) LONG_PTR XFakeCall(void);
+__declspec(dllimport) LONG_PTR IsDebuggerPresent_(void) __asm__("IsDebuggerPresent");
 __declspec(dllimport) LONG_PTR XFakeOrdinal(void);
 __declspec(dllimport) LONG_PTR XOdd(void);
 __declspec(dllimport) LONG_PTR XFwdName(void);
@@ -54,13 +56,18 @@ int main(void)
         /* HRESULTs: callers look at the low 32 bits (EAX). */
         ok &= (ULONG)r[i] == 0x80004001u;
     }
+    /* A name the Windows headers declare returning BOOL gets 0, not E_NOTIMPL. */
+    printf("IsDebuggerPresent -> %#llx\n", (unsigned long long)IsDebuggerPresent_());
+    ok &= IsDebuggerPresent_() == 0;
     return ok ? 0 : 1;
 }
 C
 x86_64-w64-mingw32-gcc -O1 -o "$work/game/probe.exe" "$work/probe.c" "$work/libfakexbox.a" "$work/libpkgfwd.a"
 
 python3 "$here/tools/scan_imports.py" "$work/game" --provider "$WINE_DLL_DIR" --shims "$here/shims" \
-    --gen-stubs "$work/gen" > "$work/scan.txt" 2>&1 || true
+    --gen-stubs "$work/gen" --prototypes-from x86_64-w64-mingw32-gcc > "$work/scan.txt" 2>&1 || true
+grep -q 'REBOX_STUB_ZERO(fakexbox, [a-z0-9_]*, "IsDebuggerPresent")' "$work/gen/dlls/fakexbox/stubs.c" \
+    || { cat "$work/scan.txt"; fail "a BOOL function's stub doesn't return 0"; }
 grep -q '"X-Odd"' "$work/gen/dlls/fakexbox/fakexbox.def" 2>/dev/null \
     || { cat "$work/scan.txt"; fail "import name pefile rejects is missing from the fakexbox stub"; }
 grep -q '"XRealName"' "$work/gen/dlls/missingx/missingx.def" 2>/dev/null && grep -q '@9 NONAME' "$work/gen/dlls/missingx/missingx.def" \

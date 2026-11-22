@@ -83,6 +83,7 @@ if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
     rm -rf "$gen"
     "${REBOX_SCAN:-scan_imports.py}" "$game_dir" --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" \
         --provider "$DXVK_DIR" --provider "$wine_dlls" --shims "$REBOX_SRC/shims" --gen-stubs "$gen" \
+        $(command -v x86_64-w64-mingw32-gcc >/dev/null && echo --prototypes-from x86_64-w64-mingw32-gcc) \
         > "$WINEPREFIX/imports.txt" 2>&1 || true  # exits 1 when it found gaps
     if [[ -d $gen/dlls ]] || grep -qs . "$gen"/*_stubs.def; then
         key=$( (echo "$REBOX_SRC"; cd "$gen" && find . -type f -print0 | sort -z | xargs -0 cat) | sha256sum | cut -d' ' -f1)

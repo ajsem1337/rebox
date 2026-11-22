@@ -75,5 +75,5 @@ void rebox_unimpl(const char *dll, const char *name, LONG *once)
         TerminateProcess(GetCurrentProcess(), 3);
     }
     if (!InterlockedExchange(once, 1))
-        rebox_log("unimplemented %s!%s (returning E_NOTIMPL)", dll, name);
+        rebox_log("unimplemented %s!%s (stub: E_NOTIMPL, or 0 for a non-HRESULT Windows function)", dll, name);
 }
