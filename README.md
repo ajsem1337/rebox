@@ -236,8 +236,9 @@ down missing translations.
   submission re-checks a fingerprint of 32 points in up to 512 textures (round robin), which sees
   a texture rewritten but not a small edit between the points (`REBOX_TEXTURE_WATCH=0` turns
   it off). Which console layout
-  means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) uses
-  `SW_64KB_D` from 1 MiB of mip 0 and `SW_4KB_S` below, as the target title's texture pools do, and each
+  means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) follows the target title's
+  texture pools: cubemaps and volumes `SW_4KB_S`, other arrays `SW_64KB_D`, and single textures
+  `SW_64KB_D` from 1 MiB of mip 0 and `SW_4KB_S` below; each
   distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton

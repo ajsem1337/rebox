@@ -15,8 +15,9 @@
  * REBOX_TEXTURE_WATCH=0 turns the sampling off.
  *
  * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
- * picks: "auto" (default: ROW_MAJOR descs linear; otherwise SW_64KB_D when mip 0 is at least
- * 1 MiB and SW_4KB_S below, the split the target title's texture pools show), "64KB_D", "4KB_S", "linear",
+ * picks: "auto" (default: ROW_MAJOR descs linear; cubemaps and volumes SW_4KB_S, other arrays
+ * SW_64KB_D; single 2D textures SW_64KB_D when mip 0 is at least 1 MiB and SW_4KB_S below: what
+ * the target title's texture pools show), "64KB_D", "4KB_S", "linear",
  * or "off" (no uploads). Each distinct console layout is logged once with what it got. */
 
 #define COBJMACROS
@@ -200,6 +201,12 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
         t->surface.mode = setting;
     else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
         t->surface.mode = DETILE_LINEAR;
+    /* By shape, as Leonida's census of the pools found (docs/textures_arrays.md): cubemaps (6
+     * faces) and volumes SW_4KB_S, other 2D arrays SW_64KB_D, whatever their size. */
+    else if (t->surface.volume || t->surface.layers == 6)
+        t->surface.mode = DETILE_4KB_S;
+    else if (t->surface.layers > 1)
+        t->surface.mode = DETILE_64KB_D;
     else
         t->surface.mode = (UINT64)((t->surface.width + block - 1) / block) * ((t->surface.height + block - 1) / block)
                 * bytes >= (1u << 20) ? DETILE_64KB_D : DETILE_4KB_S;
