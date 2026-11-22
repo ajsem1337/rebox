@@ -344,73 +344,130 @@ static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommand
     return buffer;
 }
 
+/* Uploads in flight: their buffers, list and allocator live until the fence says the GPU is done.
+ * Nothing waits on the CPU; a queue other than the one an upload ran on waits for it on the GPU
+ * before running the title's lists, so a texture is never read before it's filled. */
+struct batch
+{
+    ID3D12Fence *fence;
+    ID3D12CommandAllocator *alloc;
+    ID3D12GraphicsCommandList *list;
+    ID3D12CommandQueue *queue; /* not a reference: only compared */
+    ID3D12Resource *buffers[64];
+    UINT count;
+};
+
+static struct batch *batches[32];
+static SRWLOCK batch_lock = SRWLOCK_INIT;
+
+static void batch_free(struct batch *b)
+{
+    while (b->count)
+        ID3D12Resource_Release(b->buffers[--b->count]);
+    if (b->fence) ID3D12Fence_Release(b->fence);
+    if (b->list) ID3D12GraphicsCommandList_Release(b->list);
+    if (b->alloc) ID3D12CommandAllocator_Release(b->alloc);
+    free(b);
+}
+
+/* Frees finished batches and makes queue wait for unfinished ones another queue ran. Returns a
+ * free slot, or -1 when all are busy (the dirty textures then wait for a later submission). */
+static int batches_reclaim(ID3D12CommandQueue *queue)
+{
+    int free_slot = -1;
+
+    AcquireSRWLockExclusive(&batch_lock);
+    for (int i = 0; i < (int)ARRAYSIZE(batches); i++)
+    {
+        struct batch *b = batches[i];
+
+        if (b && ID3D12Fence_GetCompletedValue(b->fence) >= 1)
+        {
+            batch_free(b);
+            batches[i] = b = NULL;
+        }
+        if (!b && free_slot < 0)
+            free_slot = i;
+        else if (b && b->queue != queue)
+            ID3D12CommandQueue_Wait(queue, b->fence, 1);
+    }
+    ReleaseSRWLockExclusive(&batch_lock);
+    return free_slot;
+}
+
 void title_textures_upload(ID3D12CommandQueue *queue)
 {
-    ID3D12Resource *buffers[64];
     struct title_texture *t;
-    ID3D12CommandAllocator *alloc = NULL;
-    ID3D12GraphicsCommandList *list = NULL;
-    ID3D12Fence *fence = NULL;
+    struct batch *b = NULL;
     ID3D12Device *device = NULL;
     D3D12_COMMAND_QUEUE_DESC qd;
-    UINT n = 0;
+    int slot;
 
     if (!textures)
         return;
+    slot = batches_reclaim(queue);
     if (watch_enabled())
     {
         AcquireSRWLockExclusive(&lock);
         watch();
         ReleaseSRWLockExclusive(&lock);
     }
-    if (!dirty_count)
+    if (!dirty_count || slot < 0)
         return;
     qd = ID3D12CommandQueue_GetDesc(queue);
     if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && qd.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return;
     if (FAILED(ID3D12CommandQueue_GetDevice(queue, &IID_ID3D12Device, (void **)&device)))
         return;
-    if (FAILED(ID3D12Device_CreateCommandAllocator(device, qd.Type, &IID_ID3D12CommandAllocator, (void **)&alloc))
-            || FAILED(ID3D12Device_CreateCommandList(device, 0, qd.Type, alloc, NULL, &IID_ID3D12GraphicsCommandList,
-                                                     (void **)&list))
-            || FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)))
+    if (!(b = calloc(1, sizeof(*b)))
+            || FAILED(ID3D12Device_CreateCommandAllocator(device, qd.Type, &IID_ID3D12CommandAllocator, (void **)&b->alloc))
+            || FAILED(ID3D12Device_CreateCommandList(device, 0, qd.Type, b->alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                                                     (void **)&b->list))
+            || FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&b->fence)))
         goto done;
+    b->queue = queue;
 
     /* Under the lock so a texture can't be destroyed while its upload is recorded; up to 64 a
      * submission, the rest the next time. */
     AcquireSRWLockExclusive(&lock);
-    for (t = textures; t && n < ARRAYSIZE(buffers); t = t->next)
+    for (t = textures; t && b->count < ARRAYSIZE(b->buffers); t = t->next)
         if (t->dirty)
         {
             t->dirty = FALSE;
             InterlockedDecrement(&dirty_count);
             t->fingerprint = fingerprint(t);
-            if ((buffers[n] = record_upload(device, list, t)))
-                n++;
+            if ((b->buffers[b->count] = record_upload(device, b->list, t)))
+                b->count++;
         }
     ReleaseSRWLockExclusive(&lock);
-    if (FAILED(ID3D12GraphicsCommandList_Close(list)) || !n)
+    if (FAILED(ID3D12GraphicsCommandList_Close(b->list)) || !b->count)
         goto done;
-    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
-    /* Waited for here, before the title's lists: simple, and uploads are rare. */
-    if (SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, 1)))
-        for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&b->list);
+    if (FAILED(ID3D12CommandQueue_Signal(queue, b->fence, 1)))
+    {
+        /* Can't tell when it's done: wait for the queue the slow way. */
+        for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(b->fence) < 1; i++)
             Sleep(1);
+        goto done;
+    }
     {
         static LONG uploads;
         if (InterlockedIncrement(&uploads) <= 8)
-            rebox_log("d3d12_xs: uploaded %u placed texture(s) from title memory", n);
+            rebox_log("d3d12_xs: uploaded %u placed texture(s) from title memory", b->count);
     }
+    /* Another queue may have taken the slot meanwhile: any free one will do. */
+    AcquireSRWLockExclusive(&batch_lock);
+    for (int i = 0; i < (int)ARRAYSIZE(batches) && b; i++)
+        if (!batches[i])
+            batches[i] = b, b = NULL;
+    ReleaseSRWLockExclusive(&batch_lock);
+    if (b)
+        for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(b->fence) < 1; i++)
+            Sleep(1);
 
 done:
-    while (n)
-    {
-        n--;
-        ID3D12Resource_Release(buffers[n]);
-    }
-    if (fence) ID3D12Fence_Release(fence);
-    if (list) ID3D12GraphicsCommandList_Release(list);
-    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (b)
+        batch_free(b);
     if (device) ID3D12Device_Release(device);
 }
 
