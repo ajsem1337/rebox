@@ -133,7 +133,8 @@ if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
             ( [[ -n ${REBOX_BUILD_ENV:-} ]] && . "$REBOX_BUILD_ENV"
               make -C "$rebuilt" -j"$(nproc)" shims ${REBOX_MAKE_FLAGS:-} ) > "$rebuilt/build.log" 2>&1 \
                 || die "rebuilding the shims with stubs failed: $rebuilt/build.log"
-            cp "$REBOX_SHIMS_DIR"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null || true
+            cp "$REBOX_SHIMS_DIR"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null \
+                || cp "${REBOX_ANYPS5_DIR:-/nonexistent}"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null || true
             echo "$key" > "$rebuilt/.key"
         fi
         REBOX_SHIMS_DIR="$rebuilt/build"
@@ -190,6 +191,14 @@ for dll in "$REBOX_SHIMS_DIR"/*.dll "$REBOX_SHIMS_DIR"/stub/*.dll; do
         [[ $dll == */stub/* ]] && echo "rebox-run: stub DLL $name (every export returns E_NOTIMPL)" >&2
     fi
 done
+
+# AnyPS5 (console shaders): the flake's shims package has it; a local build dir (the dev shell's
+# REBOX_SHIMS_DIR) doesn't, so it comes from REBOX_ANYPS5_DIR then.
+if [[ ! -f $REBOX_SHIMS_DIR/rebox_anyps5.dll && -f ${REBOX_ANYPS5_DIR:-}/rebox_anyps5.dll ]]; then
+    install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32/"
+    overrides+=";rebox_anyps5=n"
+fi
+[[ -f $sys32/rebox_anyps5.dll ]] || echo "rebox-run: no rebox_anyps5.dll: console shaders get fallbacks" >&2
 
 for dll in "$console_dlls"/*.dll; do
     [[ -f $dll ]] || continue

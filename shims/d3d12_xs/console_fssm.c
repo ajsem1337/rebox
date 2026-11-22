@@ -14,7 +14,14 @@
  *          the 1,464 with it set are all wave32 by sa5_analyse, and 828 of the others wave64;
  *          the analysis says wave32 for the other 306, which have nothing it can tell by)
  * RSRC1 itself isn't in the header; AnyPS5 needs only its float mode, DX10 clamp and IEEE bits,
- * and PS09's are 0x402c03xx throughout (DX10 clamp on, IEEE off). */
+ * and PS09's are 0x402c03xx throughout (DX10 clamp on, IEEE off).
+ *
+ * An older layout, 16 bytes shorter (a UE5 title, SDK 0x20002; told apart by its code at 0x158):
+ * the same fields 8 bytes earlier, with no gap before the shader ID. Float mode at 0xFC (0xC0 in
+ * all of a UE5 title's, as in the target title's), RSRC2 at 0x130 (0x990: 8 user SGPRs, TGID X/Y; 0x8990 adds
+ * LDS), the thread-group size at 0x134-0x13C ((8,8,1), (16,16,1), (4,4,4)), the 24-byte shader ID
+ * at 0x140. the target title's wave32 bit (0xD4 bit 5) is clear in all of them, which says little, so the wave
+ * size is left for sa5_analyse to infer from the code. */
 
 #include <windows.h>
 #include <stdlib.h>
@@ -31,6 +38,10 @@
 #define FSSM_THREADS 0x13c
 #define FSSM_CODE_POINTER 0xc0
 #define FSSM_MIN_SIZE 0x16c
+#define FSSM_SHORT_CODE 0x158 /* the older layout */
+#define FSSM_SHORT_FLOAT_MODE 0xfc
+#define FSSM_SHORT_RSRC2 0x130
+#define FSSM_SHORT_THREADS 0x134
 
 static UINT32 u32(const BYTE *p)
 {
@@ -56,7 +67,7 @@ static BYTE *inflate_fssm(const BYTE *data, SIZE_T size, SIZE_T *out_size)
 
         if (z[0] != 0x78 || ((z[0] << 8) | z[1]) % 31)
             continue;
-        if (puff(NULL, &dest_len, z + 2, &source_len) || dest_len < FSSM_MIN_SIZE || !(out = malloc(dest_len)))
+        if (puff(NULL, &dest_len, z + 2, &source_len) || dest_len < FSSM_SHORT_CODE + 4 || !(out = malloc(dest_len)))
             continue;
         source_len = (unsigned long)(data + size - z - 2);
         if (!puff(out, &dest_len, z + 2, &source_len) && !memcmp(out, "FSSM", 4))
@@ -74,11 +85,13 @@ void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size
     struct rebox_deferred_shader *h;
     SIZE_T fssm_size, code_offset, code_bytes;
     BYTE *fssm = inflate_fssm(container, size, &fssm_size);
+    BOOL short_layout;
 
     if (!fssm)
         return NULL;
     code_offset = u32(fssm + FSSM_CODE_POINTER) + 0x28;
-    if (code_offset < FSSM_MIN_SIZE - 4 || code_offset % 4 || code_offset >= fssm_size)
+    short_layout = code_offset == FSSM_SHORT_CODE;
+    if ((!short_layout && code_offset < FSSM_MIN_SIZE - 4) || code_offset % 4 || code_offset >= fssm_size)
     {
         free(fssm);
         return NULL;
@@ -93,12 +106,24 @@ void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size
     h->version = 1;
     h->size = sizeof(*h) + code_bytes;
     h->stage = 0x20; /* VK_SHADER_STAGE_COMPUTE_BIT */
-    h->wave_size = (u32(fssm + FSSM_WAVE_FLAGS) & FSSM_WAVE32) ? 32 : 64;
-    h->workgroup_size[0] = u32(fssm + FSSM_THREADS);
-    h->workgroup_size[1] = u32(fssm + FSSM_THREADS + 4);
-    h->workgroup_size[2] = u32(fssm + FSSM_THREADS + 8);
-    h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(fssm + FSSM_FLOAT_MODE) & 0xff) << 12;
-    h->rsrc2 = u32(fssm + FSSM_RSRC2);
+    if (short_layout)
+    {
+        h->wave_size = 0; /* inferred from the code (console_compile.c) */
+        h->workgroup_size[0] = u32(fssm + FSSM_SHORT_THREADS);
+        h->workgroup_size[1] = u32(fssm + FSSM_SHORT_THREADS + 4);
+        h->workgroup_size[2] = u32(fssm + FSSM_SHORT_THREADS + 8);
+        h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(fssm + FSSM_SHORT_FLOAT_MODE) & 0xff) << 12;
+        h->rsrc2 = u32(fssm + FSSM_SHORT_RSRC2);
+    }
+    else
+    {
+        h->wave_size = (u32(fssm + FSSM_WAVE_FLAGS) & FSSM_WAVE32) ? 32 : 64;
+        h->workgroup_size[0] = u32(fssm + FSSM_THREADS);
+        h->workgroup_size[1] = u32(fssm + FSSM_THREADS + 4);
+        h->workgroup_size[2] = u32(fssm + FSSM_THREADS + 8);
+        h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(fssm + FSSM_FLOAT_MODE) & 0xff) << 12;
+        h->rsrc2 = u32(fssm + FSSM_RSRC2);
+    }
     h->code_offset = sizeof(*h);
     h->code_dwords = (UINT32)(code_bytes / 4);
     h->code_address = 0x10000000000ull;
