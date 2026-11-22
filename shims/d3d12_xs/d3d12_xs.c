@@ -264,6 +264,34 @@ static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
     return hr;
 }
 
+/* Puts fallback shaders in every stage of a parsed pipeline stream. */
+static void stream_fallbacks(BYTE *stream, const SIZE_T *stages, UINT stage_count, SIZE_T stream_output,
+        SIZE_T topology)
+{
+    for (UINT i = 0; i < stage_count; i++)
+    {
+        UINT type = *(const UINT *)(stream + stages[i]);
+        D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + stages[i] + subobj_layouts[type].offset);
+
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS)
+            *bc = fallback_vs_bc;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS)
+            *bc = bc->BytecodeLength ? fallback_ps_bc : no_shader;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS)
+            *bc = fallback_cs_bc;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
+            *bc = fallback_ms_bc;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS)
+            *bc = fallback_as_bc;
+        else
+            *bc = no_shader; /* HS, DS, GS */
+    }
+    if (stream_output)
+        memset(stream + stream_output, 0, sizeof(D3D12_STREAM_OUTPUT_DESC));
+    if (topology && *(UINT *)(stream + topology) == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+        *(UINT *)(stream + topology) = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pso)
 {
@@ -318,28 +346,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
 
     if (miss && fallback_enabled())
     {
-        for (UINT i = 0; i < stage_count; i++)
-        {
-            UINT type = *(const UINT *)(stream + stages[i]);
-            D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + stages[i] + subobj_layouts[type].offset);
-
-            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS)
-                *bc = fallback_vs_bc;
-            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS)
-                *bc = bc->BytecodeLength ? fallback_ps_bc : no_shader;
-            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS)
-                *bc = fallback_cs_bc;
-            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
-                *bc = fallback_ms_bc;
-            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS)
-                *bc = fallback_as_bc;
-            else
-                *bc = no_shader; /* HS, DS, GS */
-        }
-        if (stream_output)
-            memset(stream + stream_output, 0, sizeof(D3D12_STREAM_OUTPUT_DESC));
-        if (topology && *(UINT *)(stream + topology) == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
-            *(UINT *)(stream + topology) = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        stream_fallbacks(stream, stages, stage_count, stream_output, topology);
         note_fallback("stream");
     }
 
@@ -349,6 +356,15 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     if (cached_pso && retry_without_cache(hr, (D3D12_CACHED_PIPELINE_STATE *)(stream + cached_pso)))
     {
         memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
+        hr = orig_create_pipeline(device, &copy, riid, pso);
+    }
+    /* As for graphics and compute PSOs: bytecode that passed as PC's can still fail to compile. */
+    if (FAILED(hr) && !miss && stage_count && fallback_enabled() && hr != E_OUTOFMEMORY)
+    {
+        stream_fallbacks(stream, stages, stage_count, stream_output, topology);
+        if (cached_pso)
+            memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
+        note_failed_fallback("stream", hr);
         hr = orig_create_pipeline(device, &copy, riid, pso);
     }
     free(stream);

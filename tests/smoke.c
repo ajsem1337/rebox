@@ -481,6 +481,24 @@ static void test_d3d12(const char *fake_path, BOOL expect_hit)
         CHECK(SUCCEEDED(hr) != strict, "compute PSO whose PC bytecode doesn't compile %s (%#lx)",
               strict ? "fails in strict mode" : "gets the fallback shader", hr);
         if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+
+        /* The same through a pipeline stream. */
+        {
+            struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(8))) s_rs;
+            struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(8))) s_cs;
+            struct { __typeof__(s_rs) rs; __typeof__(s_cs) cs; } cstream;
+            D3D12_PIPELINE_STATE_STREAM_DESC sdesc = { sizeof(cstream), &cstream };
+
+            cstream.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            cstream.rs.v = cdesc.pRootSignature;
+            cstream.cs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+            cstream.cs.v = bad_desc.CS;
+            pso = NULL;
+            hr = ID3D12Device2_CreatePipelineState(device, &sdesc, &IID_ID3D12PipelineState, (void **)&pso);
+            CHECK(SUCCEEDED(hr) != strict, "compute stream whose PC bytecode doesn't compile %s (%#lx)",
+                  strict ? "fails in strict mode" : "gets the fallback shader", hr);
+            if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+        }
         free(bad);
     }
 
