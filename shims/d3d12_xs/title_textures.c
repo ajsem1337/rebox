@@ -41,6 +41,8 @@ struct title_texture
     D3D12_RESOURCE_STATES state;
     UINT subresources;
     BOOL dirty;
+    BOOL unreadable;            /* memory not committed yet: rechecked with backoff */
+    UINT check_at, backoff;     /* in submissions */
     UINT64 fingerprint;
     UINT callback;
     struct title_texture *next;
@@ -50,6 +52,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static struct title_texture *textures;
 static volatile LONG dirty_count;
 static UINT watch_cursor;
+static UINT submissions;
 
 #define WATCH_SAMPLES 32
 #define WATCH_BUDGET 512 /* textures fingerprinted per submission */
@@ -81,18 +84,40 @@ static BOOL watch_enabled(void)
     return enabled;
 }
 
+static BOOL readable(UINT64 address, UINT64 size);
+
+/* Called with the lock held: a texture whose memory wasn't readable is checked again after 1, 2,
+ * 4, ... up to 1024 submissions (TomBox backs off the same way), and uploaded once it is. */
+static void recheck(struct title_texture *t)
+{
+    if (submissions < t->check_at)
+        return;
+    if (!readable((UINT64)(ULONG_PTR)t->cpu, t->size))
+    {
+        t->backoff = t->backoff ? min(t->backoff * 2, 1024) : 1;
+        t->check_at = submissions + t->backoff;
+        return;
+    }
+    t->unreadable = FALSE;
+    t->dirty = TRUE;
+    InterlockedIncrement(&dirty_count);
+}
+
 /* Called with the lock held. */
 static void watch(void)
 {
     struct title_texture *t = textures;
     UINT skipped = 0, checked = 0, changed = 0;
+    BOOL sample = watch_enabled();
 
     for (; t && skipped < watch_cursor; t = t->next)
         skipped++;
     if (!t)
         t = textures, watch_cursor = 0;
     for (; t && checked < WATCH_BUDGET; t = t->next, checked++)
-        if (!t->dirty && fingerprint(t) != t->fingerprint)
+        if (t->unreadable)
+            recheck(t);
+        else if (sample && !t->dirty && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
             InterlockedIncrement(&dirty_count);
@@ -263,14 +288,20 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
         BOOL chunk;
         t->cpu = cpu_address(address, t->size, &chunk);
         if (t->size && !chunk && !readable((UINT64)(ULONG_PTR)t->cpu, t->size))
-            t->size = 0;
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 4)
+                rebox_log("d3d12_xs: placed texture at %#llx: its memory isn't readable yet; rechecked until it is",
+                             (unsigned long long)address);
+            t->unreadable = TRUE;
+        }
     }
     if (!t->size)
     {
         static LONG warned;
         if (!InterlockedExchange(&warned, 1))
-            rebox_log("d3d12_xs: placed texture at %#llx: no layout for it or its memory isn't readable; "
-                         "it stays as created", (unsigned long long)address);
+            rebox_log("d3d12_xs: placed texture at %#llx: no layout for it; it stays as created",
+                         (unsigned long long)address);
         free(t);
         return;
     }
@@ -281,11 +312,12 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     }
     ID3DDestructionNotifier_RegisterDestructionCallback(notifier, destroyed, t, &t->callback);
     ID3DDestructionNotifier_Release(notifier);
-    t->dirty = TRUE;
+    t->dirty = !t->unreadable;
     AcquireSRWLockExclusive(&lock);
     t->next = textures;
     textures = t;
-    InterlockedIncrement(&dirty_count);
+    if (t->dirty)
+        InterlockedIncrement(&dirty_count);
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -296,7 +328,7 @@ void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size)
         return;
     AcquireSRWLockExclusive(&lock);
     for (struct title_texture *t = textures; t; t = t->next)
-        if (!t->dirty && ((address < t->address + t->size && t->address < address + size)
+        if (!t->dirty && !t->unreadable && ((address < t->address + t->size && t->address < address + size)
                           || (address < (UINT64)(ULONG_PTR)t->cpu + t->size && (UINT64)(ULONG_PTR)t->cpu < address + size)))
         {
             t->dirty = TRUE;
@@ -445,12 +477,10 @@ void title_textures_upload(ID3D12CommandQueue *queue)
     if (!textures)
         return;
     slot = batches_reclaim(queue);
-    if (watch_enabled())
-    {
-        AcquireSRWLockExclusive(&lock);
-        watch();
-        ReleaseSRWLockExclusive(&lock);
-    }
+    AcquireSRWLockExclusive(&lock);
+    submissions++;
+    watch();
+    ReleaseSRWLockExclusive(&lock);
     if (!dirty_count || slot < 0)
         return;
     qd = ID3D12CommandQueue_GetDesc(queue);

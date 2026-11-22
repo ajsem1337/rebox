@@ -237,7 +237,8 @@ down missing translations.
   Writes nothing reports (the CPU, GPU copies to the address) are caught by sampling: each
   submission re-checks a fingerprint of 32 points in up to 512 textures (round robin), which sees
   a texture rewritten but not a small edit between the points (`REBOX_TEXTURE_WATCH=0` turns
-  it off). Which console layout
+  it off). A texture placed on memory that isn't committed yet waits until it is (rechecked after
+  1, 2, 4, ... up to 1024 submissions). Which console layout
   means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) follows the target title's
   texture pools: cubemaps and volumes `SW_4KB_S`, other arrays `SW_64KB_D`, and single textures
   `SW_64KB_D` from 1 MiB of mip 0, or with no mip chain from 64 KiB padded, `SW_4KB_S` otherwise

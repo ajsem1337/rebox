@@ -2443,6 +2443,85 @@ static void test_gameinput(void)
 
 /* A texture placed at a title address (slot 44) is filled from the tiled memory there: at first
  * use, and again after a reported write (DirectStorage reports its writes the same way). */
+/* A texture placed on memory the title has only reserved: it is filled once the memory is
+ * committed and written, after a few submissions (rechecked with backoff). */
+static void test_placed_texture_late(void *dev, void *queue)
+{
+    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
+            { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE, FALSE };
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxTile");
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256 * 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    static UINT32 linear[64 * 64];
+    ID3D12Resource *tex = NULL, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *list = NULL, *reserved;
+    UINT32 *out = NULL;
+    UINT64 value = 0;
+    HRESULT hr;
+
+    if (!tile || !(reserved = VirtualAlloc(NULL, 65536, MEM_RESERVE, PAGE_NOACCESS)))
+        return;
+    hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *,
+               REFIID, void **)(dev, (UINT64)(ULONG_PTR)reserved, &td, D3D12_RESOURCE_STATE_COPY_SOURCE, NULL,
+               &IID_ID3D12Resource, (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (FAILED(hr))
+        goto done;
+    /* Two submissions with the memory still reserved, then it is committed and written. */
+    XSLOT(list, 9, HRESULT)(list);
+    for (int i = 0; i < 2; i++)
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    VirtualAlloc(reserved, 65536, MEM_COMMIT, PAGE_READWRITE);
+    for (int i = 0; i < 64 * 64; i++)
+        linear[i] = i * 40503u + 17;
+    tile(&surface, reserved, 0, 0, linear, 256, 256 * 64);
+    for (int i = 0; i < 8; i++)
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+        D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                            { .PlacedFootprint = { 0, { DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 } } } };
+        XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+              const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+    for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
+        Sleep(10);
+    ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+done:
+    CHECK(out && !memcmp(out, linear, sizeof(linear)),
+          "a texture placed on reserved memory is filled once the memory is committed and written (%#lx)", hr);
+    if (out) ID3D12Resource_Unmap(buf, 0, NULL);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (tex) ID3D12Resource_Release(tex);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+}
+
 /* d3d12_xs's struct detile_surface (shims/d3d12_xs/detile.h). */
 struct test_surface
 {
@@ -2914,6 +2993,7 @@ static void test_xbox(void)
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
+    test_placed_texture_late(dev, queue);
     test_mip_major_layout();
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
