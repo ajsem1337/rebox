@@ -279,8 +279,9 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 
   | Word | Register (GFX10) | Agrees with the code |
   |---|---|---|
-  | 14, 15 | `SPI_SHADER_PGM_RSRC1/2` of the vertex stage (float mode 0xC0 as in compute) | not yet checked |
-  | 19, 20 | the same for the pixel stage | not yet checked |
+  | 14, 15 | `SPI_SHADER_PGM_RSRC1/2_VS` | all 1,328 dumped VS: user-SGPR count covers every binding record's SGPR, float mode 0xC0/0xCC |
+  | 19, 20 | `SPI_SHADER_PGM_RSRC1/2_PS` | all 9,519 dumped PS, as above |
+  | 24, 25 | `SPI_SHADER_PGM_RSRC1/2_GS` of NGG pipelines | all 7,498 dumped NGG shaders, as above |
   | 22 | `SPI_PS_INPUT_ENA` (0x2 perspective centre, bit 15 fixed-point position) | not yet checked |
   | 23 | `SPI_PS_IN_CONTROL.NUM_INTERP` | 1,149 |
   | 28 | `SPI_SHADER_COL_FORMAT` (a nibble per target; 4 = FP16, matching `compr` exports) | 1,155 |
@@ -288,7 +289,14 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   | 52-59 | `CB_BLENDn_CONTROL` (0x80000000 = no blend) | by value |
   | 64-71 | `SX_MRTn_BLEND_OPT` | by value |
 
-  Next: the layouts of the other block sizes, then building AnyPS5's `ShaderPixelStageInfo`
-  from these words at PSO creation. The PS input table at FSSM 0x138 gives per-interpolant
-  flags.
+  Stage slots: 0 is the pixel shader, 1 the vertex shader, 2 the NGG (mesh/primitive) shader.
+  The block sizes form two families:
+  - 388/396 bytes (VS + PS) use the offsets above;
+  - 464-504 bytes (NGG + PS) keep the `RSRC` words in place, but `COL_FORMAT` moves to word 49
+    (21 later; all 475 of the 464-byte blocks), and the words after it shift by a further
+    variable amount (`NUM_INTERP` at word 44 in 1,491 of 1,542 472-byte blocks).
+
+  Next: the variable section in the NGG family, then building AnyPS5's `ShaderPixelStageInfo`
+  (and the NGG `MeshConfiguration`) from these words at PSO creation. The PS input table at
+  FSSM 0x138 gives per-interpolant flags.
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.
