@@ -53,7 +53,13 @@ docs/d3d12x.md            what the console DLLs reveal about D3D12.X and unified
 nix run . -- --scan ../xsx    # report imports Wine + vkd3d-proton + shims can't resolve
 nix run . -- ../xsx           # run title.exe
 nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
+nix develop -c tests/run-rehearsal.sh ../xsx    # the whole launch with a stand-in exe
 ```
+
+`tests/run-rehearsal.sh` runs `nix run .` on a copy of the package with a stand-in for the exe
+(`tests/rehearsal/title.c`) that makes a console title's first calls: xmem, an Xbox-only API set,
+a name Wine's API sets lack, the Gaming Runtime, `GAME:\` paths, `D3D12XboxCreateDevice` and its
+IDXGIDevice. It needs no exe, so it checks the launch path before the real one arrives.
 
 Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launch:
 
