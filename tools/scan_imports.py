@@ -179,6 +179,23 @@ def main():
     if not any(p.suffix.lower() == ".exe" for p in targets):
         print(f"note: no .exe in {game}; scanning the DLLs only", file=sys.stderr)
 
+    # Exes without relocations load only at their preferred base (Leonida found the game exe
+    # can't be relocated under Wine). rebox-run starts the exe as Wine's main image, which gets
+    # it; anything placed in front of it (a loader, an injector) must keep that range free.
+    for t in targets:
+        if t.suffix.lower() != ".exe":
+            continue
+        try:
+            pe = pefile.PE(str(t), fast_load=True)
+        except pefile.PEFormatError:
+            continue
+        opt = pe.OPTIONAL_HEADER
+        reloc = opt.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]]
+        dynamic = bool(opt.DllCharacteristics & 0x40)
+        fixed = not reloc.Size or (pe.FILE_HEADER.Characteristics & 0x1)
+        print(f"{t.name}: image base {opt.ImageBase:#x}, size {opt.SizeOfImage:#x}, "
+              f"{'not relocatable' if fixed else 'relocatable'}{', ASLR' if dynamic else ''}", file=sys.stderr)
+
     providers = load_providers(args.provider + [str(game)])
     apiset_names = set()
     for host in APISET_HOSTS:
