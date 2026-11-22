@@ -171,6 +171,10 @@ mirror() {
     done
 }
 mirror "$game_dir" "$shadow" "$exe_dir"
+# The Gaming Runtime stand-in reads MicrosoftGame.config next to the exe (title ID, package
+# identity, storage quota); a title whose exe is deeper in the package (a UE5 title) gets a link to it
+# there. Without it a UE5 title logs "Failed to get TitleID HR=0x80070490".
+[[ $exe_dir == . || -e $shadow/$exe_dir/$(basename "$config") ]] || ln -s "$config" "$shadow/$exe_dir/$(basename "$config")"
 overrides="d3d12,d3d12core,dxgi=n"
 for dll in "$REBOX_SHIMS_DIR"/*.dll "$REBOX_SHIMS_DIR"/stub/*.dll; do
     [[ -f $dll ]] || continue
