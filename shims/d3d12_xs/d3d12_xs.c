@@ -153,6 +153,16 @@ static void note_fallback(const char *kind)
                      kind, n);
 }
 
+static void note_failed_fallback(const char *kind, HRESULT hr)
+{
+    static LONG count;
+    LONG n = InterlockedIncrement(&count);
+
+    if (n <= 16 || !(n & (n - 1)))
+        rebox_log("d3d12_xs: %s PSO #%ld failed to compile (%#lx; Xbox DXIL intrinsics, or a bad translation); "
+                     "retrying with fallback shaders", kind, n, hr);
+}
+
 /* A CachedPSO blob vkd3d-proton didn't make (a console PSO cache entry, say)
  * fails creation as a cache mismatch; retry once without it. */
 static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *cached)
@@ -204,6 +214,20 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
         hr = orig_create_graphics(device, &copy, riid, pso);
     }
+    /* Bytecode that passed as PC's or came from the cache can still fail to compile: Xbox DXIL
+     * calling @xbox.* intrinsics (XboxBvhBuilder), or a bad translation. Fallbacks then, too. */
+    if (FAILED(hr) && !miss && fallback_enabled() && hr != E_OUTOFMEMORY)
+    {
+        copy.VS = fallback_vs_bc;
+        copy.PS = desc->PS.BytecodeLength ? fallback_ps_bc : no_shader;
+        copy.HS = copy.DS = copy.GS = no_shader;
+        memset(&copy.StreamOutput, 0, sizeof(copy.StreamOutput));
+        memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
+        if (copy.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+            copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        note_failed_fallback("graphics", hr);
+        hr = orig_create_graphics(device, &copy, riid, pso);
+    }
     return hr;
 }
 
@@ -212,13 +236,14 @@ static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
 {
     D3D12_COMPUTE_PIPELINE_STATE_DESC copy;
     static const char *const names[] = { "cs" };
+    BOOL miss;
     HRESULT hr;
 
     if (!desc)
         return orig_create_compute(device, desc, riid, pso);
     shader_cache_census("compute", names, &desc->CS, 1, &desc->CachedPSO);
     copy = *desc;
-    if (shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS && fallback_enabled())
+    if ((miss = shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS) && fallback_enabled())
     {
         copy.CS = fallback_cs_bc;
         note_fallback("compute");
@@ -227,6 +252,13 @@ static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
     if (retry_without_cache(hr, &copy.CachedPSO))
     {
         memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
+        hr = orig_create_compute(device, &copy, riid, pso);
+    }
+    if (FAILED(hr) && !miss && desc->CS.BytecodeLength && fallback_enabled() && hr != E_OUTOFMEMORY)
+    {
+        copy.CS = fallback_cs_bc;
+        memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
+        note_failed_fallback("compute", hr);
         hr = orig_create_compute(device, &copy, riid, pso);
     }
     return hr;

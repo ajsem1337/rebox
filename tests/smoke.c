@@ -463,6 +463,27 @@ static void test_d3d12(const char *fake_path, BOOL expect_hit)
         if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
     }
 
+    /* PC-format bytecode that doesn't compile (Xbox DXIL with @xbox.* intrinsics, as in
+     * XboxBvhBuilder) gets fallbacks too: here a DXIL container with its bitcode scribbled on. */
+    {
+        const char *fb = getenv("REBOX_SHADER_FALLBACK");
+        BOOL strict = fb && *fb == '0';
+        D3D12_COMPUTE_PIPELINE_STATE_DESC bad_desc = cdesc;
+        BYTE *bad = malloc(sizeof(test_empty_cs));
+
+        memcpy(bad, test_empty_cs, sizeof(test_empty_cs));
+        for (size_t i = sizeof(test_empty_cs) / 2; i < sizeof(test_empty_cs); i++)
+            bad[i] ^= 0x5a;
+        bad_desc.CS.pShaderBytecode = bad;
+        bad_desc.CS.BytecodeLength = sizeof(test_empty_cs);
+        pso = NULL;
+        hr = ID3D12Device2_CreateComputePipelineState(device, &bad_desc, &IID_ID3D12PipelineState, (void **)&pso);
+        CHECK(SUCCEEDED(hr) != strict, "compute PSO whose PC bytecode doesn't compile %s (%#lx)",
+              strict ? "fails in strict mode" : "gets the fallback shader", hr);
+        if (SUCCEEDED(hr)) ID3D12PipelineState_Release(pso);
+        free(bad);
+    }
+
     /* A mesh pipeline from untranslated console AS/MS/PS gets the mesh
      * fallbacks (when the device has mesh shaders and fallbacks are on). */
     {
