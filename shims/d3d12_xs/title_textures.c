@@ -8,7 +8,11 @@
  * requests) mark it dirty, and before a queue runs the title's command lists every dirty texture
  * is detiled from title memory (detile.cpp, addrlib) into an upload buffer and copied in. A new
  * texture starts dirty, for data written before it was created. Writes nothing reports (the CPU,
- * or GPU copies to the address) aren't seen.
+ * or GPU copies to the address) are caught by sampling: each upload keeps a fingerprint of a few
+ * bytes spread over the texture's memory, and before each submission a slice of the textures
+ * (WATCH_BUDGET, round robin) is fingerprinted again; a change makes it dirty. That sees a
+ * texture rewritten (a streaming slot refilled), not a small edit between the samples.
+ * REBOX_TEXTURE_WATCH=0 turns the sampling off.
  *
  * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
  * picks: "auto" (default: ROW_MAJOR descs linear; otherwise SW_64KB_D when mip 0 is at least
@@ -36,6 +40,7 @@ struct title_texture
     D3D12_RESOURCE_STATES state;
     UINT subresources;
     BOOL dirty;
+    UINT64 fingerprint;
     UINT callback;
     struct title_texture *next;
 };
@@ -43,6 +48,63 @@ struct title_texture
 static SRWLOCK lock = SRWLOCK_INIT;
 static struct title_texture *textures;
 static volatile LONG dirty_count;
+static UINT watch_cursor;
+
+#define WATCH_SAMPLES 32
+#define WATCH_BUDGET 512 /* textures fingerprinted per submission */
+
+/* FNV-1a over 8 bytes at each of WATCH_SAMPLES points spread over the texture, the first and
+ * last included. */
+static UINT64 fingerprint(const struct title_texture *t)
+{
+    UINT64 h = 0xcbf29ce484222325ull, step = t->size > 8 ? (t->size - 8) / (WATCH_SAMPLES - 1) : 0;
+
+    for (UINT i = 0; i < WATCH_SAMPLES; i++)
+    {
+        UINT64 v;
+        memcpy(&v, t->cpu + (t->size > 8 ? i * step : 0), t->size >= 8 ? 8 : t->size);
+        h = (h ^ v) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+static BOOL watch_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        char *v = rebox_getenv("REBOX_TEXTURE_WATCH");
+        enabled = !v || strcmp(v, "0");
+        free(v);
+    }
+    return enabled;
+}
+
+/* Called with the lock held. */
+static void watch(void)
+{
+    struct title_texture *t = textures;
+    UINT skipped = 0, checked = 0, changed = 0;
+
+    for (; t && skipped < watch_cursor; t = t->next)
+        skipped++;
+    if (!t)
+        t = textures, watch_cursor = 0;
+    for (; t && checked < WATCH_BUDGET; t = t->next, checked++)
+        if (!t->dirty && fingerprint(t) != t->fingerprint)
+        {
+            t->dirty = TRUE;
+            InterlockedIncrement(&dirty_count);
+            changed++;
+        }
+    watch_cursor = t ? watch_cursor + checked : 0;
+    if (changed)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: %u placed texture(s) changed in title memory without a report", changed);
+    }
+}
 
 static int mode_setting(void)
 {
@@ -293,6 +355,14 @@ void title_textures_upload(ID3D12CommandQueue *queue)
     D3D12_COMMAND_QUEUE_DESC qd;
     UINT n = 0;
 
+    if (!textures)
+        return;
+    if (watch_enabled())
+    {
+        AcquireSRWLockExclusive(&lock);
+        watch();
+        ReleaseSRWLockExclusive(&lock);
+    }
     if (!dirty_count)
         return;
     qd = ID3D12CommandQueue_GetDesc(queue);
@@ -314,6 +384,7 @@ void title_textures_upload(ID3D12CommandQueue *queue)
         {
             t->dirty = FALSE;
             InterlockedDecrement(&dirty_count);
+            t->fingerprint = fingerprint(t);
             if ((buffers[n] = record_upload(device, list, t)))
                 n++;
         }

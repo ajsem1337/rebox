@@ -226,7 +226,10 @@ down missing translations.
   `CreatePlacedResourceX` is the memory at its address, in a Gfx10 tiled layout. Here it has its
   own memory, filled from the title's: `d3d12_xs` detiles it with AMD's addrlib (Mesa, MIT) when
   it is created and whenever DirectStorage reports writing there, before the next submission.
-  Writes nothing reports (the CPU, GPU copies to the address) aren't seen. Which console layout
+  Writes nothing reports (the CPU, GPU copies to the address) are caught by sampling: each
+  submission re-checks a fingerprint of 32 points in up to 512 textures (round robin), which sees
+  a texture rewritten but not a small edit between the points (`REBOX_TEXTURE_WATCH=0` turns
+  it off). Which console layout
   means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) uses
   `SW_64KB_D` from 1 MiB of mip 0 and `SW_4KB_S` below, as the target title's texture pools do, and each
   distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one.

@@ -2463,7 +2463,7 @@ static void test_placed_texture(void *dev, void *queue)
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
                    &IID_ID3D12Fence, (void **)&fence);
-    for (int pass = 0; pass < 2 && SUCCEEDED(hr); pass++)
+    for (int pass = 0; pass < 3 && SUCCEEDED(hr); pass++)
     {
         D3D12_TEXTURE_COPY_LOCATION src = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
         D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -2478,6 +2478,14 @@ static void test_placed_texture(void *dev, void *queue)
                 linear[i] = ~linear[i] + i;
             tile(&surface, cpu, 0, 0, linear, 256, 256 * 64);
             written(gpu, size);
+            ID3D12CommandAllocator_Reset(alloc);
+        }
+        if (pass == 2)
+        {
+            /* Rewrite it again without reporting it, as the CPU or a GPU copy would. */
+            for (int i = 0; i < 64 * 64; i++)
+                linear[i] = linear[i] * 3 + 7;
+            tile(&surface, cpu, 0, 0, linear, 256, 256 * 64);
             ID3D12CommandAllocator_Reset(alloc);
         }
         if (!list)
@@ -2498,7 +2506,9 @@ static void test_placed_texture(void *dev, void *queue)
         ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
         same = out && !memcmp(out, linear, sizeof(linear));
         if (out) ID3D12Resource_Unmap(buf, 0, NULL);
-        if (pass)
+        if (pass == 2)
+            CHECK(same, "an unreported rewrite of the title memory is noticed and uploaded at the next submission");
+        else if (pass)
             CHECK(same, "a reported write to the title memory is uploaded at the next submission");
         else
             CHECK(same, "a texture placed at a title address is filled from its tiled memory (SW_4KB_S)");
