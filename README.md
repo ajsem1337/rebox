@@ -4,7 +4,8 @@ Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 
 - **WineGDK** for Wine itself and the GDK runtime. Its `xgameruntime` answers `QueryApiImpl` for
   XSystem, XSystemAnalytics, XGameRuntimeFeature, XNetworking and XThreading (XTaskQueue, XAsync)
-  only: it has an XUser implementation that `QueryApiImpl` doesn't hand out, and no XGameSave,
+  only. Its XUser is stubs (every call but XUserGetMaxUsers returns E_NOTIMPL) that `QueryApiImpl`
+  doesn't hand out anyway, and it has no XGameSave,
   XPackage, XStore, XPersistentLocalStorage, XGameUI, XAccessibility or Xbox Live services. With
   `patches/wine/`: `VirtualAlloc` accepts the `MEM_LARGE_PAGES` and `MEM_4MB_PAGES` flags Xbox
   titles pass (ordinary pages back them). `rebox-run` also sets the `ConsoleMode` registry value
