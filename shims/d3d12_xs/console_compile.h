@@ -38,7 +38,7 @@ struct rebox_compile_out
     UINT32 spirv_words;
     UINT32 subgroup_size;
     UINT64 key[2];
-    UINT32 push[40];
+    UINT32 push[48];
 };
 
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out);

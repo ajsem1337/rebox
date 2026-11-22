@@ -3,8 +3,28 @@
 #include <windows.h>
 #include <d3d12.h>
 
+/* The kind of view each shadow slot holds, so a binding is never pointed at a vkd3d-proton
+ * descriptor of another type (mutable sets don't check). */
+enum shadow_view
+{
+    SHADOW_VIEW_NONE, SHADOW_VIEW_SRV_TEXTURE, SHADOW_VIEW_SRV_TYPED, SHADOW_VIEW_SRV_RAW, SHADOW_VIEW_UAV_TEXTURE,
+    SHADOW_VIEW_UAV_TYPED, SHADOW_VIEW_UAV_RAW, SHADOW_VIEW_CBV, SHADOW_VIEW_SAMPLER,
+};
+
 /* Console-format shadow heaps; see shadow.c. */
-void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc, UINT increment);
+/* Shader-visible CBV/SRV/UAV and sampler heaps get SHADOW_RESERVED slots past the title's count in
+ * vkd3d-proton's heap (patch 0005 raises its sampler-heap limit to match), for descriptors the host
+ * makes itself: samplers that shaders build from literals. */
+#define SHADOW_RESERVED 256
+void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc, UINT increment,
+        UINT reserved);
+UINT shadow_reserved(SIZE_T cpu_start);
+/* A slot in the reserved tail of the sampler heap at heap_cpu holding the sampler these S# words
+ * describe, made on first use (one per distinct S#). */
+BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index);
+/* A slot in the reserved tail of the CBV/SRV/UAV heap at heap_cpu holding an SRV of the texture UAV
+ * in slot uav_index (same resource, format, mip and slices), made on first use. */
+BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index);
 void shadow_heap_destroyed(ID3D12DescriptorHeap *inner);
 void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc);
@@ -17,12 +37,13 @@ void shadow_copy_ranges(UINT dst_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_s
 /* Shader-visible shadows, for the recompiler's guest memory and the BDA page table. */
 struct shadow_region { UINT64 title_va, gpu_va; const void *data; SIZE_T size; };
 UINT shadow_regions(struct shadow_region *out, UINT max);
-/* The slot of the heap starting at heap_cpu that holds these console words (4 or 8), allowing
- * the fields AnyPS5 rewrites in bound descriptors. */
-BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, UINT *index);
+/* The slot of the heap starting at heap_cpu that holds these console words (4 or 8); with loose,
+ * also allowing the fields AnyPS5 rewrites in bound descriptors. */
+BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT *index);
 
 /* What heap slot 10 reports (shadow.c). */
 enum shadow_heap_va { SHADOW_HEAP_VA_TITLE, SHADOW_HEAP_VA_REAL, SHADOW_HEAP_VA_VIRTUAL };
 enum shadow_heap_va shadow_heap_va_mode(void);
 /* The title address and byte size of the shader-visible heap whose descriptor 0 is at cpu_start. */
 BOOL shadow_title(SIZE_T cpu_start, UINT64 *title_va, UINT64 *size);
+enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index);

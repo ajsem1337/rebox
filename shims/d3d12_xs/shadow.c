@@ -45,8 +45,22 @@ struct shadow_heap
     SIZE_T cpu_start;              /* vkd3d-proton's CPU handle for descriptor 0 */
     UINT stride, count;
     BYTE *data;                    /* count * stride bytes, console format */
+    BYTE *views;                   /* count bytes: enum shadow_view of each slot */
+    struct uav_texture *uavs;      /* count entries, made on the first texture UAV write */
     UINT64 title_va, gpu_va;       /* title_va 0 for heaps that aren't shader-visible */
+    UINT reserved, reserved_used;  /* hidden slots after count in vkd3d-proton's heap */
+    UINT32 (*reserved_words)[4];   /* the S# each used one holds */
     struct shadow_heap *next;
+};
+
+/* A texture UAV's resource and view, so a sampled view of it can be made (AnyPS5 binds a
+ * storage image as a sampled image too, for size queries). The resource isn't referenced: a slot
+ * is only used while the title keeps its resource alive. */
+struct uav_texture
+{
+    ID3D12Resource *res;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+    BOOL has_desc;
 };
 
 struct entry
@@ -188,6 +202,9 @@ static void heap_free(struct shadow_heap *h)
         ReboxGpuFree(h->data);
     else
         free(h->data);
+    free(h->reserved_words);
+    free(h->views);
+    free(h->uavs);
     free(h);
 }
 
@@ -203,7 +220,8 @@ static struct shadow_heap *heap_for_cpu(SIZE_T cpu, UINT *index)
     return NULL;
 }
 
-void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc, UINT increment)
+void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc, UINT increment,
+        UINT reserved)
 {
     struct shadow_heap *heap, **p;
     SIZE_T size;
@@ -217,6 +235,7 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
     heap->cpu_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(inner).ptr;
     heap->count = desc->NumDescriptors;
     heap->stride = increment;
+    heap->reserved = reserved;
     if (increment < desc_size(heap))
     {
         static LONG logged;
@@ -233,6 +252,16 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
         memset(heap->data, 0, size);
     }
     else if (!(heap->data = calloc(1, size)))
+        ;
+    if (heap->data && !(heap->views = calloc(1, heap->count)))
+    {
+        if (heap->gpu_memory)
+            ReboxGpuFree(heap->data);
+        else
+            free(heap->data);
+        heap->data = NULL;
+    }
+    if (!heap->data)
     {
         rebox_log("d3d12_xs: no memory for a %u-descriptor shadow heap", heap->count);
         free(heap);
@@ -282,7 +311,25 @@ void shadow_heap_destroyed(ID3D12DescriptorHeap *inner)
     ReleaseSRWLockExclusive(&lock);
 }
 
-static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size)
+/* What kind of view a write made: is_buffer -1 means "from the resource" (no view desc). */
+static enum shadow_view view_kind(ID3D12Resource *res, int is_buffer, DXGI_FORMAT format, BOOL raw, BOOL uav)
+{
+    if (!res)
+        return SHADOW_VIEW_NONE;
+    if (is_buffer < 0)
+    {
+        D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(res);
+        is_buffer = rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        raw = is_buffer;
+    }
+    if (!is_buffer)
+        return uav ? SHADOW_VIEW_UAV_TEXTURE : SHADOW_VIEW_SRV_TEXTURE;
+    if (raw || format == DXGI_FORMAT_UNKNOWN)
+        return uav ? SHADOW_VIEW_UAV_RAW : SHADOW_VIEW_SRV_RAW;
+    return uav ? SHADOW_VIEW_UAV_TYPED : SHADOW_VIEW_SRV_TYPED;
+}
+
+static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_view view)
 {
     struct shadow_heap *h;
     UINT index;
@@ -293,6 +340,7 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size)
         unindex(h, index);
         memset(h->data + (SIZE_T)index * h->stride, 0, h->stride);
         memcpy(h->data + (SIZE_T)index * h->stride, words, size < h->stride ? size : h->stride);
+        h->views[index] = view;
         index_slot(h, index);
     }
     ReleaseSRWLockExclusive(&lock);
@@ -302,21 +350,38 @@ void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
 {
     UINT32 w[8];
     console_encode_cbv(desc, w);
-    write_slot(cpu, w, sizeof(w));
+    write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE);
 }
 
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
 {
     UINT32 w[8];
     console_encode_srv(res, desc, w);
-    write_slot(cpu, w, sizeof(w));
+    write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER : -1,
+               desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER
+               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) : 0, FALSE));
 }
 
 void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
 {
+    struct shadow_heap *h;
     UINT32 w[8];
+    UINT index;
+
+    AcquireSRWLockExclusive(&lock);
+    if ((h = heap_for_cpu(cpu, &index)) && h->shader_visible && res
+            && (h->uavs || (h->uavs = calloc(h->count, sizeof(*h->uavs)))))
+    {
+        h->uavs[index].res = res;
+        h->uavs[index].has_desc = desc != NULL;
+        if (desc)
+            h->uavs[index].desc = *desc;
+    }
+    ReleaseSRWLockExclusive(&lock);
     console_encode_uav(res, desc, w);
-    write_slot(cpu, w, sizeof(w));
+    write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER : -1,
+               desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER
+               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) : 0, TRUE));
 }
 
 void shadow_write_sampler(SIZE_T cpu, const D3D12_SAMPLER_DESC *desc)
@@ -325,7 +390,7 @@ void shadow_write_sampler(SIZE_T cpu, const D3D12_SAMPLER_DESC *desc)
     if (!desc)
         return;
     console_encode_sampler(desc, w);
-    write_slot(cpu, w, sizeof(w));
+    write_slot(cpu, w, sizeof(w), SHADOW_VIEW_SAMPLER);
 }
 
 void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
@@ -343,9 +408,15 @@ void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
         src += s ? s->stride : d->stride;
         unindex(d, di);
         if (s && s->stride == d->stride)
+        {
             memcpy(d->data + (SIZE_T)di * d->stride, s->data + (SIZE_T)si * s->stride, d->stride);
+            d->views[di] = s->views[si];
+        }
         else
+        {
             memset(d->data + (SIZE_T)di * d->stride, 0, d->stride);
+            d->views[di] = SHADOW_VIEW_NONE;
+        }
         index_slot(d, di);
     }
     ReleaseSRWLockExclusive(&lock);
@@ -397,8 +468,10 @@ UINT shadow_regions(struct shadow_region *out, UINT max)
 }
 
 /* Fields AnyPS5 may rewrite in the words it binds: a T#'s DST_SEL (word 3 bits 0-11, made
- * identity when the view swizzle takes it over) and an S#'s filters (word 2 bits 20-27, for the
- * point-filtered twin of each sampler). */
+ * identity when the view swizzle takes it over), an S#'s filters (word 2 bits 20-27, for the
+ * point-filtered twin of each sampler) and a V#'s word 3 (format and DST_SEL, zeroed for buffers
+ * it reads raw, such as constant buffers read with s_buffer_load; base, stride and size in words
+ * 0-2 still identify the view). */
 static BOOL loose_match(const UINT32 *slot, const UINT32 *words, UINT n, BOOL sampler)
 {
     for (UINT i = 0; i < n; i++)
@@ -408,13 +481,15 @@ static BOOL loose_match(const UINT32 *slot, const UINT32 *words, UINT n, BOOL sa
             mask = ~(0xffu << 20);
         else if (!sampler && n == 8 && i == 3)
             mask = ~0xfffu;
+        else if (!sampler && n == 4 && i == 3)
+            mask = 0;
         if ((slot[i] ^ words[i]) & mask)
             return FALSE;
     }
     return TRUE;
 }
 
-BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, UINT *index)
+BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT *index)
 {
     struct shadow_heap *heap = NULL;
     UINT32 key[8];
@@ -433,13 +508,171 @@ BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sample
     for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
         if (h->cpu_start == heap_cpu)
             heap = h;
-    for (UINT i = 0; heap && !found && i < heap->count; i++)
+    for (UINT i = 0; loose && heap && !found && i < heap->count; i++)
         if (loose_match((const UINT32 *)(heap->data + (SIZE_T)i * heap->stride), words, n, sampler))
         {
             *index = i;
             found = TRUE;
         }
     ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index)
+{
+    enum shadow_view view = SHADOW_VIEW_NONE;
+
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->cpu_start == heap_cpu)
+        {
+            if (index < h->count)
+                view = h->views[index];
+            else if (index < h->count + h->reserved_used)
+                view = h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? SHADOW_VIEW_SAMPLER : SHADOW_VIEW_SRV_TEXTURE;
+            break;
+        }
+    ReleaseSRWLockShared(&lock);
+    return view;
+}
+
+UINT shadow_reserved(SIZE_T cpu_start)
+{
+    UINT reserved = 0;
+
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->cpu_start == cpu_start)
+            reserved = h->reserved;
+    ReleaseSRWLockShared(&lock);
+    return reserved;
+}
+
+/* An SRV equivalent to a texture UAV's view. */
+static void srv_from_uav(const struct uav_texture *u, D3D12_SHADER_RESOURCE_VIEW_DESC *srv)
+{
+    D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(u->res);
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC *d = &u->desc;
+    D3D12_UAV_DIMENSION dim = u->has_desc ? d->ViewDimension
+            : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? (rd.DepthOrArraySize > 1 ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY : D3D12_UAV_DIMENSION_TEXTURE1D)
+            : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_UAV_DIMENSION_TEXTURE3D
+            : rd.DepthOrArraySize > 1 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
+
+    memset(srv, 0, sizeof(*srv));
+    srv->Format = u->has_desc && d->Format != DXGI_FORMAT_UNKNOWN ? d->Format : rd.Format;
+    srv->Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    switch (dim)
+    {
+    case D3D12_UAV_DIMENSION_TEXTURE1D:
+        srv->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        srv->Texture1D.MostDetailedMip = u->has_desc ? d->Texture1D.MipSlice : 0;
+        srv->Texture1D.MipLevels = 1;
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+        srv->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        srv->Texture1DArray.MostDetailedMip = u->has_desc ? d->Texture1DArray.MipSlice : 0;
+        srv->Texture1DArray.MipLevels = 1;
+        srv->Texture1DArray.FirstArraySlice = u->has_desc ? d->Texture1DArray.FirstArraySlice : 0;
+        srv->Texture1DArray.ArraySize = u->has_desc ? d->Texture1DArray.ArraySize : rd.DepthOrArraySize;
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+        srv->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv->Texture2DArray.MostDetailedMip = u->has_desc ? d->Texture2DArray.MipSlice : 0;
+        srv->Texture2DArray.MipLevels = 1;
+        srv->Texture2DArray.FirstArraySlice = u->has_desc ? d->Texture2DArray.FirstArraySlice : 0;
+        srv->Texture2DArray.ArraySize = u->has_desc ? d->Texture2DArray.ArraySize : rd.DepthOrArraySize;
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D:
+        srv->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv->Texture3D.MostDetailedMip = u->has_desc ? d->Texture3D.MipSlice : 0;
+        srv->Texture3D.MipLevels = 1;
+        break;
+    default:
+        srv->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv->Texture2D.MostDetailedMip = u->has_desc ? d->Texture2D.MipSlice : 0;
+        srv->Texture2D.MipLevels = 1;
+        break;
+    }
+}
+
+BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
+{
+    ID3D12Device *device = rebox_shared_device();
+    struct shadow_heap *heap = NULL;
+    BOOL found = FALSE;
+    UINT32 key[4];
+
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
+        if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && h->reserved)
+            heap = h;
+    if (heap && uav_index < heap->count && heap->uavs && heap->uavs[uav_index].res
+            && heap->views[uav_index] == SHADOW_VIEW_UAV_TEXTURE)
+    {
+        const struct uav_texture *u = &heap->uavs[uav_index];
+        /* Keyed by the UAV's resource and view, in the slot's first words. */
+        UINT64 r = (UINT64)(ULONG_PTR)u->res;
+        key[0] = (UINT32)r;
+        key[1] = (UINT32)(r >> 32);
+        key[2] = u->has_desc ? u->desc.Format : 0;
+        key[3] = u->has_desc ? (UINT32)u->desc.ViewDimension | u->desc.Texture2DArray.MipSlice << 8
+                 | u->desc.Texture2DArray.FirstArraySlice << 16 : ~0u;
+        for (UINT i = 0; i < heap->reserved_used && !found; i++)
+            if (!memcmp(heap->reserved_words[i], key, 16))
+            {
+                *index = heap->count + i;
+                found = TRUE;
+            }
+        if (!found && device && heap->reserved_used < heap->reserved
+                && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+            UINT i = heap->reserved_used++;
+
+            srv_from_uav(u, &srv);
+            memcpy(heap->reserved_words[i], key, 16);
+            *index = heap->count + i;
+            cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
+            ID3D12Device_CreateShaderResourceView(device, u->res, &srv, cpu);
+            found = TRUE;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return found;
+}
+
+BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
+{
+    ID3D12Device *device = rebox_shared_device();
+    struct shadow_heap *heap = NULL;
+    BOOL found = FALSE;
+
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
+        if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && h->reserved)
+            heap = h;
+    for (UINT i = 0; heap && i < heap->reserved_used && !found; i++)
+        if (!memcmp(heap->reserved_words[i], words, 16))
+        {
+            *index = heap->count + i;
+            found = TRUE;
+        }
+    if (heap && !found && device && heap->reserved_used < heap->reserved
+            && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
+    {
+        D3D12_SAMPLER_DESC desc;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        UINT i = heap->reserved_used++;
+
+        console_decode_sampler(words, &desc);
+        memcpy(heap->reserved_words[i], words, 16);
+        *index = heap->count + i;
+        cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
+        ID3D12Device_CreateSampler(device, &desc, cpu);
+        found = TRUE;
+    }
+    ReleaseSRWLockExclusive(&lock);
     return found;
 }
 

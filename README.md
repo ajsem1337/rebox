@@ -80,6 +80,9 @@ Once the exe is dumped:
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
+| `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
+| `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
+| `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |
 | `REBOX_HEAP_VA=title\|real\|virtual` | What descriptor heaps report as their GPU address (heap slot 10). `title` (default): the shadow heap's 32-bit title address, which AnyPS5 resolves in the console-format copy ([docs/anyps5.md](docs/anyps5.md)). `real`: the real GPU address of vkd3d-proton's descriptors (patched vkd3d-proton with descriptor buffers, as on RADV). `virtual`: vkd3d-proton's own handles. `REBOX_REAL_HEAP_VA=0` still means `virtual` |
 | `REBOX_CRASH_LOG=N` | Report the first N faults (access violations, illegal instructions, divide by zero, stack overflow) with module+RVA, target address, a GPU-window hint, registers and an unwound stack; default 8, 0 turns it off. Reports are first-chance, so a fault the title handles itself also appears |
 | `REBOX_SLOT_STATS=N` | Count calls per D3D12.X proxy slot and log them every N presents and at exit (`c` = our code, `T` = trap, unmarked = forwarded to the PC slot) |

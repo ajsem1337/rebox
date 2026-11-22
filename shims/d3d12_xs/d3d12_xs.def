@@ -18,3 +18,4 @@ EXPORTS
     ReboxShadowRead
     ReboxShadowFind
     ReboxConsoleCompile
+    ReboxConsoleLastResult

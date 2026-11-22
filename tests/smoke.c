@@ -10,6 +10,7 @@
 #include <initguid.h>
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi.h>
 #include <xaudio2.h>
 #include <mmdeviceapi.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 
 #include "../generated/test_shaders.h"
 #include "../anyps5/rebox_anyps5.h"
+#include "../generated/repro_shaders.h"
 
 static int failures;
 
@@ -1827,6 +1829,207 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* Dispatches gfx1030 code once through a deferred console PSO, with its user SGPRs as root
+ * constants and heap bound. Returns d3d12_xs's compile result (message in msg); a GPU that never
+ * finishes counts as failure. */
+static HRESULT dispatch_rdna(void *dev, void *queue, void *heap, const UINT32 *code, UINT dwords, UINT32 rsrc2,
+        UINT threads, const UINT32 *sgprs, UINT nsgprs, char *msg, size_t msg_size)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    HRESULT (WINAPI *last_result)(char *, SIZE_T) = (void *)GetProcAddress(m, "ReboxConsoleLastResult");
+    D3D12_ROOT_PARAMETER p = { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, nsgprs } };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &p };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    struct { UINT32 magic, version, size, stage, wave_size, workgroup_size[3], rsrc1, rsrc2, code_offset, code_dwords;
+             UINT64 code_address; } *blob;
+    void *rs = NULL, *pso = NULL, *list = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D10Blob *rs_blob = NULL;
+    HRESULT hr;
+
+    snprintf(msg, msg_size, "setup failed");
+    if (!(blob = calloc(1, sizeof(*blob) + dwords * 4)))
+        return E_OUTOFMEMORY;
+    *blob = (typeof(*blob)){ 0x44524353, 1, sizeof(*blob) + dwords * 4, 0x20, 32, { threads, 1, 1 }, 0x00ac0000,
+                             rsrc2, sizeof(*blob), dwords, 0x300000 };
+    memcpy(blob + 1, code, dwords * 4);
+    if (SUCCEEDED(hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, NULL)))
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(rs_blob), ID3D10Blob_GetBufferSize(rs_blob), &IID_ID3D12RootSignature, &rs);
+    if (SUCCEEDED(hr))
+    {
+        cd.pRootSignature = rs;
+        cd.CS = (D3D12_SHADER_BYTECODE){ blob, blob->size };
+        hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12PipelineState, &pso);
+    }
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+    {
+        XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+        XSLOT(list, 33, void, void *)(list, rs);
+        XSLOT(list, 25, void, void *)(list, pso);
+        XSLOT(list, 39, void, UINT, UINT, const void *, UINT)(list, 0, nsgprs, sgprs, 0);
+        XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+        for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+            Sleep(10);
+        hr = last_result(msg, msg_size);
+        if (ID3D12Fence_GetCompletedValue(fence) < 1)
+        {
+            snprintf(msg, msg_size, "the GPU did not finish");
+            hr = E_FAIL;
+        }
+    }
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (rs_blob) ID3D10Blob_Release(rs_blob);
+    free(blob);
+    return hr;
+}
+
+/* Whether the first DXGI adapter is lavapipe (llvmpipe), whose 8-wide subgroups split a guest wave. */
+static BOOL on_lavapipe(void)
+{
+    HRESULT (WINAPI *create)(REFIID, void **) = (void *)GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory1");
+    IDXGIFactory1 *factory = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    DXGI_ADAPTER_DESC1 desc;
+    BOOL lavapipe = FALSE;
+
+    if (create && SUCCEEDED(create(&IID_IDXGIFactory1, (void **)&factory)))
+    {
+        if (SUCCEEDED(IDXGIFactory1_EnumAdapters1(factory, 0, &adapter)))
+        {
+            if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &desc)))
+                lavapipe = wcsstr(desc.Description, L"llvmpipe") != NULL;
+            IDXGIAdapter1_Release(adapter);
+        }
+        IDXGIFactory1_Release(factory);
+    }
+    return lavapipe;
+}
+
+/* Hand-written gfx1030 reproductions of recompiler bugs (tests/rdna, from xsx-shader-lab's repro/),
+ * through the whole deferred path: the XOR-swapped table pointer of patches/anyps5/0003, the
+ * speculated pointer and descriptor of 0004, and two loops with exec save/restore whose output is
+ * checked. */
+static void test_rdna_repros(void *dev, void *queue)
+{
+    static const struct { const char *name; const UINT32 *code; UINT dwords; } image_cases[] = {
+        { "xor-swap (patch 0003)", repro_xor_swap, ARRAYSIZE(repro_xor_swap) },
+        { "speculation-pointer (patch 0004)", repro_speculation_pointer, ARRAYSIZE(repro_speculation_pointer) },
+        { "speculation-pointer-taken (patch 0004)", repro_speculation_pointer_taken, ARRAYSIZE(repro_speculation_pointer_taken) },
+        { "speculation-descriptor (patch 0004)", repro_speculation_descriptor, ARRAYSIZE(repro_speculation_descriptor) },
+    };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 64, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC tuav = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE1D };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC buav = { .Format = DXGI_FORMAT_R32_TYPELESS, .ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+                                              .Buffer = { 0, 1024, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW } };
+    ID3D12Resource *tex = NULL, *buf = NULL;
+    void *heap = NULL;
+    UINT32 *out = NULL, sgprs[7];
+    UINT64 gpu;
+    SIZE_T cpu;
+    UINT inc;
+    char msg[512];
+    HRESULT hr;
+
+    if (!title_heap_va() || !LoadLibraryA("rebox_anyps5.dll"))
+    {
+        printf("skip RDNA repros: no title addresses or rebox_anyps5.dll\n");
+        return;
+    }
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+    CHECK(SUCCEEDED(hr), "objects for the RDNA repros (%#lx)", hr);
+    if (FAILED(hr))
+        goto done;
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    gpu = XSLOT(heap, 10, UINT64)(heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            tex, NULL, &tuav, cpu);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            buf, NULL, &buav, cpu + inc);
+
+    /* s[0:1] = the table (a 1D storage image at slot 0); s2 = the workgroup id. */
+    for (UINT i = 0; i < ARRAYSIZE(image_cases); i++)
+    {
+        sgprs[0] = (UINT32)gpu;
+        sgprs[1] = 0;
+        hr = dispatch_rdna(dev, queue, heap, image_cases[i].code, image_cases[i].dwords, 2 << 1 | 1 << 7, 32, sgprs, 2,
+                           msg, sizeof(msg));
+        CHECK(SUCCEEDED(hr), "RDNA repro %s compiles and runs: %s", image_cases[i].name, msg);
+    }
+
+    /* Two exec-masked loops through LDS: s4 = a table with the output V# (slot 1), s5 = n1,
+     * s6 = n2. out[x] = (x & 63) + 101 if (x & 63) < n1, else 0, for x < n2. */
+    memset(out, 0xcc, 4096);
+    memset(sgprs, 0, sizeof(sgprs));
+    sgprs[4] = (UINT32)(gpu + inc);
+    sgprs[5] = 40;
+    sgprs[6] = 100;
+    hr = dispatch_rdna(dev, queue, heap, repro_wrexec_loops, ARRAYSIZE(repro_wrexec_loops), 7 << 1 | 8 << 15, 32, sgprs, 7,
+                       msg, sizeof(msg));
+    {
+        UINT good = 0, first_bad = ~0u;
+        for (UINT x = 0; x < 100; x++)
+        {
+            UINT32 expect = (x & 63) < 40 ? (x & 63) + 101 : 0;
+            if (out[x] == expect) good++;
+            else if (first_bad == ~0u) first_bad = x;
+        }
+        /* Known lavapipe-only miscompare (xsx-shader-lab): its 8-wide subgroups split the guest
+         * wave, and loops ending on a partial wave lose lanes. Exact on RADV. */
+        if (SUCCEEDED(hr) && good != 100 && on_lavapipe())
+            printf("info RDNA repro wrexec-loops: %u of 100 outputs right on lavapipe (known miscompare: 8-wide "
+                   "subgroups; exact on RADV)\n", good);
+        else
+            CHECK(SUCCEEDED(hr) && good == 100, "RDNA repro wrexec-loops: %u of 100 outputs right (%s%s)", good, msg,
+                  first_bad != ~0u ? "; first wrong is shown below" : "");
+        if (first_bad != ~0u)
+            printf("     out[%u] = %#x\n", first_bad, out[first_bad]);
+    }
+    ID3D12Resource_Unmap(buf, 0, NULL);
+
+done:
+    if (tex) ID3D12Resource_Release(tex);
+    if (buf) ID3D12Resource_Release(buf);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -1949,6 +2152,7 @@ static void test_xbox(void)
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);
     test_console_dispatch(dev, queue);
+    test_rdna_repros(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);
@@ -2216,10 +2420,403 @@ static int pso_check(const char *dir)
     return failed != 0;
 }
 
+/* smoke.exe --console-cs PLAN [FIRST [COUNT]]: runs game compute shaders through the deferred
+ * console path (tools/console-cs-plan.py writes PLAN from an xsx-shader-lab checkout; game data is
+ * never in the repo). For each shader the descriptor tables rdna-run inferred are rebuilt in real
+ * D3D12 heaps with synthetic resources, every user SGPR is passed as a root constant (table
+ * pointers as the tables' title addresses: they are 32-bit, and some are adjacent, which root-order
+ * packing can't express), and the code is dispatched once through an SCRD PSO. Each shader gets a
+ * "cs NAME STATUS: message" line: dispatched (compiled or cached, and the GPU finished), skipped
+ * (the compile failed; d3d12_xs's message follows) or hung (no result in REBOX_CONSOLE_CS_TIMEOUT seconds, default 300; the sweep stops,
+ * since the queue is stuck; REBOX_CONSOLE_CS_SKIP=NAME,... leaves shaders out). */
+/* sa5_analyse from rebox_anyps5.dll. */
+static int (*cs_analyse)(const UINT32 *, UINT32, UINT32, struct sa5_layout *, struct sa5_slot *, UINT32, char *, size_t);
+
+enum cs_resource { CS_TEX1D, CS_TEX2D, CS_TEX2DARRAY, CS_TEXCUBE, CS_TEX3D, CS_UAV1D, CS_UAV2D, CS_UAV2DARRAY,
+                   CS_UAV3D, CS_BUFFER, CS_CBUFFER, CS_RESOURCE_COUNT };
+
+struct console_cs
+{
+    void *dev, *queue, *list, *heap, *sampler_heap, *rs[33];
+    ID3D12CommandAllocator *alloc;
+    ID3D12Fence *fence;
+    ID3D12Resource *res[CS_RESOURCE_COUNT];
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize;
+    HRESULT (WINAPI *last_result)(char *, SIZE_T);
+    SIZE_T cpu, sampler_cpu;
+    UINT64 gpu, sampler_gpu, fence_value;
+    UINT inc, sampler_inc;
+};
+
+static ID3D12Resource *cs_create(struct console_cs *c, D3D12_RESOURCE_DIMENSION dim, UINT64 width, UINT height,
+        UINT16 depth, D3D12_RESOURCE_FLAGS flags)
+{
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rd = { dim, 0, width, height, depth, 1,
+                               dim == D3D12_RESOURCE_DIMENSION_BUFFER ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, dim == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                               : D3D12_TEXTURE_LAYOUT_UNKNOWN, flags };
+    ID3D12Resource *r = NULL;
+
+    XSLOT(c->dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+          D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(c->dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+          D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r);
+    return r;
+}
+
+static BOOL cs_setup(struct console_cs *c)
+{
+    HMODULE m = LoadLibraryA("d3d12_xs.dll");
+    xbox_create_fn create = m ? (xbox_create_fn)(void *)GetProcAddress(m, "D3D12XboxCreateDevice") : NULL;
+    D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4 * 512,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC sd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    if (!create || !LoadLibraryA("rebox_anyps5.dll"))
+        return FALSE;
+    c->serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)GetProcAddress(m, "D3D12SerializeRootSignature");
+    c->last_result = (void *)GetProcAddress(m, "ReboxConsoleLastResult");
+    cs_analyse = (void *)GetProcAddress(GetModuleHandleA("rebox_anyps5.dll"), "sa5_analyse");
+    if (!cs_analyse)
+        return FALSE;
+    if (!c->last_result || FAILED(create(NULL, NULL, &IID_ID3D12Device, &c->dev))
+            || FAILED(XSLOT(c->dev, 8, HRESULT, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **)(c->dev, &qd,
+                &IID_ID3D12CommandQueue, &c->queue))
+            || FAILED(XSLOT(c->dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(c->dev, &hd,
+                &IID_ID3D12DescriptorHeap, &c->heap))
+            || FAILED(XSLOT(c->dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(c->dev, &sd,
+                &IID_ID3D12DescriptorHeap, &c->sampler_heap))
+            || FAILED(XSLOT(c->dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(c->dev,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&c->alloc))
+            || FAILED(XSLOT(c->dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *,
+                ID3D12PipelineState *, REFIID, void **)(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->alloc, NULL,
+                &IID_ID3D12GraphicsCommandList, &c->list))
+            || FAILED(XSLOT(c->dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(c->dev, 0,
+                D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&c->fence)))
+        return FALSE;
+    XSLOT(c->list, 9, HRESULT)(c->list);
+    c->cpu = XSLOT(c->heap, 9, SIZE_T)(c->heap);
+    c->gpu = XSLOT(c->heap, 10, UINT64)(c->heap);
+    c->sampler_cpu = XSLOT(c->sampler_heap, 9, SIZE_T)(c->sampler_heap);
+    c->sampler_gpu = XSLOT(c->sampler_heap, 10, UINT64)(c->sampler_heap);
+    c->inc = XSLOT(c->dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(c->dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    c->sampler_inc = XSLOT(c->dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(c->dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (c->inc != 32 || c->sampler_inc < 16 || c->sampler_inc > 32 || c->gpu >> 32 || c->sampler_gpu >> 32)
+    {
+        printf("FAIL console-cs: needs 32-byte resource slots, 16- or 32-byte sampler slots and title addresses "
+               "(increments %u/%u, heaps at %#llx/%#llx)\n", c->inc, c->sampler_inc, (unsigned long long)c->gpu,
+               (unsigned long long)c->sampler_gpu);
+        return FALSE;
+    }
+    c->res[CS_TEX1D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE1D, 64, 1, 1, 0);
+    c->res[CS_TEX2D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, 0);
+    c->res[CS_TEX2DARRAY] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 2, 0);
+    c->res[CS_TEXCUBE] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 32, 32, 6, 0);
+    c->res[CS_TEX3D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE3D, 16, 16, 16, 0);
+    c->res[CS_UAV1D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE1D, 64, 1, 1, uav);
+    c->res[CS_UAV2D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, uav);
+    c->res[CS_UAV2DARRAY] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 2, uav);
+    c->res[CS_UAV3D] = cs_create(c, D3D12_RESOURCE_DIMENSION_TEXTURE3D, 16, 16, 16, uav);
+    c->res[CS_BUFFER] = cs_create(c, D3D12_RESOURCE_DIMENSION_BUFFER, 1 << 20, 1, 1, uav);
+    c->res[CS_CBUFFER] = cs_create(c, D3D12_RESOURCE_DIMENSION_BUFFER, 1 << 16, 1, 1, 0);
+    for (int i = 0; i < CS_RESOURCE_COUNT; i++)
+        if (!c->res[i])
+        {
+            printf("FAIL console-cs: synthetic resource %d\n", i);
+            return FALSE;
+        }
+    return TRUE;
+}
+
+/* The descriptor a slot needs, written at cpu. */
+static BOOL cs_write(struct console_cs *c, const char *kind, const char *dim, SIZE_T cpu)
+{
+    BOOL is3d = !strcmp(dim, "3D"), isarray = !strcmp(dim, "2D_ARRAY"), is1d = !strcmp(dim, "1D");
+
+    if (!strcmp(kind, "texture"))
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+        ID3D12Resource *r = c->res[CS_TEX2D];
+        if (is3d) { d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; d.Texture3D.MipLevels = 1; r = c->res[CS_TEX3D]; }
+        else if (is1d) { d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D; d.Texture1D.MipLevels = 1; r = c->res[CS_TEX1D]; }
+        else if (!strcmp(dim, "CUBE")) { d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; d.TextureCube.MipLevels = 1; r = c->res[CS_TEXCUBE]; }
+        else if (isarray) { d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; d.Texture2DArray.MipLevels = 1;
+                            d.Texture2DArray.ArraySize = 2; r = c->res[CS_TEX2DARRAY]; }
+        else d.Texture2D.MipLevels = 1;
+        XSLOT(c->dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(c->dev, r, &d, cpu);
+    }
+    else if (!strcmp(kind, "storage"))
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D };
+        ID3D12Resource *r = c->res[CS_UAV2D];
+        if (is3d) { d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D; d.Texture3D.WSize = 16; r = c->res[CS_UAV3D]; }
+        else if (is1d) { d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D; r = c->res[CS_UAV1D]; }
+        else if (isarray) { d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; d.Texture2DArray.ArraySize = 2;
+                            r = c->res[CS_UAV2DARRAY]; }
+        XSLOT(c->dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(
+              c->dev, r, NULL, &d, cpu);
+    }
+    else if (!strncmp(kind, "buf", 3) || !strncmp(kind, "ubuf", 4))
+    {
+        BOOL typed = kind[strlen(kind) - 1] == 'f';
+        if (kind[0] == 'u')
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC d = { typed ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32_TYPELESS,
+                    D3D12_UAV_DIMENSION_BUFFER, .Buffer = { 0, (1 << 20) / 4, 0, 0,
+                    typed ? D3D12_BUFFER_UAV_FLAG_NONE : D3D12_BUFFER_UAV_FLAG_RAW } };
+            XSLOT(c->dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *,
+                  SIZE_T)(c->dev, c->res[CS_BUFFER], NULL, &d, cpu);
+        }
+        else
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d = { typed ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32_TYPELESS,
+                    D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Buffer = { 0, (1 << 20) / 4,
+                    0, typed ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW } };
+            XSLOT(c->dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(c->dev,
+                  c->res[CS_BUFFER], &d, cpu);
+        }
+    }
+    else if (!strcmp(kind, "cbuffer"))
+    {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC d = { ID3D12Resource_GetGPUVirtualAddress(c->res[CS_CBUFFER]), 1 << 16 };
+        XSLOT(c->dev, 17, void, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, SIZE_T)(c->dev, &d, cpu);
+    }
+    else if (!strcmp(kind, "sampler"))
+    {
+        D3D12_SAMPLER_DESC d = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                 D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0, 1,
+                                 D3D12_COMPARISON_FUNC_NEVER, { 0 }, 0, 16 };
+        XSLOT(c->dev, 22, void, const D3D12_SAMPLER_DESC *, SIZE_T)(c->dev, &d, cpu);
+    }
+    else
+        return FALSE;
+    return TRUE;
+}
+
+static void *cs_root_signature(struct console_cs *c, UINT count)
+{
+    D3D12_ROOT_PARAMETER p = { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, count } };
+    D3D12_ROOT_SIGNATURE_DESC d = { count ? 1 : 0, &p };
+    ID3D10Blob *blob = NULL;
+
+    if (!c->rs[count] && SUCCEEDED(c->serialize(&d, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+    {
+        XSLOT(c->dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(c->dev, 0,
+              ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &c->rs[count]);
+        ID3D10Blob_Release(blob);
+    }
+    return c->rs[count];
+}
+
+/* One plan line; returns 0 dispatched, 1 skipped (compile failed), 2 error, 3 hung. */
+/* Prints why a shader's inferred tables can't be D3D12 heaps here, and returns 4 (not run). */
+static int cs_unplannable(const char *name, const char *why, void *blob)
+{
+    printf("cs %s not run: %s\n", name, why);
+    free(blob);
+    return 4;
+}
+
+/* One plan line; returns 0 dispatched, 1 skipped (compile failed), 2 error, 3 hung, 4 not run (its
+ * inferred tables can't be D3D12 heaps). */
+static int cs_run(struct console_cs *c, char *line)
+{
+    static const char *const kinds[] = { "texture", "storage", "sampler", "buffer", "cbuffer" };
+    static const char *const dims[] = { "-", "1D", "2D", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2D_MSAA", "2D_MSAA_ARRAY" };
+    char *name = strtok(line, " "), *path = strtok(NULL, " "), *skip = strtok(NULL, " "), *r1 = strtok(NULL, " ");
+    char *r2 = strtok(NULL, " "), *threads = strtok(NULL, " \r\n"), winpath[MAX_PATH], message[512], why[128];
+    struct { UINT32 magic, version, size, stage, wave_size, workgroup_size[3], rsrc1, rsrc2, code_offset, code_dwords;
+             UINT64 code_address; } *blob;
+    static struct sa5_slot slots[4096];
+    struct sa5_layout layout;
+    UINT32 sgprs[32] = { 0 }, nsgprs, table_heap_slot[16];
+    BOOL table_sampler[16];
+    UINT next_slot[2] = { 0, 0 };
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { 0 };
+    void *heaps[2] = { c->heap, c->sampler_heap }, *pso = NULL;
+    SIZE_T size, code_bytes;
+    BYTE *data;
+    HRESULT hr;
+    int status;
+
+    if (!name || !threads)
+        return 2;
+    snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+    for (char *p = winpath; *p; p++)
+        if (*p == '/') *p = '\\';
+    if (!(data = read_file(winpath, &size)) || size <= (SIZE_T)atoi(skip))
+    {
+        printf("cs %s error: can't read %s\n", name, winpath);
+        free(data);
+        return 2;
+    }
+    code_bytes = (size - atoi(skip)) & ~(SIZE_T)3;
+    blob = calloc(1, sizeof(*blob) + code_bytes);
+    *blob = (typeof(*blob)){ 0x44524353, 1, sizeof(*blob) + code_bytes, 0x20, 32, { 1, 1, 1 },
+                             strtoul(r1, NULL, 0), strtoul(r2, NULL, 0), sizeof(*blob), code_bytes / 4, 0x10000000000ull };
+    sscanf(threads, "%u,%u,%u", &blob->workgroup_size[0], &blob->workgroup_size[1], &blob->workgroup_size[2]);
+    memcpy(blob + 1, data + atoi(skip), code_bytes);
+    free(data);
+    nsgprs = (blob->rsrc2 >> 1) & 0x1f;
+
+    /* The descriptor tables the code reads (sa5_analyse), each placed in its own run of slots in
+     * the heap of its kind; its SGPR holds that run's title address. */
+    if (cs_analyse((const UINT32 *)(blob + 1), blob->code_dwords, nsgprs, &layout, slots, ARRAYSIZE(slots), message,
+                   sizeof(message)))
+    {
+        snprintf(why, sizeof(why), "analysis failed: %.100s", message);
+        return cs_unplannable(name, why, blob);
+    }
+    blob->wave_size = layout.wave;
+    if (!layout.table_count)
+        return cs_unplannable(name, "no descriptor table", blob);
+    for (UINT t = 0; t < layout.table_count; t++)
+    {
+        UINT samplers = 0, others = 0, span = 1, inc;
+        for (UINT i = 0; i < layout.slot_count; i++)
+            if (slots[i].table == t)
+                slots[i].kind == SA5_SLOT_SAMPLER ? samplers++ : others++;
+        if (samplers && others)
+        {
+            snprintf(why, sizeof(why), "samplers and resources share table %u", t);
+            return cs_unplannable(name, why, blob);
+        }
+        table_sampler[t] = samplers != 0;
+        inc = table_sampler[t] ? c->sampler_inc : c->inc;
+        for (UINT i = 0; i < layout.slot_count; i++)
+            if (slots[i].table == t)
+            {
+                if ((slots[i].dword * 4) % inc)
+                {
+                    /* Console S#s are 16 bytes apart; a driver's sampler slots may be wider. */
+                    snprintf(why, sizeof(why), "%s at table %u dword %u is not on a %u-byte slot boundary",
+                             kinds[slots[i].kind], t, slots[i].dword, inc);
+                    return cs_unplannable(name, why, blob);
+                }
+                span = max(span, slots[i].dword * 4 / inc + 1);
+            }
+        table_heap_slot[t] = next_slot[table_sampler[t]];
+        if (layout.table_sgprs[t] < 32)
+            sgprs[layout.table_sgprs[t]] = (UINT32)((table_sampler[t] ? c->sampler_gpu : c->gpu)
+                    + (UINT64)next_slot[table_sampler[t]] * inc);
+        next_slot[table_sampler[t]] += span;
+    }
+    if (next_slot[0] > 4 * 512 || next_slot[1] > 2048)
+    {
+        snprintf(why, sizeof(why), "tables need %u resource and %u sampler slots", next_slot[0], next_slot[1]);
+        return cs_unplannable(name, why, blob);
+    }
+    for (UINT i = 0; i < layout.slot_count; i++)
+    {
+        const struct sa5_slot *sl = &slots[i];
+        BOOL smp = table_sampler[sl->table];
+        UINT inc = smp ? c->sampler_inc : c->inc;
+        char kind[8];
+        if (sl->kind == SA5_SLOT_BUFFER)
+            snprintf(kind, sizeof(kind), "%sbuf%s", sl->stored ? "u" : "", sl->formatted ? "f" : "");
+        else
+            snprintf(kind, sizeof(kind), "%s", kinds[sl->kind]);
+        cs_write(c, kind, dims[sl->dim <= 8 ? sl->dim : 0], (smp ? c->sampler_cpu : c->cpu)
+                 + (SIZE_T)table_heap_slot[sl->table] * inc + (SIZE_T)sl->dword * 4);
+    }
+
+    cd.pRootSignature = cs_root_signature(c, nsgprs);
+    cd.CS = (D3D12_SHADER_BYTECODE){ blob, blob->size };
+    hr = XSLOT(c->dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(c->dev, &cd,
+            &IID_ID3D12PipelineState, &pso);
+    free(blob);
+    if (FAILED(hr))
+    {
+        printf("cs %s error: PSO creation failed %#lx\n", name, hr);
+        return 2;
+    }
+    ID3D12CommandAllocator_Reset(c->alloc);
+    XSLOT(c->list, 10, HRESULT, ID3D12CommandAllocator *, void *)(c->list, c->alloc, NULL);
+    XSLOT(c->list, 32, void, UINT, void *const *)(c->list, 2, heaps);
+    XSLOT(c->list, 33, void, void *)(c->list, cd.pRootSignature);
+    XSLOT(c->list, 25, void, void *)(c->list, pso);
+    if (nsgprs)
+        XSLOT(c->list, 39, void, UINT, UINT, const void *, UINT)(c->list, 0, nsgprs, sgprs, 0);
+    XSLOT(c->list, 14, void, UINT, UINT, UINT)(c->list, 1, 1, 1);
+    XSLOT(c->list, 9, HRESULT)(c->list);
+    XSLOT(c->queue, 10, void, UINT, void *const *)(c->queue, 1, &c->list);
+    XSLOT(c->queue, 14, HRESULT, ID3D12Fence *, UINT64)(c->queue, c->fence, ++c->fence_value);
+    {
+        /* REBOX_CONSOLE_CS_TIMEOUT: seconds to wait for the GPU (default 300: llvmpipe takes
+         * about a minute over the largest shaders). */
+        const char *t = getenv("REBOX_CONSOLE_CS_TIMEOUT");
+        int limit = (t ? atoi(t) : 300) * 100;
+        for (int i = 0; i < limit && ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value; i++)
+            Sleep(10);
+    }
+    hr = c->last_result(message, sizeof(message));
+    if (ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value)
+        status = 3;
+    else
+        status = SUCCEEDED(hr) ? 0 : 1;
+    printf("cs %s %s: %s\n", name, status == 0 ? "dispatched" : status == 1 ? "skipped" : "hung", message);
+    fflush(stdout);
+    XSLOT(pso, 2, ULONG)(pso);
+    return status;
+}
+
+static int console_cs(const char *plan, int first, int count)
+{
+    struct console_cs c = { 0 };
+    int totals[5] = { 0 }, n = 0, index = 0;
+    char line[16384];
+    FILE *f = fopen(plan, "r");
+
+    if (!f || !cs_setup(&c))
+    {
+        printf("FAIL console-cs: no plan, device, rebox_anyps5.dll or heaps\n");
+        return 1;
+    }
+    while (fgets(line, sizeof(line), f) && (count <= 0 || n < count))
+    {
+        int status;
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        if (index++ < first)
+            continue;
+        {
+            /* REBOX_CONSOLE_CS_SKIP=NAME,NAME...: shaders known to hang (synthetic inputs can
+             * make a loop run forever, and a hung queue stops the sweep). */
+            const char *skip = getenv("REBOX_CONSOLE_CS_SKIP");
+            char name[64];
+            size_t len = strcspn(line, " ");
+            snprintf(name, sizeof(name), "%.*s", (int)min(len, sizeof(name) - 1), line);
+            if (skip && strstr(skip, name))
+            {
+                printf("cs %s not run: REBOX_CONSOLE_CS_SKIP\n", name);
+                continue;
+            }
+        }
+        n++;
+        status = cs_run(&c, line);
+        totals[status]++;
+        if (status == 3)
+        {
+            printf("FAIL console-cs: the GPU did not finish; stopping\n");
+            break;
+        }
+    }
+    fclose(f);
+    printf("%s console-cs: %d of %d game compute shaders dispatched, %d skipped by the compile, %d not run "
+           "(tables not expressible as D3D12 heaps), %d errors, %d hung\n", totals[2] || totals[3] ? "FAIL" : "ok  ",
+           totals[0], n, totals[1], totals[4], totals[2], totals[3]);
+    return totals[2] || totals[3];
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && !strcmp(argv[1], "--pso-check"))
         return pso_check(argv[2]);
+    if (argc > 2 && !strcmp(argv[1], "--console-cs"))
+        return console_cs(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
     test_xmem();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));

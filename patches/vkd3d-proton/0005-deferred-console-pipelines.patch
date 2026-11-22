@@ -412,10 +412,30 @@ index 0536bd1..06eab1b 100644
          /* We compiled this PSO without any cache (internal or app-provided),
           * so we should serialize this to internal disk cache.
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 626ad9b..87544cc 100644
+index 626ad9b..16b25cd 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -2294,12 +2294,59 @@ const struct vkd3d_rebox_console_shader *vkd3d_rebox_console_shader(const
+@@ -64,7 +64,9 @@
+ #define VKD3D_MAX_DESCRIPTOR_SIZE 256u /* Maximum allowed value in VK_EXT_descriptor_buffer. */
+ 
+ #define VKD3D_MIN_VIEW_DESCRIPTOR_COUNT (1000000u)
+-#define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT (2048u)
++/* rebox: 2048 plus the 256 hidden slots d3d12_xs reserves after every shader-visible
++ * sampler heap for samplers console shaders build themselves (patch 0005). */
++#define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT (2048u + 256u)
+ 
+ #define VKD3D_TILE_SIZE (65536ull)
+ 
+@@ -2276,7 +2278,7 @@ struct vkd3d_pipeline_cache_compatibility
+  * heap_base and code_base, then the descriptor lookup tables of the bound
+  * resource and sampler heaps (all 64-bit). */
+ #define VKD3D_REBOX_CONSOLE_MAGIC 0x56534353u /* "SCSV" */
+-#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 160u
++#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 192u
+ struct vkd3d_rebox_console_shader
+ {
+     uint32_t magic;
+@@ -2294,12 +2296,59 @@ const struct vkd3d_rebox_console_shader *vkd3d_rebox_console_shader(const
   * or the bytecode itself. */
  struct vkd3d_shader_code vkd3d_rebox_shader_dxbc(const D3D12_SHADER_BYTECODE *code);
  
@@ -423,7 +443,7 @@ index 626ad9b..87544cc 100644
 + * code that d3d12_xs.dll compiles with AnyPS5 at each dispatch, once the descriptors it reads are
 + * known. The PSO keeps the blob and creates no pipeline; at dispatch the user SGPRs are packed as
 + * for SCSV shaders, with descriptor tables at the shadow heaps' title addresses, and
-+ * ReboxConsoleCompile returns SPIR-V for the root signature's layout plus 160 bytes of push
++ * ReboxConsoleCompile returns SPIR-V for the root signature's layout plus 192 bytes of push
 + * data. The pipelines are cached per PSO by the key d3d12_xs returns. Compute only for now. */
 +#define VKD3D_REBOX_DEFERRED_MAGIC 0x44524353u /* "SCRD" */
 +struct vkd3d_rebox_deferred_header
@@ -448,7 +468,7 @@ index 626ad9b..87544cc 100644
 +    uint32_t spirv_words;
 +    uint32_t subgroup_size; /* 0: any */
 +    uint64_t key[2];        /* identifies the SPIR-V */
-+    uint32_t push[40];      /* bytes 0-159 of the push block */
++    uint32_t push[48];      /* bytes 0-191 of the push block */
 +};
 +typedef HRESULT (*PFN_vkd3d_rebox_console_compile)(const struct vkd3d_rebox_compile_in *in,
 +        struct vkd3d_rebox_compile_out *out);
@@ -475,7 +495,7 @@ index 626ad9b..87544cc 100644
  
      union
      {
-@@ -2332,6 +2379,10 @@ struct d3d12_pipeline_state
+@@ -2332,6 +2381,10 @@ struct d3d12_pipeline_state
  HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
          VkShaderModule *vk_module, const struct vkd3d_shader_code *code);
  
@@ -486,7 +506,7 @@ index 626ad9b..87544cc 100644
  static inline bool d3d12_pipeline_state_is_compute(const struct d3d12_pipeline_state *state)
  {
      return state && state->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE;
-@@ -3238,6 +3289,16 @@ struct d3d12_command_list
+@@ -3238,6 +3291,16 @@ struct d3d12_command_list
      bool is_recording;
      bool is_valid;
      bool debug_capture;
@@ -498,7 +518,7 @@ index 626ad9b..87544cc 100644
 +    {
 +        uint64_t heap_cpu[2];
 +        uint64_t title_base[2];
-+        uint32_t push[40];
++        uint32_t push[48];
 +    } rebox;
      bool has_replaced_shaders;
  

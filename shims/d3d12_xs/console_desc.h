@@ -9,3 +9,6 @@ void console_encode_srv(ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DE
 void console_encode_uav(ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, UINT32 out[8]);
 void console_encode_cbv(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, UINT32 out[8]);
 void console_encode_sampler(const D3D12_SAMPLER_DESC *desc, UINT32 out[4]);
+/* The D3D12 sampler an S# describes (console_encode_sampler's inverse, for samplers shaders build
+ * themselves). */
+void console_decode_sampler(const UINT32 words[4], D3D12_SAMPLER_DESC *desc);

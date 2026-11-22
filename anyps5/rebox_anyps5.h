@@ -71,8 +71,8 @@ SA5_API void sa5_result_free(struct sa5_result *result);
  * frozen to the result's values. Each remap moves a guest descriptor array at (set, binding) to
  * (new_set, new_binding) as a runtime array, element i becoming element heap_indices[i] there; kind
  * is the binding's DescriptorKind. Each host buffer (a role AnyPS5's driver fills itself) becomes a
- * buffer-device-address pointer read from the push block: 64-bit address push_slot (0-3) at byte
- * 128 + 8 * push_slot. array_length is what OpArrayLength on it returns (its u32 count). */
+ * buffer-device-address pointer read from the push block: 64-bit address push_slot at byte
+ * 128 + 8 * push_slot (0-7). array_length is what OpArrayLength on it returns (its u32 count). */
 struct sa5_remap
 {
     uint32_t set, binding, kind;
@@ -86,6 +86,10 @@ struct sa5_host_buffer
     uint32_t set, binding;
     uint32_t push_slot;
     uint32_t array_length;
+    /* Nonzero: (set, binding) is a guest buffer array, and the buffer at push_slot is a table with
+     * a 16-byte entry per element, {64-bit address, u32 length in dwords, 0}. Each element becomes
+     * a pointer to its address, and OpArrayLength on it reads the length. */
+    uint32_t guest_array;
 };
 
 /* Returns 0 and the validated module in *out (free with sa5_free_words), or -1 and a message. */
@@ -93,6 +97,36 @@ SA5_API int sa5_finalize(const struct sa5_result *result, const struct sa5_remap
                          const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t **out,
                          uint32_t *out_count, char *error, size_t error_size);
 SA5_API void sa5_free_words(uint32_t *words);
+
+/* The descriptor tables a compute shader reads, inferred from its code (layout.cpp, moved from
+ * xsx-shader-lab's rdna-run): which user SGPRs hold 32-bit table pointers, and what each table
+ * holds at which dword. Shaders form {sN, 0} addresses and s_load descriptors from fixed offsets;
+ * following the loaded registers to their users gives each slot's kind. */
+enum sa5_slot_kind { SA5_SLOT_TEXTURE, SA5_SLOT_STORAGE, SA5_SLOT_SAMPLER, SA5_SLOT_BUFFER, SA5_SLOT_CBUFFER };
+enum sa5_slot_dim { SA5_DIM_NONE, SA5_DIM_1D, SA5_DIM_2D, SA5_DIM_3D, SA5_DIM_CUBE, SA5_DIM_1D_ARRAY,
+                    SA5_DIM_2D_ARRAY, SA5_DIM_2D_MSAA, SA5_DIM_2D_MSAA_ARRAY };
+struct sa5_slot
+{
+    uint32_t table;             /* index into table_sgprs */
+    uint32_t dword;             /* within the table */
+    uint32_t kind;              /* enum sa5_slot_kind */
+    uint32_t dim;               /* enum sa5_slot_dim (images) */
+    uint32_t size;              /* dwords: 8 (T#), 4 (V#, S#) */
+    uint32_t stored;            /* written (store or atomic) */
+    uint32_t formatted;         /* buffers: typed access */
+    uint32_t indexed;           /* buffers: idxen (structured) */
+};
+struct sa5_layout
+{
+    uint32_t wave;
+    uint32_t table_count;
+    uint32_t table_sgprs[16];
+    uint32_t slot_count;        /* slots filled; more may exist when slot_capacity was too small */
+    uint32_t notes;             /* bit 0: unresolved descriptors, 1: dynamic table offsets, 2: undecodable code */
+};
+/* code starts at the first instruction. Returns 0, or -1 with a message in error. */
+SA5_API int sa5_analyse(const uint32_t *code, uint32_t code_dwords, uint32_t user_sgprs, struct sa5_layout *layout,
+                        struct sa5_slot *slots, uint32_t slot_capacity, char *error, size_t error_size);
 
 #ifdef __cplusplus
 }

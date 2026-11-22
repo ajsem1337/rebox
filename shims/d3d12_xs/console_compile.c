@@ -53,9 +53,53 @@ static struct
     UINT32 (*gds_bytes)(void);
 } sa5;
 
+/* AnyPS5's settings, made before anything loads rebox_anyps5.dll (it reads some of them once,
+ * into statics): from DllMain. */
+static void set_anyps5_environment(void)
+{
+    const char *local = getenv("LOCALAPPDATA");
+
+    /* AnyPS5 keeps compiled variants on disk, by default in shader_cache next to the exe: the
+     * game's directory. Unless ANYPS5_SHADER_CACHE_DIR or ANYPS5_NO_SHADER_CACHE says otherwise,
+     * use %LOCALAPPDATA%\rebox\anyps5-cache. Both DLLs use msvcrt, so _putenv reaches
+     * AnyPS5's getenv. */
+    if (!getenv("ANYPS5_SHADER_CACHE_DIR") && !getenv("ANYPS5_NO_SHADER_CACHE") && local)
+    {
+        char dir[MAX_PATH], setting[MAX_PATH + 32];
+        snprintf(dir, sizeof(dir), "%s\\rebox", local);
+        CreateDirectoryA(dir, NULL);
+        snprintf(dir, sizeof(dir), "%s\\rebox\\anyps5-cache", local);
+        CreateDirectoryA(dir, NULL);
+        snprintf(setting, sizeof(setting), "ANYPS5_SHADER_CACHE_DIR=%s", dir);
+        _putenv(setting);
+        rebox_log("d3d12_xs: AnyPS5 shader cache in %s", dir);
+    }
+    /* patches/anyps5/0004: when a descriptor or table pointer is a phi AnyPS5 can't evaluate (a
+     * path the dispatch never takes clobbers it), speculate the evaluable value and check it at
+     * run time. On by default; REBOX_ANYPS5_SPECULATE=0 turns it off. The host doesn't read
+     * the check's fault buffer back yet, so a wrong guess goes unnoticed. */
+    {
+        const char *speculate = getenv("REBOX_ANYPS5_SPECULATE");
+        if (!(speculate && speculate[0] == '0') && !getenv("APS5_SPECULATE_DESCRIPTORS"))
+            _putenv("APS5_SPECULATE_DESCRIPTORS=1");
+    }
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(instance);
+        set_anyps5_environment();
+    }
+    return TRUE;
+}
+
 static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
 {
-    HMODULE m = LoadLibraryA("rebox_anyps5.dll");
+    HMODULE m;
+
+    m = LoadLibraryA("rebox_anyps5.dll");
 
     if (!m)
     {
@@ -233,6 +277,52 @@ static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
     return count;
 }
 
+/* The last compile's outcome, for test harnesses (ReboxConsoleLastResult). */
+static SRWLOCK last_lock = SRWLOCK_INIT;
+static HRESULT last_hr;
+static char last_message[512];
+
+static void set_last(HRESULT hr, const char *what, const char *detail)
+{
+    AcquireSRWLockExclusive(&last_lock);
+    last_hr = hr;
+    snprintf(last_message, sizeof(last_message), "%s%s%s", what, detail ? ": " : "", detail ? detail : "");
+    ReleaseSRWLockExclusive(&last_lock);
+}
+
+/* The most recent ReboxConsoleCompile's result and a one-line description. */
+HRESULT WINAPI ReboxConsoleLastResult(char *message, SIZE_T size)
+{
+    HRESULT hr;
+
+    AcquireSRWLockShared(&last_lock);
+    hr = last_hr;
+    if (message && size)
+        snprintf(message, size, "%s", last_message);
+    ReleaseSRWLockShared(&last_lock);
+    return hr;
+}
+
+/* Whether a vkd3d-proton descriptor of this view kind can back an AnyPS5 binding of this kind:
+ * bindless sets alias every type at one slot, so a mismatch reads the wrong descriptor type. */
+static BOOL view_fits(UINT32 kind, enum shadow_view view)
+{
+    switch (kind)
+    {
+    case 0: return view == SHADOW_VIEW_CBV;
+    case 1: return view == SHADOW_VIEW_SRV_RAW || view == SHADOW_VIEW_UAV_RAW;
+    case 2: return view == SHADOW_VIEW_SRV_TYPED || view == SHADOW_VIEW_SRV_RAW;
+    case 3: return view == SHADOW_VIEW_UAV_TYPED || view == SHADOW_VIEW_UAV_RAW;
+    case 4: return view == SHADOW_VIEW_SRV_TEXTURE;
+    case 5: return view == SHADOW_VIEW_UAV_TEXTURE;
+    case 6: return view == SHADOW_VIEW_SAMPLER;
+    default: return FALSE;
+    }
+}
+
+static const char *const view_names[] = { "nothing", "a texture SRV", "a typed buffer SRV", "a raw buffer SRV",
+        "a texture UAV", "a typed buffer UAV", "a raw buffer UAV", "a CBV", "a sampler" };
+
 /* Logs a shader's first failure only (keyed by its code). */
 static void log_failure(const struct rebox_deferred_shader *h, const char *what, const char *detail)
 {
@@ -242,6 +332,7 @@ static void log_failure(const struct rebox_deferred_shader *h, const char *what,
     UINT64 id = hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
     BOOL seen = FALSE;
 
+    set_last(E_FAIL, what, detail);
     AcquireSRWLockExclusive(&log_lock);
     for (UINT i = 0; i < logged_count && !seen; i++)
         seen = logged[i] == id;
@@ -259,8 +350,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     struct sa5_region regions[MAX_REGIONS];
     struct shadow_region shadows[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
-    struct sa5_host_buffer hosts[4];
-    UINT64 host_va[4], key[2];
+    struct sa5_host_buffer hosts[8];
+    UINT64 host_va[8], key[2];
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
     static UINT32 indices[MAX_ELEMENTS]; /* under compile_lock */
     static SRWLOCK compile_lock = SRWLOCK_INIT;
@@ -277,9 +368,13 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             || h->size > in->shader_size || h->code_offset % 4 || h->code_offset > h->size
             || h->code_dwords > (h->size - h->code_offset) / 4)
         return E_INVALIDARG;
+    set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     if (!sa5.compile)
+    {
+        set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable", NULL);
         return E_NOTIMPL;
+    }
     {
         static LONG logged;
         if (!InterlockedExchange(&logged, 1))
@@ -348,7 +443,43 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     {
         struct sa5_binding b;
         sa5.binding(result, i, &b);
-        if (b.role <= 2)
+        if (b.role == 0 && b.kind == 1)
+        {
+            /* Guest storage buffers (every V#, constant buffers included) are reached through their
+             * addresses, which buffers' GPU VAs make valid device addresses: a table of
+             * {address, length in dwords} the module reads (sa5_host_buffer.guest_array). That
+             * needs no descriptor, so V#s from memory work too, and CBVs (uniform-buffer
+             * descriptors in vkd3d-proton) can be read as storage buffers. */
+            UINT32 *table, per = b.count ? b.word_count / b.count : 0;
+            UINT64 va;
+            if (host_count == ARRAYSIZE(hosts) || per != 4 || !(table = calloc(b.count ? b.count : 1, 16)))
+            {
+                log_failure(h, "no room for the guest buffer table", NULL);
+                goto done;
+            }
+            for (UINT32 e = 0; e < b.count; e++)
+            {
+                const UINT32 *w = b.words + e * 4;
+                UINT64 base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
+                UINT32 stride = (w[1] >> 16) & 0x3fff;
+                UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
+                table[e * 4] = (UINT32)base;
+                table[e * 4 + 1] = (UINT32)(base >> 32);
+                table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
+            }
+            va = host_buffer(table, (b.count ? b.count : 1) * 16);
+            free(table);
+            if (!va)
+            {
+                log_failure(h, "no GPU memory for the guest buffer table", NULL);
+                goto done;
+            }
+            host_va[host_count] = va;
+            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, 0, 1 };
+            key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
+            host_count++;
+        }
+        else if (b.role <= 2)
         {
             BOOL sampler = b.kind == 6;
             UINT32 per = b.count ? b.word_count / b.count : 0;
@@ -359,12 +490,44 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 goto done;
             }
             for (UINT32 e = 0; e < b.count; e++)
-                if (!shadow_find_index((SIZE_T)in->heap_cpu[sampler], b.words + e * per, per, sampler,
-                                       &indices[index_count + e]))
+            {
+                const UINT32 *w = b.words + e * per;
+                SIZE_T heap = (SIZE_T)in->heap_cpu[sampler];
+                UINT *index = &indices[index_count + e];
+                /* Samplers not in the heap (built from literals, or AnyPS5's point-filtered twins)
+                 * are made in its reserved tail; matching that ignores rewritten fields is the
+                 * last resort. */
+                BOOL found = shadow_find_index(heap, w, per, sampler, !sampler, index)
+                        || (sampler && shadow_reserve_sampler(heap, w, index))
+                        || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
+                if (!found)
                 {
-                    log_failure(h, "a descriptor it binds isn't in the bound heap", NULL);
+                    char detail[160];
+                    const UINT32 *w = b.words + e * per;
+                    snprintf(detail, sizeof(detail), "kind %u binding %u element %u: %08x %08x %08x %08x%s", b.kind,
+                             b.binding, e, w[0], w[1], w[2], w[3], per == 8 ? " ..." : "");
+                    if (per == 8)
+                        snprintf(detail + strlen(detail) - 4, sizeof(detail) - strlen(detail) + 4,
+                                 " %08x %08x %08x %08x", w[4], w[5], w[6], w[7]);
+                    log_failure(h, "a descriptor it binds isn't in the bound heap", detail);
                     goto done;
                 }
+                /* A storage image AnyPS5 also binds as a sampled image (size queries): an SRV of
+                 * the same texture in the reserved tail. Empty slots are refused: binding one
+                 * crashed lavapipe. */
+                if (b.kind == 4 && shadow_slot_view(heap, *index) == SHADOW_VIEW_UAV_TEXTURE)
+                    shadow_reserve_srv_for_uav(heap, *index, index);
+                if (!view_fits(b.kind, shadow_slot_view(heap, *index)))
+                {
+                    static const char *const kinds[] = { "uniform buffer", "storage buffer", "uniform texel buffer",
+                            "storage texel buffer", "sampled image", "storage image", "sampler" };
+                    char detail[128];
+                    snprintf(detail, sizeof(detail), "binding %u wants a %s, heap slot %u holds %s", b.binding,
+                             kinds[b.kind], *index, view_names[shadow_slot_view(heap, *index)]);
+                    log_failure(h, "a binding doesn't match the view in its slot", detail);
+                    goto done;
+                }
+            }
             remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, in->bindless[b.kind][0],
                                                         in->bindless[b.kind][1], b.count, &indices[index_count] };
             key[0] = hash_bytes(key[0], &b.binding, sizeof(b.binding));
@@ -377,7 +540,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             UINT32 bytes = b.word_count * 4;
             if (host_count == ARRAYSIZE(hosts))
             {
-                log_failure(h, "more than 4 host buffers", NULL);
+                log_failure(h, "more than 8 host buffers", NULL);
                 goto done;
             }
             switch (b.role)
@@ -453,6 +616,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     for (UINT32 i = 0; i < host_count; i++)
         memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
     hr = S_OK;
+    {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "%u SPIR-V words, %u guest bindings, %u host buffers", module->count,
+                 remap_count, host_count);
+        set_last(S_OK, words ? "compiled" : "cached", detail);
+    }
 
 done:
     ReleaseSRWLockExclusive(&compile_lock);

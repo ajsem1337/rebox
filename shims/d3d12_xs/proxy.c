@@ -556,12 +556,29 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
         REFIID riid, void **out)
 {
     ID3D12DescriptorHeap *heap = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC d;
+    UINT reserved = 0;
+    HRESULT hr;
 
-    HRESULT hr = ID3D12Device_CreateDescriptorHeap(INNER(p, ID3D12Device), desc, &IID_ID3D12DescriptorHeap,
-                                                   (void **)&heap);
-
+    if (!desc)
+        return E_INVALIDARG;
+    /* Shader-visible heaps get a hidden tail for descriptors the host makes (shadow.h). An
+     * unpatched vkd3d-proton refuses a full sampler heap plus the tail: then go without. */
+    d = *desc;
+    if ((d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+            && (d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
+        reserved = SHADOW_RESERVED;
+    d.NumDescriptors += reserved;
+    hr = ID3D12Device_CreateDescriptorHeap(INNER(p, ID3D12Device), &d, &IID_ID3D12DescriptorHeap, (void **)&heap);
+    if (FAILED(hr) && reserved)
+    {
+        reserved = 0;
+        hr = ID3D12Device_CreateDescriptorHeap(INNER(p, ID3D12Device), desc, &IID_ID3D12DescriptorHeap,
+                                               (void **)&heap);
+    }
     if (SUCCEEDED(hr))
-        shadow_heap_created(heap, desc, ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), desc->Type));
+        shadow_heap_created(heap, desc, ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device),
+                            desc->Type), reserved);
     return wrap_result(hr, (IUnknown *)heap, &heap_class, out);
 }
 
@@ -1107,6 +1124,19 @@ static UINT64 heap_handle_to_vkd3d(UINT64 handle)
     return out;
 }
 
+/* Slot 8, GetDesc: without the hidden tail (shadow.h). */
+static D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE heap_GetDesc(struct proxy *p, D3D12_DESCRIPTOR_HEAP_DESC *desc)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { 0 };
+
+    ((D3D12_DESCRIPTOR_HEAP_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_DESCRIPTOR_HEAP_DESC *))
+        PC_SLOT(p->inner, 8))(p->inner, desc);
+    ((D3D12_CPU_DESCRIPTOR_HANDLE *(STDMETHODCALLTYPE *)(void *, D3D12_CPU_DESCRIPTOR_HANDLE *))
+        PC_SLOT(p->inner, 9))(p->inner, &h);
+    desc->NumDescriptors -= shadow_reserved(h.ptr);
+    return desc;
+}
+
 /* Slots 9 and 10 return the handle in RAX on Xbox (ScarlettX, verified in a
  * retail title); vkd3d-proton uses the MSVC hidden return pointer. */
 static SIZE_T STDMETHODCALLTYPE heap_GetCPUDescriptorHandleForHeapStart(struct proxy *p)
@@ -1320,6 +1350,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     };
     static const struct slot heap_slots[] = {
         FN(7, child_GetDevice),
+        FN(8, heap_GetDesc),
         FN(9, heap_GetCPUDescriptorHandleForHeapStart),
         FN(10, heap_GetGPUDescriptorHandleForHeapStart),
     };

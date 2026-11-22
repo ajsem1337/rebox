@@ -90,18 +90,21 @@ words (16 dwords), which the dispatch path will have to fill.
    - freezes the specialization constants, which AnyPS5 also uses for descriptor indices;
    - moves each guest descriptor array onto the bindless set as a runtime array indexed by
      those slots;
-   - turns host buffers into BDA pointers read from push bytes 128-159.
+   - turns host buffers into BDA pointers read from push bytes 128-191 (up to 8).
    It validates the module, which is then cached by AnyPS5's pipeline identity plus the slots.
 4. **Bind**. vkd3d-proton makes one pipeline per key, with the root signature's own layout, so
    its bindless sets are already bound. After its descriptors are updated, it pushes the
-   160 bytes from the compile (AnyPS5's 128 bytes of push data, then the host-buffer addresses)
+   192 bytes from the compile (AnyPS5's 128 bytes of push data, then the host-buffer addresses)
    and marks its own root parameters dirty for the next ordinary pipeline.
 
 What AnyPS5's driver would do and this host does instead, from its sources:
 
 | AnyPS5 binding role | Here |
 |---|---|
-| Guest buffers, images, samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at the slot where the shadow holds the same words. AnyPS5 may rewrite a T#'s `DST_SEL` (identity) and gives each sampler a point-filtered twin (`S#` word 2 filters changed), so those fields are ignored when matching |
+| Guest buffers (storage buffers: every V#, constant buffers included) | not descriptors: a table of {address, length} built from the V# words, read through BDA, so each element is a pointer to its buffer (buffers' GPU VAs are device addresses). vkd3d-proton keeps CBVs as uniform-buffer descriptors with descriptor buffers, which a storage-buffer binding can't read, and V#s from memory have no heap slot at all |
+| Guest images and samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at the slot where the shadow holds the same words, if that slot holds the matching kind of view (the shadow records each slot's: a mismatch would read the wrong descriptor type from a mutable set, and crashed lavapipe). AnyPS5 may rewrite a T#'s `DST_SEL` and gives samplers point-filtered twins, so matching can ignore those fields |
+| Samplers in no heap (built from literals in the code, or a twin) | decoded from the S# into a real sampler in the heap's hidden tail: every shader-visible heap gets 256 extra slots the title doesn't see (`GetDesc` hides them; patch 0005 raises vkd3d-proton's sampler-heap limit by 256) |
+| A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail |
 | FlattenedSrt (binding 61): every dword the shader's scalar loads read through user SGPRs | its words, in GPU memory shared by content |
 | BDA page table (59) | identity ranges for GPU memory, plus title address → GPU copy for each shadow heap |
 | Fault buffer (60), GDS (58) | zeroed GPU memory (faults are not read back yet) |
@@ -121,6 +124,29 @@ in root constants into `ReboxGpuAlloc` memory. Both pass on RADV (Radeon 890M, 2
 where the bindless sets differ from lavapipe's: samplers 0/0, typed views and images 1/1, raw
 buffers and CBVs 2/0 (lavapipe: 1/2 for typed views and images). `REBOX_DUMP_SPIRV=DIR` writes each
 finalized module.
+
+## Tests moved from xsx-shader-lab
+
+These came from the user's lab and are GPL-2.0-only here:
+- the layout analysis (`rdna-run --analyse`, now `anyps5/layout.cpp` behind `sa5_analyse`);
+- the PS09 reader and manifest step (`tools/ps09.py`);
+- the hand-written gfx1030 repros (`tests/rdna/*.s`, assembled into
+  `generated/repro_shaders.h` by `tools/gen_repro_shaders.sh`).
+
+The smoke test runs the repros through the deferred path:
+- the XOR-swapped table pointer (patch 0003);
+- three speculated pointers and descriptors (patch 0004);
+- two exec-masked loops through LDS, whose output is checked.
+
+The loop repro is a known lavapipe-only miscompare (8-wide subgroups split a guest wave; exact on
+RADV), so on lavapipe it is reported, not failed. The lab keeps its native runners (`xsxrun`,
+`rdna-run`), its per-shader Python models and the shader-3094 bisection. That bisection is
+disassembled game code, so it can't be committed.
+
+Patch 0004's speculation is on by default: `d3d12_xs` sets `APS5_SPECULATE_DESCRIPTORS` when it
+loads, before anything loads AnyPS5. The patch reads it once, into a static.
+`REBOX_ANYPS5_SPECULATE=0` turns it off. A wrong guess is reported in the fault buffer, which
+isn't read back yet.
 
 ## Where AnyPS5 runs
 
@@ -170,7 +196,22 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    slot 10 now returns title addresses, for pointers the title stores in memory itself. Then
    guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
    roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.
-4. Real the target title compute shaders on the 890M.
+4. Real the target title compute shaders: `tests/run-console-cs.sh DUMP [FIRST [COUNT]]` runs every compute
+   shader in PercyStar's dump of `the shader archive` (2,684, from the PS09 cache) through the whole path
+   under Wine (`smoke.exe --console-cs`):
+   - `tools/console-cs-plan.py` reads each shader's `RSRC1`/`RSRC2` and thread-group size from
+     the PS09 cache (`tools/ps09.py`).
+   - `smoke.exe` infers its descriptor tables with `sa5_analyse` (`anyps5/layout.cpp`).
+   - It rebuilds the tables in real D3D12 heaps from synthetic resources, passes every user SGPR
+     as a root constant, and gives table pointers as title addresses. Table pointers are single
+     32-bit SGPRs, sometimes adjacent, which root-order packing can't express.
+
+   Inputs are synthetic, so this checks compiling, binding and running without faults, not output
+   values. Skipped: shaders that bind a slot the inferred layout left empty, and one whose layout
+   puts a buffer where it reads an image. Both are artefacts of the inference. The largest shaders
+   (around 400k SPIR-V words) take llvmpipe about a minute each, so a lavapipe sweep takes hours.
+   The first 110 on lavapipe: 102 dispatched, 8 skipped. `tests/manual-test.sh` runs the sweep on
+   the 890M.
 5. Graphics stages, starting with a pixel shader.
 
 ## Open questions

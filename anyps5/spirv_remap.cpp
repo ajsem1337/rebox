@@ -21,6 +21,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <spirv-tools/optimizer.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,7 +40,7 @@ enum : std::uint32_t {
     OpTypePointer = 32, OpConstant = 43, OpConstantComposite = 44, OpFunction = 54, OpFunctionEnd = 56,
     OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65, OpInBoundsAccessChain = 66,
     OpPtrAccessChain = 67, OpArrayLength = 68, OpDecorate = 71, OpMemberDecorate = 72, OpCopyObject = 83,
-    OpBitcast = 124, OpLabel = 248,
+    OpBitcast = 124, OpLabel = 248, OpCompositeConstruct = 80, OpIAdd = 128, OpIMul = 132,
 };
 enum : std::uint32_t {
     DecorationBlock = 2, DecorationArrayStride = 6, DecorationBinding = 33, DecorationDescriptorSet = 34,
@@ -58,7 +59,7 @@ enum : std::uint32_t {
 constexpr std::uint32_t AddressingPhysicalStorageBuffer64 = 5348;
 constexpr std::uint32_t MemoryAccessAligned = 2;
 constexpr std::uint32_t HostPushOffset = 128;
-constexpr std::uint32_t MaxHostBuffers = 4;
+constexpr std::uint32_t MaxHostBuffers = 8;
 
 using Inst = std::vector<std::uint32_t>;
 
@@ -75,6 +76,39 @@ Inst Make(std::uint32_t op, std::initializer_list<std::uint32_t> operands)
 }
 
 [[noreturn]] void Fail(const std::string& message) { throw std::runtime_error(message); }
+
+// The word of an instruction that holds a pointer operand, or 0: loads, stores, access chains,
+// copies, array lengths, image texel pointers, function-call arguments and atomics. Other words may
+// be literals that merely equal a variable's id, so only these are compared or replaced.
+std::vector<std::size_t> PointerOperands(const Inst& inst)
+{
+    const auto op = Op(inst);
+    switch (op) {
+    case 61 /* OpLoad */: case 65: case 66: case 67: case 68 /* OpArrayLength */: case 83 /* OpCopyObject */:
+    case 60 /* OpImageTexelPointer */:
+        return {3};
+    case 62 /* OpStore */:
+        return {1};
+    case 63 /* OpCopyMemory */:
+        return {1, 2};
+    case 57 /* OpFunctionCall */: {
+        std::vector<std::size_t> args;
+        for (std::size_t w = 4; w < inst.size(); w++) args.push_back(w);
+        return args;
+    }
+    default:
+        if (op >= 227 && op <= 242) return {3};  // OpAtomicLoad .. OpAtomicXor (OpAtomicStore: word 1)
+        return {};
+    }
+}
+
+std::vector<std::size_t> PointerWords(const Inst& inst)
+{
+    if (Op(inst) == 228 /* OpAtomicStore */) return {1};
+    auto words = PointerOperands(inst);
+    words.erase(std::remove_if(words.begin(), words.end(), [&](std::size_t w) { return w >= inst.size(); }), words.end());
+    return words;
+}
 
 struct Module {
     std::vector<std::uint32_t> header;
@@ -294,8 +328,8 @@ void Rebind(Module& m, const sa5_remap& remap)
         if ((op == OpAccessChain || op == OpInBoundsAccessChain) && inst.size() >= 5 && inst[3] == var) {
             if (constantValues.count(inst[4])) constantIndex[inst[2]] = heapIndex(constantValues[inst[4]]);
             else dynamic = true;
-        } else if (op != OpName && op != OpEntryPoint && op != OpDecorate && !(op == OpVariable && inst[2] == var)) {
-            for (std::size_t w = 1; w < inst.size(); w++)
+        } else {
+            for (const auto w : PointerWords(inst))
                 if (inst[w] == var) Fail("binding " + std::to_string(remap.binding) + " is used by opcode " + std::to_string(op));
         }
     }
@@ -414,18 +448,34 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     const auto [pushVar, member] = PushBlock(m);
     const std::uint32_t pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
 
-    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; };
+    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; };
     std::vector<Buffer> list;
     std::set<std::uint32_t> vars;
+    const std::uint32_t psbUint = m.Pointer(StorageClassPhysicalStorageBuffer, uintType);
     for (std::uint32_t i = 0; i < count; i++) {
         const std::uint32_t var = m.VariableAt(buffers[i].set, buffers[i].binding);
         const Inst varDef = m.Def(var);
         if (varDef[3] != StorageClassStorageBuffer) Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is not a storage buffer");
-        const std::uint32_t block = m.Def(varDef[1])[3];
-        if (Op(m.Def(block)) != OpTypeStruct) Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is an array");
-        list.push_back({var, block, m.Pointer(StorageClassPhysicalStorageBuffer, block), buffers[i].push_slot, buffers[i].array_length});
+        std::uint32_t block = m.Def(varDef[1])[3];
+        if (buffers[i].guest_array) {
+            // A guest buffer array: element i comes from an address table, {address, u32 count, 0}.
+            const Inst arr = m.Def(block);
+            if (Op(arr) != OpTypeArray) Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not an array");
+            block = arr[2];
+            const Inst s = m.Def(block);
+            if (Op(s) != OpTypeStruct || s.size() != 3 || Op(m.Def(s[2])) != OpTypeRuntimeArray || m.Def(s[2])[2] != uintType)
+                Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not uint arrays");
+        } else if (Op(m.Def(block)) != OpTypeStruct) {
+            Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is an array");
+        }
+        list.push_back({var, block, m.Pointer(StorageClassPhysicalStorageBuffer, block), buffers[i].push_slot,
+                        buffers[i].array_length, buffers[i].guest_array != 0});
         vars.insert(var);
     }
+    std::map<std::uint32_t, const Buffer*> tableOf;
+    for (const auto& b : list)
+        if (b.table) tableOf[b.var] = &b;
+    const std::uint32_t c0 = m.Constant(0), c1 = m.Constant(1), c2 = m.Constant(2), c4 = m.Constant(4);
     // Physical-storage-buffer twins of every StorageBuffer pointer type, for derived pointers.
     std::map<std::uint32_t, std::uint32_t> psbOf;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> sbPointers;
@@ -441,6 +491,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     std::vector<Inst> out;
     std::map<std::uint32_t, std::uint32_t> current;  // host buffer variable -> this function's pointer
     std::map<std::uint32_t, std::uint32_t> rootOf;   // derived pointer -> host buffer variable
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> elementOf;  // guest buffer pointer -> table, entry*4
     bool inFunction = false, needPrologue = false;
     for (auto& inst : m.insts) {
         const auto op = Op(inst);
@@ -465,6 +516,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
             needPrologue = true;
             current.clear();
             rootOf.clear();
+            elementOf.clear();
         } else if (op == OpFunctionEnd) {
             inFunction = false;
         }
@@ -487,8 +539,47 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
                 out.push_back(Make(OpCopyObject, {inst[1], inst[2], lengthConstants[inst[3]]}));
                 continue;
             }
-            for (std::size_t w = 1; w < inst.size(); w++)
+            if (op == OpArrayLength && inst.size() >= 5 && elementOf.count(inst[3])) {
+                // A guest buffer's length: the table entry's third word.
+                const auto [table, entry] = elementOf[inst[3]];
+                const std::uint32_t at = m.NewId(), chain = m.NewId();
+                out.push_back(Make(OpIAdd, {uintType, at, entry, c2}));
+                out.push_back(Make(OpAccessChain, {psbUint, chain, table, c0, at}));
+                out.push_back(Make(OpLoad, {inst[1], inst[2], chain, MemoryAccessAligned, 4}));
+                continue;
+            }
+            if ((op == OpAccessChain || op == OpInBoundsAccessChain) && inst.size() >= 5 && tableOf.count(inst[3])) {
+                // &buffers[i]...: the address in table entry i, as a pointer to the element.
+                const Buffer& b = *tableOf[inst[3]];
+                const std::uint32_t table = current[b.var];
+                const std::uint32_t entry = m.NewId(), loChain = m.NewId(), lo = m.NewId(), hiAt = m.NewId(),
+                                    hiChain = m.NewId(), hi = m.NewId(), pair = m.NewId(), pointer = m.NewId();
+                out.push_back(Make(OpIMul, {uintType, entry, inst[4], c4}));
+                out.push_back(Make(OpAccessChain, {psbUint, loChain, table, c0, entry}));
+                out.push_back(Make(OpLoad, {uintType, lo, loChain, MemoryAccessAligned, 4}));
+                out.push_back(Make(OpIAdd, {uintType, hiAt, entry, c1}));
+                out.push_back(Make(OpAccessChain, {psbUint, hiChain, table, c0, hiAt}));
+                out.push_back(Make(OpLoad, {uintType, hi, hiChain, MemoryAccessAligned, 4}));
+                out.push_back(Make(OpCompositeConstruct, {uvec2, pair, lo, hi}));
+                out.push_back(Make(OpBitcast, {b.psbPtr, pointer, pair}));
+                rootOf[pointer] = b.var;
+                elementOf[pointer] = {table, entry};
+                if (inst.size() == 5) {
+                    out.push_back(Make(OpCopyObject, {b.psbPtr, inst[2], pointer}));
+                    elementOf[inst[2]] = {table, entry};
+                } else {
+                    if (!psbOf.count(inst[1])) Fail("pointer into a guest buffer has an unexpected type");
+                    Inst chain{op, psbOf[inst[1]], inst[2], pointer};
+                    chain.insert(chain.end(), inst.begin() + 5, inst.end());
+                    Seal(chain);
+                    out.push_back(std::move(chain));
+                }
+                rootOf[inst[2]] = b.var;
+                continue;
+            }
+            for (const auto w : PointerWords(inst))
                 if (vars.count(inst[w])) {
+                    if (tableOf.count(inst[w])) Fail("a guest buffer array is used whole by opcode " + std::to_string(op));
                     rootOf[current[inst[w]]] = inst[w];
                     inst[w] = current[inst[w]];
                 }

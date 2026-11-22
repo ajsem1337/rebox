@@ -305,3 +305,51 @@ void console_encode_sampler(const D3D12_SAMPLER_DESC *d, UINT32 out[4])
     if (d->BorderColor[3] == 1.0f)
         out[3] = (d->BorderColor[0] == 1.0f ? 2u : 1u) << 30; /* opaque white / opaque black */
 }
+
+static D3D12_TEXTURE_ADDRESS_MODE address_mode(UINT clamp)
+{
+    switch (clamp)
+    {
+    case 0: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    case 1: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case 3: case 4: case 5: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    case 6: case 7: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    }
+}
+
+void console_decode_sampler(const UINT32 w[4], D3D12_SAMPLER_DESC *d)
+{
+    UINT mag = (w[2] >> 20) & 3, min = (w[2] >> 22) & 3, mip = (w[2] >> 26) & 3, compare = (w[0] >> 12) & 7;
+    UINT aniso = mag >= 2 || min >= 2, filter = 0;
+    INT bias = (INT)((w[2] & 0x3fff) << 18) >> 18;
+
+    memset(d, 0, sizeof(*d));
+    d->AddressU = address_mode(w[0] & 7);
+    d->AddressV = address_mode((w[0] >> 3) & 7);
+    d->AddressW = address_mode((w[0] >> 6) & 7);
+    d->MaxAnisotropy = aniso ? 1u << ((w[0] >> 9) & 7) : 1;
+    if (d->MaxAnisotropy > 16)
+        d->MaxAnisotropy = 16;
+    d->MipLODBias = bias / 256.0f;
+    d->MinLOD = (w[1] & 0xfff) / 256.0f;
+    d->MaxLOD = ((w[1] >> 12) & 0xfff) / 256.0f;
+    if (aniso)
+        filter = 0x55; /* D3D12_FILTER_ANISOTROPIC */
+    else
+        filter = (min & 1) << 4 | (mag & 1) << 2 | (mip == 2);
+    if (compare)
+    {
+        filter |= 0x80;
+        d->ComparisonFunc = (D3D12_COMPARISON_FUNC)(compare + 1);
+    }
+    else
+        d->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    d->Filter = (D3D12_FILTER)filter;
+    switch (w[3] >> 30)
+    {
+    case 1: d->BorderColor[3] = 1.0f; break;
+    case 2: d->BorderColor[0] = d->BorderColor[1] = d->BorderColor[2] = d->BorderColor[3] = 1.0f; break;
+    default: break; /* transparent black; register-table colours aren't modelled */
+    }
+}

@@ -12,3 +12,6 @@ They come from the user's `xsx-shader-lab`, where `upstream/` holds their pull r
 
 The flake applies only the hunks under `core/shader/` (the recompiler); hunks for AnyPS5's driver,
 tests and docs are skipped. Drop a patch here once its pull request is merged and the pin moves past it.
+
+The smoke test checks 0003 and 0004 through the whole deferred path with the lab's hand-written
+repros (`tests/rdna/`, docs/anyps5.md).

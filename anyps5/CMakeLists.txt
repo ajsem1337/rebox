@@ -32,7 +32,7 @@ target_include_directories(rebox_anyps5_runtime INTERFACE "${ANYPS5_SOURCE}/core
 include("${ANYPS5_SOURCE}/core/shader/recompiler/CMakeLists.txt")
 add_shader_recompiler(anyps5_recompiler rebox_anyps5_runtime)
 
-add_library(rebox_anyps5 SHARED rebox_anyps5.cpp spirv_remap.cpp host_streams.c)
+add_library(rebox_anyps5 SHARED rebox_anyps5.cpp spirv_remap.cpp layout.cpp layout_export.cpp host_streams.c)
 target_link_libraries(rebox_anyps5 PRIVATE anyps5_recompiler SPIRV-Tools-opt SPIRV-Tools-static pthread)
 # One self-contained DLL for the Wine prefix: no libstdc++/libgcc/winpthread DLLs.
 target_link_options(rebox_anyps5 PRIVATE -static -static-libgcc -static-libstdc++)

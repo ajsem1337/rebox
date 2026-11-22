@@ -40,6 +40,20 @@ REBOX_HEAP_VA=real SMOKE_ONLY=fake.bin nixx develop -c tests/run-smoke.sh >> "$l
 echo "run-smoke.sh (real heap addresses) exit status: $?"
 sed -n '/REBOX_HEAP_VA=real/,$p' "$log" | grep -E 'heap GPU start|report real|SGPR table|descriptor table set|^(FAIL|PASSED|FAILED)' | uniq
 
+# The game's compute shaders through the deferred console path (AnyPS5 at dispatch), from
+# PercyStar's shader dump (game data, local only): REBOX_SHADER_DUMP, by default
+# ../xsx-shader-lab/dump. REBOX_CONSOLE_CS_COUNT=N limits the run to the first N shaders.
+shader_dump=${REBOX_SHADER_DUMP:-../xsx-shader-lab/dump}
+if [ -f "$shader_dump/ps09.bin" ]; then
+    section "game compute shaders through AnyPS5 at dispatch"
+    nixx develop -c tests/run-console-cs.sh "$shader_dump" 0 "${REBOX_CONSOLE_CS_COUNT:-0}" \
+        > build/console-cs.log 2>&1 || true
+    grep -E '^(ok|FAIL) +console-cs' build/console-cs.log || tail -5 build/console-cs.log
+    grep '^cs ' build/console-cs.log | grep -v ' dispatched:' | sed -E 's/^cs [^ ]+ //; s/[0-9]+/N/g' \
+        | sort | uniq -c | sort -rn | head -12
+    echo "(per-shader lines: build/console-cs.log)"
+fi
+
 # Translated game shaders (tools/scsv_pack.py output, local only): can the
 # driver create compute pipelines from them?
 if [ -d build/console-shaders ]; then
