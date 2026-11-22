@@ -708,6 +708,68 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
     return found;
 }
 
+/* A view of a 1x1 zeroed dummy texture (SRV, or UAV for a storage image) in the heap's reserved
+ * tail, made once: what a console shader gets for a descriptor the title left empty or wrote
+ * outside our heaps (a UE5 title's T# with base 0x9200, a dummy), which reads zero there as a null
+ * descriptor does. A real texture, not a null view: lavapipe crashed on a null storage image. */
+static ID3D12Resource *dummy_texture(ID3D12Device *device)
+{
+    static ID3D12Resource *texture;
+    D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                 { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+
+    if (!texture)
+        ID3D12Device_CreateCommittedResource(device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource,
+                                             (void **)&texture);
+    return texture;
+}
+BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index)
+{
+    ID3D12Device *device = rebox_shared_device();
+    struct shadow_heap *heap = NULL;
+    const UINT32 key[4] = { 0x4c4c554e /* NULL */, storage, 0, 0 };
+    BOOL found = FALSE;
+
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
+        if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && h->reserved)
+            heap = h;
+    for (UINT i = 0; heap && heap->reserved_words && i < heap->reserved_used && !found; i++)
+        if (!memcmp(heap->reserved_words[i], key, 16))
+        {
+            *index = heap->count + i;
+            found = TRUE;
+        }
+    if (heap && !found && device && dummy_texture(device) && heap->reserved_used < heap->reserved
+            && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
+    {
+        ID3D12Resource *texture = dummy_texture(device);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        UINT i = heap->reserved_used++;
+
+        memcpy(heap->reserved_words[i], key, 16);
+        *index = heap->count + i;
+        cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
+        if (storage)
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D };
+            ID3D12Device_CreateUnorderedAccessView(device, texture, NULL, &uav, cpu);
+        }
+        else
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+            srv.Texture2D.MipLevels = 1;
+            ID3D12Device_CreateShaderResourceView(device, texture, &srv, cpu);
+        }
+        found = TRUE;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return found;
+}
+
 BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
 {
     ID3D12Device *device = rebox_shared_device();

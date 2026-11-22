@@ -25,6 +25,8 @@ BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
 /* A slot in the reserved tail of the CBV/SRV/UAV heap at heap_cpu holding an SRV of the texture UAV
  * in slot uav_index (same resource, format, mip and slices), made on first use. */
 BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index);
+/* A null texture SRV (or UAV, storage) in the reserved tail, made once per heap. */
+BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index);
 void shadow_heap_destroyed(ID3D12DescriptorHeap *inner);
 void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc);

@@ -658,6 +658,23 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 BOOL found = shadow_find_index(heap, w, per, sampler, !sampler, index)
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
+                BOOL null_view = FALSE;
+                /* A texture descriptor the title wrote outside our heaps, or an empty slot, reads
+                 * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
+                 * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
+                 * crashed lavapipe. */
+                if ((b.kind == 4 || b.kind == 5) && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
+                    null_view = shadow_reserve_null(heap, b.kind == 5, index);
+                if (null_view)
+                {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 8)
+                        rebox_log("d3d12_xs: console shader %016llx: binding %u (%s) gets a dummy texture: "
+                                     "the descriptor %s", (unsigned long long)hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u), b.binding,
+                                     b.kind == 5 ? "storage image" : "sampled image",
+                                     found ? "slot is empty" : "isn't in the bound heap");
+                    found = TRUE;
+                }
                 if (!found)
                 {
                     char detail[160];
@@ -673,9 +690,9 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 /* A storage image AnyPS5 also binds as a sampled image (size queries): an SRV of
                  * the same texture in the reserved tail. Empty slots are refused: binding one
                  * crashed lavapipe. */
-                if (b.kind == 4 && shadow_slot_view(heap, *index) == SHADOW_VIEW_UAV_TEXTURE)
+                if (!null_view && b.kind == 4 && shadow_slot_view(heap, *index) == SHADOW_VIEW_UAV_TEXTURE)
                     shadow_reserve_srv_for_uav(heap, *index, index);
-                if (!view_fits(b.kind, shadow_slot_view(heap, *index)))
+                if (!null_view && !view_fits(b.kind, shadow_slot_view(heap, *index)))
                 {
                     static const char *const kinds[] = { "uniform buffer", "storage buffer", "uniform texel buffer",
                             "storage texel buffer", "sampled image", "storage image", "sampler" };
