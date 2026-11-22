@@ -2285,6 +2285,49 @@ static void test_xcrdapi(void)
     DeleteFileW(path);
 }
 
+/* gameinput.dll (v0): the gamepad is enumerated as connected, readings carry its state, and
+ * other kinds have none. */
+static void *gi_seen_device;
+static void WINAPI gi_device_callback(UINT64 token, void *context, void *device, UINT64 timestamp, UINT32 now,
+                                      UINT32 before)
+{
+    if (now & 1)
+        gi_seen_device = device;
+}
+
+static void test_gameinput(void)
+{
+    typedef HRESULT (WINAPI *create_fn)(void **);
+    HMODULE m = LoadLibraryA("gameinput.dll");
+    create_fn create = m ? (create_fn)(void *)GetProcAddress(m, "GameInputCreate") : NULL;
+    void *gi = NULL, *reading = NULL, *none = (void *)1;
+    UINT64 token = 0;
+    struct { UINT32 buttons; float lt, rt, lx, ly, rx, ry; } state;
+    const BYTE *info;
+
+    CHECK(create != NULL, "gameinput.dll exports GameInputCreate");
+    if (!create || FAILED(create(&gi)) || !gi) return;
+    CHECK(SUCCEEDED(XSLOT(gi, 9, HRESULT, void *, UINT32, UINT32, UINT32, void *, void *, UINT64 *)(gi, NULL,
+              0x00040000, 1, 2 /* blocking */, NULL, (void *)gi_device_callback, &token)) && gi_seen_device,
+          "GameInput enumerates a connected gamepad (%p)", gi_seen_device);
+    if (!gi_seen_device) return;
+    info = XSLOT(gi_seen_device, 3, const BYTE *)(gi_seen_device);
+    CHECK(info && *(const UINT32 *)info == 328 && (*(const UINT32 *)(info + 104) & 0x00040000)
+              && XSLOT(gi_seen_device, 4, UINT32)(gi_seen_device) == 1,
+          "the gamepad's device info and status");
+    CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x00040000, gi_seen_device, &reading)) && reading,
+          "GameInput GetCurrentReading(gamepad)");
+    if (reading)
+    {
+        memset(&state, 0xcc, sizeof(state));
+        CHECK(XSLOT(reading, 22, BOOL, void *)(reading, &state) && state.lx >= -1.0f && state.lx <= 1.0f,
+              "the reading has a gamepad state (buttons %#x)", state.buttons);
+        XSLOT(reading, 2, ULONG)(reading);
+    }
+    CHECK(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x00000010 /* keyboard */, NULL, &none) == (HRESULT)0x838a0003
+              && !none, "GameInput has no keyboard readings");
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -3211,6 +3254,7 @@ int main(int argc, char **argv)
         return console_cs(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
     test_xmem();
     test_xcrdapi();
+    test_gameinput();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();

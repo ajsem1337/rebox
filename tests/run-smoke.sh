@@ -43,8 +43,8 @@ sys32="$WINEPREFIX/drive_c/windows/system32"
 install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
 install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REBOX_SHIMS_DIR"/xaudio2_9.dll \
     "$REBOX_SHIMS_DIR"/amd_fidelityfx_loader_xbox.dll "$REBOX_SHIMS_DIR"/pixevt.dll \
-    "$REBOX_SHIMS_DIR"/xcrdapi.dll "$sys32"/
-export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9=n"
+    "$REBOX_SHIMS_DIR"/xcrdapi.dll "$REBOX_SHIMS_DIR"/gameinput.dll "$sys32"/
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9,gameinput=n"
 # AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
 if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
     install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/
