@@ -108,7 +108,7 @@ method the title asked for that isn't implemented.
 | `REBOX_CONSOLE_MODE` | `ConsoleMode` value `rebox-run` puts in the registry for `XSystemGetDeviceType` (default `0x64`, Series X; `0x50` is Xbox One X) |
 | `REBOX_KEYBOARD_PAD=0` | Don't drive the gamepad from the keyboard when no controller is connected (`shims/gameinput`: WASD/arrows sticks, Space A, Left Ctrl B, R X, F Y, Q/E shoulders, Z/C triggers, Enter menu, Tab view, IJKL D-pad) |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
-| `REBOX_TEXTURE_ARRAYS=mip-major` | Read placed 2D array textures a mip (all its slices) at a time, as the target title's pools store them, instead of addrlib's slice at a time: try it if array textures look scrambled |
+| `REBOX_TEXTURE_ARRAYS=slice-major` | Read placed 2D array textures a slice (its whole mip chain) at a time, addrlib's order, instead of a mip (all its slices) at a time as the target title's pools store them |
 | `REBOX_GAME_ALIAS=0` | Leave out the `GAME:` link in the package directory, which makes console `GAME:\...` paths resolve to the package (the package is also drive `G:`) |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |

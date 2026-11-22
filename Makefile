@@ -83,6 +83,10 @@ $(BUILD)/detile.o: shims/d3d12_xs/detile.cpp shims/d3d12_xs/detile.h
 LIBS_d3d12_xs := $(BUILD)/detile.o $(ADDRLIB_OBJ) -static -lstdc++
 $(BUILD)/d3d12_xs.dll: $(BUILD)/detile.o $(ADDRLIB_OBJ)
 
+# helpers/textures/texcheck.py's detiler: d3d12_xs's detile.cpp and addrlib in a program.
+$(BUILD)/texcheck.exe: tools/texcheck.c $(BUILD)/detile.o $(ADDRLIB_OBJ)
+	$(MINGW_CC) $(CFLAGS) -o $@ $< $(BUILD)/detile.o $(ADDRLIB_OBJ) -static -lstdc++
+
 .SECONDEXPANSION:
 $(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
 	@mkdir -p $(BUILD)

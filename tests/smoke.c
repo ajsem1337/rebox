@@ -2452,7 +2452,7 @@ struct test_surface
     BOOL volume, mip_major;
 };
 
-/* Mip-major arrays (REBOX_TEXTURE_ARRAYS=mip-major, Leonida's pool layout): each subresource is
+/* Mip-major arrays (the default; the target title's pool layout): each subresource is
  * the single-slice layout of that mip, at its offset times the slice count plus the slice times
  * the mip's size in one slice. */
 static void test_mip_major_layout(void)

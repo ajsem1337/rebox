@@ -120,15 +120,17 @@ static int mode_setting(void)
     return setting;
 }
 
-/* REBOX_TEXTURE_ARRAYS=mip-major: 2D arrays laid out a mip (all its slices) at a time, as
- * the target title's pools store them, instead of addrlib's (the hardware's, per Mesa) slice at a time. */
+/* 2D arrays are read a mip (all its slices) at a time: the target title's pools store them that way, and a
+ * pool is the texture's memory image (helpers/textures: every array matches Leonida's decoder
+ * mip-major, cubemaps and 2D textures match as they are). REBOX_TEXTURE_ARRAYS=slice-major
+ * reads them in addrlib's order instead, a slice (its whole mip chain) at a time. */
 static BOOL arrays_mip_major(void)
 {
     static int setting = -1;
     if (setting == -1)
     {
         char *v = rebox_getenv("REBOX_TEXTURE_ARRAYS");
-        setting = v && !strcmp(v, "mip-major");
+        setting = !v || strcmp(v, "slice-major");
         free(v);
     }
     return setting;
