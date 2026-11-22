@@ -3010,6 +3010,14 @@ static int console_cs(const char *plan, int first, int count)
     printf("%s console-cs: %d of %d game compute shaders dispatched, %d skipped by the compile, %d not run "
            "(tables not expressible as D3D12 heaps), %d errors, %d hung\n", totals[2] || totals[3] ? "FAIL" : "ok  ",
            totals[0], n, totals[1], totals[4], totals[2], totals[3]);
+    /* After a hang the device is lost and tearing it down can block or crash, which kept
+     * tests/console-cs.sh from resuming: leave now, with everything printed. */
+    if (totals[3])
+    {
+        fflush(stdout);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
     return totals[2] || totals[3];
 }
 
