@@ -14,6 +14,7 @@
 
 #include "../common/rebox_log.h"
 #include "crash.h"
+#include "import_fixup.h"
 
 typedef union
 {
@@ -187,6 +188,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
         DisableThreadLibraryCalls(instance);
         reserve_gpu_window();
         crash_report_install(0x200000000000ull, 0x10000000000ull);
+        /* The title's imports are bound before its DLLs initialise. */
+        char *fixup = rebox_getenv("REBOX_IMPORT_FIXUP");
+        if (!fixup || strcmp(fixup, "0"))
+            import_fixup_run();
+        free(fixup);
     }
     return TRUE;
 }

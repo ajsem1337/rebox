@@ -107,3 +107,34 @@ if "$WINE" "$work/game/probe.exe"; then
 else
     fail "generated stub DLLs"
 fi
+
+# A name missing from an API set Wine hosts can't be stubbed by a DLL (the schema wins), so Wine
+# binds a stub that aborts when called. xmem.dll, which titles import, repoints those at E_NOTIMPL.
+cat > "$work/hosted.def" <<'DEF'
+LIBRARY api-ms-win-core-file-l1-1-0.dll
+EXPORTS
+    XHostedButMissing
+DEF
+x86_64-w64-mingw32-dlltool -d "$work/hosted.def" -l "$work/libhosted.a"
+x86_64-w64-mingw32-dlltool -d "$here/shims/xmem/xmem.def" -l "$work/libxmem.a"
+cat > "$work/fixup.c" <<'C'
+#include <stdio.h>
+#include <windows.h>
+__declspec(dllimport) LONG_PTR XHostedButMissing(void);
+__declspec(dllimport) void *XMemAlloc(SIZE_T, ULONGLONG);
+int main(void)
+{
+    void *volatile keep = XMemAlloc;
+    LONG_PTR r = XHostedButMissing();
+    printf("XHostedButMissing -> %#llx\n", (unsigned long long)r);
+    return keep && (ULONG)r == 0x80004001u ? 0 : 1;
+}
+C
+x86_64-w64-mingw32-gcc -O1 -o "$work/game/fixup.exe" "$work/fixup.c" "$work/libhosted.a" "$work/libxmem.a"
+make -s -C "$here" BUILD="$work/build" "$work/build/xmem.dll"
+cp "$work/build/xmem.dll" "$work/game/"
+if "$WINE" "$work/game/fixup.exe"; then
+    echo "ok   a name missing from an API set Wine hosts returns E_NOTIMPL instead of aborting"
+else
+    fail "xmem's import fixup"
+fi

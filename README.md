@@ -65,8 +65,10 @@ Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launc
    `$WINEPREFIX/shim-build` (only when the stubs change; `REBOX_AUTO_STUBS=0` turns this off).
    An API set (`api-ms-win-*`) that Wine's schema doesn't host, such as an Xbox-only one, would
    stop the exe loading; it gets a DLL of its own that forwards the names Wine's core DLLs export
-   and stubs the rest. Wine's own sets missing a name are fine: Wine binds a stub that fails only
-   when called.
+   and stubs the rest. A name missing from a set Wine does host can't be replaced by a DLL (the
+   schema wins), and Wine binds a stub that aborts the process when called; `xmem.dll`, which
+   titles import, repoints those imports at a stub that logs the name and returns `E_NOTIMPL`
+   (`REBOX_IMPORT_FIXUP=0` leaves Wine's).
    Forwarded exports in package DLLs are followed. `nix run . -- --scan ../xsx` prints the report
    without running. To make an entry point real, implement it in `shims/<dll>/` and add it to that
    DLL's `.def`. `tests/run-stubgen.sh` checks the stub generation end to end.
