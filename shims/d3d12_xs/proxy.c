@@ -992,6 +992,27 @@ static void STDMETHODCALLTYPE device_CreateSamplerX(struct proxy *p, const struc
     device_CreateSampler(p, &d, handle);
 }
 
+/* Slots 74/75: RegisterPagePoolX(address, page count, HANDLE *) and UnregisterPagePoolX(handle)
+ * (XValkyrie). They tell the console which physical pages back a range. xmem's physical pages are
+ * ordinary committed memory, so there is nothing to register: accepted, with a unique handle. */
+static HRESULT STDMETHODCALLTYPE device_RegisterPagePoolX(struct proxy *p, void *address, UINT_PTR count, HANDLE *out)
+{
+    static LONG64 next;
+    static LONG logged;
+
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: RegisterPagePoolX(%p, %llu pages) accepted (physical pages are ordinary memory)",
+                     address, (unsigned long long)count);
+    if (out)
+        *out = (HANDLE)(ULONG_PTR)(0x7a6f0000 + InterlockedIncrement64(&next));
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE device_UnregisterPagePoolX(struct proxy *p, HANDLE pool)
+{
+    return S_OK;
+}
+
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
  * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f.
  * Xbox2Windows saw Layout 0x101 with +0x34 = 3 and +0x38 = 0 there. */
@@ -1489,6 +1510,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(68, device_Slot68),
         FN(69, device_Slot69),
         FN(73, device_CreateCommandListX),
+        FN(74, device_RegisterPagePoolX),
+        FN(75, device_UnregisterPagePoolX),
         FN(76, device_CreateCommittedResourceX),
         FN(78, device_SetFrameIntervalX),
         FN(79, device_ScheduleFrameEventX),
