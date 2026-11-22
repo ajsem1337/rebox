@@ -2214,6 +2214,77 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* XCRDAPI.dll (DirectStorage): a plain and a zlib read from a file queue, a copy through a
+ * memory queue, each followed by a status entry. Slots as shims/xcrdapi/xcrdapi.c names them. */
+static void test_xcrdapi(void)
+{
+    static const BYTE zlib_data[] = {
+        0x78,0xda,0x2b,0x4e,0x4e,0x2c,0xca,0x49,0x2d,0x29,0xd1,0x4d,0xce,0xcf,0x2d,0x48,0x2c,0x51,0x70,0xc9,0x2c,
+        0x4a,0x4d,0x2e,0x09,0x2e,0xc9,0x2f,0x4a,0x4c,0x4f,0x55,0xa8,0xca,0xc9,0x4c,0x52,0x28,0x1e,0x89,0x4a,0x00,
+        0xbc,0x7e,0x6a,0xa1 };
+    static const char unit[] = "rebox DirectStorage zlib ";
+    struct { UINT64 source_type; UINT16 capacity; INT8 priority; const char *name; } fdesc = { 0, 128 }, mdesc = { 1, 128 };
+    struct req { UINT64 options; void *dst; UINT64 page; UINT32 dst_size, reserved; void *src; UINT64 offset;
+                 UINT32 src_size, intermediate; UINT64 tag; const char *name; };
+    typedef HRESULT (WINAPI *get_factory_fn)(REFIID, void **);
+    HMODULE m = LoadLibraryA("XCRDAPI.dll");
+    get_factory_fn get_factory = m ? (get_factory_fn)(void *)GetProcAddress(m, "DStorageGetFactory") : NULL;
+    void *factory = NULL, *fq = NULL, *mq = NULL, *file = NULL, *status = NULL;
+    WCHAR path[MAX_PATH], dir[MAX_PATH];
+    BYTE plain[64], inflated[280 + 16] = { 0 }, copy[16];
+    HANDLE h;
+    DWORD written;
+    BOOL ok;
+
+    CHECK(get_factory != NULL, "XCRDAPI.dll exports DStorageGetFactory");
+    if (!get_factory) return;
+    CHECK(SUCCEEDED(get_factory(&IID_IUnknown, &factory)) && factory, "DStorageGetFactory");
+    GetTempPathW(MAX_PATH, dir);
+    GetTempFileNameW(dir, L"dst", 0, path);
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    for (int i = 0; i < 64; i++) { BYTE b = (BYTE)(i * 3); WriteFile(h, &b, 1, &written, NULL); }
+    WriteFile(h, zlib_data, sizeof(zlib_data), &written, NULL);
+    CloseHandle(h);
+
+    ok = SUCCEEDED(XSLOT(factory, 3, HRESULT, const void *, REFIID, void **)(factory, &fdesc, &IID_IUnknown, &fq))
+         && SUCCEEDED(XSLOT(factory, 3, HRESULT, const void *, REFIID, void **)(factory, &mdesc, &IID_IUnknown, &mq))
+         && SUCCEEDED(XSLOT(factory, 4, HRESULT, const WCHAR *, REFIID, void **)(factory, path, &IID_IUnknown, &file))
+         && SUCCEEDED(XSLOT(factory, 5, HRESULT, UINT32, const char *, REFIID, void **)(factory, 4, "test",
+                                                                                         &IID_IUnknown, &status));
+    CHECK(ok, "DirectStorage factory creates queues, a file and a status array");
+    if (ok)
+    {
+        struct req r1 = { 0, plain, 0, sizeof(plain), 0, file, 0, 64 };
+        struct req r2 = { 1 /* zlib */, inflated, 0, 280, 0, file, 64, sizeof(zlib_data) };
+        struct req r3 = { 1ull << 22 /* source memory */, copy, 0, sizeof(copy), 0, (void *)"0123456789abcdef", 0, 16 };
+        BOOL plain_ok = TRUE, inflated_ok = TRUE;
+
+        XSLOT(fq, 3, void, const struct req *)(fq, &r1);
+        XSLOT(fq, 4, void, void *, UINT32)(fq, status, 0);
+        XSLOT(fq, 3, void, const struct req *)(fq, &r2);
+        XSLOT(fq, 4, void, void *, UINT32)(fq, status, 1);
+        XSLOT(fq, 6, void)(fq);
+        XSLOT(mq, 3, void, const struct req *)(mq, &r3);
+        XSLOT(mq, 4, void, void *, UINT32)(mq, status, 2);
+        XSLOT(mq, 6, void)(mq);
+        for (int i = 0; i < 500 && !(XSLOT(status, 3, BOOL, UINT32)(status, 0) && XSLOT(status, 3, BOOL, UINT32)(status, 1)
+                                     && XSLOT(status, 3, BOOL, UINT32)(status, 2)); i++)
+            Sleep(10);
+        for (int i = 0; i < 64; i++) plain_ok &= plain[i] == (BYTE)(i * 3);
+        for (int i = 0; i < 280; i++) inflated_ok &= inflated[i] == (BYTE)unit[i % (sizeof(unit) - 1)];
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 0) == S_OK && plain_ok, "DirectStorage file read");
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 1) == S_OK && inflated_ok, "DirectStorage zlib read");
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 2) == S_OK && !memcmp(copy, "0123456789abcdef", 16),
+              "DirectStorage memory copy");
+        CHECK(XSLOT(status, 3, BOOL, UINT32)(status, 3), "an unused status entry reads complete");
+    }
+    if (file) XSLOT(file, 2, ULONG)(file);
+    if (status) XSLOT(status, 2, ULONG)(status);
+    if (fq) XSLOT(fq, 2, ULONG)(fq);
+    if (mq) XSLOT(mq, 2, ULONG)(mq);
+    DeleteFileW(path);
+}
+
 static void test_xbox(void)
 {
     HMODULE m = LoadLibraryA("d3d12_xs.dll");
@@ -3139,6 +3210,7 @@ int main(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "--console-cs"))
         return console_cs(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
     test_xmem();
+    test_xcrdapi();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();
