@@ -1984,14 +1984,22 @@ static void test_rdna_repros(void *dev, void *queue)
     XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
             buf, NULL, &buav, cpu + inc);
 
-    /* s[0:1] = the table (a 1D storage image at slot 0); s2 = the workgroup id. */
+    /* s[0:1] = the table (a 1D storage image at slot 0); s2 = the workgroup id. pointer-taken runs
+     * the path that clobbers the speculated pointer, so its run-time check must report a fault. */
     for (UINT i = 0; i < ARRAYSIZE(image_cases); i++)
     {
+        UINT (WINAPI *faults)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxConsoleFaults");
+        UINT before = faults ? faults() : 0;
         sgprs[0] = (UINT32)gpu;
         sgprs[1] = 0;
         hr = dispatch_rdna(dev, queue, heap, image_cases[i].code, image_cases[i].dwords, 2 << 1 | 1 << 7, 32, sgprs, 2,
                            msg, sizeof(msg));
         CHECK(SUCCEEDED(hr), "RDNA repro %s compiles and runs: %s", image_cases[i].name, msg);
+        if (faults && strstr(image_cases[i].name, "pointer-taken"))
+            CHECK(faults() > before, "a failed speculation is read back from AnyPS5's fault buffer (%u fault(s))",
+                  faults() - before);
+        else if (faults && strstr(image_cases[i].name, "speculation"))
+            CHECK(faults() == before, "%s reports no fault", image_cases[i].name);
     }
 
     /* Two exec-masked loops through LDS: s4 = a table with the output V# (slot 1), s5 = n1,

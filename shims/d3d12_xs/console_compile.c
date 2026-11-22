@@ -195,6 +195,82 @@ static UINT64 page_table(void)
     return host_buffer(table, 16 + count * sizeof(struct range));
 }
 
+/* Buffers the GPU writes (AnyPS5's fault buffer and GDS) can't come from the content-shared pool:
+ * one of each for the process, as AnyPS5's own driver keeps them. */
+static struct { UINT64 gpu; volatile UINT32 *cpu; UINT32 size; } fault_buffer, gds_buffer;
+
+static BOOL CALLBACK init_fault_buffer(INIT_ONCE *once, void *param, void **context)
+{
+    void *cpu;
+    fault_buffer.size = sa5.fault_buffer_bytes();
+    if (SUCCEEDED(ReboxGpuAlloc(fault_buffer.size, 256, &cpu, &fault_buffer.gpu)))
+    {
+        memset(cpu, 0, fault_buffer.size);
+        fault_buffer.cpu = cpu;
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK init_gds_buffer(INIT_ONCE *once, void *param, void **context)
+{
+    void *cpu;
+    gds_buffer.size = sa5.gds_bytes();
+    if (SUCCEEDED(ReboxGpuAlloc(gds_buffer.size, 256, &cpu, &gds_buffer.gpu)))
+    {
+        memset(cpu, 0, gds_buffer.size);
+        gds_buffer.cpu = cpu;
+    }
+    return TRUE;
+}
+
+/* AnyPS5's fault record (BdaAbi.hpp): state (2 = ready), reason, address, bytes, stage,
+ * instruction, ...; and the SRT guard word, which a failed speculation check (patches/anyps5/0004)
+ * sets. Read at each compile, logged (the first few of each kind) and cleared. Faults come from
+ * any earlier dispatch, so they aren't tied to the shader being compiled. */
+#define FAULT_SRT_GUARD_WORD 6156
+static LONG faults_seen;
+static void poll_faults(void);
+#define poll_faults_now poll_faults
+
+/* Console shader faults and failed speculation checks seen so far (for tests). */
+UINT WINAPI ReboxConsoleFaults(void)
+{
+    InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
+    poll_faults_now();
+    return (UINT)faults_seen;
+}
+
+static void poll_faults(void)
+{
+    static const char *const reasons[] = { "?", "unmapped address", "permission", "overflow", "invalid table",
+            "invalid rectangle", "loop limit", "unaligned", "invalid descriptor", "image table", "unlinked call",
+            "window lane spill", "split state" };
+    static LONG fault_logs, guard_logs;
+    volatile UINT32 *f = fault_buffer.cpu;
+
+    if (!f)
+        return;
+    if (f[0] == 2)
+    {
+        UINT32 reason = f[1];
+        if (InterlockedIncrement(&fault_logs) <= 20)
+            rebox_log("d3d12_xs: console shader fault: %s at %#llx (%u bytes), instruction %#x",
+                         reason < ARRAYSIZE(reasons) ? reasons[reason] : "?",
+                         (unsigned long long)(f[2] | (UINT64)f[3] << 32), f[4], f[6]);
+        for (UINT i = 0; i < 10; i++)
+            f[i] = 0;
+        InterlockedIncrement(&faults_seen);
+    }
+    if (fault_buffer.size > FAULT_SRT_GUARD_WORD * 4 && f[FAULT_SRT_GUARD_WORD])
+    {
+        if (InterlockedIncrement(&guard_logs) <= 20)
+            rebox_log("d3d12_xs: a speculated console descriptor didn't match at run time (SRT guard %#x); "
+                         "REBOX_ANYPS5_SPECULATE=0 turns speculation off", f[FAULT_SRT_GUARD_WORD]);
+        f[FAULT_SRT_GUARD_WORD] = 0;
+        InterlockedIncrement(&faults_seen);
+    }
+}
+
 static UINT64 zero_buffer(UINT32 size)
 {
     void *zeros = calloc(1, size);
@@ -370,6 +446,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         return E_INVALIDARG;
     set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
+    poll_faults();
     if (!sa5.compile)
     {
         set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable", NULL);
@@ -550,11 +627,21 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 va = b.word_count ? host_buffer(b.words, bytes) : zero_buffer(bytes = 16);
                 break;
             case ROLE_FAULT_BUFFER:
-                va = zero_buffer(bytes = sa5.fault_buffer_bytes());
+            {
+                static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+                InitOnceExecuteOnce(&once, init_fault_buffer, NULL, NULL);
+                va = fault_buffer.gpu;
+                bytes = fault_buffer.size;
                 break;
+            }
             case ROLE_GDS:
-                va = zero_buffer(bytes = sa5.gds_bytes());
+            {
+                static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+                InitOnceExecuteOnce(&once, init_gds_buffer, NULL, NULL);
+                va = gds_buffer.gpu;
+                bytes = gds_buffer.size;
                 break;
+            }
             case ROLE_BDA_PAGETABLE:
                 va = page_table();
                 bytes = 0;

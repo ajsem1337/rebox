@@ -107,7 +107,7 @@ What AnyPS5's driver would do and this host does instead, from its sources:
 | A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail |
 | FlattenedSrt (binding 61): every dword the shader's scalar loads read through user SGPRs | its words, in GPU memory shared by content |
 | BDA page table (59) | identity ranges for GPU memory, plus title address → GPU copy for each shadow heap |
-| Fault buffer (60), GDS (58) | zeroed GPU memory (faults are not read back yet) |
+| Fault buffer (60), GDS (58) | one of each for the process, zeroed GPU memory as AnyPS5's driver keeps them. The fault record and the SRT guard word (set when a speculated descriptor turns out wrong at run time) are read at each compile, logged (the first 20 of each) and cleared. Faults come from earlier dispatches, so the log doesn't name the shader |
 | ShaderData (62) | its words, as FlattenedSrt (compute normally uses push data instead) |
 | Image and sampler tables, LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
 
@@ -145,8 +145,9 @@ disassembled game code, so it can't be committed.
 
 Patch 0004's speculation is on by default: `d3d12_xs` sets `APS5_SPECULATE_DESCRIPTORS` when it
 loads, before anything loads AnyPS5. The patch reads it once, into a static.
-`REBOX_ANYPS5_SPECULATE=0` turns it off. A wrong guess is reported in the fault buffer, which
-isn't read back yet.
+`REBOX_ANYPS5_SPECULATE=0` turns it off. A wrong guess sets the fault buffer, which `d3d12_xs`
+reads back and logs. The smoke test checks that the repro whose clobbering path runs reports one
+fault, and that the others report none.
 
 ## Where AnyPS5 runs
 
