@@ -439,6 +439,22 @@ static ULONG STDMETHODCALLTYPE resource_Release(void *self)
     return refs;
 }
 
+/* Struct-returning methods: console titles call them with the return pointer first and the
+ * object second (a UE5 title's GetResourceAllocationInfo: rcx the result, rdx the device), the C
+ * convention, where PC's MSVC member functions put the object first. Small structs (8 bytes:
+ * descriptor handles, LUIDs) come back in RAX instead, already handled where they occur. Our
+ * own callers use the PC order, so each wrapper looks at which argument is the object. */
+typedef D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *resource_get_desc_fn)(void *, D3D12_RESOURCE_DESC *);
+static resource_get_desc_fn orig_resource_get_desc;
+static void **resource_vtbl;
+
+static D3D12_RESOURCE_DESC *STDMETHODCALLTYPE resource_GetDesc(void *a, void *b)
+{
+    if (*(void ***)a != resource_vtbl && b && *(void ***)b == resource_vtbl)
+        return orig_resource_get_desc(b, a); /* console order: (result, resource) */
+    return orig_resource_get_desc(a, b);
+}
+
 static void patch_resource_class(void *resource)
 {
     void **vtbl = *(void ***)resource;
@@ -447,9 +463,12 @@ static void patch_resource_class(void *resource)
     if (vtbl[11] == (void *)resource_GetGPUVirtualAddress)
         return;
     VirtualProtect(vtbl, 12 * sizeof(void *), PAGE_READWRITE, &old);
+    resource_vtbl = vtbl;
     orig_resource_release = vtbl[2];
+    orig_resource_get_desc = vtbl[10];
     orig_resource_get_va = vtbl[11];
     vtbl[2] = (void *)resource_Release;
+    vtbl[10] = (void *)resource_GetDesc;
     vtbl[11] = (void *)resource_GetGPUVirtualAddress;
     VirtualProtect(vtbl, 12 * sizeof(void *), old, &old);
 }
@@ -781,6 +800,13 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
             UINT, const D3D12_RESOURCE_DESC *);
     D3D12_RESOURCE_DESC *copy = NULL;
 
+    if (!is_proxy(p) && is_proxy(ret)) /* console order: (result, device, ...) */
+    {
+        struct proxy *device = (struct proxy *)ret;
+        ret = (D3D12_RESOURCE_ALLOCATION_INFO *)p;
+        p = device;
+    }
+
     for (UINT i = 0; descs && i < count; i++)
         if (descs[i].Layout >= 0x100)
         {
@@ -791,6 +817,22 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
         }
     ((fn)PC_SLOT(p->inner, 25))(p->inner, ret, visible_mask, count, copy ? copy : descs);
     free(copy);
+    return ret;
+}
+
+/* Slot 26: GetCustomHeapProperties, either argument order (see resource_GetDesc). */
+static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE device_GetCustomHeapProperties(struct proxy *p,
+        D3D12_HEAP_PROPERTIES *ret, UINT node_mask, D3D12_HEAP_TYPE type)
+{
+    typedef D3D12_HEAP_PROPERTIES *(STDMETHODCALLTYPE *fn)(void *, D3D12_HEAP_PROPERTIES *, UINT, D3D12_HEAP_TYPE);
+
+    if (!is_proxy(p) && is_proxy(ret))
+    {
+        struct proxy *device = (struct proxy *)ret;
+        ret = (D3D12_HEAP_PROPERTIES *)p;
+        p = device;
+    }
+    ((fn)PC_SLOT(p->inner, 26))(p->inner, ret, node_mask, type);
     return ret;
 }
 
@@ -920,6 +962,76 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineStateX(struct prox
             rebox_log("d3d12_xs: Xbox CreateGraphicsPipelineStateX: %u extension structs ignored", ext_count);
     }
     return device_CreateGraphicsPipelineState(p, desc, riid, out);
+}
+
+/* The PC size of a CheckFeatureSupport struct, or 0 if not known. */
+static UINT feature_size(D3D12_FEATURE feature)
+{
+    switch (feature)
+    {
+    case D3D12_FEATURE_D3D12_OPTIONS: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS);
+    case D3D12_FEATURE_ARCHITECTURE: return sizeof(D3D12_FEATURE_DATA_ARCHITECTURE);
+    case D3D12_FEATURE_FEATURE_LEVELS: return sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS);
+    case D3D12_FEATURE_FORMAT_SUPPORT: return sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT);
+    case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: return sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS);
+    case D3D12_FEATURE_FORMAT_INFO: return sizeof(D3D12_FEATURE_DATA_FORMAT_INFO);
+    case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: return sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT);
+    case D3D12_FEATURE_SHADER_MODEL: return sizeof(D3D12_FEATURE_DATA_SHADER_MODEL);
+    case D3D12_FEATURE_D3D12_OPTIONS1: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1);
+    case D3D12_FEATURE_ROOT_SIGNATURE: return sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE);
+    case D3D12_FEATURE_ARCHITECTURE1: return sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1);
+    case D3D12_FEATURE_D3D12_OPTIONS2: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2);
+    case D3D12_FEATURE_SHADER_CACHE: return sizeof(D3D12_FEATURE_DATA_SHADER_CACHE);
+    case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: return sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY);
+    case D3D12_FEATURE_D3D12_OPTIONS3: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3);
+    case D3D12_FEATURE_EXISTING_HEAPS: return sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS);
+    case D3D12_FEATURE_D3D12_OPTIONS4: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4);
+    case D3D12_FEATURE_D3D12_OPTIONS5: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5);
+    case D3D12_FEATURE_D3D12_OPTIONS6: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6);
+    case D3D12_FEATURE_D3D12_OPTIONS7: return sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7);
+    default: return 0;
+    }
+}
+
+/* Slot 13: CheckFeatureSupport. vkd3d-proton wants each struct's PC size exactly; a console SDK's
+ * structs can be sized differently (a UE5 title's D3D12_OPTIONS check failed and it crashed), so on
+ * a size mismatch the PC struct is filled and what fits copied back, the rest zeroed. */
+static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(struct proxy *p, D3D12_FEATURE feature, void *data,
+        UINT size)
+{
+    ID3D12Device *device = INNER(p, ID3D12Device);
+    UINT pc = feature_size(feature);
+    BYTE buffer[512];
+    HRESULT hr;
+
+    if (!pc || pc == size || pc > sizeof(buffer) || !data)
+    {
+        hr = ID3D12Device_CheckFeatureSupport(device, feature, data, size);
+        if (FAILED(hr))
+        {
+            static LONG seen[64];
+            if ((UINT)feature >= 64 || InterlockedIncrement(&seen[feature]) <= 2)
+                rebox_log("d3d12_xs: CheckFeatureSupport(feature %u, %u bytes) failed %#lx", feature, size, hr);
+        }
+        return hr;
+    }
+    /* In-out structs (format support, sample counts, levels, shader model, root signature...)
+     * carry the title's input in their first bytes. */
+    memset(buffer, 0, pc);
+    memcpy(buffer, data, min(size, pc));
+    if (SUCCEEDED(hr = ID3D12Device_CheckFeatureSupport(device, feature, buffer, pc)))
+    {
+        memcpy(data, buffer, min(size, pc));
+        if (size > pc)
+            memset((BYTE *)data + pc, 0, size - pc);
+    }
+    {
+        static LONG seen[64];
+        if ((UINT)feature >= 64 || InterlockedIncrement(&seen[feature]) <= 1)
+            rebox_log("d3d12_xs: CheckFeatureSupport(feature %u): the title's struct is %u bytes, PC's %u (%#lx)",
+                         feature, size, pc, hr);
+    }
+    return hr;
 }
 
 /* Slot 55: a graphics PSO derived from another with state patches (TomBox, a UE5 title):
@@ -1129,6 +1241,27 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
     if (raw != stack)
         free(raw);
+}
+
+/* SignalX(fence, value, flush flags): Signal; the flags (cache flushes before the signal, e.g.
+ * 0x8000000 from Unreal) have nothing to do here, the queue is already ordered. */
+static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
+{
+    return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
+}
+
+/* GetDesc, in either argument order (see resource_GetDesc). */
+static D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_GetDesc(struct proxy *p, D3D12_COMMAND_QUEUE_DESC *ret)
+{
+    if (!is_proxy(p) && is_proxy(ret))
+    {
+        struct proxy *queue = (struct proxy *)ret;
+        ret = (D3D12_COMMAND_QUEUE_DESC *)p;
+        p = queue;
+    }
+    ((D3D12_COMMAND_QUEUE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_COMMAND_QUEUE_DESC *))PC_SLOT(p->inner, 18))(
+            p->inner, ret);
+    return ret;
 }
 
 /* Slot 30 (ScarlettX): PresentX(plane count, plane params, present params).
@@ -1538,6 +1671,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(23, device_CopyDescriptors),
         FN(24, device_CopyDescriptorsSimple),
         FN(25, device_GetResourceAllocationInfo),
+        FN(26, device_GetCustomHeapProperties),
         FN(27, device_CreateCommittedResource),
         FN(28, device_CreateHeap),
         FN(29, device_CreatePlacedResource),
@@ -1547,6 +1681,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
+        FN(13, device_CheckFeatureSupport),
         FN(55, device_CreateDerivedPipelineStateX),
         FN(60, device_CreateGraphicsPipelineStateX),
         FN(61, device_CreateSamplerX),
@@ -1562,10 +1697,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(80, device_WaitFrameEventX),
         FN(81, device_GetFrameStatisticsX),
     };
-    /* Queue: PC through GetDesc (18). */
+    /* Queue: PC 0-17, then console methods 18-25 with SignalX at 23 (XValkyrie; a UE5 title, SDK
+     * 0x20002, calls it with (fence, value, flush flags)), GetDesc at 26, PresentX at 30. */
     static const struct slot queue_slots[] = {
         FN(7, child_GetDevice),
         FN(10, queue_ExecuteCommandLists),
+        FN(23, queue_SignalX),
+        FN(26, queue_GetDesc),
         FN(30, queue_PresentX),
     };
     /* Queue for titles built against SDK 0x20004 or later (ScarlettX 1e5473d, from a title's
@@ -1577,6 +1715,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(10, queue_ExecuteCommandLists),
         FWD(16, 14), /* Signal */
         FWD(17, 15), /* Wait, assumed to follow Signal */
+        FN(25, queue_SignalX), /* inferred: 23 + 2, as PresentX 30 + 2 */
+        FN(28, queue_GetDesc), /* inferred: 26 + 2 */
         FN(32, queue_PresentX),
     };
     /* Graphics list: PC through ResourceBarrier (26), then PC + 4 for PC
@@ -1648,7 +1788,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     }
 
     build(&device_class, 44, device_slots, ARRAYSIZE(device_slots));
-    build(&queue_class, 19, queue_slots, ARRAYSIZE(queue_slots));
+    build(&queue_class, 18, queue_slots, ARRAYSIZE(queue_slots));
     build(&queue_v4_class, 11, queue_v4_slots, ARRAYSIZE(queue_v4_slots));
     build(&list_class, 27, list_slots, n);
 

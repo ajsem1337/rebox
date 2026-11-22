@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <initguid.h>
 #include <xaudio2.h>
+#include <mmdeviceapi.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -467,6 +468,45 @@ static ULONG STDMETHODCALLTYPE engine_Release(struct engine *e)
     return refs;
 }
 
+/* Wine creates a mastering voice even with no audio device, and FAudio then crashes on the
+ * first source voice (a UE5 title, headless). Without a render endpoint this fails the way XAudio2
+ * does on Windows, HRESULT_FROM_WIN32(ERROR_NOT_FOUND), so the title can go on without sound. */
+static BOOL have_render_device(void)
+{
+    IMMDeviceEnumerator *enumerator = NULL;
+    IMMDevice *device = NULL;
+    HRESULT init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    BOOL found = FALSE;
+
+    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator,
+                                   (void **)&enumerator)))
+    {
+        found = SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eConsole, &device));
+        if (device)
+            IMMDevice_Release(device);
+        IMMDeviceEnumerator_Release(enumerator);
+    }
+    if (SUCCEEDED(init))
+        CoUninitialize();
+    return found;
+}
+
+static HRESULT STDMETHODCALLTYPE engine_CreateMasteringVoice(struct engine *e, IXAudio2MasteringVoice **out,
+        UINT32 channels, UINT32 rate, UINT32 flags, LPCWSTR device, const XAUDIO2_EFFECT_CHAIN *effects,
+        AUDIO_STREAM_CATEGORY category)
+{
+    if (!device && !have_render_device())
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("xaudio2_9: no audio output device; the mastering voice fails as on Windows (no sound)");
+        if (out)
+            *out = NULL;
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    return IXAudio2_CreateMasteringVoice(e->inner, out, channels, rate, flags, device, effects, category);
+}
+
 static HRESULT STDMETHODCALLTYPE engine_CreateSourceVoice(struct engine *e, IXAudio2SourceVoice **out,
         const WAVEFORMATEX *fmt, UINT32 flags, float max_ratio, IXAudio2VoiceCallback *callback,
         const XAUDIO2_VOICE_SENDS *sends, const XAUDIO2_EFFECT_CHAIN *effects)
@@ -535,6 +575,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     engine_slots[1] = (void *)engine_AddRef;
     engine_slots[2] = (void *)engine_Release;
     engine_slots[5] = (void *)engine_CreateSourceVoice;
+    engine_slots[7] = (void *)engine_CreateMasteringVoice;
     engine_vtbl = engine_slots;
 
     for (unsigned i = 0; i < ARRAYSIZE(voice_slots); i++)

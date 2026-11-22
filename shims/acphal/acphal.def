@@ -1,0 +1,8 @@
+LIBRARY acphal.dll
+EXPORTS
+    ApuCreateHeap
+    ApuAlloc
+    ApuFree
+    ApuHeapGetState
+    AcpHalCreate
+    AcpHalAllocateShapeContexts

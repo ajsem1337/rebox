@@ -353,18 +353,47 @@ BOOL WINAPI XMemVirtualQuery(HANDLE process, const void *address, XMEM_BASIC_INF
  * anything. */
 #define XMEM_WSS_SELECTOR_OBSERVED 0x20000001
 
+/* Selector 0x10000001 fills the whole working-set struct (XValkyrie's layout, facts only):
+ * game/tools limits and use, stack and kernel pool, GPU limits and use. Unreal reads its
+ * memory budget from it and, with nothing filled in, stops for want of memory (a UE5 title: "Ran out
+ * of memory allocating 65536 bytes" with every MemoryStats field zero). The limit is what a Series
+ * X title gets, 13 GiB, or the host's memory if less. */
+#define XMEM_WSS_SELECTOR_FULL 0x10000001
+
+struct xmem_working_set
+{
+    SIZE_T game_limit, game_used, tools_limit, tools_used;
+    UINT32 stack_used, kernel_pool_used;
+    SIZE_T gpu_limit, gpu_used, tools_gpu_limit, tools_gpu_used;
+};
+
 BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
 {
     static LONG warned;
-    PROCESS_MEMORY_COUNTERS pmc = { .cb = sizeof(pmc) };
+    PROCESS_MEMORY_COUNTERS_EX pmc = { .cb = sizeof(pmc) };
 
+    if (selector == XMEM_WSS_SELECTOR_FULL && stats)
+    {
+        MEMORYSTATUSEX host = { .dwLength = sizeof(host) };
+        struct xmem_working_set ws = { 0 };
+        SIZE_T gpu = gpu_usage ? gpu_usage() : 0;
+
+        if (!GlobalMemoryStatusEx(&host)
+                || !K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc)))
+            return FALSE;
+        ws.game_limit = ws.gpu_limit = (SIZE_T)min(13ull << 30, host.ullTotalPhys);
+        ws.game_used = min(pmc.PrivateUsage + gpu, ws.game_limit);
+        ws.gpu_used = min(gpu, ws.gpu_limit);
+        memcpy(stats, &ws, sizeof(ws));
+        return TRUE;
+    }
     if (selector != XMEM_WSS_SELECTOR_OBSERVED || !stats)
     {
         if (!InterlockedExchange(&warned, 1))
             rebox_log("xmem: XMemGetWorkingSetStatistics(%#lx, %p) unsupported", selector, stats);
         return FALSE;
     }
-    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc)))
         return FALSE;
     /* GPU-visible allocations live in D3D12 heaps, which Wine doesn't count. */
     *(ULONGLONG *)((BYTE *)stats + 8) = pmc.PagefileUsage + (gpu_usage ? gpu_usage() : 0);
@@ -382,9 +411,30 @@ BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
  * against the console's xmem.dll and a title's calls; XValkyrie agrees). The flags only matter
  * to the console's allocator. The page-size flags go too: they need a privilege on Windows, and
  * our Wine patch drops them anyway. */
+/* Console-only bits Windows rejects (a UE5 title: type 0x20401000, protect 0x2404):
+ *   type     MEM_PHYSICAL (0x400000) next to MEM_COMMIT: the console maps title pages there;
+ *   protect  0x800-0x4000 (PAGE_GRAPHICS_* in the console's winnt.h: GPU access to the pages),
+ *            PAGE_WRITECOMBINE (0x400) and PAGE_NOCACHE (0x200), cache behaviour.
+ * The pages become plain CPU memory: GPU access at a title-chosen address is unified memory's
+ * business (docs/d3d12x.md). */
+#define CONSOLE_PROTECT_BITS 0xfe00
+
 void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
 {
-    return VirtualAlloc(address, size, type & ~CONSOLE_PAGE_FLAGS, protect);
+    DWORD host_type = type & ~CONSOLE_PAGE_FLAGS, host_protect = protect & ~CONSOLE_PROTECT_BITS;
+    void *p;
+    static LONG calls, failures, graphics;
+
+    if (host_type & MEM_COMMIT)
+        host_type &= ~MEM_PHYSICAL;
+    if ((protect & 0x7800) && !InterlockedExchange(&graphics, 1))
+        rebox_log("xmem: XMemVirtualAlloc with GPU access bits (protect %#lx): plain CPU memory here", protect);
+    p = VirtualAlloc(address, size, host_type, host_protect);
+
+    if (!p ? InterlockedIncrement(&failures) <= 16 : InterlockedIncrement(&calls) <= 4)
+        rebox_log("xmem: XMemVirtualAlloc(%p, %#zx, type %#lx, flags %#llx, protect %#lx) -> %p (error %lu)", address,
+                     size, type, (unsigned long long)xmem_flags, protect, p, p ? 0 : GetLastError());
+    return p;
 }
 
 BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
@@ -415,6 +465,12 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
     {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+    {
+        static LONG calls;
+        if (InterlockedIncrement(&calls) <= 4)
+            rebox_log("xmem: XMemAllocatePhysicalPages(flags %#llx, %lu pages)", (unsigned long long)flags,
+                         (unsigned long)*count);
     }
     first = InterlockedExchangeAdd64(&next_page_token, *count);
     for (ULONG_PTR i = 0; i < *count; i++)

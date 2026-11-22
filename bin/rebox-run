@@ -81,6 +81,31 @@ if ! grep -qi "\"ConsoleMode\"=dword:$console_mode" "$WINEPREFIX/system.reg" 2>/
         /t REG_DWORD /d "0x$console_mode" /f >/dev/null 2>&1 || die "couldn't set ConsoleMode in $WINEPREFIX"
 fi
 
+# Console system DLLs that are pure computation, taken from the dump's own system partition
+# (EmbeddedXvd/Windows/System32, next to or inside the game directory, or REBOX_CONSOLE_SYSTEM)
+# rather than stubbed: xg_xs.dll, the console's texture-layout library (Unreal's D3D12 RHI needs
+# XGCreateTextureComputer), imports only the CRT, core API sets and xmem. They come from the
+# user's dump and stay in the prefix. REBOX_CONSOLE_DLLS lists them (default xg_xs.dll);
+# empty uses none.
+console_sys=${REBOX_CONSOLE_SYSTEM:-}
+if [[ -z $console_sys ]]; then
+    for d in "$game_dir/../EmbeddedXvd/Windows/System32" "$game_dir/EmbeddedXvd/Windows/System32"; do
+        [[ -d $d ]] && { console_sys=$(realpath "$d"); break; }
+    done
+fi
+console_dlls="$WINEPREFIX/console-system"
+rm -rf "$console_dlls"
+mkdir -p "$console_dlls"
+if [[ -n $console_sys ]]; then
+    for name in ${REBOX_CONSOLE_DLLS-xg_xs.dll}; do
+        found=$(find "$console_sys" -maxdepth 1 -iname "$name" -print -quit)
+        if [[ -n $found ]]; then
+            install -m 644 "$found" "$console_dlls/$name"
+            echo "rebox-run: using the console's own $name from the dump's system partition" >&2
+        fi
+    done
+fi
+
 # Imports nothing provides (the scan, as with --scan): stub them so the title still loads. A
 # missing export of one of our shims needs that shim rebuilt, so when the scan finds gaps the
 # shims are rebuilt in the prefix from REBOX_SRC (the flake sets it, with mingw and make on
@@ -90,7 +115,8 @@ fi
 if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
     gen="$WINEPREFIX/generated-stubs"
     rm -rf "$gen"
-    "${REBOX_SCAN:-scan_imports.py}" "$game_dir/$exe_dir" --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" \
+    "${REBOX_SCAN:-scan_imports.py}" "$game_dir/$exe_dir" --provider "$REBOX_SHIMS_DIR" --provider "$console_dlls" \
+        --provider "$VKD3D_PROTON_DIR" \
         --provider "$DXVK_DIR" --provider "$wine_dlls" --shims "$REBOX_SRC/shims" --gen-stubs "$gen" \
         $(command -v x86_64-w64-mingw32-gcc >/dev/null && echo --prototypes-from x86_64-w64-mingw32-gcc) \
         > "$WINEPREFIX/imports.txt" 2>&1 || true  # exits 1 when it found gaps
@@ -159,6 +185,13 @@ for dll in "$REBOX_SHIMS_DIR"/*.dll "$REBOX_SHIMS_DIR"/stub/*.dll; do
         overrides+=";${name%.dll}=n"
         [[ $dll == */stub/* ]] && echo "rebox-run: stub DLL $name (every export returns E_NOTIMPL)" >&2
     fi
+done
+
+for dll in "$console_dlls"/*.dll; do
+    [[ -f $dll ]] || continue
+    name=$(basename "$dll")
+    install -m 644 "$dll" "$sys32/"
+    overrides+=";${name%.dll}=n"
 done
 
 # Mount the package as G: too, for titles that assume a package drive.

@@ -3086,6 +3086,15 @@ static void test_xbox(void)
             XSLOT(buf, 10, D3D12_RESOURCE_DESC *, D3D12_RESOURCE_DESC *)(buf, &got); /* GetDesc, MSVC hidden return */
         CHECK(SUCCEEDED(hr) && got.Width == 256, "an 80-byte committed buffer is made 256 bytes (%#lx, %llu)", hr,
               (unsigned long long)got.Width);
+        if (buf)
+        {
+            D3D12_RESOURCE_DESC console_desc = { 0 };
+            /* GetDesc in the console order: (result, resource). */
+            ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, void *))(*(void ***)buf)[10])(&console_desc, buf);
+            CHECK(console_desc.Width == 256 && console_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER,
+                  "a resource's GetDesc called in the console order, result first (%llu)",
+                  (unsigned long long)console_desc.Width);
+        }
         if (buf) ID3D12Resource_Release(buf);
     }
 
@@ -3112,6 +3121,15 @@ static void test_xbox(void)
               const D3D12_RESOURCE_DESC *)(dev, &info, 0, 1, &td);
         CHECK(info.SizeInBytes >= 64 * 48 * 4, "GetResourceAllocationInfo (slot 25) with Xbox layout 0x101 (%llu)",
               (unsigned long long)info.SizeInBytes);
+        /* Console titles pass the result first and the device second (a UE5 title). */
+        {
+            D3D12_RESOURCE_ALLOCATION_INFO console_info = { 0 }, *r;
+            r = XSLOT(dev, 25, D3D12_RESOURCE_ALLOCATION_INFO *, void *, UINT, UINT,
+                      const D3D12_RESOURCE_DESC *)(&console_info, dev, 0, 1, &td);
+            CHECK(r == &console_info && console_info.SizeInBytes == info.SizeInBytes,
+                  "GetResourceAllocationInfo (slot 25) called in the console order, result first (%llu)",
+                  (unsigned long long)console_info.SizeInBytes);
+        }
     }
 
     /* DEFAULT-heap buffers become CPU-visible, so a title can write through

@@ -9,7 +9,7 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -Wall -Wno-unused-function -std=gnu11 -D__USE_MINGW_ANSI_STDIO=1
 LDFLAGS += -shared -static-libgcc -Wl,--enable-stdcall-fixup
 
-SHIMS   := xmem d3d12_xs xaudio2_9 amd_fidelityfx_loader_xbox pixevt xcrdapi gameinput
+SHIMS   := xmem d3d12_xs xaudio2_9 amd_fidelityfx_loader_xbox pixevt xcrdapi gameinput acphal
 COMMON  := shims/common/rebox_log.c
 
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
@@ -56,6 +56,8 @@ ifneq ($(FFMPEG_XMA2),)
 CFLAGS_xaudio2_9 := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
 LIBS_xaudio2_9 := -L$(FFMPEG_XMA2)/lib -lavcodec -lavutil -lbcrypt
 endif
+# It asks mmdevapi whether there is an audio device.
+LIBS_xaudio2_9 += -lole32
 
 # The DirectStorage shim talks to the BCPack helper over a localhost socket.
 LIBS_xcrdapi := -lws2_32
