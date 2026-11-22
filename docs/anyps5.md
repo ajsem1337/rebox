@@ -292,9 +292,11 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   Stage slots: 0 is the pixel shader, 1 the vertex shader, 2 the NGG (mesh/primitive) shader.
   The block sizes form two families:
   - 388/396 bytes (VS + PS) use the offsets above;
-  - 464-504 bytes (NGG + PS) keep the `RSRC` words in place, but `COL_FORMAT` moves to word 49
-    (21 later; all 475 of the 464-byte blocks), and the words after it shift by a further
-    variable amount (`NUM_INTERP` at word 44 in 1,491 of 1,542 472-byte blocks).
+  - 464-520 bytes (NGG + PS) keep the `RSRC` words in place, but the pixel-output group moves
+    21 words later: `NUM_INTERP` is word 44 and `COL_FORMAT` word 49. `NUM_INTERP` is at least
+    the number of interpolants the PS reads in all 6,756 such PSOs with a dumped PS. It counts
+    what the earlier stage outputs, so it can exceed what the PS reads; equality holds where they
+    match, e.g. 1,491 of 1,542 472-byte blocks. The size differences come after word 49.
 
   Next: the variable section in the NGG family, then building AnyPS5's `ShaderPixelStageInfo`
   (and the NGG `MeshConfiguration`) from these words at PSO creation. The PS input table at
