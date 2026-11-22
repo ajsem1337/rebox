@@ -9,7 +9,8 @@ So the decoder runs here, as a separate program the DirectStorage shim talks to 
 
 ## Licence
 
-Everything in this directory is GPL-3.0-or-later (each file says so). It runs Leonida's decoder,
+Everything in this directory is GPL-3.0-or-later (each file says so), except `bcpack-serve.rs`
+(MIT OR Apache-2.0, built against bcpack-rs). It runs Leonida's decoder,
 pinned in `flake.nix` (`leonida-src`); nothing of Leonida's is copied into this repository. The
 rest of rebox stays GPL-2.0-only: the shim and the helper are separate programs that
 communicate over a localhost socket.
@@ -26,7 +27,19 @@ the code's licence.
   from the file or memory source, the destination size) and copies the blocks back. Each
   DirectStorage worker thread has its own connection, and each connection its own helper
   process, so queues decode in parallel.
+- BC1 chunks go to `bcpack-serve`, built by the flake (`.#bcpack-serve`) from
+  [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) (MIT OR Apache-2.0, pinned as
+  `bcpack-rs-src`) and `bcpack-serve.rs`: 34-40 MB/s of blocks per core by its own measurement,
+  more than ten times the PyPy path, with tables validated on held-out pools. Each connection
+  starts one on its first BC1 chunk; a chunk it rejects goes to Leonida's decoder.
+  `REBOX_BCPACK_SERVE=` (empty) keeps Leonida's for BC1 too.
 - Without the helper, BCPack requests fail with `E_NOTIMPL` and are logged, as before.
+
+On 14 BC1 chunks sampled from two of the target title's pools (2026-11-22, local data), bcpack-serve matched
+bcpack-rs's own decoder byte for byte. Leonida's decoder agreed on every block of 4 chunks and
+differed on the rest, mostly in a few blocks' indices (one chunk: 1,021 of 1,024 blocks). Neither
+is shown better: on the differing blocks each gives the smoother pixels about as often (excluding
+that chunk), and the two tables were fitted independently.
 
 BC6H and BC7 chunks often need history entries Leonida marks provisional, because the calibrated
 tables are fitted from local data and not in its repository. The helper allows them by default

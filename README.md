@@ -225,7 +225,8 @@ down missing translations.
 - **BCPack decodes slowly, and BC6H/BC7 approximately.** BCPack, the console's hardware texture
   compression (about 14% of the target title's textures), is decoded by Leonida's GPLv3 decoder running as a
   separate process ([helpers/bcpack](helpers/bcpack/README.md)), at about 3 MB/s per DirectStorage
-  queue under PyPy, far below the console's hardware. BC6H and BC7 often need history tables
+  queue under PyPy, far below the console's hardware. BC1 is the exception: bcpack-rs
+  (`bcpack-serve`, MIT/Apache) decodes it at 34-40 MB/s per core. BC6H and BC7 often need history tables
   Leonida doesn't ship, so those use its provisional entries unless calibrated tables are given
   (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page addresses in DirectStorage
   requests aren't supported.
@@ -261,7 +262,8 @@ down missing translations.
 
 rebox is licensed under the GNU General Public License, version 2 only
 ([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
-`helpers/bcpack` is GPL-3.0-or-later and runs as a separate process; see its README.
+`helpers/bcpack` is GPL-3.0-or-later and runs as a separate process, except `bcpack-serve.rs`
+(MIT OR Apache-2.0, a separate program built against bcpack-rs); see its README.
 The patches in `patches/` modify vkd3d-proton (LGPL-2.1+), Mesa (MIT), Wine (LGPL-2.1+) and AnyPS5
 (GPL-2.0-only) and are offered under
 those projects' licences too. Game data, dumps and anything derived from them (`build/`) are never

@@ -21,9 +21,14 @@
       url = "github:ItsNotRexed/Leonida/bb2e18421dac527374eb837c88b5063c5d96f81f";
       flake = false;
     };
+    # bcpack-rs (MIT OR Apache-2.0): the BC1 decoder behind helpers/bcpack/bcpack-serve.rs.
+    bcpack-rs-src = {
+      url = "github:Ahmet-Dedeler/bcpack-rs/5bf5cc56ed56f1ababf1f9592300bd182ff90bd8";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime, leonida-src }:
+  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime, leonida-src, bcpack-rs-src }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -233,6 +238,20 @@
           '';
         };
 
+        # BC1 BCPack decoding for helpers/bcpack: our bcpack-serve.rs built as a binary of bcpack-rs.
+        bcpack-serve = pkgs.rustPlatform.buildRustPackage {
+          pname = "bcpack-serve";
+          version = "0.2.0";
+          src = bcpack-rs-src;
+          cargoLock.lockFile = "${bcpack-rs-src}/Cargo.lock";
+          postPatch = ''
+            mkdir -p src/bin
+            cp ${./helpers/bcpack/bcpack-serve.rs} src/bin/bcpack-serve.rs
+          '';
+          cargoBuildFlags = [ "--bin" "bcpack-serve" ];
+          doCheck = false;
+        };
+
         scan-imports = pyTool "scan_imports.py" ./tools/scan_imports.py;
         anyps5-cache = pyTool "anyps5_cache.py" ./tools/anyps5_cache.py;
         # mingw gcc on PATH lets the probe find d3d12.h for GUID and vtable names.
@@ -251,6 +270,7 @@
           export REBOX_BCPACK_SCRIPT=${./helpers/bcpack/bcpack-helper.py}
           export REBOX_BCPACK_PYTHON=''${REBOX_BCPACK_PYTHON:-${pkgs.pypy3}/bin/pypy3}
           export LEONIDA_SRC=${leonida-src}
+          export REBOX_BCPACK_SERVE=''${REBOX_BCPACK_SERVE-${bcpack-serve}/bin/bcpack-serve}
           export PATH=$PATH:${lib.makeBinPath [ mingwCC pkgs.gnumake pkgs.python3 pkgs.findutils ]}
           export REBOX_GPUVA_LAYER_DIR=''${REBOX_GPUVA_LAYER_DIR:-${gpuva-layer}/share/vulkan/explicit_layer.d}
           export REBOX_RADV_ICD=''${REBOX_RADV_ICD:-${radv-rebox}/share/vulkan/icd.d/radeon_icd.x86_64.json}

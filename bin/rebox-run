@@ -195,6 +195,8 @@ if [[ ${REBOX_BCPACK:-1} != 0 && -n ${REBOX_BCPACK_SCRIPT:-} && -n ${LEONIDA_SRC
     helper_args=(--leonida "$LEONIDA_SRC" --port-file "$portfile" --watch-pid $$)
     [[ -n ${REBOX_BCPACK_HISTORY:-} ]] && helper_args+=(--history "$REBOX_BCPACK_HISTORY")
     [[ ${REBOX_BCPACK_STRICT:-0} == 1 ]] && helper_args+=(--strict)
+    # BC1 through bcpack-rs (bcpack-serve; the flake sets it): REBOX_BCPACK_SERVE= keeps Leonida's.
+    [[ -n ${REBOX_BCPACK_SERVE:-} ]] && helper_args+=(--bc1-serve "$REBOX_BCPACK_SERVE")
     "${REBOX_BCPACK_PYTHON:-python3}" -I "$REBOX_BCPACK_SCRIPT" "${helper_args[@]}" \
         > "$WINEPREFIX/bcpack-helper.log" 2>&1 &
     for _ in $(seq 100); do [[ -s $portfile ]] && break; sleep 0.1; done
