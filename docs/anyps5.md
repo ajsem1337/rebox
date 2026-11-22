@@ -117,7 +117,9 @@ memory yet. The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod amo
 The smoke test runs this whole path on lavapipe. `test_console_dispatch` creates a deferred PSO from
 hand-assembled RDNA2 code that stores `0x1234abcd` through the V# at the start of its descriptor
 table (heap slot 1), dispatches it, and reads the value back. A second dispatch gets the same V# through a pointer
-in root constants into `ReboxGpuAlloc` memory. `REBOX_DUMP_SPIRV=DIR` writes each
+in root constants into `ReboxGpuAlloc` memory. Both pass on RADV (Radeon 890M, 2026-11-22),
+where the bindless sets differ from lavapipe's: samplers 0/0, typed views and images 1/1, raw
+buffers and CBVs 2/0 (lavapipe: 1/2 for typed views and images). `REBOX_DUMP_SPIRV=DIR` writes each
 finalized module.
 
 ## Where AnyPS5 runs
