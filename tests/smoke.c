@@ -10,7 +10,7 @@
 #include <initguid.h>
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi.h>
+#include <dxgi1_6.h>
 #include <xaudio2.h>
 #include <mmdeviceapi.h>
 #include <stdio.h>
@@ -1005,6 +1005,43 @@ done:
     if (rs) XSLOT(rs, 2, ULONG)(rs);
     if (blob) ID3D10Blob_Release(blob);
     if (err) ID3D10Blob_Release(err);
+}
+
+/* Titles go device -> IDXGIDevice -> GetAdapter (+0x38) -> EnumOutputs (+0x38), hand the output to
+ * SetFrameIntervalX, and take the adapter's parent IDXGIFactory2, checking nothing. */
+static void test_dxgi_device(void *dev)
+{
+    IDXGIDevice *dxgi = NULL;
+    IDXGIAdapter *adapter = NULL;
+    IDXGIOutput *output = NULL;
+    IDXGIFactory2 *factory = NULL;
+    void *back = NULL;
+    HRESULT hr;
+
+    hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &IID_IDXGIDevice, (void **)&dxgi);
+    CHECK(SUCCEEDED(hr) && dxgi, "device QueryInterface(IDXGIDevice) %#lx", hr);
+    if (!dxgi)
+        return;
+    hr = XSLOT(dxgi, 0, HRESULT, REFIID, void **)(dxgi, &IID_ID3D12Device, &back);
+    CHECK(SUCCEEDED(hr) && back == dev, "IDXGIDevice QueryInterface(ID3D12Device) gives the device back %#lx", hr);
+    if (back)
+        XSLOT(back, 2, ULONG)(back);
+    hr = XSLOT(dxgi, 7, HRESULT, IDXGIAdapter **)(dxgi, &adapter);
+    CHECK(SUCCEEDED(hr) && adapter, "IDXGIDevice::GetAdapter (+0x38) %#lx", hr);
+    if (!adapter)
+        return;
+    hr = XSLOT(adapter, 7, HRESULT, UINT, IDXGIOutput **)(adapter, 0, &output);
+    CHECK(SUCCEEDED(hr) && output, "IDXGIAdapter::EnumOutputs(0) (+0x38) %#lx", hr);
+    hr = XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, output, 16667, 1);
+    CHECK(SUCCEEDED(hr), "SetFrameIntervalX with the adapter's output %#lx", hr);
+    hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory);
+    CHECK(SUCCEEDED(hr) && factory, "adapter's parent IDXGIFactory2 %#lx", hr);
+    if (factory)
+        IDXGIFactory2_Release(factory);
+    if (output)
+        IDXGIOutput_Release(output);
+    IDXGIAdapter_Release(adapter);
+    IDXGIDevice_Release(dxgi);
 }
 
 static void test_pacing(void *dev)
@@ -2683,6 +2720,7 @@ static void test_xbox(void)
     hr = XSLOT(dev, 100, HRESULT, UINT_PTR, UINT_PTR, UINT_PTR)(dev, 1, 2, 3);
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
 
+    test_dxgi_device(dev);
     test_pacing(dev);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);

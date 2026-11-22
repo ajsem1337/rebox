@@ -33,7 +33,7 @@
 #include <d3d12.h>
 /* DXGI IIDs are instantiated here; d3d12_xs.c does the D3D12 ones. */
 #include <initguid.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

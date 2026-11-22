@@ -35,6 +35,7 @@
 #include "present.h"
 #include "proxy.h"
 #include "title_textures.h"
+#include "dxgi_device.h"
 
 #define INNER_OFFSET 0x1000
 #define DEVICE_OUT_OF_LINE_FLAG 0x18
@@ -230,6 +231,12 @@ static HRESULT STDMETHODCALLTYPE proxy_QueryInterface(struct proxy *p, REFIID ri
     if (!out)
         return E_POINTER;
     *out = NULL;
+    /* The console device is also an IDXGIDevice, which titles use without checking. */
+    if (p->cls == &device_class && dxgi_device_iid(riid))
+    {
+        *out = dxgi_device_get((IUnknown *)p);
+        return S_OK;
+    }
     /* vkd3d-proton returns the same pointer for every version of an
      * interface (and for IUnknown/ID3D12Object/ID3D12DeviceChild), so "same
      * object back" means the proxy can answer for it. */
