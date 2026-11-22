@@ -2990,6 +2990,25 @@ static void test_xbox(void)
         if (pso) XSLOT(pso, 2, ULONG)(pso);
     }
 
+    /* A committed buffer smaller than a constant buffer view is rounded up to 256 bytes, so a
+     * 256-byte CBV on it (as console titles make, per XValkyrie) stays inside. */
+    {
+        D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC small = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 80, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                      D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+        ID3D12Resource *buf = NULL;
+        D3D12_RESOURCE_DESC got = { 0 };
+
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
+                   &small, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&buf);
+        if (buf)
+            XSLOT(buf, 10, D3D12_RESOURCE_DESC *, D3D12_RESOURCE_DESC *)(buf, &got); /* GetDesc, MSVC hidden return */
+        CHECK(SUCCEEDED(hr) && got.Width == 256, "an 80-byte committed buffer is made 256 bytes (%#lx, %llu)", hr,
+              (unsigned long long)got.Width);
+        if (buf) ID3D12Resource_Release(buf);
+    }
+
     /* Slot 76 as the FidelityFX upscaler calls it (Xbox2Windows): a 0x40-byte
      * desc with Xbox texture layout 0x101 and extension word 3. */
     {

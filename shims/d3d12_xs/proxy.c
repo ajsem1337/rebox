@@ -812,12 +812,21 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p,
         const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
     D3D12_HEAP_PROPERTIES storage;
-    D3D12_RESOURCE_DESC desc_storage;
+    D3D12_RESOURCE_DESC desc_storage, rounded;
     HRESULT hr;
 
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         props = buffer_heap(props, &storage);
     desc = pc_desc(desc, &desc_storage);
+    /* Console titles put 256-byte constant buffer views on smaller buffers (XValkyrie: 256 on
+     * 80 bytes, which got the device removed on Windows). Committed buffers are rounded up to
+     * 256 bytes so such a view stays inside the buffer. */
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && (desc->Width & 0xff))
+    {
+        rounded = *desc;
+        rounded.Width = (desc->Width + 0xff) & ~(UINT64)0xff;
+        desc = &rounded;
+    }
     hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear, riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
