@@ -240,7 +240,8 @@ down missing translations.
   it off). Which console layout
   means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) follows the target title's
   texture pools: cubemaps and volumes `SW_4KB_S`, other arrays `SW_64KB_D`, and single textures
-  `SW_64KB_D` from 1 MiB of mip 0 and `SW_4KB_S` below; each
+  `SW_64KB_D` from 1 MiB of mip 0, or with no mip chain from 64 KiB padded, `SW_4KB_S` otherwise
+  (true of all but one of the pools' 351,795 2D textures); each
   distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton

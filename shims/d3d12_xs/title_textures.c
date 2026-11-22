@@ -16,8 +16,8 @@
  *
  * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
  * picks: "auto" (default: ROW_MAJOR descs linear; cubemaps and volumes SW_4KB_S, other arrays
- * SW_64KB_D; single 2D textures SW_64KB_D when mip 0 is at least 1 MiB and SW_4KB_S below: what
- * the target title's texture pools show), "64KB_D", "4KB_S", "linear",
+ * SW_64KB_D; single 2D textures by single_texture_mode: what the target title's texture pools show),
+ * "64KB_D", "4KB_S", "linear",
  * or "off" (no uploads). Each distinct console layout is logged once with what it got. */
 
 #define COBJMACROS
@@ -118,6 +118,22 @@ static int mode_setting(void)
         free(v);
     }
     return setting;
+}
+
+/* A single 2D texture's swizzle mode, by the rule the target title's pools follow for all but one of their
+ * 351,795 2D textures (helpers/textures): SW_64KB_D when mip 0 is 1 MiB or more, or when there is
+ * only mip 0 and it takes more than 64 KiB in SW_4KB_S (padding included: a 4x2048 BC1 texture
+ * is one block wide but pads to 128 KiB); SW_4KB_S otherwise. */
+static enum detile_mode single_texture_mode(const struct detile_surface *s, UINT block, UINT bytes)
+{
+    struct detile_surface one = *s;
+    UINT64 mip0 = (UINT64)((s->width + block - 1) / block) * ((s->height + block - 1) / block) * bytes;
+
+    if (mip0 >= (1u << 20))
+        return DETILE_64KB_D;
+    one.mode = DETILE_4KB_S;
+    one.mips = 1;
+    return s->mips == 1 && detile_size(&one) > 65536 ? DETILE_64KB_D : DETILE_4KB_S;
 }
 
 /* 2D arrays are read a mip (all its slices) at a time: the target title's pools store them that way, and a
@@ -225,8 +241,7 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     else if (t->surface.layers > 1)
         t->surface.mode = DETILE_64KB_D;
     else
-        t->surface.mode = (UINT64)((t->surface.width + block - 1) / block) * ((t->surface.height + block - 1) / block)
-                * bytes >= (1u << 20) ? DETILE_64KB_D : DETILE_4KB_S;
+        t->surface.mode = single_texture_mode(&t->surface, block, bytes);
     t->subresources = t->surface.mips * (t->surface.volume ? 1 : t->surface.layers);
     t->size = detile_size(&t->surface);
 

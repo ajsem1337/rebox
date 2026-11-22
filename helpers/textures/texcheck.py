@@ -23,14 +23,21 @@ DETILE_LINEAR, DETILE_4KB_S, DETILE_64KB_D = 0, 1, 2
 MODE_NAMES = {DETILE_LINEAR: "linear", DETILE_4KB_S: "SW_4KB_S", DETILE_64KB_D: "SW_64KB_D"}
 
 
-def our_mode(shape, width, height, layers, block, element_bytes):
-    """title_textures.c's REBOX_TEXTURE_SWIZZLE=auto rule."""
+TILE_4K = {1: (64, 64), 2: (64, 32), 4: (32, 32), 8: (32, 16), 16: (16, 16)}  # elements per 4 KiB tile
+
+
+def our_mode(shape, width, height, layers, mips, block, element_bytes):
+    """title_textures.c's REBOX_TEXTURE_SWIZZLE=auto rule (single_texture_mode for 2D)."""
     if shape in ("volume", "cubemap") or (shape != "2d" and layers == 6):
         return DETILE_4KB_S
     if layers > 1:
         return DETILE_64KB_D
-    blocks = ((width + block - 1) // block) * ((height + block - 1) // block)
-    return DETILE_64KB_D if blocks * element_bytes >= 1 << 20 else DETILE_4KB_S
+    bw, bh = (width + block - 1) // block, (height + block - 1) // block
+    if bw * bh * element_bytes >= 1 << 20:
+        return DETILE_64KB_D
+    tw, th = TILE_4K[element_bytes]
+    padded = -(-bw // tw) * tw * -(-bh // th) * th * element_bytes
+    return DETILE_64KB_D if mips == 1 and padded > 65536 else DETILE_4KB_S
 
 
 def jobs_for(tm, pool, index, a):
@@ -40,7 +47,7 @@ def jobs_for(tm, pool, index, a):
     block = 4 if d["format"] in tm.BC_FORMATS else 1
     eb = layout["element_bytes"]
     layers = d["depth"]
-    mode = our_mode(shape, d["width"], d["height"], layers, block, eb)
+    mode = our_mode(shape, d["width"], d["height"], layers, d["mips"], block, eb)
     cache = {}
     if shape == "cubemap":
         tiled = pool.read_range(d["base"] + layout["data_offset"], 6 * layout["face_size"], cache,
