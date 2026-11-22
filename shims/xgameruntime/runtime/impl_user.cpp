@@ -153,13 +153,14 @@ HRESULT XUserGetGamertag_impl(void*, void* h, uint32_t component, size_t size, c
   if (used) *used = n + 1;
   return S_OK;
 }
-uint8_t XUserIsStoreUser_impl(void*, void*) { return 0; }
+uint8_t XUserIsStoreUser_impl(void*, void*) { return 1; }
 uint8_t XUserIsSignOutPresent_impl(void*) { return 0; }
 
 // change events never fire (the one user never signs out); registration succeeds so titles that wait for sign-in events proceed
-HRESULT XUserRegisterForChangeEvent_impl(void*, void*, void*, void*, task::RegistrationToken* tok) {
+HRESULT XUserRegisterForChangeEvent_impl(void*, void*, void*, void* callback, task::RegistrationToken* tok) {
   static std::atomic<uint64_t> next{1};
-  if (tok) tok->token = next++;
+  if (!callback || !tok) return E_INVALIDARG;
+  tok->token = next++;
   return S_OK;
 }
 uint8_t XUserUnregisterForChangeEvent_impl(void*, task::RegistrationToken, uint8_t) { return 1; }

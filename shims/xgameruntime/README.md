@@ -4,7 +4,7 @@ Titles load `xgameruntime.dll` with `LoadLibrary` and get every Gaming Runtime A
 (XUser, XGameSave, XPackage, XStore, XTaskQueue, ...) as an interface from `QueryApiImpl`.
 WineGDK's runtime answers five of them, and its XUser is stubs. This directory is
 [americas-recomp](https://github.com/realdody/americas-recomp)'s replacement
-(`tools/xbox/platform/xgr` at a3c48315113391d93771f1121bff14cc12d2dbca, GPL-2.0-or-later), which
+(`tools/xbox/platform/xgr` at 99cea85c1385bea66026e1d6e7586f437a96cac1, GPL-2.0-or-later), which
 vendors GrandTheftXbox's XTaskQueue/XAsync layer (MIT, `runtime/GTX_LICENSE.txt`). Its behaviour,
 offline answers and settings are described in `UPSTREAM-README.md`, with a summary below.
 
@@ -56,6 +56,9 @@ outright:
 - `test_launch`: 5 checks fail. Launching a URI through the program registered for its scheme,
   and `RegisterApplicationRestart`, aren't what Wine does.
 - `test_system`: the desktop HDR state through DXGI, which Wine doesn't report.
-- `test_package`: mounting the title's own persistent local storage as a package fails when the
-  test changes `XGR_PLS_DIR` within one process. Not investigated yet.
+- `test_package`: mounting the title's own persistent local storage as a package fails in the
+  phase that changes `XGR_PLS_DIR`. The storage root and quota are read once per process and kept
+  in statics, and under Wine the DLL isn't really unloaded between the test's phases, so the
+  earlier phase's settings stay. A title sets nothing mid-run: `rebox-run` sets `XGR_PLS_DIR`
+  before it starts, and the target title's `MicrosoftGame.Config` gives the quota (2048 MB).
 - `test_accessibility` isn't built: it needs the WinRT headers too.

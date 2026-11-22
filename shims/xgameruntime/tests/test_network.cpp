@@ -160,6 +160,58 @@ static void CheckPortChanged() {
   g_threading.At<void (*)(void*, void*)>(17, "XTaskQueueCloseHandle")(g_threading.self, manual);
 }
 
+struct Blocking { HANDLE entered; HANDLE release; volatile LONG calls; };
+static void CALLBACK BlockingPortChanged(void* context, uint16_t) {
+  auto* b = static_cast<Blocking*>(context);
+  InterlockedIncrement(&b->calls);
+  SetEvent(b->entered);
+  WaitForSingleObject(b->release, 10000);
+}
+
+struct UnregisterCall { UnregisterFn unreg; void* self; Token token; BOOLEAN result; };
+static DWORD WINAPI UnregisterAndWait(void* p) {
+  auto* call = static_cast<UnregisterCall*>(p);
+  call->result = call->unreg(call->self, call->token, TRUE);
+  return 0;
+}
+
+static void CheckPortUnregisterWhileRunning() {
+  auto reg = g_net.At<RegisterFn>(6, "XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged");
+  auto unreg = g_net.At<UnregisterFn>(7, "XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged");
+  Blocking b{CreateEventW(nullptr, FALSE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+  Token token{};
+  HRESULT hr = reg(g_net.self, nullptr, &b, reinterpret_cast<void*>(&BlockingPortChanged), &token);
+  bool running = hr == S_OK && WaitForSingleObject(b.entered, 5000) == WAIT_OBJECT_0;
+  Check(running && unreg(g_net.self, token, FALSE) == 0,
+        "XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(wait=false) during the callback returns false (documented: pending)");
+  Check(unreg(g_net.self, token, FALSE) == 0,
+        "XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged: polling a pending token keeps returning false while the callback runs");
+  SetEvent(b.release);
+  BOOLEAN done = 0;
+  for (int i = 0; i < 500 && !done; ++i) {
+    done = unreg(g_net.self, token, FALSE);
+    if (!done) Sleep(10);
+  }
+  Check(done == 1 && b.calls == 1,
+        "XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged: polling returns true once the callback has returned");
+
+  ResetEvent(b.release);
+  Token second{};
+  hr = reg(g_net.self, nullptr, &b, reinterpret_cast<void*>(&BlockingPortChanged), &second);
+  running = hr == S_OK && WaitForSingleObject(b.entered, 5000) == WAIT_OBJECT_0;
+  running = running && unreg(g_net.self, second, FALSE) == 0;
+  UnregisterCall call{unreg, g_net.self, second, 2};
+  HANDLE thread = CreateThread(nullptr, 0, &UnregisterAndWait, &call, 0, nullptr);
+  bool blocked = thread && WaitForSingleObject(thread, 200) == WAIT_TIMEOUT;
+  SetEvent(b.release);
+  bool finished = thread && WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0;
+  Check(running && blocked && finished && call.result == 1,
+        "XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(wait=true) after a pending wait=false still blocks until the callback returns");
+  if (thread) CloseHandle(thread);
+  CloseHandle(b.entered);
+  CloseHandle(b.release);
+}
+
 static void CheckOfflineQuery(HRESULT begun, AsyncBlock* block, SecuritySizeFn size, SecurityResultFn result, const char* name) {
   char label[200];
   HRESULT status = WaitAsync(block);
@@ -283,6 +335,7 @@ int main() {
   g_net = Get(kNetworking);
   CheckPreferredPort();
   CheckPortChanged();
+  CheckPortUnregisterWhileRunning();
   CheckSecurityInformation();
   CheckVerifyServerCertificate();
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);

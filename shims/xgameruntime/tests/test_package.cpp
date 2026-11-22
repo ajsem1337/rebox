@@ -375,6 +375,19 @@ void phase_bogus_language() {
   lang.text = "ZZ-zz";
   check(r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 1u, &lang, &avail) == S_OK && avail == 0, P,
         "FindChunkAvailability(declared language) = Ready");
+  lang.text = "zz-ZZ;ZZ-zz";
+  check(r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 1u, &lang, &avail) == S_OK && avail == 0, P,
+        "FindChunkAvailability(\"declared;declared\") = Ready");
+  for (const char* bad : {"zz-ZZ;en-US", "en-US;zz-ZZ", "zz-ZZ;", ";zz-ZZ", "zz-ZZ;;zz-ZZ", ";", "", "zz-ZZ ; zz-ZZ"}) {
+    lang.text = bad;
+    check(r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 1u, &lang, &avail) == kInvalidSelector, P,
+          (std::string("FindChunkAvailability(\"") + bad + "\") -> E_GAMEPACKAGE_INVALID_SELECTOR").c_str());
+  }
+  Selector pair[2]{};
+  pair[0].type = 0; pair[0].text = "zz-ZZ";
+  pair[1].type = 0; pair[1].text = "en-US";
+  check(r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 2u, pair, &avail) == kInvalidSelector, P,
+        "FindChunkAvailability({declared},{undeclared}) -> E_GAMEPACKAGE_INVALID_SELECTOR, like \"declared;undeclared\"");
   SeenChunks seen;
   check(r.pkg<HRESULT>(EnumerateChunkAvailability, "XGR.LocalPackage", 0u, static_cast<void*>(&seen), &record_chunk) == S_OK && seen.calls == 1 &&
             seen.languages[0] == "zz-ZZ" && seen.availability[0] == 0, P, "EnumerateChunkAvailability(Language): declared language, Ready");
@@ -408,6 +421,17 @@ void phase_config() {
   char locale[85] = {};
   check(r.pkg<HRESULT>(GetUserLocale, sizeof(locale), locale) == S_OK && locale_utf8 == locale, P, "XPackageGetUserLocale = user locale declared by the package");
   check(r.pkg<HRESULT>(GetUserLocale, static_cast<size_t>(2), locale) == E_NOT_SUFFICIENT_BUFFER, P, "XPackageGetUserLocale: short buffer");
+  {
+    std::string joined = "zz-ZZ;" + locale_utf8;
+    Selector one{}; one.type = 0; one.text = joined.c_str();
+    Selector two[2]{};
+    two[0].type = 0; two[0].text = "zz-ZZ";
+    two[1].type = 0; two[1].text = locale_utf8.c_str();
+    uint32_t a1 = 9, a2 = 9;
+    check(r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 1u, &one, &a1) == S_OK && a1 == 0 &&
+              r.pkg<HRESULT>(FindChunkAvailability, "XGR.LocalPackage", 2u, two, &a2) == S_OK && a2 == 0, P,
+          "FindChunkAvailability: {Lang \"a;b\"} and {Lang a},{Lang b} both Ready");
+  }
 
   AsyncBlock ab{};
   ab = {};

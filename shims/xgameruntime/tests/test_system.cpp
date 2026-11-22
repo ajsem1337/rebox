@@ -251,6 +251,76 @@ static void CheckActivation() {
   CheckSilentEvent(invite, 5, "XGameInviteRegisterForPendingEvent", 6, "XGameInviteUnregisterForPendingEvent");
 }
 
+struct Blocking { HANDLE entered; HANDLE release; volatile LONG calls; };
+static void CALLBACK BlockingHint(void* context, const ConnectivityHint*) {
+  auto* b = static_cast<Blocking*>(context);
+  InterlockedIncrement(&b->calls);
+  SetEvent(b->entered);
+  WaitForSingleObject(b->release, 10000);
+}
+
+struct UnregisterCall { UnregisterFn unreg; void* self; Token token; BOOLEAN result; };
+static DWORD WINAPI UnregisterAndWait(void* p) {
+  auto* call = static_cast<UnregisterCall*>(p);
+  call->result = call->unreg(call->self, call->token, TRUE);
+  return 0;
+}
+
+static void CheckConnectivityUnregisterWhileRunning() {
+  Api net = Get(kNetworking);
+  auto reg = net.At<HRESULT (*)(void*, void*, void*, void*, Token*)>(16, "XNetworkingRegisterConnectivityHintChanged");
+  auto unreg = net.At<UnregisterFn>(17, "XNetworkingUnregisterConnectivityHintChanged");
+  Blocking b{CreateEventW(nullptr, FALSE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+  Token token{};
+  HRESULT hr = reg(net.self, nullptr, &b, reinterpret_cast<void*>(&BlockingHint), &token);
+  bool running = hr == S_OK && WaitForSingleObject(b.entered, 5000) == WAIT_OBJECT_0;
+  Check(running && unreg(net.self, token, FALSE) == 0,
+        "XNetworkingUnregisterConnectivityHintChanged(wait=false) during the callback returns false (documented: pending)");
+  Check(unreg(net.self, token, FALSE) == 0,
+        "XNetworkingUnregisterConnectivityHintChanged: polling a pending token keeps returning false while the callback runs");
+  SetEvent(b.release);
+  BOOLEAN done = 0;
+  for (int i = 0; i < 500 && !done; ++i) {
+    done = unreg(net.self, token, FALSE);
+    if (!done) Sleep(10);
+  }
+  Check(done == 1 && b.calls == 1, "XNetworkingUnregisterConnectivityHintChanged: polling returns true once the callback has returned");
+
+  ResetEvent(b.release);
+  Token second{};
+  hr = reg(net.self, nullptr, &b, reinterpret_cast<void*>(&BlockingHint), &second);
+  running = hr == S_OK && WaitForSingleObject(b.entered, 5000) == WAIT_OBJECT_0;
+  running = running && unreg(net.self, second, FALSE) == 0;
+  UnregisterCall call{unreg, net.self, second, 2};
+  HANDLE thread = CreateThread(nullptr, 0, &UnregisterAndWait, &call, 0, nullptr);
+  bool blocked = thread && WaitForSingleObject(thread, 200) == WAIT_TIMEOUT;
+  SetEvent(b.release);
+  bool finished = thread && WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0;
+  Check(running && blocked && finished && call.result == 1,
+        "XNetworkingUnregisterConnectivityHintChanged(wait=true) after a pending wait=false still blocks until the callback returns");
+  if (thread) CloseHandle(thread);
+  CloseHandle(b.entered);
+  CloseHandle(b.release);
+
+  auto query = net.At<HRESULT (*)(void*, uint32_t, uint64_t*)>(18, "XNetworkingQueryConfigurationSetting");
+  auto set = net.At<HRESULT (*)(void*, uint32_t, uint64_t)>(19, "XNetworkingSetConfigurationSetting");
+  auto stats = net.At<HRESULT (*)(void*, uint32_t, TcpStatistics*)>(20, "XNetworkingQueryStatistics");
+  bool configOk = true, statsOk = true;
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint64_t value = 77;
+    configOk = configOk && query(net.self, i, &value) == S_OK && value == 0 && set(net.self, i, 0) == E_NOTIMPL;
+    TcpStatistics s;
+    std::memset(&s, 0xcc, sizeof(s));
+    bool zero = stats(net.self, i, &s) == S_OK;
+    for (uint64_t v : s.values) zero = zero && v == 0;
+    statsOk = statsOk && zero;
+  }
+  Check(configOk, "XNetworking{Query,Set}ConfigurationSetting: all three settings read 0 and refuse a set with E_NOTIMPL (documented for PC)");
+  Check(statsOk, "XNetworkingQueryStatistics: all three types report zeros (documented for PC)");
+  Check(query(net.self, 0, nullptr) == E_INVALIDARG && stats(net.self, 0, nullptr) == E_INVALIDARG,
+        "XNetworkingQueryConfigurationSetting and XNetworkingQueryStatistics reject a null out pointer");
+}
+
 static void CheckNetworking() {
   Api net = Get(kNetworking);
   ConnectivityHint hint;
@@ -477,6 +547,7 @@ int main() {
   CheckFeatures();
   CheckActivation();
   CheckNetworking();
+  CheckConnectivityUnregisterWhileRunning();
   CheckAccessibility();
   CheckUser();
   CheckGameUi();

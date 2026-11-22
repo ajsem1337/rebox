@@ -186,15 +186,44 @@ static void CheckCanAcquire() {
   Api package = Get(kPackage);
   package.At<HRESULT (*)(void*, size_t, char*)>(3, "XPackageGetCurrentProcessPackageIdentifier")(package.self, sizeof(packageId), packageId);
 
+  AsyncBlock licenseBlock{};
+  GameLicense license{};
+  g_store.At<ContextAsyncFn>(28, "XStoreQueryGameLicenseAsync")(g_store.self, g_context, &licenseBlock);
+  Wait(&licenseBlock);
+  g_store.At<HRESULT (*)(void*, AsyncBlock*, GameLicense*)>(29, "XStoreQueryGameLicenseResult")(g_store.self, &licenseBlock, &license);
+  std::string ownStoreId(license.skuStoreId, strnlen(license.skuStoreId, sizeof(license.skuStoreId)));
+  ownStoreId = ownStoreId.substr(0, ownStoreId.find('/'));
+
   AsyncBlock block{};
   CanAcquireLicenseResult result{};
-  Check(canPackage(g_store.self, g_context, packageId, &block) == S_OK && Wait(&block) == S_OK &&
-            canPackageResult(g_store.self, &block, &result) == S_OK && result.status == 1 && std::strcmp(result.licensableSku, "0010") == 0,
-        "the title's own package is licensable");
+  Check(canPackage(g_store.self, g_context, packageId, &block) == S_OK && Wait(&block) == kNetworkError &&
+            canPackageResult(g_store.self, &block, &result) == kNetworkError,
+        "XStoreCanAcquireLicenseForPackageAsync needs the store, also for the title's own package (documented as online only)");
+  block = {};
+  Check(!ownStoreId.empty() && canStoreId(g_store.self, g_context, ownStoreId.c_str(), &block) == S_OK && Wait(&block) == kNetworkError &&
+            canStoreIdResult(g_store.self, &block, &result) == kNetworkError,
+        "XStoreCanAcquireLicenseForStoreIdAsync needs the store, also for the title's own store id");
   block = {};
   Check(canStoreId(g_store.self, g_context, "9NOTOURS0000", &block) == S_OK && Wait(&block) == kNetworkError &&
             canStoreIdResult(g_store.self, &block, &result) == kNetworkError,
-        "another store id needs the store (E_GAMESTORE_NETWORK_ERROR)");
+        "XStoreCanAcquireLicenseForStoreIdAsync needs the store (E_GAMESTORE_NETWORK_ERROR)");
+  block = {};
+  Check(canPackage(g_store.self, g_context, nullptr, &block) == E_INVALIDARG && canStoreId(g_store.self, g_context, nullptr, &block) == E_INVALIDARG &&
+            canPackage(g_store.self, nullptr, packageId, &block) == E_INVALIDARG,
+        "XStoreCanAcquireLicenseFor*Async reject a null id or context");
+}
+
+static void CheckLicenseToken() {
+  auto token = g_store.At<HRESULT (*)(void*, void*, const char**, size_t, const char*, AsyncBlock*)>(43, "XStoreQueryLicenseTokenAsync");
+  const char* products[] = {"9NOTOURS0000"};
+  AsyncBlock block{};
+  Check(token(g_store.self, g_context, products, 1, "developer", &block) == S_OK && Wait(&block) == kNetworkError,
+        "XStoreQueryLicenseTokenAsync needs the store (E_GAMESTORE_NETWORK_ERROR)");
+  block = {};
+  Check(token(g_store.self, g_context, products, 1, "", &block) == E_INVALIDARG,
+        "XStoreQueryLicenseTokenAsync rejects an empty customDeveloperString (documented)");
+  Check(token(g_store.self, g_context, products, 1, nullptr, &block) == E_INVALIDARG && token(g_store.self, g_context, nullptr, 1, "developer", &block) == E_INVALIDARG,
+        "XStoreQueryLicenseTokenAsync rejects a null customDeveloperString or product list");
 }
 
 static void CheckOfflineQueries() {
@@ -277,6 +306,7 @@ int main() {
   CheckLicenses();
   CheckPackageLicense();
   CheckCanAcquire();
+  CheckLicenseToken();
   CheckOfflineQueries();
   CheckLicenseChanged();
   g_store.At<void (*)(void*, void*)>(4, "XStoreCloseContextHandle")(g_store.self, g_context);

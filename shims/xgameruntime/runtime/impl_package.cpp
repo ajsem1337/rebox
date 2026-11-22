@@ -443,12 +443,21 @@ HRESULT resolve_package(const char* packageIdentifier) {
   return identity().packageId == std::string(packageIdentifier, len) ? S_OK : kNoPackageIdentifier;
 }
 
-bool declares_language(const char* language) {
+bool declares_language(const char* languages) {
   const Identity& id = identity();
   if (id.languages.empty()) return true;
-  for (const std::string& l : id.languages)
-    if (equals_ignore_case(l, language)) return true;
-  return false;
+  const std::string list(languages, strnlen(languages, kMaxIdentifierScan));
+  size_t start = 0;
+  for (;;) {
+    size_t end = list.find(';', start);
+    std::string item = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    bool found = false;
+    for (const std::string& l : id.languages)
+      if (equals_ignore_case(l, item)) { found = true; break; }
+    if (item.empty() || !found) return false;
+    if (end == std::string::npos) return true;
+    start = end + 1;
+  }
 }
 
 HRESULT check_selectors(uint32_t count, const Selector* selectors) {

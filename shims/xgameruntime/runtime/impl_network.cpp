@@ -53,7 +53,7 @@ HRESULT XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult_impl(void*, 
                               sizeof(uint16_t), port, nullptr);
 }
 
-using PreferredPortChangedCallback = void(CALLBACK*)(void* context, uint64_t preferredLocalUdpMultiplayerPort);
+using PreferredPortChangedCallback = void(CALLBACK*)(void* context, uint16_t preferredLocalUdpMultiplayerPort);
 
 struct PortRegistration {
   void* context;
@@ -61,6 +61,7 @@ struct PortRegistration {
   task::Queue* queue;
   bool active;
   bool running;
+  uint64_t token;
 };
 
 std::atomic<uint64_t> g_next_port_token{1};
@@ -81,6 +82,7 @@ void CALLBACK deliver_initial_preferred_port(void* holder, bool canceled) {
     r.callback(r.context, kDefaultPreferredLocalUdpMultiplayerPort);
     std::lock_guard<std::mutex> lock(g_port_lock);
     r.running = false;
+    if (!r.active) g_port_registrations.erase(r.token);
     g_port_idle.notify_all();
   }
   task::Close(r.queue);
@@ -97,8 +99,8 @@ HRESULT XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged_impl(void*, t
   } else if (!task::GetProcessQueue(&target)) {
     return E_INVALIDARG;
   }
-  auto registration = std::make_shared<PortRegistration>(PortRegistration{context, callback, target, true, false});
   uint64_t value = g_next_port_token++;
+  auto registration = std::make_shared<PortRegistration>(PortRegistration{context, callback, target, true, false, value});
   {
     std::lock_guard<std::mutex> lock(g_port_lock);
     g_port_registrations.emplace(value, registration);
@@ -121,9 +123,11 @@ uint8_t XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged_impl(void*,
   auto found = g_port_registrations.find(token.token);
   if (found == g_port_registrations.end()) return 1;
   std::shared_ptr<PortRegistration> registration = found->second;
-  g_port_registrations.erase(found);
   registration->active = false;
-  if (!registration->running) return 1;
+  if (!registration->running) {
+    g_port_registrations.erase(found);
+    return 1;
+  }
   if (!wait) return 0;
   g_port_idle.wait(lock, [&] { return !registration->running; });
   return 1;

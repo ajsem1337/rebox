@@ -95,6 +95,8 @@ constexpr HRESULT kFailedToGetToken = static_cast<HRESULT>(0x89245111);
 static const GUID kUser = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
 static const GUID kUser2 = {0xeb9bf948, 0x18dc, 0x4d82, {0xbb, 0xcc, 0x40, 0xe0, 0xa8, 0x09, 0xc4, 0xc0}};
 static const GUID kUser3 = {0x1bf2f8c5, 0xd507, 0x4e52, {0xbb, 0x05, 0xf7, 0x26, 0xd0, 0xe7, 0x11, 0x61}};
+static const GUID kUser4 = {0x079415e3, 0x6727, 0x437f, {0x8e, 0x9d, 0x8f, 0x8f, 0x9b, 0x24, 0x39, 0xf7}};
+static const GUID kUserGamertag = {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
 static const GUID kUser5 = {0x26f3c674, 0xa2fe, 0x44fa, {0xb6, 0xc4, 0xa3, 0x23, 0xbc, 0x94, 0xff, 0x53}};
 static const GUID kUser6 = {0x5131d685, 0x4394, 0x4ee6, {0x8c, 0x18, 0xbf, 0xb5, 0xd4, 0xae, 0xf1, 0xff}};
 static const GUID kThreading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
@@ -394,6 +396,83 @@ static void CheckSignOut(const Api& user6) {
   Check(result(user6.self, &unused) == E_INVALIDARG, "XUserSignOutResult rejects a block that was never started");
 }
 
+struct LocalId { uint64_t value; };
+struct RegistrationToken { uint64_t token; };
+static void CALLBACK NeverFiredChange(void*, LocalId, uint32_t) {}
+
+static void CheckProfileAnswers(const Api& user4) {
+  auto closeHandle = g_user.At<void (*)(void*, void*)>(4, "XUserCloseHandle");
+  uint32_t maxUsers = 0;
+  Check(g_user.At<HRESULT (*)(void*, uint32_t*)>(6, "XUserGetMaxUsers")(g_user.self, &maxUsers) == S_OK && maxUsers == 4,
+        "XUserGetMaxUsers reports 4 (a choice; no GDK page gives a number)");
+  Check(user4.At<BOOLEAN (*)(void*, void*)>(42, "XUserIsStoreUser")(user4.self, g_handle) == 1,
+        "XUserIsStoreUser is true, the documented console answer");
+  uint32_t ageGroup = 9;
+  Check(g_user.At<HRESULT (*)(void*, void*, uint32_t*)>(19, "XUserGetAgeGroup")(g_user.self, g_handle, &ageGroup) == S_OK && ageGroup == 3,
+        "XUserGetAgeGroup reports an adult");
+  BOOLEAN guest = 9;
+  Check(g_user.At<HRESULT (*)(void*, void*, BOOLEAN*)>(13, "XUserGetIsGuest")(g_user.self, g_handle, &guest) == S_OK && guest == 0,
+        "XUserGetIsGuest reports that the local user is not a guest");
+
+  auto compare = g_user.At<int32_t (*)(void*, void*, void*)>(5, "XUserCompare");
+  int32_t forward = compare(g_user.self, g_handle, nullptr);
+  int32_t backward = compare(g_user.self, nullptr, g_handle);
+  Check(compare(g_user.self, g_handle, g_handle) == 0 && forward != 0 && backward != 0 && (forward < 0) != (backward < 0),
+        "XUserCompare is 0 for the same user and orders two different handles consistently");
+
+  LocalId localId{};
+  void* found = nullptr;
+  HRESULT getHr = g_user.At<HRESULT (*)(void*, void*, LocalId*)>(9, "XUserGetLocalId")(g_user.self, g_handle, &localId);
+  auto findByLocalId = g_user.At<HRESULT (*)(void*, LocalId, void**)>(10, "XUserFindUserByLocalId");
+  HRESULT findHr = findByLocalId(g_user.self, localId, &found);
+  Check(getHr == S_OK && findHr == S_OK && found == g_handle, "XUserFindUserByLocalId finds the user XUserGetLocalId named");
+  if (found) closeHandle(g_user.self, found);
+  void* missing = g_foreign;
+  LocalId other{localId.value + 1};
+  Check(findByLocalId(g_user.self, other, &missing) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "XUserFindUserByLocalId reports ERROR_NOT_FOUND for another local id");
+}
+
+static void CheckGamertag(const Api& gamertag) {
+  auto get = gamertag.At<HRESULT (*)(void*, void*, uint32_t, size_t, char*, size_t*)>(3, "XUserGetGamertag");
+  char modern[128] = {}, classic[128] = {}, suffix[128] = {'x'}, unique[128] = {};
+  size_t modernUsed = 0, classicUsed = 0, suffixUsed = 9, uniqueUsed = 0;
+  HRESULT modernHr = get(gamertag.self, g_handle, 1, sizeof(modern), modern, &modernUsed);
+  Check(modernHr == S_OK && modern[0] && modernUsed == std::strlen(modern) + 1, "XUserGetGamertag gives the modern gamertag and counts its terminator");
+  size_t classicLength = std::strlen(modern) < 15 ? std::strlen(modern) : 15;
+  Check(get(gamertag.self, g_handle, 0, sizeof(classic), classic, &classicUsed) == S_OK && classicUsed == classicLength + 1 &&
+            std::strncmp(classic, modern, classicLength) == 0 && classic[classicLength] == 0,
+        "XUserGetGamertag cuts the classic gamertag to 15 bytes");
+  Check(get(gamertag.self, g_handle, 2, sizeof(suffix), suffix, &suffixUsed) == S_OK && suffix[0] == 0 && suffixUsed == 1,
+        "XUserGetGamertag gives an empty modern suffix");
+  Check(get(gamertag.self, g_handle, 3, sizeof(unique), unique, &uniqueUsed) == S_OK && std::strcmp(unique, modern) == 0 && uniqueUsed == modernUsed,
+        "XUserGetGamertag gives the modern gamertag as the unique modern one");
+  char exact[128] = {};
+  Check(get(gamertag.self, g_handle, 1, modernUsed, exact, nullptr) == S_OK && std::strcmp(exact, modern) == 0,
+        "XUserGetGamertag fills a buffer of exactly the reported size, without a used pointer");
+  char tooShort[128] = {};
+  Check(get(gamertag.self, g_handle, 1, modernUsed - 1, tooShort, nullptr) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+        "XUserGetGamertag reports ERROR_INSUFFICIENT_BUFFER for a buffer one byte short");
+  Check(get(gamertag.self, g_handle, 4, sizeof(modern), modern, nullptr) == E_INVALIDARG, "XUserGetGamertag rejects an unknown component");
+  Check(get(gamertag.self, nullptr, 1, sizeof(modern), modern, nullptr) == E_INVALIDARG, "XUserGetGamertag rejects a null user");
+  Check(get(gamertag.self, g_handle, 1, sizeof(modern), nullptr, nullptr) == E_INVALIDARG, "XUserGetGamertag rejects a null buffer");
+}
+
+static void CheckChangeEvent() {
+  auto reg = g_user.At<HRESULT (*)(void*, void*, void*, void*, RegistrationToken*)>(33, "XUserRegisterForChangeEvent");
+  auto unreg = g_user.At<BOOLEAN (*)(void*, RegistrationToken, BOOLEAN)>(34, "XUserUnregisterForChangeEvent");
+  void* callback = reinterpret_cast<void*>(&NeverFiredChange);
+  RegistrationToken first{}, second{};
+  HRESULT firstHr = reg(g_user.self, nullptr, nullptr, callback, &first);
+  HRESULT secondHr = reg(g_user.self, nullptr, nullptr, callback, &second);
+  Check(firstHr == S_OK && secondHr == S_OK && first.token && second.token && first.token != second.token,
+        "XUserRegisterForChangeEvent gives each registration its own token");
+  RegistrationToken untouched{77};
+  Check(reg(g_user.self, nullptr, nullptr, nullptr, &untouched) == E_INVALIDARG && untouched.token == 77,
+        "XUserRegisterForChangeEvent rejects a null callback and leaves the token alone");
+  Check(reg(g_user.self, nullptr, nullptr, callback, nullptr) == E_INVALIDARG, "XUserRegisterForChangeEvent rejects a null token");
+  Check(unreg(g_user.self, first, TRUE) == TRUE && unreg(g_user.self, second, FALSE) == TRUE, "XUserUnregisterForChangeEvent succeeds with and without wait");
+}
+
 int main() {
   HMODULE module = LoadLibraryA("xgameruntime.dll");
   if (!module) {
@@ -409,8 +488,10 @@ int main() {
   g_user = Get(kUser, "IXUserImpl");
   Api user2 = Get(kUser2, "IXUserImpl2");
   Api user3 = Get(kUser3, "IXUserImpl3");
+  Api user4 = Get(kUser4, "IXUserImpl4");
   Api user5 = Get(kUser5, "IXUserImpl5");
   Api user6 = Get(kUser6, "IXUserImpl6");
+  Api gamertag = Get(kUserGamertag, "IXUserGamertagImpl");
   g_completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
   AsyncBlock add{};
@@ -420,6 +501,9 @@ int main() {
   Check(hr == S_OK && added == S_OK && g_handle, "XUserAddAsync gives the local user");
   if (!g_handle) return 1;
 
+  CheckProfileAnswers(user4);
+  CheckGamertag(gamertag);
+  CheckChangeEvent();
   CheckGamerPicture();
   CheckResolvePrivilege();
   const HttpHeader headers[] = {{"Accept", "application/json"}};

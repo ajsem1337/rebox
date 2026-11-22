@@ -301,27 +301,17 @@ uint8_t XStoreIsLicenseValid_impl(void*, const License* license) { return live_l
 
 void XStoreCloseLicenseHandle_impl(void*, License* license) { close_license(license); }
 
-HRESULT begin_can_acquire(task::AsyncBlock* async, const void* identity, const char* name, bool ownProduct) {
-  if (!ownProduct) return begin(async, identity, name, kNetworkError);
-  CanAcquireLicenseResult result{};
-  std::memcpy(result.licensableSku, kSkuId, sizeof(kSkuId));
-  result.status = CanLicenseStatus::Licensable;
-  return begin(async, identity, name, S_OK, &result, sizeof(result));
-}
-
 HRESULT XStoreCanAcquireLicenseForStoreIdAsync_impl(void*, Context* context, const char* storeId, task::AsyncBlock* async) {
-  if (!live_context(context) || !storeId || !async) return E_INVALIDARG;
-  return begin_can_acquire(async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForStoreIdAsync_impl),
-                           "XStoreCanAcquireLicenseForStoreIdAsync", is_title_store_id(storeId));
+  if (!storeId) return E_INVALIDARG;
+  return offline(context, async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForStoreIdAsync_impl), "XStoreCanAcquireLicenseForStoreIdAsync");
 }
 HRESULT XStoreCanAcquireLicenseForStoreIdResult_impl(void*, task::AsyncBlock* async, CanAcquireLicenseResult* result) {
   return result_into(async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForStoreIdAsync_impl), result);
 }
 
 HRESULT XStoreCanAcquireLicenseForPackageAsync_impl(void*, Context* context, const char* packageIdentifier, task::AsyncBlock* async) {
-  if (!live_context(context) || !packageIdentifier || !async) return E_INVALIDARG;
-  return begin_can_acquire(async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForPackageAsync_impl),
-                           "XStoreCanAcquireLicenseForPackageAsync", is_title_package(packageIdentifier));
+  if (!packageIdentifier) return E_INVALIDARG;
+  return offline(context, async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForPackageAsync_impl), "XStoreCanAcquireLicenseForPackageAsync");
 }
 HRESULT XStoreCanAcquireLicenseForPackageResult_impl(void*, task::AsyncBlock* async, CanAcquireLicenseResult* result) {
   return result_into(async, reinterpret_cast<const void*>(&XStoreCanAcquireLicenseForPackageAsync_impl), result);
@@ -396,7 +386,7 @@ HRESULT XStoreGetUserPurchaseIdResult_impl(void*, task::AsyncBlock* async, size_
 
 HRESULT XStoreQueryLicenseTokenAsync_impl(void*, Context* context, const char** productIds, size_t productIdsCount, const char* customDeveloperString,
                                           task::AsyncBlock* async) {
-  if ((productIdsCount && !productIds) || !customDeveloperString) return E_INVALIDARG;
+  if ((productIdsCount && !productIds) || !customDeveloperString || !*customDeveloperString) return E_INVALIDARG;
   return offline(context, async, reinterpret_cast<const void*>(&XStoreQueryLicenseTokenAsync_impl), "XStoreQueryLicenseTokenAsync");
 }
 HRESULT XStoreQueryLicenseTokenResultSize_impl(void*, task::AsyncBlock* async, size_t* size) { return task::AsyncGetResultSize(async, size); }

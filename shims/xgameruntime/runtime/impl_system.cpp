@@ -215,6 +215,7 @@ struct ConnectivityRegistration {
   task::Queue* queue;
   bool active;
   bool running;
+  uint64_t token;
 };
 
 std::mutex g_connectivity_lock;
@@ -234,6 +235,7 @@ void CALLBACK deliver_initial_connectivity_hint(void* holder, bool canceled) {
     r.callback(r.context, &kOfflineHint);
     std::lock_guard<std::mutex> lock(g_connectivity_lock);
     r.running = false;
+    if (!r.active) g_connectivity.erase(r.token);
     g_connectivity_idle.notify_all();
   }
   task::Close(r.queue);
@@ -250,8 +252,8 @@ HRESULT XNetworkingRegisterConnectivityHintChanged_impl(void*, task::Queue* queu
   } else if (!task::GetProcessQueue(&target)) {
     return E_INVALIDARG;
   }
-  auto registration = std::make_shared<ConnectivityRegistration>(ConnectivityRegistration{context, callback, target, true, false});
   uint64_t value = g_next_token++;
+  auto registration = std::make_shared<ConnectivityRegistration>(ConnectivityRegistration{context, callback, target, true, false, value});
   {
     std::lock_guard<std::mutex> lock(g_connectivity_lock);
     g_connectivity.emplace(value, registration);
@@ -274,9 +276,11 @@ uint8_t XNetworkingUnregisterConnectivityHintChanged_impl(void*, task::Registrat
   auto found = g_connectivity.find(token.token);
   if (found == g_connectivity.end()) return 1;
   std::shared_ptr<ConnectivityRegistration> registration = found->second;
-  g_connectivity.erase(found);
   registration->active = false;
-  if (!registration->running) return 1;
+  if (!registration->running) {
+    g_connectivity.erase(found);
+    return 1;
+  }
   if (!wait) return 0;
   g_connectivity_idle.wait(lock, [&] { return !registration->running; });
   return 1;
