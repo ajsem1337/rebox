@@ -329,6 +329,68 @@ static enum shadow_view view_kind(ID3D12Resource *res, int is_buffer, DXGI_FORMA
     return uav ? SHADOW_VIEW_UAV_TYPED : SHADOW_VIEW_SRV_TYPED;
 }
 
+/* GPU address ranges of buffers the title made views of, for AnyPS5's BDA page table: memory a
+ * shader may reach by address. Kept after the views go: a buffer's range only matters while some
+ * descriptor or pointer still names it. */
+static SRWLOCK ranges_lock = SRWLOCK_INIT;
+static struct { UINT64 begin, end; } *buffer_ranges;
+static UINT buffer_range_count, buffer_range_capacity;
+
+static void note_buffer_range(UINT64 va, UINT64 size)
+{
+    if (!va || !size)
+        return;
+    AcquireSRWLockExclusive(&ranges_lock);
+    for (UINT i = 0; i < buffer_range_count; i++)
+        if (buffer_ranges[i].begin == va)
+        {
+            if (buffer_ranges[i].end < va + size)
+                buffer_ranges[i].end = va + size;
+            ReleaseSRWLockExclusive(&ranges_lock);
+            return;
+        }
+    if (buffer_range_count == buffer_range_capacity)
+    {
+        UINT capacity = buffer_range_capacity ? buffer_range_capacity * 2 : 256;
+        void *grown = realloc(buffer_ranges, capacity * sizeof(*buffer_ranges));
+        if (!grown)
+        {
+            ReleaseSRWLockExclusive(&ranges_lock);
+            return;
+        }
+        buffer_ranges = grown;
+        buffer_range_capacity = capacity;
+    }
+    buffer_ranges[buffer_range_count].begin = va;
+    buffer_ranges[buffer_range_count++].end = va + size;
+    ReleaseSRWLockExclusive(&ranges_lock);
+}
+
+static void note_buffer_view(ID3D12Resource *res)
+{
+    D3D12_RESOURCE_DESC rd;
+    if (!res)
+        return;
+    rd = ID3D12Resource_GetDesc(res);
+    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        note_buffer_range(ID3D12Resource_GetGPUVirtualAddress(res), rd.Width);
+}
+
+UINT shadow_buffer_ranges(UINT64 (*out)[2], UINT max)
+{
+    UINT n;
+
+    AcquireSRWLockShared(&ranges_lock);
+    n = min(buffer_range_count, max);
+    for (UINT i = 0; i < n; i++)
+    {
+        out[i][0] = buffer_ranges[i].begin;
+        out[i][1] = buffer_ranges[i].end;
+    }
+    ReleaseSRWLockShared(&ranges_lock);
+    return n;
+}
+
 static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_view view)
 {
     struct shadow_heap *h;
@@ -349,6 +411,8 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
 void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
 {
     UINT32 w[8];
+    if (desc)
+        note_buffer_range(desc->BufferLocation, desc->SizeInBytes);
     console_encode_cbv(desc, w);
     write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE);
 }
@@ -356,6 +420,7 @@ void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
 {
     UINT32 w[8];
+    note_buffer_view(res);
     console_encode_srv(res, desc, w);
     write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER : -1,
                desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER
@@ -378,6 +443,7 @@ void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACC
             h->uavs[index].desc = *desc;
     }
     ReleaseSRWLockExclusive(&lock);
+    note_buffer_view(res);
     console_encode_uav(res, desc, w);
     write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER : -1,
                desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER

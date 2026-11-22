@@ -168,33 +168,83 @@ static UINT64 host_buffer(const void *data, SIZE_T size)
 
 /* AnyPS5's BDA page table (BdaAbi.hpp): a header, then ranges sorted by guest address. GPU memory
  * is identity-mapped; shadow heaps map their title addresses to their GPU copies. */
-static UINT64 page_table(void)
+struct page_range { UINT64 begin, end, device; UINT32 permissions, reserved; };
+
+static int compare_ranges(const void *a, const void *b)
+{
+    const struct page_range *x = a, *y = b;
+    return x->begin < y->begin ? -1 : x->begin > y->begin;
+}
+
+/* Returns the table's GPU address and its size in *bytes (AnyPS5 checks that its length in words
+ * is exactly 4 + 8 * count, through OpArrayLength). */
+static UINT64 page_table(UINT32 *bytes)
 {
     struct shadow_region regions[MAX_REGIONS];
-    struct range { UINT64 begin, end, device; UINT32 permissions, reserved; } ranges[MAX_REGIONS + 2];
-    BYTE table[16 + sizeof(ranges)];
-    UINT n = shadow_regions(regions, MAX_REGIONS), count = 0;
+    struct gpu_memory_region chunks[MAX_REGIONS];
+    UINT64 (*buffers)[2] = malloc(65536 * sizeof(*buffers));
+    UINT n = shadow_regions(regions, MAX_REGIONS), nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
+    UINT nbuffers = buffers ? shadow_buffer_ranges(buffers, 65536) : 0, count = 0, merged = 0;
+    struct page_range *ranges = malloc((n + nchunks + nbuffers) * sizeof(*ranges));
+    BYTE *table;
+    UINT64 va = 0;
 
-    /* Insertion sort by title address. */
-    for (UINT i = 1; i < n; i++)
-        for (UINT j = i; j > 0 && regions[j].title_va < regions[j - 1].title_va; j--)
+    if (!ranges)
+    {
+        free(buffers);
+        return 0;
+    }
+    /* Memory that exists: GPU memory chunks and buffers the title viewed, at their GPU VAs, and
+     * the shadow heaps' title addresses mapped to their GPU copies. Anything else is unmapped, so
+     * a stray access becomes an AnyPS5 fault record, not a GPU page fault. */
+    for (UINT i = 0; i < nchunks; i++)
+        ranges[count++] = (struct page_range){ chunks[i].gpu, chunks[i].gpu + chunks[i].size, chunks[i].gpu, 3, 0 };
+    for (UINT i = 0; i < nbuffers; i++)
+        ranges[count++] = (struct page_range){ buffers[i][0], buffers[i][1], buffers[i][0], 3, 0 };
+    free(buffers);
+    qsort(ranges, count, sizeof(*ranges), compare_ranges);
+    /* Merge overlapping identity ranges (buffers inside chunks, repeated views). */
+    for (UINT i = 0; i < count; i++)
+    {
+        if (merged && ranges[i].begin <= ranges[merged - 1].end)
         {
-            struct shadow_region t = regions[j];
-            regions[j] = regions[j - 1];
-            regions[j - 1] = t;
+            if (ranges[i].end > ranges[merged - 1].end)
+                ranges[merged - 1].end = ranges[i].end;
         }
-    ranges[count++] = (struct range){ 0x10000, TITLE_BASE, 0x10000, 3, 0 };
+        else
+            ranges[merged++] = ranges[i];
+    }
+    count = merged;
+    /* Shadow heaps win where they overlap (identity ranges below 4 GiB, as with RADV's low window,
+     * could): identity ranges that touch one are dropped. */
     for (UINT i = 0; i < n; i++)
-        if (regions[i].gpu_va)
-            ranges[count++] = (struct range){ regions[i].title_va, regions[i].title_va + regions[i].size,
-                                              regions[i].gpu_va, 3, 0 };
-    ranges[count++] = (struct range){ 0x100000000ull, 1ull << 48, 0x100000000ull, 3, 0 };
+    {
+        UINT64 begin = regions[i].title_va, end = begin + regions[i].size;
+        if (!regions[i].gpu_va)
+            continue;
+        merged = 0;
+        for (UINT j = 0; j < count; j++)
+            if (ranges[j].end <= begin || ranges[j].begin >= end || ranges[j].device != ranges[j].begin)
+                ranges[merged++] = ranges[j];
+        count = merged;
+        ranges[count++] = (struct page_range){ begin, end, regions[i].gpu_va, 3, 0 };
+    }
+    qsort(ranges, count, sizeof(*ranges), compare_ranges);
+    if (!(table = malloc(16 + count * sizeof(*ranges))))
+    {
+        free(ranges);
+        return 0;
+    }
     ((UINT32 *)table)[0] = 1;            /* version */
     ((UINT32 *)table)[1] = count;
-    ((UINT32 *)table)[2] = sizeof(struct range);
+    ((UINT32 *)table)[2] = sizeof(struct page_range);
     ((UINT32 *)table)[3] = 0;
-    memcpy(table + 16, ranges, count * sizeof(struct range));
-    return host_buffer(table, 16 + count * sizeof(struct range));
+    memcpy(table + 16, ranges, count * sizeof(*ranges));
+    va = host_buffer(table, 16 + count * sizeof(*ranges));
+    *bytes = (UINT32)(16 + count * sizeof(*ranges));
+    free(table);
+    free(ranges);
+    return va;
 }
 
 /* Buffers the GPU writes (AnyPS5's fault buffer and GDS) can't come from the content-shared pool:
@@ -655,8 +705,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 break;
             }
             case ROLE_BDA_PAGETABLE:
-                va = page_table();
-                bytes = 0;
+                va = page_table(&bytes);
                 break;
             default:
             {

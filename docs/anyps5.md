@@ -126,7 +126,7 @@ What AnyPS5's driver would do and this host does instead, from its sources:
 | Samplers in no heap (built from literals in the code, or a twin) | decoded from the S# into a real sampler in the heap's hidden tail: every shader-visible heap gets 256 extra slots the title doesn't see (`GetDesc` hides them; patch 0005 raises vkd3d-proton's sampler-heap limit by 256) |
 | A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail |
 | FlattenedSrt (binding 61): every dword the shader's scalar loads read through user SGPRs | its words, in GPU memory shared by content |
-| BDA page table (59) | identity ranges for GPU memory, plus title address → GPU copy for each shadow heap |
+| BDA page table (59) | only memory that exists: `ReboxGpuAlloc` chunks and the buffers the title made views of, at their GPU VAs, plus each shadow heap's title address mapped to its GPU copy. A stray address then becomes an AnyPS5 fault record ("unmapped address") instead of a GPU page fault. AnyPS5 checks the table's length in words is exactly 4 + 8 × count |
 | Fault buffer (60), GDS (58) | one of each for the process, zeroed GPU memory as AnyPS5's driver keeps them. The fault record and the SRT guard word (set when a speculated descriptor turns out wrong at run time) are read at each compile, logged (the first 20 of each) and cleared. Faults come from earlier dispatches, so the log doesn't name the shader |
 | ShaderData (62) | its words, as FlattenedSrt (compute normally uses push data instead) |
 | Image and sampler tables, LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
@@ -231,8 +231,14 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    values. Skipped: shaders that bind a slot the inferred layout left empty, and one whose layout
    puts a buffer where it reads an image. Both are artefacts of the inference. The largest shaders
    (around 400k SPIR-V words) take llvmpipe about a minute each, so a lavapipe sweep takes hours.
-   The first 110 on lavapipe: 102 dispatched, 8 skipped. `tests/manual-test.sh` runs the sweep on
-   the 890M.
+   The first 110 on lavapipe: 102 dispatched, 8 skipped. The 890M (2026-11-22), first run: 232 of
+   the first 290 dispatched, 57 skipped, then a device loss on `sh_01093`, a BDA-path shader. The
+   page table then mapped the whole address space and had a wrong length, so every access through
+   it was invalid. Both are fixed, not yet re-run on hardware. Skips there: 31 bind a slot the
+   inferred layout left empty, 15 have a buffer V# where an image is read (layout artefacts), and
+   11 need role 10 (image table maps: runtime-indexed texture tables, not supported yet). lavapipe
+   segfaults on `sh_01092`, which RADV runs. `smoke.exe --console-cs` reports each shader's AnyPS5
+   faults on its line.
 5. Graphics stages, starting with a pixel shader.
 
 ## Open questions

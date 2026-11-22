@@ -2538,6 +2538,8 @@ struct console_cs
     ID3D12Resource *res[CS_RESOURCE_COUNT];
     PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize;
     HRESULT (WINAPI *last_result)(char *, SIZE_T);
+    UINT (WINAPI *faults)(void);
+    UINT faults_seen;
     SIZE_T cpu, sampler_cpu;
     UINT64 gpu, sampler_gpu, fence_value;
     UINT inc, sampler_inc;
@@ -2573,6 +2575,7 @@ static BOOL cs_setup(struct console_cs *c)
         return FALSE;
     c->serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)GetProcAddress(m, "D3D12SerializeRootSignature");
     c->last_result = (void *)GetProcAddress(m, "ReboxConsoleLastResult");
+    c->faults = (void *)GetProcAddress(m, "ReboxConsoleFaults");
     cs_analyse = (void *)GetProcAddress(GetModuleHandleA("rebox_anyps5.dll"), "sa5_analyse");
     if (!cs_analyse)
         return FALSE;
@@ -2852,7 +2855,13 @@ static int cs_run(struct console_cs *c, char *line)
         status = 3;
     else
         status = SUCCEEDED(hr) ? 0 : 1;
-    printf("cs %s %s: %s\n", name, status == 0 ? "dispatched" : status == 1 ? "skipped" : "hung", message);
+    {
+        /* AnyPS5 fault records (unmapped addresses, failed speculation) this dispatch left. */
+        UINT faults = c->faults ? c->faults() : 0;
+        printf("cs %s %s: %s%s\n", name, status == 0 ? "dispatched" : status == 1 ? "skipped" : "hung", message,
+               faults > c->faults_seen ? " [AnyPS5 reported a fault]" : "");
+        c->faults_seen = faults;
+    }
     fflush(stdout);
     XSLOT(pso, 2, ULONG)(pso);
     return status;
