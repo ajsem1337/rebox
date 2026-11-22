@@ -1105,10 +1105,62 @@ static void test_real_heap_va(void *dev, void *queue)
     {
         CHECK(mapped[0] == 0x5ca71e77, "compute shader wrote through a descriptor table set from heap slot 10 "
               "(%#x)", mapped[0]);
+        mapped[0] = 0;
         ID3D12Resource_Unmap(buf, 0, NULL);
     }
     else
         CHECK(0, "map the UAV buffer (%#lx)", hr);
+
+    /* The same dispatch through list slot 61 as ExecuteIndirect (Leonida, from the retail FSR DLL),
+     * with a command signature made through device slot 41. */
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+        D3D12_COMMAND_SIGNATURE_DESC sd = { sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &arg, 0 };
+        D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC ad = bd;
+        ID3D12CommandSignature *sig = NULL;
+        ID3D12Resource *args = NULL;
+        D3D12_DISPATCH_ARGUMENTS *dispatch = NULL;
+
+        ad.Flags = D3D12_RESOURCE_FLAG_NONE;
+        hr = XSLOT(dev, 41, HRESULT, const D3D12_COMMAND_SIGNATURE_DESC *, void *, REFIID, void **)(dev, &sd, NULL,
+                &IID_ID3D12CommandSignature, (void **)&sig);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                    D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
+                    &ad, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&args);
+        if (SUCCEEDED(hr) && SUCCEEDED(hr = ID3D12Resource_Map(args, 0, NULL, (void **)&dispatch)))
+        {
+            *dispatch = (D3D12_DISPATCH_ARGUMENTS){ 1, 1, 1 };
+            ID3D12Resource_Unmap(args, 0, NULL);
+        }
+        if (SUCCEEDED(hr))
+            hr = ID3D12CommandAllocator_Reset(alloc);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        CHECK(SUCCEEDED(hr), "command signature (device slot 41) and arguments for list slot 61 (%#lx)", hr);
+        if (SUCCEEDED(hr))
+        {
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, pso);
+            XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+            XSLOT(list, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 0, NULL, 0);
+            hr = XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
+                Sleep(10);
+            if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
+            {
+                CHECK(mapped[0] == 0x5ca71e77, "list slot 61 with a command signature runs ExecuteIndirect (%#x)",
+                      mapped[0]);
+                ID3D12Resource_Unmap(buf, 0, NULL);
+            }
+        }
+        if (args) ID3D12Resource_Release(args);
+        if (sig) ID3D12CommandSignature_Release(sig);
+    }
 
 done:
     if (fence) ID3D12Fence_Release(fence);

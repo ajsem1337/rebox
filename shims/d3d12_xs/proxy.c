@@ -632,6 +632,67 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT
     shadow_copy(dst, src, count);
 }
 
+/* Command signatures the title creates (slot 41, as on PC), so list slot 61 can tell
+ * ExecuteIndirect from BeginEvent. */
+static SRWLOCK signatures_lock = SRWLOCK_INIT;
+static void **signatures;
+static UINT signature_count, signature_capacity;
+
+static BOOL is_command_signature(void *object)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&signatures_lock);
+    for (UINT i = 0; i < signature_count && !found; i++)
+        found = signatures[i] == object;
+    ReleaseSRWLockShared(&signatures_lock);
+    return found;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, const D3D12_COMMAND_SIGNATURE_DESC *desc,
+        ID3D12RootSignature *rs, REFIID riid, void **out)
+{
+    HRESULT hr = ID3D12Device_CreateCommandSignature(INNER(p, ID3D12Device), desc, rs, riid, out);
+
+    if (SUCCEEDED(hr) && out && *out)
+    {
+        AcquireSRWLockExclusive(&signatures_lock);
+        if (signature_count == signature_capacity)
+        {
+            UINT capacity = signature_capacity ? signature_capacity * 2 : 64;
+            void **grown = realloc(signatures, capacity * sizeof(*signatures));
+            if (grown)
+            {
+                signatures = grown;
+                signature_capacity = capacity;
+            }
+        }
+        if (signature_count < signature_capacity)
+            signatures[signature_count++] = *out;
+        ReleaseSRWLockExclusive(&signatures_lock);
+    }
+    return hr;
+}
+
+/* List slot 61. The two measurements disagree: Leonida (the retail FSR DLL) calls it with
+ * ExecuteIndirect's arguments (PC 59), ScarlettX has the PIX trio SetMarker, BeginEvent, EndEvent
+ * at 60-62 (PC + 4: BeginEvent, PC 57). ExecuteIndirect's first argument is a command signature,
+ * BeginEvent's a small metadata word: dispatch on that. */
+static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, void *c, UINT64 d, void *e, UINT64 f)
+{
+    static LONG logged;
+
+    if (a && is_command_signature(a))
+    {
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
+        ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
+                p->inner, a, (UINT)b, c, d, e, f);
+        return;
+    }
+    ((void (STDMETHODCALLTYPE *)(void *, UINT_PTR, void *, UINT_PTR))PC_SLOT(p->inner, 57))(p->inner, (UINT_PTR)a,
+            (void *)b, (UINT_PTR)c);
+}
+
 /* Slot 43. An 8-byte struct: the Xbox ABI returns those in RAX (see the
  * descriptor heap), while vkd3d-proton uses the MSVC hidden pointer. */
 static LUID STDMETHODCALLTYPE device_GetAdapterLuid(struct proxy *p)
@@ -1307,6 +1368,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(29, device_CreatePlacedResource),
         FN(30, device_CreateReservedResource),
         FN(38, device_GetCopyableFootprints),
+        FN(41, device_CreateCommandSignature),
         FN(43, device_GetAdapterLuid),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(60, device_CreateGraphicsPipelineStateX),
@@ -1336,6 +1398,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
         FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
         FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
+        FN(61, list_Slot61),                          /* PC 59 or 57 */
         FN(83, list_CopyTextureRegionX),
         FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
