@@ -920,6 +920,44 @@ static double ms_since(LARGE_INTEGER a)
     return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
 }
 
+/* Xbox-only root signature flags (0x01000000, 0x02000000, 0x80000000; Leonida found the PC
+ * deserializer rejects them): serializing, creating and deserializing must all work. */
+static void test_xbox_root_flags(void *dev)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(m, "D3D12SerializeRootSignature");
+    PFN_D3D12_CREATE_ROOT_SIGNATURE_DESERIALIZER deserialize = (PFN_D3D12_CREATE_ROOT_SIGNATURE_DESERIALIZER)(void *)
+            GetProcAddress(m, "D3D12CreateRootSignatureDeserializer");
+    D3D12_ROOT_PARAMETER param = { .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, .Constants = { 0, 0, 1 } };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &param, 0, NULL, 0x83000000 };
+    ID3D12RootSignatureDeserializer *des = NULL;
+    ID3D10Blob *blob = NULL, *err = NULL;
+    void *rs = NULL;
+    HRESULT hr;
+
+    hr = serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    CHECK(SUCCEEDED(hr), "D3D12SerializeRootSignature takes Xbox-only flags 0x83000000 (%#lx)", hr);
+    if (FAILED(hr))
+        goto done;
+    hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0, ID3D10Blob_GetBufferPointer(blob),
+            ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+    CHECK(SUCCEEDED(hr), "CreateRootSignature (device slot 16) takes a blob with Xbox-only flags (%#lx)", hr);
+    hr = deserialize(ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
+            &IID_ID3D12RootSignatureDeserializer, (void **)&des);
+    CHECK(SUCCEEDED(hr), "D3D12CreateRootSignatureDeserializer takes a blob with Xbox-only flags (%#lx)", hr);
+    if (des)
+    {
+        const D3D12_ROOT_SIGNATURE_DESC *d = ID3D12RootSignatureDeserializer_GetRootSignatureDesc(des);
+        printf("info deserialized root signature flags %#x\n", d ? d->Flags : 0);
+        ID3D12RootSignatureDeserializer_Release(des);
+    }
+done:
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    if (blob) ID3D10Blob_Release(blob);
+    if (err) ID3D10Blob_Release(err);
+}
+
 static void test_pacing(void *dev)
 {
     typedef HRESULT (STDMETHODCALLTYPE *wait_fn)(void *, UINT, UINT, void *, UINT, UINT64 *);
@@ -1885,6 +1923,7 @@ static void test_xbox(void)
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
 
     test_pacing(dev);
+    test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
