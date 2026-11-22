@@ -227,10 +227,16 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   variant cache and memo patches limit this; the pipeline cache should persist across runs.
 - **Speculated descriptors** (lab patch 0004) are checked at runtime through the fault buffer; the
   host must read it back and recompile on a mismatch.
-- **The real user-SGPR map.** TomBox reads, from the retail `the shader archive` PS09 cache
-  (unconfirmed except for one shader), per-shader metadata records (tag 0x41). Each gives a
-  binding's kind (SRV, CBV, UAV, sampler, direct), its dword offset, register, and a packed word
-  with the descriptor dword count (bits 0-7), user SGPR (bits 8-15) and register space. If that
-  holds, SGPRs come from those records, not root-parameter order (patch 0005 still packs in root
-  order).
+- **The real user-SGPR map: per shader, in the PS09 records.** Each shader in the PS09 cache
+  carries binding records: kind (SRV, UAV, CBV, sampler, root table), register (`slot_id`), a
+  dword offset (`byte_offset`, despite the name), and a packed word. TomBox read the packed word
+  as descriptor dword count in bits 0-7, user SGPR in bits 8-15 and register space from bit 16.
+  Checked across the corpus (2026-11-22) against the tables `sa5_analyse` infers from the code:
+  68,991 of 73,512 inferred slots (94%) have a record at exactly that user SGPR and dword
+  offset. The kinds agree: textures are SRVs, storage images UAVs, constant buffers CBVs or SRVs.
+  The misses are mostly samplers, which seem to be described elsewhere. Records also exist for
+  bindings the code never touches. So the console maps registers to SGPRs per shader, not in
+  root-parameter order. Once we know how a PSO gets its shader (open question 1), patch 0005
+  should pack SGPRs from these records: for each record, the root parameter whose range covers
+  its register and space, its table address plus the offset. That replaces the root-order guess.
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.
