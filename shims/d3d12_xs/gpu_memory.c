@@ -353,3 +353,21 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
     ReleaseSRWLockShared(&lock);
     return n;
 }
+
+BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (struct chunk *c = chunks; c; c = c->next)
+        if (address >= c->gpu && address < c->gpu + c->size)
+        {
+            ID3D12Heap_AddRef(c->heap);
+            *heap = c->heap;
+            *offset = address - c->gpu;
+            found = TRUE;
+            break;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}

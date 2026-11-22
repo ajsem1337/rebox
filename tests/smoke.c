@@ -2391,6 +2391,41 @@ static void test_xbox(void)
     hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &IID_ID3D12Device5, &dev5);
     CHECK(SUCCEEDED(hr) && dev5 == dev, "QueryInterface for another device version returns the proxy");
 
+    /* Slot 44, CreatePlacedResourceX: a buffer at an address in GPU memory shares that memory; a
+     * texture gets its own. */
+    {
+        typedef HRESULT (WINAPI *gpu_alloc_fn)(SIZE_T, SIZE_T, void **, UINT64 *);
+        gpu_alloc_fn gpu_alloc = (gpu_alloc_fn)(void *)GetProcAddress(m, "ReboxGpuAlloc");
+        D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+        D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                   { 1, 0 } };
+        ID3D12Resource *placed = NULL, *tex = NULL;
+        void *cpu = NULL, *mapped = NULL;
+        UINT64 gpu = 0;
+
+        if (gpu_alloc && SUCCEEDED(gpu_alloc(1 << 20, 65536, &cpu, &gpu)))
+        {
+            UINT64 at = gpu + 65536;
+            hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                       const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, at, &bd, D3D12_RESOURCE_STATE_COMMON, NULL,
+                       &IID_ID3D12Resource, (void **)&placed);
+            if (SUCCEEDED(hr))
+                ID3D12Resource_Map(placed, 0, NULL, &mapped);
+            CHECK(SUCCEEDED(hr) && ID3D12Resource_GetGPUVirtualAddress(placed) == at
+                      && mapped == (BYTE *)cpu + 65536,
+                  "CreatePlacedResourceX (slot 44) places a buffer at its GPU address (%#lx)", hr);
+            hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                       const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, at, &td, D3D12_RESOURCE_STATE_COMMON, NULL,
+                       &IID_ID3D12Resource, (void **)&tex);
+            CHECK(SUCCEEDED(hr) && tex, "CreatePlacedResourceX gives a texture its own memory (%#lx)", hr);
+            if (placed) ID3D12Resource_Release(placed);
+            if (tex) ID3D12Resource_Release(tex);
+        }
+        else
+            printf("skip CreatePlacedResourceX: no GPU memory\n");
+    }
+
     /* Titles built against SDK 0x20004 or later get the later queue layout: Signal at 16. */
     {
         UINT32 params[6] = { 0x20004 }, old[6] = { 0 };

@@ -901,6 +901,49 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineStateX(struct prox
     return device_CreateGraphicsPipelineState(p, desc, riid, out);
 }
 
+/* Slot 44: CreatePlacedResourceX(address, desc, state, clear, iid, out) (ScarlettX, XValkyrie):
+ * a resource on memory the title already has, at a GPU address it chose. A buffer in GPU memory
+ * from ReboxGpuAlloc (XMemAlloc's GPU-visible memory) is placed in that chunk's heap at the
+ * address, so the title and the GPU share it. Anything else gets its own memory and is logged
+ * once per kind: textures (the chunk heaps hold buffers only, and console tilings aren't
+ * modelled), addresses outside GPU memory, and placements the heap refuses. */
+static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
+        const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
+        void **out)
+{
+    static const D3D12_HEAP_PROPERTIES own = { D3D12_HEAP_TYPE_DEFAULT };
+    static LONG logged[3];
+    D3D12_RESOURCE_DESC storage;
+    const D3D12_RESOURCE_DESC *d = pc_desc(desc, &storage);
+    ID3D12Heap *heap;
+    UINT64 offset;
+    HRESULT hr = E_FAIL;
+    int why;
+
+    if (!d || !out)
+        return E_INVALIDARG;
+    if (d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        why = 0;
+    else if (!gpu_memory_heap_at(address, &heap, &offset))
+        why = 1;
+    else
+    {
+        hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, d, state, clear, riid, out);
+        ID3D12Heap_Release(heap);
+        why = 2;
+    }
+    if (SUCCEEDED(hr))
+    {
+        present_track_state(*out, state);
+        return hr;
+    }
+    if (!InterlockedExchange(&logged[why], 1))
+        rebox_log("d3d12_xs: CreatePlacedResourceX(%#llx, dimension %u, %llu bytes): %s; it gets its own memory",
+                     (unsigned long long)address, d->Dimension, (unsigned long long)d->Width,
+                     why == 0 ? "a texture" : why == 1 ? "not in GPU memory" : "the heap refused the placement");
+    return device_CreateCommittedResource(p, &own, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+}
+
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
  * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f.
  * Xbox2Windows saw Layout 0x101 with +0x34 = 3 and +0x38 = 0 there. */
@@ -1390,6 +1433,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(38, device_GetCopyableFootprints),
         FN(41, device_CreateCommandSignature),
         FN(43, device_GetAdapterLuid),
+        FN(44, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(60, device_CreateGraphicsPipelineStateX),
         FN(62, device_CreateComputePipelineStateX),
