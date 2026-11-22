@@ -2443,11 +2443,70 @@ static void test_gameinput(void)
 
 /* A texture placed at a title address (slot 44) is filled from the tiled memory there: at first
  * use, and again after a reported write (DirectStorage reports its writes the same way). */
+/* d3d12_xs's struct detile_surface (shims/d3d12_xs/detile.h). */
+struct test_surface
+{
+    UINT mode; /* 0 linear, 1 SW_4KB_S, 2 SW_64KB_D */
+    DXGI_FORMAT format;
+    UINT width, height, layers, mips;
+    BOOL volume, mip_major;
+};
+
+/* Mip-major arrays (REBOX_TEXTURE_ARRAYS=mip-major, Leonida's pool layout): each subresource is
+ * the single-slice layout of that mip, at its offset times the slice count plus the slice times
+ * the mip's size in one slice. */
+static void test_mip_major_layout(void)
+{
+    typedef UINT64 (WINAPI *size_fn)(const void *);
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    size_fn surface_size = (size_fn)(void *)GetProcAddress(m, "ReboxDetileSize");
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(m, "ReboxTile");
+    struct test_surface one = { 2, DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 3, FALSE, FALSE };
+    struct test_surface arr = { 2, DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 3, 3, FALSE, TRUE };
+    static UINT32 linear[256 * 256];
+    UINT64 slice, size;
+    BYTE *single, *array;
+    BOOL ok = TRUE;
+
+    if (!surface_size || !tile || !(slice = surface_size(&one)))
+        return;
+    size = surface_size(&arr);
+    single = calloc(1, slice);
+    array = calloc(1, size);
+    for (UINT layer = 0; layer < 3; layer++)
+        for (UINT mip = 0; mip < 3; mip++)
+        {
+            UINT w = 256 >> mip;
+            for (UINT i = 0; i < w * w; i++)
+                linear[i] = i * 2654435761u + layer * 7919 + mip * 104729;
+            tile(&arr, array, mip, layer, linear, w * 4, w * w * 4);
+        }
+    /* Mip 0 is 256 KiB, mip 1 64 KiB and mip 2 sits in the 64 KiB tail, smallest first: so in one
+     * slice tail 0-64K, mip 1 64K-128K, mip 0 128K-384K; times 3 slices, mip-major. */
+    for (UINT layer = 0; layer < 3; layer++)
+        for (UINT mip = 0; mip < 3; mip++)
+        {
+            static const UINT64 start[3] = { 0x20000, 0x10000, 0 }, region[3] = { 0x40000, 0x10000, 0x10000 };
+            UINT w = 256 >> mip;
+            for (UINT i = 0; i < w * w; i++)
+                linear[i] = i * 2654435761u + layer * 7919 + mip * 104729;
+            memset(single, 0, slice);
+            tile(&one, single, mip, 0, linear, w * 4, w * w * 4);
+            ok &= slice == 0x60000 && size == 3 * slice
+                  && !memcmp(single + start[mip], array + 3 * start[mip] + layer * region[mip], region[mip]);
+        }
+    CHECK(ok, "mip-major arrays: mip m of slice s at 3 * offset(m) + s * size(m) (slice %llu, array %llu bytes)",
+          (unsigned long long)slice, (unsigned long long)size);
+    free(single);
+    free(array);
+}
+
 /* A small 2D array placed at a title address is read as SW_64KB_D, as every array in the target title's
  * pools is, though its mip 0 is far below the 1 MiB the single-texture rule uses. */
 static void test_placed_texture_array(void *dev, void *queue)
 {
-    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume; } surface =
+    struct test_surface surface =
             { 2 /* SW_64KB_D */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 2, 1, FALSE };
     typedef HRESULT (WINAPI *gpu_alloc_fn)(SIZE_T, SIZE_T, void **, UINT64 *);
     typedef UINT64 (WINAPI *size_fn)(const void *);
@@ -2525,7 +2584,7 @@ static void test_placed_texture_array(void *dev, void *queue)
 
 static void test_placed_texture(void *dev, void *queue)
 {
-    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume; } surface =
+    struct test_surface surface =
             { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE };
     typedef HRESULT (WINAPI *gpu_alloc_fn)(SIZE_T, SIZE_T, void **, UINT64 *);
     typedef UINT64 (WINAPI *size_fn)(const void *);
@@ -2855,6 +2914,7 @@ static void test_xbox(void)
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
+    test_mip_major_layout();
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);

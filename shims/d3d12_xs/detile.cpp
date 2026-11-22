@@ -104,8 +104,48 @@ UINT64 detile_size(const struct detile_surface *s)
 }
 
 static BOOL copy(const struct detile_surface *s, void *surface, UINT mip, UINT layer, void *linear, UINT64 row_pitch,
+                 UINT64 slice_pitch, BOOL to_linear);
+
+/* Mip-major 2D arrays (Leonida, docs/textures_arrays.md, measured on the target title's pools): one slice's
+ * layout, with every block scaled by the slice count. The packed tail comes first, slice s's at
+ * s * (tail block); then each mip outside it, from the smallest up, slice s at that mip's offset
+ * times the slice count plus s * (the mip's size in one slice). So a subresource is addrlib's
+ * single-slice layout read from a shifted base. */
+static BOOL mip_major_base(const struct detile_surface *s, UINT mip, UINT layer, UINT64 *shift)
+{
+    struct detile_surface one = *s;
+    ADDR2_COMPUTE_SURFACE_INFO_OUTPUT info = {};
+    ADDR2_MIP_INFO mips[16] = {};
+    UINT bytes, block, first = mip;
+    UINT64 start, end;
+
+    one.layers = 1;
+    one.mip_major = FALSE;
+    if (!surface_info(&one, &info, mips, &bytes, &block) || mip >= s->mips)
+        return FALSE;
+    if (info.firstMipIdInTail < s->mips && mip >= info.firstMipIdInTail)
+        first = info.firstMipIdInTail;
+    start = mips[first].macroBlockOffset;
+    end = first ? mips[first - 1].macroBlockOffset : info.sliceSize;
+    *shift = (s->layers - 1) * start + layer * (end - start);
+    return TRUE;
+}
+
+static BOOL copy(const struct detile_surface *s, void *surface, UINT mip, UINT layer, void *linear, UINT64 row_pitch,
                  UINT64 slice_pitch, BOOL to_linear)
 {
+    if (s->mip_major && !s->volume && s->layers > 1)
+    {
+        struct detile_surface one = *s;
+        UINT64 shift;
+
+        if (layer >= s->layers || !mip_major_base(s, mip, layer, &shift))
+            return FALSE;
+        one.layers = 1;
+        one.mip_major = FALSE;
+        return copy(&one, (BYTE *)surface + shift, mip, 0, linear, row_pitch, slice_pitch, to_linear);
+    }
+
     ADDR2_COMPUTE_SURFACE_INFO_OUTPUT info = {};
     ADDR2_MIP_INFO mips[16] = {};
     ADDR2_COPY_MEMSURFACE_INPUT in = {};

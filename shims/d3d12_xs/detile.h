@@ -25,6 +25,8 @@ struct detile_surface
     UINT width, height, layers; /* layers: array size (2D) or depth (3D) */
     UINT mips;
     BOOL volume;
+    BOOL mip_major; /* 2D arrays: each mip's slices together (the target title's pools), not addrlib's
+                       slice-major order; see detile.cpp */
 };
 
 /* The bytes the surface occupies in title memory, or 0 if addrlib can't lay it out. */

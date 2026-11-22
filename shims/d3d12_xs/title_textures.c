@@ -120,6 +120,20 @@ static int mode_setting(void)
     return setting;
 }
 
+/* REBOX_TEXTURE_ARRAYS=mip-major: 2D arrays laid out a mip (all its slices) at a time, as
+ * the target title's pools store them, instead of addrlib's (the hardware's, per Mesa) slice at a time. */
+static BOOL arrays_mip_major(void)
+{
+    static int setting = -1;
+    if (setting == -1)
+    {
+        char *v = rebox_getenv("REBOX_TEXTURE_ARRAYS");
+        setting = v && !strcmp(v, "mip-major");
+        free(v);
+    }
+    return setting;
+}
+
 static void WINAPI destroyed(void *data)
 {
     struct title_texture *t = data, **p;
@@ -197,6 +211,7 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     t->surface.layers = desc->DepthOrArraySize;
     t->surface.volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     t->surface.mips = desc->MipLevels ? desc->MipLevels : 1;
+    t->surface.mip_major = arrays_mip_major();
     if (setting >= 0)
         t->surface.mode = setting;
     else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
