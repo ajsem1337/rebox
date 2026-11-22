@@ -9,7 +9,7 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -Wall -Wno-unused-function -std=gnu11 -D__USE_MINGW_ANSI_STDIO=1
 LDFLAGS += -shared -static-libgcc -Wl,--enable-stdcall-fixup
 
-SHIMS   := xmem d3d12_xs xaudio2_9 amd_fidelityfx_loader_xbox
+SHIMS   := xmem d3d12_xs xaudio2_9 amd_fidelityfx_loader_xbox pixevt
 COMMON  := shims/common/rebox_log.c
 
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).

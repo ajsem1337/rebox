@@ -1,0 +1,18 @@
+LIBRARY pixevt.dll
+EXPORTS
+    ConfigurePMCs
+    ConfigureNBPMCs
+    ConfigureL3PMCs
+    PIXBeginCapture1
+    PIXBeginCapture2
+    PIXEndCapture
+    PIXReportCounter
+    PIXEventsReplaceBlock
+    PIXGetCaptureState
+    GetCaptureControlState
+    RegisterForCaptureControl
+    UnregisterForCaptureControl
+    SetCaptureCallgraphState
+    SetCaptureFunctionDetailsState
+    SetCaptureFunctionSummaryState
+    SetCaptureInstructionTraceState
