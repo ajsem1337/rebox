@@ -266,4 +266,29 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   root-parameter order. Once we know how a PSO gets its shader (open question 1), patch 0005
   should pack SGPRs from these records: for each record, the root parameter whose range covers
   its register and space, its table address plus the offset. That replaces the root-order guess.
+- **Graphics register state is in the PS09 cache.** Each graphics PSO record (0x70 bytes)
+  names metadata blobs:
+  - its head word 2 is a register block, its word 3 the input signature (semantic names such
+    as `POSITION`, `COLOR`, `TEXCOORD`);
+  - its seven stage slots each pair a 20-byte blob with that stage's binding records.
+
+  americas-recomp guesses all of this register state (`inputAddr`, export formats, float mode,
+  mesh configuration). Measured 2026-11-22 on the 1,161 PSOs whose register block is 388 bytes
+  (the other sizes, 396-480, hold more sections and shift the offsets), against the dumped PS
+  code:
+
+  | Word | Register (GFX10) | Agrees with the code |
+  |---|---|---|
+  | 14, 15 | `SPI_SHADER_PGM_RSRC1/2` of the vertex stage (float mode 0xC0 as in compute) | not yet checked |
+  | 19, 20 | the same for the pixel stage | not yet checked |
+  | 22 | `SPI_PS_INPUT_ENA` (0x2 perspective centre, bit 15 fixed-point position) | not yet checked |
+  | 23 | `SPI_PS_IN_CONTROL.NUM_INTERP` | 1,149 |
+  | 28 | `SPI_SHADER_COL_FORMAT` (a nibble per target; 4 = FP16, matching `compr` exports) | 1,155 |
+  | 30 | `CB_SHADER_MASK` | 1,141 |
+  | 52-59 | `CB_BLENDn_CONTROL` (0x80000000 = no blend) | by value |
+  | 64-71 | `SX_MRTn_BLEND_OPT` | by value |
+
+  Next: the layouts of the other block sizes, then building AnyPS5's `ShaderPixelStageInfo`
+  from these words at PSO creation. The PS input table at FSSM 0x138 gives per-interpolant
+  flags.
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.
