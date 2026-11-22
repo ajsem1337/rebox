@@ -80,6 +80,7 @@ Once the exe is dumped:
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
+| `REBOX_CONSOLE_COMPUTE=0` | Console compute shaders (FSSM containers) keep the old path (translation cache, then fallback shaders) instead of AnyPS5 at dispatch ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
 | `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
 | `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |
@@ -150,8 +151,8 @@ down missing translations.
   SPIR-V that reads user SGPRs and raw hardware descriptors. The plan is AnyPS5 compiling at
   dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL, console-format shadow heaps
   and compute compile-and-bind at dispatch (vkd3d-proton patch 0005) work on a hand-written
-  shader. The game's own shader containers aren't turned into deferred PSOs yet, so every console
-  PSO still uses fallback shaders.
+  shader and on the game's compute shaders from the lab dump. Console compute containers now become
+  deferred PSOs at creation; graphics stages still use fallback shaders.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified

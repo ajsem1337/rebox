@@ -71,11 +71,31 @@ words (16 dwords), which the dispatch path will have to fill.
 1. **PSO creation** (`d3d12_xs` → patch 0005). A deferred console shader is an `SCRD` blob
    (`shims/d3d12_xs/console_compile.h`): header, `RSRC1`/`RSRC2`, wave size, thread-group size,
    code address, then the RDNA code. vkd3d-proton keeps the blob with the PSO and creates no
-   pipeline. Only the smoke test makes `SCRD` blobs so far: turning the game's FSSM containers
-   (or PS09 cache entries) into them waits on the PSO census (open question 1). The
-   `FLAT_SCRATCH` setup many console shaders open with (`s_setreg_imm32_b32` or `s_setreg_b32`
-   to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size `s_nop`s before each compile; only the leading
-   run is touched, and the first time is logged.
+   pipeline.
+
+   A console compute shader in the game's own container (DXBC → DXIL part → XBCH header + zlib
+   FSSM + NOBC stub) becomes one when its PSO is created (`console_fssm.c`; on by default,
+   `REBOX_CONSOLE_COMPUTE=0` turns it off). The FSSM header fields were measured on all 2,555
+   compute shaders of `the shader archive` against the PS09 cache, matched by the 24-byte shader ID at
+   0x150:
+
+   | Offset | Field | Agreement with PS09 |
+   |---|---|---|
+   | 0x104 | float mode | 2,472 |
+   | 0x138 | `COMPUTE_PGM_RSRC2` | user SGPR count in all; the enables and LDS describe this code, PS09 the driver's recompile |
+   | 0x13C, 0x140, 0x144 | thread-group size | all |
+   | 0x168 | code (u32 at 0xC0 plus 0x28) | |
+
+   `RSRC1` isn't in the header. AnyPS5 needs only its float mode and clamp bits, which PS09 has
+   as 0x402c03xx throughout, so it is rebuilt as 0x402c0000 plus the float mode. The wave size
+   isn't there either; the SCRD says 0 and the compile infers it with `sa5_analyse`. zlib comes
+   from zlib's `contrib/puff` (zlib licence, `shims/d3d12_xs/puff.c`).
+
+   `smoke.exe --fssm-check DIR` converts every compute container in a carve: all 2,573 in
+   `the shader archive` convert. Whether the exe passes these containers at PSO creation, or PS09 cache
+   blobs, is still open question 1. The `FLAT_SCRATCH` setup many console shaders open with
+   (`s_setreg_imm32_b32` or `s_setreg_b32` to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size
+   `s_nop`s before each compile. Only the leading run is touched, and the first time is logged.
 2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
    from the root parameters as for SCSV shaders, except that descriptor tables point at the
    shadow heaps' title addresses (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`).
@@ -192,8 +212,8 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    move to title addresses with step 3.
 3. ~~Deferred compute pipelines and the dispatch path~~ Done (above): patch 0005,
    `console_compile.c`, `sa5_finalize`, and the end-to-end smoke test. Still to do before real
-   shaders: `SCRD` blobs from the game's containers (the `FLAT_SCRATCH` prologue is already
-   NOPed at compile). Heap
+   shaders: nothing on the container side (console compute containers become `SCRD`s at PSO
+   creation). Heap
    slot 10 now returns title addresses, for pointers the title stores in memory itself. Then
    guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
    roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.

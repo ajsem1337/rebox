@@ -20,3 +20,5 @@ EXPORTS
     ReboxConsoleCompile
     ReboxConsoleLastResult
     ReboxConsoleFaults
+    ReboxConsoleFromContainer
+    ReboxConsoleFree

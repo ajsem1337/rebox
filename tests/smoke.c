@@ -1658,6 +1658,60 @@ static const UINT32 rdna_uav_write[] = {
     0xba80f814, 0x00001000, 0xba807815, 0x00000002, 0xf4080100, 0xfa000000, 0xbf8cc07f, 0x7e0202ff, 0x1234abcd, 0x7e040280, 0xe0701000, 0x80010102, 0xbf810000,
 };
 
+/* A console DXBC container as the game ships them: a DXIL part holding an XBCH header and a zlib
+ * stream (here one stored deflate block) of FSSM, then a NOBC stub. The FSSM header gives the code
+ * offset (u32 at 0xC0, plus 0x28), float mode (0x104), RSRC2 (0x138) and thread-group size (0x13C).
+ * Returns the container's size; free *out. */
+static SIZE_T make_console_container(const UINT32 *code, UINT dwords, UINT32 rsrc2, BYTE **out)
+{
+    SIZE_T fssm_size = 0x168 + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part = 4 + 0x60 + zsize + 4 + 0x14;
+    SIZE_T total = 0x24 + 8 + ((part + 3) & ~(SIZE_T)3);
+    BYTE *c = calloc(1, total), *fssm = calloc(1, fssm_size), *p;
+    UINT32 a = 1, b = 0;
+
+    memcpy(fssm, "FSSM", 4);
+    *(UINT32 *)(fssm + 0xc0) = 0x168 - 0x28;
+    *(UINT32 *)(fssm + 0x104) = 0xc0;
+    *(UINT32 *)(fssm + 0x138) = rsrc2;
+    *(UINT32 *)(fssm + 0x13c) = 1;
+    *(UINT32 *)(fssm + 0x140) = 1;
+    *(UINT32 *)(fssm + 0x144) = 1;
+    memcpy(fssm + 0x168, code, dwords * 4);
+    for (SIZE_T i = 0; i < fssm_size; i++)
+    {
+        a = (a + fssm[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    memcpy(c, "DXBC", 4);
+    *(UINT32 *)(c + 0x14) = 1;
+    *(UINT32 *)(c + 0x18) = (UINT32)total;
+    *(UINT32 *)(c + 0x1c) = 1;
+    *(UINT32 *)(c + 0x20) = 0x24;
+    p = c + 0x24;
+    memcpy(p, "DXIL", 4);
+    *(UINT32 *)(p + 4) = (UINT32)(total - 0x24 - 8);
+    p += 8;
+    memcpy(p, "XBCH", 4);
+    p += 4 + 0x60;
+    *p++ = 0x78;
+    *p++ = 0x01;
+    *p++ = 0x01; /* final stored block */
+    *p++ = (BYTE)fssm_size;
+    *p++ = (BYTE)(fssm_size >> 8);
+    *p++ = (BYTE)~fssm_size;
+    *p++ = (BYTE)(~fssm_size >> 8);
+    memcpy(p, fssm, fssm_size);
+    p += fssm_size;
+    *p++ = (BYTE)(b >> 8);
+    *p++ = (BYTE)b;
+    *p++ = (BYTE)(a >> 8);
+    *p++ = (BYTE)a;
+    memcpy(p, "NOBC", 4);
+    free(fssm);
+    *out = c;
+    return total;
+}
+
 /* A deferred console compute PSO (patch 0005, console_compile.c): vkd3d-proton keeps the RDNA
  * code and, at dispatch, d3d12_xs compiles it with AnyPS5 against the shadow heaps and rebinds it
  * onto vkd3d-proton's bindless sets. The table starts at heap slot 1, so a wrong slot shows. */
@@ -1811,6 +1865,39 @@ static void test_console_dispatch(void *dev, void *queue)
                 Sleep(10);
             CHECK(out[0] == 0x1234abcd, "a deferred console shader whose V# pointer leads into ReboxGpuAlloc "
                   "memory wrote %#x (expected 0x1234abcd)", out[0]);
+        }
+
+        /* The same code in a console container, created as an ordinary compute PSO: d3d12_xs
+         * turns its FSSM into a deferred console shader (console_fssm.c). */
+        {
+            void *fpso = NULL;
+            BYTE *container = NULL;
+            SIZE_T csize = make_console_container(rdna_uav_write, ARRAYSIZE(rdna_uav_write), 2 << 1, &container);
+
+            out[0] = 0;
+            cd.pRootSignature = rs;
+            cd.CS = (D3D12_SHADER_BYTECODE){ container, csize };
+            hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                    &IID_ID3D12PipelineState, &fpso);
+            CHECK(SUCCEEDED(hr), "a compute PSO from a console FSSM container (%#lx)", hr);
+            if (SUCCEEDED(hr) && SUCCEEDED(ID3D12CommandAllocator_Reset(alloc))
+                    && SUCCEEDED(XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL)))
+            {
+                XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+                XSLOT(list, 33, void, void *)(list, rs);
+                XSLOT(list, 25, void, void *)(list, fpso);
+                XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+                XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+                XSLOT(list, 9, HRESULT)(list);
+                XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+                XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 3);
+                for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 3; i++)
+                    Sleep(10);
+                CHECK(out[0] == 0x1234abcd, "the console container's FSSM code ran through AnyPS5 at dispatch "
+                      "(wrote %#x)", out[0]);
+            }
+            if (fpso) XSLOT(fpso, 2, ULONG)(fpso);
+            free(container);
         }
         if (cpso) XSLOT(cpso, 2, ULONG)(cpso);
         if (crs) XSLOT(crs, 2, ULONG)(crs);
@@ -2819,8 +2906,55 @@ static int console_cs(const char *plan, int first, int count)
     return totals[2] || totals[3];
 }
 
+/* smoke.exe --fssm-check DIR: turns every compute container (*_CS_*.dxbc) in DIR into a deferred
+ * console shader and prints one "fssm NAME rsrc1 rsrc2 x,y,z dwords" line each, for comparing
+ * with the PS09 cache (game data, never in the repo). */
+static int fssm_check(const char *dir)
+{
+    HMODULE m = LoadLibraryA("d3d12_xs.dll");
+    void *(WINAPI *convert)(const void *, SIZE_T, SIZE_T *) = m ? (void *)GetProcAddress(m, "ReboxConsoleFromContainer") : NULL;
+    void (WINAPI *release)(void *) = m ? (void *)GetProcAddress(m, "ReboxConsoleFree") : NULL;
+    char pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    int ok = 0, failed = 0;
+    HANDLE find;
+
+    if (!convert || !release)
+        return 1;
+    snprintf(pattern, sizeof(pattern), "%s\\*_CS_*.dxbc", dir);
+    if ((find = FindFirstFileA(pattern, &fd)) == INVALID_HANDLE_VALUE)
+        return 1;
+    do
+    {
+        SIZE_T size, blob_size;
+        BYTE *data;
+        const UINT32 *h;
+
+        snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+        if (!(data = read_file(path, &size)))
+            continue;
+        if ((h = convert(data, size, &blob_size)))
+        {
+            printf("fssm %s %#x %#x %u,%u,%u %u\n", fd.cFileName, h[8], h[9], h[5], h[6], h[7], h[11]);
+            release((void *)h);
+            ok++;
+        }
+        else
+        {
+            printf("fssm %s failed\n", fd.cFileName);
+            failed++;
+        }
+        free(data);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    printf("%s fssm-check: %d of %d compute containers converted\n", failed ? "FAIL" : "ok  ", ok, ok + failed);
+    return failed != 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "--fssm-check"))
+        return fssm_check(argv[2]);
     if (argc > 2 && !strcmp(argv[1], "--pso-check"))
         return pso_check(argv[2]);
     if (argc > 2 && !strcmp(argv[1], "--console-cs"))

@@ -46,6 +46,7 @@ static struct
     const void *(*push_constants)(const struct sa5_result *, UINT32 *);
     UINT32 (*subgroup_size)(const struct sa5_result *);
     void (*identity)(const struct sa5_result *, UINT64 *);
+    int (*analyse)(const UINT32 *, UINT32, UINT32, struct sa5_layout *, struct sa5_slot *, UINT32, char *, size_t);
     void (*result_free)(struct sa5_result *);
     int (*finalize)(const struct sa5_result *, const struct sa5_remap *, UINT32, const struct sa5_host_buffer *,
             UINT32, UINT32 **, UINT32 *, char *, size_t);
@@ -114,6 +115,7 @@ static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
     GET(push_constants, "sa5_result_push_constants");
     GET(subgroup_size, "sa5_result_subgroup_size");
     GET(identity, "sa5_result_identity");
+    GET(analyse, "sa5_analyse");
     GET(result_free, "sa5_result_free");
     GET(finalize, "sa5_finalize");
     GET(fault_buffer_bytes, "sa5_fault_buffer_bytes");
@@ -496,6 +498,16 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     req.code_dwords = h->code_dwords;
     req.code_address = h->code_address;
     req.wave = h->wave_size;
+    if (!req.wave)
+    {
+        /* Containers don't record the wave size: infer it from the code, as the layout analysis
+         * does (wave64 code uses 64-bit exec and VCC). */
+        struct sa5_layout layout;
+        static struct sa5_slot slots[1];
+        char ignored[64];
+        req.wave = sa5.analyse && !sa5.analyse(code, h->code_dwords, (h->rsrc2 >> 1) & 0x1f, &layout, slots, 0,
+                                                 ignored, sizeof(ignored)) ? layout.wave : 32;
+    }
     req.user_data = in->user_sgprs;
     req.user_data_count = min(in->user_sgpr_count, (h->rsrc2 >> 1) & 0x1f);
     memcpy(req.threads, h->workgroup_size, sizeof(req.threads));

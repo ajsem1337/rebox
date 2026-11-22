@@ -1,3 +1,4 @@
+#include "console_fssm.h"
 #include "shader_cache.h"
 
 #include <stdio.h>
@@ -218,6 +219,51 @@ void shader_cache_census(const char *kind, const char *const *names, const D3D12
     rebox_log("%s", line);
 }
 
+/* Console compute shaders become deferred console shaders (SCRD), compiled with AnyPS5 at each
+ * dispatch (console_fssm.c, console_compile.c), unless REBOX_CONSOLE_COMPUTE=0. Built once per
+ * container and kept, like cache entries. */
+static BOOL deferred_compute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTECODE *out)
+{
+    static SRWLOCK scrd_lock = SRWLOCK_INIT;
+    static struct entry *scrds;
+    static int enabled = -1;
+    UINT64 hash;
+    struct entry *e;
+
+    if (enabled < 0)
+    {
+        char *env = rebox_getenv("REBOX_CONSOLE_COMPUTE");
+        enabled = !(env && env[0] == '0');
+        free(env);
+    }
+    if (!enabled)
+        return FALSE;
+    hash = shader_hash(in->pShaderBytecode, in->BytecodeLength);
+    AcquireSRWLockExclusive(&scrd_lock);
+    for (e = scrds; e && e->hash != hash; e = e->next)
+        ;
+    if (!e && (e = calloc(1, sizeof(*e))))
+    {
+        e->hash = hash;
+        e->data = console_fssm_compute(in->pShaderBytecode, in->BytecodeLength, &e->size);
+        e->next = scrds;
+        scrds = e;
+        if (e->data)
+        {
+            static LONG logged;
+            if (!InterlockedExchange(&logged, 1))
+                rebox_log("d3d12_xs: console compute shaders run through AnyPS5 at dispatch (first: %016llx)",
+                             (unsigned long long)hash);
+        }
+    }
+    ReleaseSRWLockExclusive(&scrd_lock);
+    if (!e || !e->data)
+        return FALSE;
+    out->pShaderBytecode = e->data;
+    out->BytecodeLength = e->size;
+    return TRUE;
+}
+
 enum shader_lookup shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D12_SHADER_BYTECODE *out,
                                            const char *stage)
 {
@@ -231,6 +277,8 @@ enum shader_lookup shader_cache_substitute(const D3D12_SHADER_BYTECODE *in, D3D1
         return SHADER_NONE;
     if (is_pc_bytecode(in->pShaderBytecode, in->BytecodeLength))
         return SHADER_PC;
+    if (!strcmp(stage, "cs") && deferred_compute(in, out))
+        return SHADER_HIT;
     if (!cache_dir)
     {
         static LONG once;
