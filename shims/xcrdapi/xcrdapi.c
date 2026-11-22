@@ -7,11 +7,14 @@
  * between EnqueueStatus and Submit there too. Other slots log their first calls and return 0.
  *
  * Requests run in order on one worker thread per queue, reading from host files or memory.
- * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack, swizzled
- * destinations and physical-page addresses aren't supported: those requests fail with E_NOTIMPL
- * and are logged, and the next status entry reports the failure. */
+ * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests go to
+ * helpers/bcpack, a separate process running Leonida's GPLv3 decoder (rebox-run starts it and
+ * sets REBOX_BCPACK_PORT), over a localhost connection per worker thread. Swizzled
+ * destinations and physical-page addresses aren't supported, nor is BCPack without the helper:
+ * those requests fail with E_NOTIMPL and are logged, and the next status entry reports it. */
 
 #define COBJMACROS
+#include <winsock2.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -232,6 +235,124 @@ static HRESULT inflate_into(BYTE *dst, UINT32 dst_size, const BYTE *src, UINT32 
     return ret ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA) : S_OK;
 }
 
+/* ---------------------------------------------------------------- BCPack, through the helper */
+
+#define BCPACK_MAGIC 0x4b504342u /* 'BCPK' */
+
+static BOOL send_all(SOCKET s, const void *data, size_t size)
+{
+    const char *p = data;
+    while (size)
+    {
+        int n = send(s, p, size > 0x40000000 ? 0x40000000 : (int)size, 0);
+        if (n <= 0)
+            return FALSE;
+        p += n, size -= n;
+    }
+    return TRUE;
+}
+
+static BOOL recv_all(SOCKET s, void *data, size_t size)
+{
+    char *p = data;
+    while (size)
+    {
+        int n = recv(s, p, size > 0x40000000 ? 0x40000000 : (int)size, 0);
+        if (n <= 0)
+            return FALSE;
+        p += n, size -= n;
+    }
+    return TRUE;
+}
+
+/* One connection per worker thread, made on first use. A TLS slot rather than __thread, which
+ * would make mingw's GCC depend on libmcfgthread-2.dll. */
+static DWORD bcpack_tls = TLS_OUT_OF_INDEXES;
+
+static BOOL CALLBACK alloc_tls(INIT_ONCE *once, void *param, void **ctx)
+{
+    bcpack_tls = TlsAlloc();
+    return TRUE;
+}
+
+static SOCKET get_socket(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    void *v;
+
+    InitOnceExecuteOnce(&once, alloc_tls, NULL, NULL);
+    v = bcpack_tls == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(bcpack_tls);
+    return v ? (SOCKET)(ULONG_PTR)v - 1 : INVALID_SOCKET;
+}
+
+static void set_socket(SOCKET s)
+{
+    if (bcpack_tls != TLS_OUT_OF_INDEXES)
+        TlsSetValue(bcpack_tls, s == INVALID_SOCKET ? NULL : (void *)(ULONG_PTR)(s + 1));
+}
+
+static SOCKET bcpack_connect(void)
+{
+    const char *port = getenv("REBOX_BCPACK_PORT");
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    SOCKET s;
+    BOOL nodelay = TRUE;
+
+    if ((s = get_socket()) != INVALID_SOCKET)
+        return s;
+    if (!port || !*port)
+        return INVALID_SOCKET;
+    {
+        static LONG started;
+        WSADATA wsa;
+        if (!InterlockedExchange(&started, 1))
+            WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    addr.sin_port = htons((u_short)atoi(port));
+    if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET)
+        return INVALID_SOCKET;
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("xcrdapi: can't reach the BCPack helper on port %s (error %d)", port, WSAGetLastError());
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+    set_socket(s);
+    return s;
+}
+
+static HRESULT bcpack_decode(UINT32 codec, const BYTE *raw, UINT32 raw_size, BYTE *dst, UINT32 dst_size)
+{
+    UINT32 header[4] = { BCPACK_MAGIC, codec, dst_size, raw_size }, reply[2];
+    SOCKET s = bcpack_connect();
+
+    if (s == INVALID_SOCKET)
+        return E_NOTIMPL;
+    if (!send_all(s, header, sizeof(header)) || !send_all(s, raw, raw_size) || !recv_all(s, reply, sizeof(reply)))
+    {
+        closesocket(s);
+        set_socket(INVALID_SOCKET);
+        return E_FAIL;
+    }
+    if (reply[1] > dst_size)
+    {
+        /* Can't happen with the helper's decoder; drop the connection rather than resync. */
+        closesocket(s);
+        set_socket(INVALID_SOCKET);
+        return E_FAIL;
+    }
+    if (reply[1] && !recv_all(s, dst, reply[1]))
+    {
+        closesocket(s);
+        set_socket(INVALID_SOCKET);
+        return E_FAIL;
+    }
+    return (HRESULT)reply[0];
+}
+
 static HRESULT run_request(struct queue *q, const struct entry *e)
 {
     const DSTORAGE_REQUEST *r = &e->request;
@@ -239,7 +360,10 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     BYTE *data = NULL;
     HRESULT hr = S_OK;
 
-    if (r->options & (OPT_BCPACK | OPT_SWIZZLE | OPT_DEST_PHYSICAL | OPT_SOURCE_PHYSICAL))
+    BOOL bcpack = !!(r->options & OPT_BCPACK);
+
+    if ((r->options & (OPT_SWIZZLE | OPT_DEST_PHYSICAL | OPT_SOURCE_PHYSICAL))
+            || (bcpack && !getenv("REBOX_BCPACK_PORT")))
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 16)
@@ -252,7 +376,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         return S_OK;
     if (!r->destination || !r->source)
         return E_INVALIDARG;
-    if (!(r->options & OPT_ZLIB) && r->destination_size < r->source_size)
+    if (!(r->options & OPT_ZLIB) && !bcpack && r->destination_size < r->source_size)
         return E_INVALIDARG;
 
     if (from_memory)
@@ -263,7 +387,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         DWORD read = 0;
         BOOL ok;
 
-        if (r->options & OPT_ZLIB)
+        if (r->options & OPT_ZLIB || bcpack)
         {
             if (!(data = malloc(r->source_size)))
                 return E_OUTOFMEMORY;
@@ -279,7 +403,19 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
             hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
         ReleaseSRWLockShared(&e->file->lock);
     }
-    if (SUCCEEDED(hr) && (r->options & OPT_ZLIB))
+    if (SUCCEEDED(hr) && bcpack)
+    {
+        hr = bcpack_decode((UINT32)((r->options & OPT_BCPACK) >> 1), data, r->source_size, r->destination,
+                           r->destination_size);
+        if (FAILED(hr))
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 16)
+                rebox_log("xcrdapi: BCPack codec %u, %u -> %u bytes: %#lx", (unsigned)((r->options & OPT_BCPACK) >> 1),
+                             r->source_size, r->destination_size, hr);
+        }
+    }
+    else if (SUCCEEDED(hr) && (r->options & OPT_ZLIB))
         hr = inflate_into(r->destination, r->destination_size, data, r->source_size);
     else if (SUCCEEDED(hr) && from_memory)
         memcpy(r->destination, r->source, r->source_size);

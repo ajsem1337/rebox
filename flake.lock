@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "leonida-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795346723,
+        "narHash": "sha256-jVFSfX5gi8s6Nk7teBPu0ack8M9a3c+MqoZQThAHjXk=",
+        "owner": "ItsNotRexed",
+        "repo": "Leonida",
+        "rev": "bb2e18421dac527374eb837c88b5063c5d96f81f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ItsNotRexed",
+        "repo": "Leonida",
+        "rev": "bb2e18421dac527374eb837c88b5063c5d96f81f",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1795187554,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "leonida-src": "leonida-src",
         "nixpkgs": "nixpkgs",
         "winegdk-src": "winegdk-src",
         "xodus-xgameruntime": "xodus-xgameruntime"

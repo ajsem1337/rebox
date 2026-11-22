@@ -198,12 +198,13 @@ down missing translations.
   `amd_fidelityfx_loader_xbox.dll` in place of the package's. That stub answers FSR's queries
   (quality-mode ratios, but no jitter) and scales the colour input into the output with a
   compute blit. There's no temporal anti-aliasing; frame generation reports no provider.
-- **DirectStorage can't decode BCPack.** `shims/xcrdapi` (the console's `XCRDAPI.dll`) reads files
-  and memory and inflates zlib, but BCPack, the console's hardware texture compression, isn't
-  decoded: such requests fail with `E_NOTIMPL` and are logged. the target title's world texture pools are
-  BCPack (Leonida's texture notes), so if the exe streams them through DirectStorage, textures will
-  be missing until a clean-room BCPack decoder exists. Swizzled destinations and physical-page
-  addresses fail the same way.
+- **BCPack decodes slowly, and BC6H/BC7 approximately.** BCPack, the console's hardware texture
+  compression (about 14% of the target title's textures), is decoded by Leonida's GPLv3 decoder running as a
+  separate process ([helpers/bcpack](helpers/bcpack/README.md)), at about 3 MB/s per DirectStorage
+  queue under PyPy, far below the console's hardware. BC6H and BC7 often need history tables
+  Leonida doesn't ship, so those use its provisional entries unless calibrated tables are given
+  (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page addresses in DirectStorage
+  requests aren't supported.
 - **Textures written through their GPU VA** get scratch memory (see docs/d3d12x.md): no crash,
   but the texture doesn't see the data. Console tiling (`4KB_S`/`64KB_S`) isn't handled yet.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
@@ -226,6 +227,7 @@ down missing translations.
 
 rebox is licensed under the GNU General Public License, version 2 only
 ([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
+`helpers/bcpack` is GPL-3.0-or-later and runs as a separate process; see its README.
 The patches in `patches/` modify vkd3d-proton (LGPL-2.1+), Mesa (MIT), Wine (LGPL-2.1+) and AnyPS5
 (GPL-2.0-only) and are offered under
 those projects' licences too. Game data, dumps and anything derived from them (`build/`) are never

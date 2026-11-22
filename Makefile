@@ -57,6 +57,9 @@ CFLAGS_xaudio2_9 := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
 LIBS_xaudio2_9 := -L$(FFMPEG_XMA2)/lib -lavcodec -lavutil -lbcrypt
 endif
 
+# The DirectStorage shim talks to the BCPack helper over a localhost socket.
+LIBS_xcrdapi := -lws2_32
+
 .SECONDEXPANSION:
 $(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
 	@mkdir -p $(BUILD)

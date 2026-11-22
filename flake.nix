@@ -15,9 +15,15 @@
       url = "github:xodus-gaming/xgameruntime/642e41c7617310c5d1b39d4e525b01ecae261f9e";
       flake = false;
     };
+    # Leonida's clean-room BCPack decoder (GPLv3), run by helpers/bcpack as a separate process
+    # (it can't share a process with AnyPS5, GPL-2.0-only).
+    leonida-src = {
+      url = "github:ItsNotRexed/Leonida/bb2e18421dac527374eb837c88b5063c5d96f81f";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime }:
+  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime, leonida-src }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -242,6 +248,9 @@
           export REBOX_SRC=${shims-src}
           export REBOX_MAKE_FLAGS="${lib.concatStringsSep " " shimsMakeFlags}"
           export REBOX_BUILD_ENV=${mingwBuildEnv}
+          export REBOX_BCPACK_SCRIPT=${./helpers/bcpack/bcpack-helper.py}
+          export REBOX_BCPACK_PYTHON=''${REBOX_BCPACK_PYTHON:-${pkgs.pypy3}/bin/pypy3}
+          export LEONIDA_SRC=${leonida-src}
           export PATH=$PATH:${lib.makeBinPath [ mingwCC pkgs.gnumake pkgs.python3 pkgs.findutils ]}
           export REBOX_GPUVA_LAYER_DIR=''${REBOX_GPUVA_LAYER_DIR:-${gpuva-layer}/share/vulkan/explicit_layer.d}
           export REBOX_RADV_ICD=''${REBOX_RADV_ICD:-${radv-rebox}/share/vulkan/icd.d/radeon_icd.x86_64.json}
@@ -269,6 +278,7 @@
           export REBOX_SHIMS_DIR=$PWD/build
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
           export XODUS_IDL=${xodus-xgameruntime}/include
+          export LEONIDA_SRC=${leonida-src}
           export REBOX_ANYPS5_DIR=${self.packages.${system}.rebox-anyps5}
           export WINE_DLL_DIR=${pkgs.wineWow64Packages.unstable}/lib/wine/x86_64-windows
           # Software Vulkan only for machines (or sandboxes) without a GPU;
