@@ -52,28 +52,27 @@ nix run . -- ../xsx           # run title.exe
 nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
 ```
 
-Once the exe is dumped:
+Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launch:
 
-1. **Find what's missing.** `nix run . -- --scan ../xsx`. Expect the exe to import many more
-   `xmem`/`d3d12_xs` symbols and some GDK APIs that WineGDK lacks.
-2. **Stub the shim gaps.** In `nix develop`: `python3 tools/scan_imports.py ../xsx --provider build
-   --provider "$VKD3D_PROTON_DIR" --provider "$DXVK_DIR" --provider "$WINE_DLL_DIR" --shims shims
-   --gen-stubs generated`, then `make`. Stubs log once and return `E_NOTIMPL`. To make an entry
-   point real, implement it in `shims/<dll>/`, add it to that DLL's `.def`, and regenerate. A DLL
-   that nobody provides at all (e.g. `xg_xs.dll`) gets a whole stub DLL in
-   `generated/dlls/<name>/`, built to `build/stub/` and installed by `rebox-run`, so the exe
-   still loads. Forwarded exports in package DLLs are followed: if one forwards to a DLL nobody
-   provides, that DLL gets a stub too, and the report names the forwarder (`via dll.symbol`).
-   Import and export tables are read directly, so names pefile would drop (characters
-   outside `._?@$()<>`) still count. `tests/run-stubgen.sh` checks all of this end to end.
-3. **Shaders: not usable yet.** The plan is AnyPS5, compiling at first use inside the runner
-   ([docs/anyps5.md](docs/anyps5.md)). Console shaders translate to SPIR-V that expects console-style
-   resources, which vkd3d-proton can't take. [docs/shaders.md](docs/shaders.md) has the design
-   (patched vkd3d-proton, Leonida's runtime contract). Until then every console shader gets a
-   fallback, so the title runs with effects missing. `anyps5-cache link` still links PC-format
-   (DXBC/DXIL) translations into the cache.
-4. **Run, then iterate.** Read `misses.txt` in the cache dir (`anyps5-cache misses <cache>`). Set
-   `REBOX_STUB_FATAL=1` to stop at the first unimplemented stub the title reaches.
+1. **Stubs what nothing provides.** `rebox-run` scans the exe and the package's DLLs against
+   Wine, vkd3d-proton, DXVK and our shims (the report is `$WINEPREFIX/imports.txt`). A missing
+   export of one of our shims, or a DLL nobody provides at all (e.g. `pixevt.dll`), gets a stub
+   that logs its first call and returns `E_NOTIMPL`; the shims are then rebuilt in
+   `$WINEPREFIX/shim-build` (only when the stubs change; `REBOX_AUTO_STUBS=0` turns this off).
+   Forwarded exports in package DLLs are followed. `nix run . -- --scan ../xsx` prints the report
+   without running. To make an entry point real, implement it in `shims/<dll>/` and add it to that
+   DLL's `.def`. `tests/run-stubgen.sh` checks the stub generation end to end.
+2. **Sets up the prefix:** the shims (including the Gaming Runtime stand-in, which logs to
+   `$WINEPREFIX/xgameruntime.log`), `ConsoleMode`, persistent local storage in the prefix, and
+   the package as a shadow directory with our FidelityFX stub.
+3. **Runs the title.** Console compute shaders compile through AnyPS5 at dispatch
+   ([docs/anyps5.md](docs/anyps5.md)); graphics stages still get fallback shaders, so effects are
+   missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
+   ([docs/d3d12x.md](docs/d3d12x.md)).
+
+Then iterate: `REBOX_LOG=/path` keeps the shim log, `REBOX_STUB_FATAL=1` stops at the first
+unimplemented stub the title reaches, and `xgameruntime.log` lists any Gaming Runtime interface or
+method the title asked for that isn't implemented.
 
 ### Environment
 

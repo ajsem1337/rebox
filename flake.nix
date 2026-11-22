@@ -25,6 +25,32 @@
       mingwCC = pkgs.pkgsCross.mingwW64.stdenv.cc;
       python = pkgs.python3.withPackages (p: [ p.pefile p.capstone ]);
 
+      # The shims' sources, also given to rebox-run, which rebuilds them in the prefix with
+      # stubs for imports a title needs and nothing provides.
+      shims-src = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.unions [
+          ./Makefile
+          ./shims
+          ./anyps5/rebox_anyps5.h
+          (lib.fileset.maybeMissing ./generated)
+        ];
+      };
+      # The variables nix's setup hooks give mingw's compiler wrapper inside a build (its role,
+      # and the mcfgthread include and library paths), for rebox-run's rebuild outside one.
+      mingwBuildEnv = pkgs.stdenvNoCC.mkDerivation {
+        name = "mingw-build-env";
+        nativeBuildInputs = [ mingwCC ];
+        dontUnpack = true;
+        installPhase = ''
+          { printf 'export NIX_CFLAGS_COMPILE=%q\n' "$NIX_CFLAGS_COMPILE"
+            printf 'export NIX_LDFLAGS=%q\n' "$NIX_LDFLAGS"
+            env | grep '^NIX_.*_WRAPPER_TARGET_HOST_' | sed 's/^/export /'; } > $out
+        '';
+      };
+      shimsMakeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "MINGW_CXX=x86_64-w64-mingw32-g++" "FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}"
+                         "XODUS_IDL=${xodus-xgameruntime}/include" ];
+
       pyTool = name: file: pkgs.runCommand name { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
         makeWrapper ${python}/bin/python3 $out/bin/${name} --add-flags ${file} \
           --suffix PATH : ${mingwCC}/bin
@@ -189,18 +215,9 @@
 
         shims = pkgs.stdenvNoCC.mkDerivation {
           name = "rebox-shims";
-          src = lib.fileset.toSource {
-            root = ./.;
-            fileset = lib.fileset.unions [
-              ./Makefile
-              ./shims
-              ./anyps5/rebox_anyps5.h
-              (lib.fileset.maybeMissing ./generated)
-            ];
-          };
+          src = shims-src;
           nativeBuildInputs = [ mingwCC pkgs.python3 ];
-          makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "MINGW_CXX=x86_64-w64-mingw32-g++" "FFMPEG_XMA2=${ffmpeg-xma2}"
-                        "XODUS_IDL=${xodus-xgameruntime}/include" ];
+          makeFlags = shimsMakeFlags;
           buildFlags = [ "shims" ];
           installPhase = ''
             mkdir -p $out
@@ -222,6 +239,10 @@
           export DXVK_DIR=''${DXVK_DIR:-${dxvk-win}/x64}
           export REBOX_SHIMS_DIR=''${REBOX_SHIMS_DIR:-${shims}}
           export REBOX_SCAN=${scan-imports}/bin/scan_imports.py
+          export REBOX_SRC=${shims-src}
+          export REBOX_MAKE_FLAGS="${lib.concatStringsSep " " shimsMakeFlags}"
+          export REBOX_BUILD_ENV=${mingwBuildEnv}
+          export PATH=$PATH:${lib.makeBinPath [ mingwCC pkgs.gnumake pkgs.python3 pkgs.findutils ]}
           export REBOX_GPUVA_LAYER_DIR=''${REBOX_GPUVA_LAYER_DIR:-${gpuva-layer}/share/vulkan/explicit_layer.d}
           export REBOX_RADV_ICD=''${REBOX_RADV_ICD:-${radv-rebox}/share/vulkan/icd.d/radeon_icd.x86_64.json}
           exec ${pkgs.bash}/bin/bash ${./bin/rebox-run} "$@"

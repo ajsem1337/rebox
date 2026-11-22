@@ -69,6 +69,39 @@ if ! grep -qi "\"ConsoleMode\"=dword:$console_mode" "$WINEPREFIX/system.reg" 2>/
         /t REG_DWORD /d "0x$console_mode" /f >/dev/null 2>&1 || die "couldn't set ConsoleMode in $WINEPREFIX"
 fi
 
+# Imports nothing provides (the scan, as with --scan): stub them so the title still loads. A
+# missing export of one of our shims needs that shim rebuilt, so when the scan finds gaps the
+# shims are rebuilt in the prefix from REBOX_SRC (the flake sets it, with mingw and make on
+# PATH) with its stubs, which log their first call and return E_NOTIMPL. The scan's report goes
+# to $WINEPREFIX/imports.txt; the rebuild happens again only when the stubs change.
+# REBOX_AUTO_STUBS=0 turns this off.
+if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
+    gen="$WINEPREFIX/generated-stubs"
+    rm -rf "$gen"
+    "${REBOX_SCAN:-scan_imports.py}" "$game_dir" --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" \
+        --provider "$DXVK_DIR" --provider "$wine_dlls" --shims "$REBOX_SRC/shims" --gen-stubs "$gen" \
+        > "$WINEPREFIX/imports.txt" 2>&1 || true  # exits 1 when it found gaps
+    if [[ -d $gen/dlls ]] || grep -qs . "$gen"/*_stubs.def; then
+        key=$( (echo "$REBOX_SRC"; cd "$gen" && find . -type f -print0 | sort -z | xargs -0 cat) | sha256sum | cut -d' ' -f1)
+        rebuilt="$WINEPREFIX/shim-build"
+        if [[ $(cat "$rebuilt/.key" 2>/dev/null) != "$key" ]]; then
+            echo "rebox-run: stubbing imports nothing provides (see $WINEPREFIX/imports.txt); rebuilding the shims" >&2
+            rm -rf "$rebuilt"
+            cp -r "$REBOX_SRC" "$rebuilt"
+            chmod -R u+w "$rebuilt"
+            mkdir -p "$rebuilt/generated"
+            cp -r "$gen"/. "$rebuilt/generated/"
+            ( [[ -n ${REBOX_BUILD_ENV:-} ]] && . "$REBOX_BUILD_ENV"
+              make -C "$rebuilt" -j"$(nproc)" shims ${REBOX_MAKE_FLAGS:-} ) > "$rebuilt/build.log" 2>&1 \
+                || die "rebuilding the shims with stubs failed: $rebuilt/build.log"
+            cp "$REBOX_SHIMS_DIR"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null || true
+            echo "$key" > "$rebuilt/.key"
+        fi
+        REBOX_SHIMS_DIR="$rebuilt/build"
+        grep -E '^generated' "$WINEPREFIX/imports.txt" | sed 's/^/rebox-run: /' >&2
+    fi
+fi
+
 # Copy rather than symlink so the prefix survives nix garbage collection.
 sys32="$WINEPREFIX/drive_c/windows/system32"
 install -m 644 "$VKD3D_PROTON_DIR"/d3d12.dll "$VKD3D_PROTON_DIR"/d3d12core.dll "$DXVK_DIR"/dxgi.dll "$sys32"/
