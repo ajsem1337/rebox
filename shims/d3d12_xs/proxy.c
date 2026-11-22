@@ -957,6 +957,12 @@ static HRESULT STDMETHODCALLTYPE device_WaitFrameEventX(struct proxy *p, UINT ty
     return pacing_wait(type, timeout_ms, token);
 }
 
+static HRESULT STDMETHODCALLTYPE device_GetFrameStatisticsX(struct proxy *p, UINT64 token, UINT types, UINT *count,
+        void *statistics)
+{
+    return pacing_frame_statistics(token, types, count, statistics);
+}
+
 /* ------------------------------------------------------------------ queue */
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
@@ -1394,6 +1400,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(78, device_SetFrameIntervalX),
         FN(79, device_ScheduleFrameEventX),
         FN(80, device_WaitFrameEventX),
+        FN(81, device_GetFrameStatisticsX),
     };
     /* Queue: PC through GetDesc (18). */
     static const struct slot queue_slots[] = {

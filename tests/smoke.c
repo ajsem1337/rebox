@@ -1053,6 +1053,28 @@ static void test_pacing(void *dev)
     ms = ms_since(t0);
     CHECK(ok && ms > 25 && ms < 120, "ScheduleFrameEventX (slot 79) sets its event each frame: 3 in %.1f ms", ms);
 
+    /* GetFrameStatisticsX (slot 81): interval and frame event at once, rendering, presenting and
+     * display once the next origin has passed. */
+    {
+        BYTE stats[5][56];
+        UINT count = 5, types[5];
+        UINT64 token = 0;
+        wait(dev, 0, INFINITE, NULL, 0, &token);
+        hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
+        CHECK(SUCCEEDED(hr) && count == 2 && *(UINT *)stats[0] == 1 && *(UINT *)(stats[0] + 8) == 20000,
+              "GetFrameStatisticsX (slot 81) right after the frame event: %u entries", count);
+        Sleep(45);
+        count = 5;
+        hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
+        for (i = 0; i < 5; i++)
+            types[i] = *(UINT *)stats[i];
+        CHECK(SUCCEEDED(hr) && count == 5 && types[2] == 0x100 && types[3] == 0x1000 && types[4] == 0x10000,
+              "GetFrameStatisticsX a frame later: %u entries", count);
+        count = 2;
+        hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
+        CHECK(SUCCEEDED(hr) && count == 2, "GetFrameStatisticsX fills no more than the room it has (%u)", count);
+    }
+
     XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, HANDLE)(dev, 1, 0, NULL);
     XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 16667, 1);
     CloseHandle(event);

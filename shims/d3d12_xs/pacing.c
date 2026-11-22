@@ -18,6 +18,7 @@
  *
  * REBOX_FRAME_PACING=0 makes the calls no-ops again. */
 
+#include <string.h>
 #include <windows.h>
 
 #include "../common/rebox_log.h"
@@ -36,6 +37,7 @@ static struct
     LONGLONG next_signal;
 } types[MAX_TYPES];
 static HANDLE signal_thread, wake;
+static UINT interval_us_set = DEFAULT_INTERVAL_US;
 static BOOL disabled;
 
 static LONGLONG now(void)
@@ -150,6 +152,7 @@ HRESULT pacing_set_interval(UINT interval_us, UINT period)
     rebox_log("d3d12_xs: SetFrameIntervalX(%u us, period %u): origin every %.2f ms", interval_us, period,
                  interval_us * period / 1000.0);
     AcquireSRWLockExclusive(&lock);
+    interval_us_set = interval_us * period; /* the frame length, with 1 at +4, as XValkyrie reports it */
     /* Restart the clock so frame numbers stay monotonic from here. */
     period_ticks = us_to_ticks((LONGLONG)interval_us * period);
     epoch = now();
@@ -213,5 +216,83 @@ HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
     sleep_until(t);
     if (token)
         *token = (UINT64)frame + 1;
+    return S_OK;
+}
+
+/* Device slot 81, GetFrameStatisticsX(token, types, count, statistics) (XValkyrie: an Unreal
+ * title waits for these per frame token and stops after a few frames without them). Each entry
+ * is D3D12XBOX_FRAME_STATISTICS, 56 bytes: a type, padding, and 48 bytes for that type, one per
+ * type asked for that has something to report. The numbers come from the frame clock: frame k's
+ * origin at its due time, and rendering, presenting and the display taken to finish by the next
+ * origin, so those three are reported only once that has passed. Offsets into the 48 data bytes
+ * (which start at +8), as XValkyrie fills them:
+ *   0x1      interval: +0 the frame length (interval x period) in us, +4 1
+ *   0x2      frame event: +8 waited, +16 and +24 came (QPC)
+ *   0x100    rendering: +8 done, +16 how long
+ *   0x1000   presenting: +1 planes, +2 views, +8/+16 started, +24 done, +32 how long, +42 1
+ *   0x10000  display: +8 vertical blank, +16 flip */
+HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *statistics)
+{
+    static const UINT kinds[] = { 0x1, 0x2, 0x100, 0x1000, 0x10000 };
+    BYTE *out = statistics;
+    UINT room;
+    LONGLONG origin, next, t = now();
+
+    if (!count)
+        return E_POINTER;
+    room = statistics ? *count : 0;
+    *count = 0;
+    if (!ready() || !token)
+        return S_OK;
+    AcquireSRWLockShared(&lock);
+    origin = due(0, (LONGLONG)token - 1);
+    next = origin + period_ticks;
+    for (UINT i = 0; i < ARRAYSIZE(kinds) && *count < room; i++)
+    {
+        BYTE *e = out + *count * 56;
+        LONGLONG v;
+        UINT32 u;
+        UINT16 one = 1;
+
+        if (!(types & kinds[i]) || (kinds[i] >= 0x100 && t < next) || (kinds[i] == 0x2 && t < origin))
+            continue;
+        memset(e, 0, 56);
+        memcpy(e, &kinds[i], 4);
+        switch (kinds[i])
+        {
+        case 0x1:
+            u = interval_us_set;
+            memcpy(e + 8, &u, 4);
+            u = 1;
+            memcpy(e + 12, &u, 4);
+            break;
+        case 0x2:
+            memcpy(e + 16, &origin, 8);
+            memcpy(e + 24, &origin, 8);
+            memcpy(e + 32, &origin, 8);
+            break;
+        case 0x100:
+            v = next - origin;
+            memcpy(e + 16, &next, 8);
+            memcpy(e + 24, &v, 8);
+            break;
+        case 0x1000:
+            e[9] = 1;
+            e[10] = 1;
+            v = 0;
+            memcpy(e + 16, &next, 8);
+            memcpy(e + 24, &next, 8);
+            memcpy(e + 32, &next, 8);
+            memcpy(e + 40, &v, 8);
+            memcpy(e + 50, &one, 2);
+            break;
+        default:
+            memcpy(e + 16, &next, 8);
+            memcpy(e + 24, &next, 8);
+            break;
+        }
+        (*count)++;
+    }
+    ReleaseSRWLockShared(&lock);
     return S_OK;
 }
