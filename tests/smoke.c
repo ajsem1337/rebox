@@ -2771,8 +2771,8 @@ static int cs_unplannable(const char *name, const char *why, void *blob)
 }
 
 /* After a GPU reset the kernel completes the killed job's fence, so the fence alone reads as the
- * shader finishing and the next one takes the blame; vkd3d-proton marks the device removed once it
- * next submits.
+ * shader finishing and the next one takes the blame; vkd3d-proton marks the device removed once a
+ * submission fails.
  * Fences aren't proxied, so GetDevice gives vkd3d's own device. */
 static BOOL device_lost(ID3D12Fence *fence)
 {
@@ -2936,8 +2936,15 @@ static int cs_run(struct console_cs *c, char *line)
         status = 3;
     else
     {
-        /* vkd3d-proton notices a lost device at its next submission, so make one: a signal
-         * with no work, which a lost context refuses. */
+        /* vkd3d-proton notices a lost device when a submission fails, so make one with real GPU
+         * work (an empty signal never reaches the kernel): copy 4 bytes inside the synthetic
+         * buffer, which a lost context refuses. List slots 6-26 match PC; 15 is CopyBufferRegion. */
+        ID3D12CommandAllocator_Reset(c->alloc);
+        XSLOT(c->list, 10, HRESULT, ID3D12CommandAllocator *, void *)(c->list, c->alloc, NULL);
+        XSLOT(c->list, 15, void, ID3D12Resource *, UINT64, ID3D12Resource *, UINT64, UINT64)(c->list,
+                c->res[CS_BUFFER], 0, c->res[CS_BUFFER], 1 << 19, 4);
+        XSLOT(c->list, 9, HRESULT)(c->list);
+        XSLOT(c->queue, 10, void, UINT, void *const *)(c->queue, 1, &c->list);
         XSLOT(c->queue, 14, HRESULT, ID3D12Fence *, UINT64)(c->queue, c->fence, ++c->fence_value);
         for (int i = 0; i < 200 && ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value; i++)
             Sleep(10);
