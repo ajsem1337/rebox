@@ -2771,7 +2771,8 @@ static int cs_unplannable(const char *name, const char *why, void *blob)
 }
 
 /* After a GPU reset the kernel completes the killed job's fence, so the fence alone reads as the
- * shader finishing and the next one takes the blame; vkd3d-proton marks the device removed, though.
+ * shader finishing and the next one takes the blame; vkd3d-proton marks the device removed once it
+ * next submits.
  * Fences aren't proxied, so GetDevice gives vkd3d's own device. */
 static BOOL device_lost(ID3D12Fence *fence)
 {
@@ -2931,8 +2932,18 @@ static int cs_run(struct console_cs *c, char *line)
             Sleep(10);
     }
     hr = c->last_result(message, sizeof(message));
-    if (ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value || device_lost(c->fence))
+    if (ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value)
         status = 3;
+    else
+    {
+        /* vkd3d-proton notices a lost device at its next submission, so make one: a signal
+         * with no work, which a lost context refuses. */
+        XSLOT(c->queue, 14, HRESULT, ID3D12Fence *, UINT64)(c->queue, c->fence, ++c->fence_value);
+        for (int i = 0; i < 200 && ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value; i++)
+            Sleep(10);
+        if (device_lost(c->fence))
+            status = 3;
+    }
     else
         status = SUCCEEDED(hr) ? 0 : 1;
     {
