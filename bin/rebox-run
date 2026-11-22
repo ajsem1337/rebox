@@ -13,6 +13,7 @@
 #   WINEPREFIX            default: ~/.local/share/rebox/<TitleId>
 #   REBOX_SHADER_CACHE Unix path to the AnyPS5 cache; default: $WINEPREFIX/shader-cache
 #   REBOX_GPUVA_LAYER_DIR  directory holding VK_LAYER_REBOX_gpuva_identity's manifest (flake sets it)
+#   REBOX_CONSOLE_MODE ConsoleMode registry value the title reads (default 0x64, Series X)
 #   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
@@ -55,6 +56,15 @@ if [[ ! -d $WINEPREFIX/drive_c ]]; then
     echo "rebox-run: creating prefix $WINEPREFIX" >&2
     mkdir -p "$WINEPREFIX"
     "$WINE" wineboot -i >/dev/null 2>&1 || die "wineboot failed for $WINEPREFIX"
+fi
+
+# Which console this is: the GDK's XSystemGetDeviceType is compiled into the title and reads
+# ConsoleMode under this key (0x64 Series X, 0x50 Xbox One X). Without it the title is told it's
+# on a PC, which a console build has no case for (XValkyrie, docs/d3d12x.md).
+console_mode=$(printf '%08x' "$((${REBOX_CONSOLE_MODE:-0x64}))")
+if ! grep -qi "\"ConsoleMode\"=dword:$console_mode" "$WINEPREFIX/system.reg" 2>/dev/null; then
+    "$WINE" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM' /v ConsoleMode \
+        /t REG_DWORD /d "0x$console_mode" /f >/dev/null 2>&1 || die "couldn't set ConsoleMode in $WINEPREFIX"
 fi
 
 # Copy rather than symlink so the prefix survives nix garbage collection.

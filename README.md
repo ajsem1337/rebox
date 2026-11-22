@@ -2,7 +2,10 @@
 
 Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 
-- **WineGDK** for Wine itself and the GDK runtime (`xgameruntime`: XUser, XTaskQueue, XGameSave and so on)
+- **WineGDK** for Wine itself and the GDK runtime (`xgameruntime`: XUser, XTaskQueue, XGameSave and so on),
+  with `patches/wine/`: `VirtualAlloc` accepts the `MEM_LARGE_PAGES` and `MEM_4MB_PAGES` flags Xbox
+  titles pass (ordinary pages back them). `rebox-run` also sets the `ConsoleMode` registry value
+  the GDK's `XSystemGetDeviceType` reads, so the title knows it's on a Series X.
 - **vkd3d-proton** for D3D12 on Vulkan, built from source with our patches (`.#vkd3d-proton-rebox`,
   `patches/vkd3d-proton/`), plus **DXVK's `dxgi.dll`** for adapter enumeration
 - **shims for the console-only DLLs** WineGDK doesn't cover: `xmem.dll` and `d3d12_xs.dll` (D3D12.X)
@@ -25,7 +28,8 @@ shims/amd_fidelityfx_loader_xbox/  FidelityFX API stub: FSR-style queries, bilin
 shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA2 voices played as silence
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
-patches/                  Mesa patch letting RADV place memory at lower-half device addresses
+patches/                  Mesa patch letting RADV place memory at lower-half device addresses;
+                          vkd3d-proton, AnyPS5 and Wine patches
 shims/common/             logging + REBOX_STUB macro for generated stubs
 generated/                stubs from tools/scan_imports.py --gen-stubs (one-off fill-in exports;
                           dlls/<name>/ for whole DLLs nobody provides) and generated shaders
@@ -77,6 +81,7 @@ Once the exe is dumped:
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
 | `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |
+| `REBOX_CONSOLE_MODE` | `ConsoleMode` value `rebox-run` puts in the registry for `XSystemGetDeviceType` (default `0x64`, Series X; `0x50` is Xbox One X) |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
@@ -209,6 +214,7 @@ down missing translations.
 
 rebox is licensed under the GNU General Public License, version 2 only
 ([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
-The patches in `patches/` modify vkd3d-proton (LGPL-2.1+) and Mesa (MIT) and are offered under
+The patches in `patches/` modify vkd3d-proton (LGPL-2.1+), Mesa (MIT), Wine (LGPL-2.1+) and AnyPS5
+(GPL-2.0-only) and are offered under
 those projects' licences too. Game data, dumps and anything derived from them (`build/`) are never
 part of the repository.

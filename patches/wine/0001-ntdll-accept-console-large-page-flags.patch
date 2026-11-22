@@ -1,0 +1,29 @@
+From: rebox
+Subject: [PATCH] ntdll: Accept the large and 4 MiB page flags Xbox titles pass.
+
+Xbox titles call VirtualAlloc with MEM_LARGE_PAGES or MEM_4MB_PAGES
+(XValkyrie, docs/research). NtAllocateVirtualMemory(Ex) rejected both;
+ordinary pages do.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index db820a8..7c7ea23 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5257,6 +5257,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
+ #ifndef _WIN64
+     if (!is_old_wow64() && zero_bits >= 32) return STATUS_INVALID_PARAMETER_3;
+ #endif
++    /* Xbox titles ask for large or 4 MiB pages; ordinary pages do. */
++    type &= ~(MEM_LARGE_PAGES | MEM_4MB_PAGES);
+     if (type & ~type_mask) return STATUS_INVALID_PARAMETER;
+ 
+     if (process != NtCurrentProcess())
+@@ -5401,6 +5403,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
+                                   &align, &attributes, &machine );
+     if (status) return status;
+ 
++    /* Xbox titles ask for large or 4 MiB pages; ordinary pages do. */
++    type &= ~(MEM_LARGE_PAGES | MEM_4MB_PAGES);
+     if (type & ~type_mask) return STATUS_INVALID_PARAMETER;
+     if (*ret && (align || limit_low || limit_high)) return STATUS_INVALID_PARAMETER;
+     if (!*size_ptr) return STATUS_INVALID_PARAMETER;

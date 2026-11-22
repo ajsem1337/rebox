@@ -30,6 +30,8 @@
           pname = "winegdk";
           version = "11.14-gdk-${winegdk-src.shortRev}";
           src = winegdk-src;
+          # Fixes Xbox titles need from Wine itself (patches/wine/).
+          patches = (old.patches or [ ]) ++ [ ./patches/wine/0001-ntdll-accept-console-large-page-flags.patch ];
         });
 
         # The nixpkgs vkd3d-proton package is the native Linux build; Wine
