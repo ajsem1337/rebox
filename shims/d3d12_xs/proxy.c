@@ -76,11 +76,21 @@ C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
 
 static struct proxy_class device_class = { "Device", 128 };
 static struct proxy_class queue_class = { "CommandQueue", 64 };
+static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", 64 };
 static struct proxy_class list_class = { "GraphicsCommandList", MAX_SLOTS };
 static struct proxy_class copy_list_class = { "CopyCommandList", 64 };
 static struct proxy_class heap_class = { "DescriptorHeap", 16 };
 
-static struct proxy_class *const classes[] = { &device_class, &queue_class, &list_class, &copy_list_class, &heap_class };
+static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &copy_list_class,
+                                               &heap_class };
+
+/* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
+static UINT32 sdk_version;
+
+void proxy_set_sdk_version(UINT32 version)
+{
+    sdk_version = version;
+}
 
 static struct proxy *device_proxy;
 
@@ -523,7 +533,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(struct proxy *p, cons
     d.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     d.NodeMask = 0;
     hr = ID3D12Device_CreateCommandQueue(INNER(p, ID3D12Device), &d, &IID_ID3D12CommandQueue, (void **)&queue);
-    return wrap_result(hr, (IUnknown *)queue, &queue_class, out);
+    return wrap_result(hr, (IUnknown *)queue, sdk_version >= 0x20004 ? &queue_v4_class : &queue_class, out);
 }
 
 static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
@@ -1388,6 +1398,17 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(10, queue_ExecuteCommandLists),
         FN(30, queue_PresentX),
     };
+    /* Queue for titles built against SDK 0x20004 or later (ScarlettX 1e5473d, from a title's
+     * calls): two methods were added ahead of Signal, so Signal is 16 and PresentX 32. Where they
+     * were added isn't known, so 11-15 (PC's markers, then the two new ones) trap, and only the
+     * slots a title was seen calling, plus Wait after Signal, are mapped. */
+    static const struct slot queue_v4_slots[] = {
+        FN(7, child_GetDevice),
+        FN(10, queue_ExecuteCommandLists),
+        FWD(16, 14), /* Signal */
+        FWD(17, 15), /* Wait, assumed to follow Signal */
+        FN(32, queue_PresentX),
+    };
     /* Graphics list: PC through ResourceBarrier (26), then PC + 4 for PC
      * slots 28-58 (both sources agree at 32-48, 50-52 and 60-62). */
     static struct slot list_slots[64] = {
@@ -1436,6 +1457,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
 
     build(&device_class, 44, device_slots, ARRAYSIZE(device_slots));
     build(&queue_class, 19, queue_slots, ARRAYSIZE(queue_slots));
+    build(&queue_v4_class, 11, queue_v4_slots, ARRAYSIZE(queue_v4_slots));
     build(&list_class, 27, list_slots, n);
     build(&copy_list_class, 11, copy_slots, ARRAYSIZE(copy_slots));
     build(&heap_class, 9, heap_slots, ARRAYSIZE(heap_slots));

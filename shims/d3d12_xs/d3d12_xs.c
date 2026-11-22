@@ -393,15 +393,25 @@ ID3D12Device *rebox_shared_device(void)
     return device;
 }
 
-/* Console device creation. The adapter and D3D12XBOX_CREATE_DEVICE_PARAMETERS
- * are ignored; vkd3d-proton picks the Vulkan device. Every call returns the
- * same device, as on the console. */
+/* Console device creation. The adapter is ignored; vkd3d-proton picks the Vulkan device. Of
+ * D3D12XBOX_CREATE_DEVICE_PARAMETERS (Version, ProcessDebugFlags, GraphicsCommandQueueRingSizeBytes,
+ * GraphicsScratchMemorySizeBytes, ComputeScratchMemorySizeBytes, PreferWarp: ScarlettX) only the
+ * version is used: from 0x20004 the queue has a later layout (proxy.c). Every call returns the same
+ * device, as on the console. */
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown *adapter, const void *params, REFIID riid, void **device)
 {
     ID3D12Device *shared = rebox_shared_device();
     char buf[40];
 
-    rebox_log("d3d12_xs: D3D12XboxCreateDevice(riid %s), creation parameters ignored", debugstr_guid(riid, buf));
+    if (params)
+    {
+        const UINT32 *p = params;
+        rebox_log("d3d12_xs: D3D12XboxCreateDevice(riid %s): SDK version %#x, debug flags %#x, ring %u, "
+                     "scratch %u/%u bytes, prefer WARP %u", debugstr_guid(riid, buf), p[0], p[1], p[2], p[3], p[4], p[5]);
+        proxy_set_sdk_version(p[0]);
+    }
+    else
+        rebox_log("d3d12_xs: D3D12XboxCreateDevice(riid %s), no creation parameters", debugstr_guid(riid, buf));
     if (!device)
         return E_POINTER;
     *device = NULL;

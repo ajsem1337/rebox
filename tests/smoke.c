@@ -2218,6 +2218,33 @@ static void test_xbox(void)
     hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &IID_ID3D12Device5, &dev5);
     CHECK(SUCCEEDED(hr) && dev5 == dev, "QueryInterface for another device version returns the proxy");
 
+    /* Titles built against SDK 0x20004 or later get the later queue layout: Signal at 16. */
+    {
+        UINT32 params[6] = { 0x20004 }, old[6] = { 0 };
+        void *dev4 = NULL, *queue4 = NULL;
+        ID3D12Fence *fence4 = NULL;
+
+        hr = create(NULL, params, &IID_ID3D12Device, &dev4);
+        CHECK(SUCCEEDED(hr) && dev4 == dev, "D3D12XboxCreateDevice with SDK version 0x20004 %#lx", hr);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(dev, 8, HRESULT, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **)(dev, &qd,
+                    &IID_ID3D12CommandQueue, &queue4);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                    &IID_ID3D12Fence, (void **)&fence4);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(queue4, 16, HRESULT, ID3D12Fence *, UINT64)(queue4, fence4, 7);
+        for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 7; i++)
+            Sleep(10);
+        CHECK(SUCCEEDED(hr) && fence4 && ID3D12Fence_GetCompletedValue(fence4) == 7,
+              "SDK 0x20004 queue: Signal at slot 16 (%#lx)", hr);
+        if (fence4) ID3D12Fence_Release(fence4);
+        if (queue4) XSLOT(queue4, 2, ULONG)(queue4);
+        if (dev4) XSLOT(dev4, 2, ULONG)(dev4);
+        create(NULL, old, &IID_ID3D12Device, &dev4);
+        XSLOT(dev4, 2, ULONG)(dev4);
+    }
+
     /* Device slot 8 (PC 8), 9 (PC, forwarded unwrapped), 12, 14. */
     hr = XSLOT(dev, 8, HRESULT, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **)(dev, &qd,
             &IID_ID3D12CommandQueue, &queue);

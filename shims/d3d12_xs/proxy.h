@@ -8,6 +8,8 @@
 
 /* Returns the device proxy for the shared device, as riid. */
 HRESULT proxy_query_device(ID3D12Device *inner, REFIID riid, void **out);
+/* The SDK version from D3D12XBOX_CREATE_DEVICE_PARAMETERS: picks the queue layout. */
+void proxy_set_sdk_version(UINT32 version);
 
 /* For work d3d12_xs records into a title's command list: the wrapped list,
  * plus the descriptor heaps the title last set on it (up to 2), so they can
