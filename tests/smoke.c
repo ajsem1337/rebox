@@ -2770,6 +2770,22 @@ static int cs_unplannable(const char *name, const char *why, void *blob)
     return 4;
 }
 
+/* After a GPU reset the kernel completes the killed job's fence, so the fence alone reads as the
+ * shader finishing and the next one takes the blame; vkd3d-proton marks the device removed, though.
+ * Fences aren't proxied, so GetDevice gives vkd3d's own device. */
+static BOOL device_lost(ID3D12Fence *fence)
+{
+    ID3D12Device *device;
+    BOOL lost = FALSE;
+
+    if (SUCCEEDED(ID3D12Fence_GetDevice(fence, &IID_ID3D12Device, (void **)&device)))
+    {
+        lost = FAILED(ID3D12Device_GetDeviceRemovedReason(device));
+        ID3D12Device_Release(device);
+    }
+    return lost;
+}
+
 /* One plan line; returns 0 dispatched, 1 skipped (compile failed), 2 error, 3 hung, 4 not run (its
  * inferred tables can't be D3D12 heaps). */
 static int cs_run(struct console_cs *c, char *line)
@@ -2915,7 +2931,7 @@ static int cs_run(struct console_cs *c, char *line)
             Sleep(10);
     }
     hr = c->last_result(message, sizeof(message));
-    if (ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value)
+    if (ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value || device_lost(c->fence))
         status = 3;
     else
         status = SUCCEEDED(hr) ? 0 : 1;
