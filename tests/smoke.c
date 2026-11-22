@@ -2941,11 +2941,8 @@ static int cs_run(struct console_cs *c, char *line)
         XSLOT(c->queue, 14, HRESULT, ID3D12Fence *, UINT64)(c->queue, c->fence, ++c->fence_value);
         for (int i = 0; i < 200 && ID3D12Fence_GetCompletedValue(c->fence) < c->fence_value; i++)
             Sleep(10);
-        if (device_lost(c->fence))
-            status = 3;
+        status = device_lost(c->fence) ? 3 : SUCCEEDED(hr) ? 0 : 1;
     }
-    else
-        status = SUCCEEDED(hr) ? 0 : 1;
     {
         /* AnyPS5 fault records (unmapped addresses, failed speculation) this dispatch left. */
         UINT faults = c->faults ? c->faults() : 0;

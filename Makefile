@@ -15,7 +15,7 @@ COMMON  := shims/common/rebox_log.c
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
 STUB_DLLS := $(notdir $(wildcard $(GEN)/dlls/*))
 
-all: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll)
+all: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll) $(BUILD)/smoke.exe
 
 # XMA2 decoding in xaudio2_9 needs FFMPEG_XMA2 (the flake's ffmpeg-xma2:
 # static mingw libavcodec/libavutil); without it XMA2 plays as silence.
