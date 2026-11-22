@@ -84,11 +84,14 @@ words (16 dwords), which the dispatch path will have to fill.
    | 0x104 | float mode | 2,472 |
    | 0x138 | `COMPUTE_PGM_RSRC2` | user SGPR count in all; the enables and LDS describe this code, PS09 the driver's recompile |
    | 0x13C, 0x140, 0x144 | thread-group size | all |
+   | 0xD4 | bit 5: wave32 (clear: wave64), from americas-recomp | of the 2,598 matched, the 1,464 with it set are all wave32 by `sa5_analyse` and 828 of the rest wave64; the analysis defaulted the other 306 to wave32 |
    | 0x168 | code (u32 at 0xC0 plus 0x28) | |
 
    `RSRC1` isn't in the header. AnyPS5 needs only its float mode and clamp bits, which PS09 has
    as 0x402c03xx throughout, so it is rebuilt as 0x402c0000 plus the float mode. The wave size
-   isn't there either; the SCRD says 0 and the compile infers it with `sa5_analyse`. zlib comes
+   comes from 0xD4; SCRDs without one (wave 0) are inferred with `sa5_analyse`. The console-cs
+   plan takes it from the game's containers too (`tools/console-cs-plan.py DUMP CONTAINERS`),
+   since the analysis can't tell a wave64 shader with no wave-wide instructions from a wave32 one. zlib comes
    from zlib's `contrib/puff` (zlib licence, `shims/d3d12_xs/puff.c`).
 
    Pixel-shader containers (facts from Leonida, GPLv3, `docs/design.md` rows "Pixel-shader

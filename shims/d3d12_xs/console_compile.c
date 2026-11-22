@@ -558,8 +558,9 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     req.wave = h->wave_size;
     if (!req.wave)
     {
-        /* Containers don't record the wave size: infer it from the code, as the layout analysis
-         * does (wave64 code uses 64-bit exec and VCC). */
+        /* No wave size given (game containers carry one, console_fssm.c; SCRDs from other
+         * sources may not): infer it from the code, as the layout analysis does (wave64 code
+         * uses 64-bit exec and VCC). */
         struct sa5_layout layout;
         static struct sa5_slot slots[1];
         char ignored[64];

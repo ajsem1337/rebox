@@ -10,9 +10,11 @@
  *   0x13C, 0x140, 0x144  thread-group size: equal for all
  *   0x150  the 24-byte shader ID PS09 also carries
  *   0x168  code (u32 at 0xC0 plus 0x28), then the tail Leonida parses
+ *   0xD4   bit 5: wave32, clear for wave64 (americas-recomp bd0a9013d3; of the 2,598 we matched,
+ *          the 1,464 with it set are all wave32 by sa5_analyse, and 828 of the others wave64;
+ *          the analysis says wave32 for the other 306, which have nothing it can tell by)
  * RSRC1 itself isn't in the header; AnyPS5 needs only its float mode, DX10 clamp and IEEE bits,
- * and PS09's are 0x402c03xx throughout (DX10 clamp on, IEEE off). The wave size isn't in the
- * header either; the SCRD says 0 and ReboxConsoleCompile infers it from the code. */
+ * and PS09's are 0x402c03xx throughout (DX10 clamp on, IEEE off). */
 
 #include <windows.h>
 #include <stdlib.h>
@@ -22,6 +24,8 @@
 #include "console_fssm.h"
 #include "puff.h"
 
+#define FSSM_WAVE_FLAGS 0xd4
+#define FSSM_WAVE32 0x20
 #define FSSM_FLOAT_MODE 0x104
 #define FSSM_RSRC2 0x138
 #define FSSM_THREADS 0x13c
@@ -89,7 +93,7 @@ void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size
     h->version = 1;
     h->size = sizeof(*h) + code_bytes;
     h->stage = 0x20; /* VK_SHADER_STAGE_COMPUTE_BIT */
-    h->wave_size = 0;
+    h->wave_size = (u32(fssm + FSSM_WAVE_FLAGS) & FSSM_WAVE32) ? 32 : 64;
     h->workgroup_size[0] = u32(fssm + FSSM_THREADS);
     h->workgroup_size[1] = u32(fssm + FSSM_THREADS + 4);
     h->workgroup_size[2] = u32(fssm + FSSM_THREADS + 8);

@@ -2975,7 +2975,8 @@ static int cs_run(struct console_cs *c, char *line)
     static const char *const kinds[] = { "texture", "storage", "sampler", "buffer", "cbuffer" };
     static const char *const dims[] = { "-", "1D", "2D", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2D_MSAA", "2D_MSAA_ARRAY" };
     char *name = strtok(line, " "), *path = strtok(NULL, " "), *skip = strtok(NULL, " "), *r1 = strtok(NULL, " ");
-    char *r2 = strtok(NULL, " "), *threads = strtok(NULL, " \r\n"), winpath[MAX_PATH], message[512], why[128];
+    char *r2 = strtok(NULL, " "), *threads = strtok(NULL, " \r\n"), *wave = strtok(NULL, " \r\n");
+    char winpath[MAX_PATH], message[512], why[128];
     struct { UINT32 magic, version, size, stage, wave_size, workgroup_size[3], rsrc1, rsrc2, code_offset, code_dwords;
              UINT64 code_address; } *blob;
     static struct sa5_slot slots[4096];
@@ -3019,6 +3020,13 @@ static int cs_run(struct console_cs *c, char *line)
         return cs_unplannable(name, why, blob);
     }
     blob->wave_size = layout.wave;
+    /* The container header's wave size, when the plan has it, beats the inference. */
+    if (wave && (atoi(wave) == 32 || atoi(wave) == 64))
+    {
+        if ((UINT)atoi(wave) != layout.wave)
+            printf("cs %s: wave%d from the header, the analysis said wave%u\n", name, atoi(wave), layout.wave);
+        blob->wave_size = atoi(wave);
+    }
     if (!layout.table_count)
         return cs_unplannable(name, "no descriptor table", blob);
     for (UINT t = 0; t < layout.table_count; t++)
