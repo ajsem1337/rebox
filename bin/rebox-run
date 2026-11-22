@@ -50,7 +50,7 @@ wine_dlls="$(dirname "$(realpath "$(command -v "$WINE")")")/../lib/wine/x86_64-w
 
 if (( scan )); then
     exec ${REBOX_SCAN:-scan_imports.py} "$game_dir" \
-        --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" --provider "$wine_dlls"
+        --provider "$REBOX_SHIMS_DIR" --provider "$VKD3D_PROTON_DIR" --provider "$DXVK_DIR" --provider "$wine_dlls"
 fi
 
 [[ -f $game_dir/$exe ]] || die "$exe is listed in MicrosoftGame.Config but missing from $game_dir (not dumped/decrypted yet?)"
