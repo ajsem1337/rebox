@@ -2873,6 +2873,18 @@ static int cs_run(struct console_cs *c, char *line)
                  + (SIZE_T)table_heap_slot[sl->table] * inc + (SIZE_T)sl->dword * 4);
     }
 
+    /* Every shader shares the synthetic buffers: zero them, so what one shader wrote (say, a loop
+     * bound) can't make the next one run forever. They are CPU-visible (cpu_visible_buffers). */
+    for (int r = CS_BUFFER; r <= CS_CBUFFER; r++)
+    {
+        void *mem;
+        if (SUCCEEDED(ID3D12Resource_Map(c->res[r], 0, NULL, &mem)))
+        {
+            memset(mem, 0, r == CS_BUFFER ? 1 << 20 : 1 << 16);
+            ID3D12Resource_Unmap(c->res[r], 0, NULL);
+        }
+    }
+
     cd.pRootSignature = cs_root_signature(c, nsgprs);
     cd.CS = (D3D12_SHADER_BYTECODE){ blob, blob->size };
     hr = XSLOT(c->dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(c->dev, &cd,
