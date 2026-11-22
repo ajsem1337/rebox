@@ -1738,6 +1738,21 @@ static void test_shadow_heap(void *dev)
               && ((s[2] >> 26) & 3) == 2 && ((s[1] >> 12) & 0xfff) == 8 * 256,
               "sampler becomes an S#: clamp/wrap/mirror, linear filters, max LOD 8");
     }
+    {
+        /* Slot 61, CreateSamplerX: the same sampler in the console's own terms gives the same S#. */
+        struct { UINT flags, mag, min, mip, z, mode; D3D12_TEXTURE_ADDRESS_MODE u, v, w;
+                 FLOAT min_lod, max_lod, bias, bias2; UINT aniso; FLOAT aniso_bias; UINT threshold;
+                 D3D12_COMPARISON_FUNC cmp; FLOAT border[4]; } x = {
+            0, 1, 1, 2, 0, 0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            D3D12_TEXTURE_ADDRESS_MODE_MIRROR, 0.0f, 8.0f, 0.0f, 0.0f, 1, 0.0f, 0, D3D12_COMPARISON_FUNC_NEVER };
+        XSLOT(dev, 61, void, const void *, SIZE_T)(dev, &x, scpu);
+        CHECK(!memcmp(sam, (BYTE *)sam + sinc, 16), "CreateSamplerX (slot 61) gives the same S# as CreateSampler");
+        /* Leave slot 0 different, so the S# lookup below finds slot 1. */
+        x.mag = x.min = 0;
+        x.mip = 1;
+        XSLOT(dev, 61, void, const void *, SIZE_T)(dev, &x, scpu);
+        CHECK(memcmp(sam, (BYTE *)sam + sinc, 16), "CreateSamplerX with point filters gives a different S#");
+    }
     CHECK(shadow_read(title_va + 2 * inc, readback, 32) && !memcmp(readback, (BYTE *)res + 2 * inc, 32),
           "ReboxShadowRead reads the T# at its title address");
     CHECK(!shadow_read(title_va + 3 * inc, readback, 2 * inc), "ReboxShadowRead refuses a read past the heap");

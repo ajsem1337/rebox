@@ -944,6 +944,54 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     return device_CreateCommittedResource(p, &own, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
 }
 
+/* Slot 61: CreateSamplerX(desc, handle) (ScarlettX's retail trace; layout from XValkyrie): a
+ * sampler with each console filter separate. Filters are 0 point, 1 linear, 2/3 those with
+ * anisotropy; the mip filter 0 none, 1 point, 2 linear; the mode 0 blend, 1 minimum, 2 maximum.
+ * The Z filter, the second LOD bias, the anisotropy bias and threshold have no D3D12 field. */
+struct console_sampler
+{
+    UINT flags, filter_mag, filter_min, filter_mip, filter_z, filter_mode;
+    D3D12_TEXTURE_ADDRESS_MODE address_u, address_v, address_w;
+    FLOAT min_lod, max_lod, lod_bias, lod_bias_secondary;
+    UINT max_anisotropy;
+    FLOAT anisotropy_bias;
+    UINT anisotropy_threshold;
+    D3D12_COMPARISON_FUNC comparison;
+    FLOAT border[4];
+};
+
+static D3D12_TEXTURE_ADDRESS_MODE sampler_address(D3D12_TEXTURE_ADDRESS_MODE mode)
+{
+    return mode >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && mode <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
+            ? mode : D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+}
+
+static void STDMETHODCALLTYPE device_CreateSamplerX(struct proxy *p, const struct console_sampler *x, SIZE_T handle)
+{
+    D3D12_SAMPLER_DESC d = { 0 };
+    BOOL compare, aniso;
+    UINT reduction;
+
+    if (!x)
+        return;
+    compare = x->comparison > D3D12_COMPARISON_FUNC_NEVER && x->comparison < D3D12_COMPARISON_FUNC_ALWAYS;
+    aniso = x->filter_mag >= 2 || x->filter_min >= 2;
+    reduction = compare ? 1 : x->filter_mode == 1 ? 2 : x->filter_mode == 2 ? 3 : 0;
+    d.Filter = (D3D12_FILTER)((aniso ? 0x55u : ((x->filter_min & 1) << 4 | (x->filter_mag & 1) << 2
+                                                | (x->filter_mip == 2)))
+                              | reduction << 7);
+    d.AddressU = sampler_address(x->address_u);
+    d.AddressV = sampler_address(x->address_v);
+    d.AddressW = sampler_address(x->address_w);
+    d.MipLODBias = x->lod_bias;
+    d.MaxAnisotropy = aniso ? min(max(x->max_anisotropy, 1u), 16u) : 1;
+    d.ComparisonFunc = compare ? x->comparison : D3D12_COMPARISON_FUNC_NEVER;
+    memcpy(d.BorderColor, x->border, sizeof(d.BorderColor));
+    d.MinLOD = x->min_lod;
+    d.MaxLOD = x->filter_mip ? x->max_lod : x->min_lod;
+    device_CreateSampler(p, &d, handle);
+}
+
 /* Slot 76 (FFX 0x1800033cc): CreateCommittedResource with a 0x40-byte
  * resource desc; the PC fields come first, Xbox fields fill +0x34..+0x3f.
  * Xbox2Windows saw Layout 0x101 with +0x34 = 3 and +0x38 = 0 there. */
@@ -1436,6 +1484,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(44, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(60, device_CreateGraphicsPipelineStateX),
+        FN(61, device_CreateSamplerX),
         FN(62, device_CreateComputePipelineStateX),
         FN(68, device_Slot68),
         FN(69, device_Slot69),
