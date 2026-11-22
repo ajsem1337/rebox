@@ -15,7 +15,40 @@ COMMON  := shims/common/rebox_log.c
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
 STUB_DLLS := $(notdir $(wildcard $(GEN)/dlls/*))
 
-all: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll) $(BUILD)/smoke.exe
+all: shims $(BUILD)/smoke.exe
+
+# What the flake's shims package builds (it has no tests/).
+shims: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll) $(if $(XODUS_IDL),$(BUILD)/xgameruntime.dll)
+
+# xgameruntime.dll: americas-recomp's Gaming Runtime stand-in (shims/xgameruntime/README.md). Its
+# interface table is generated from the Xodus project's IDLs (LGPL-2.1, not in this repository:
+# XODUS_IDL, which the flake sets); without them it isn't built and WineGDK's runtime is used.
+MINGW_CXX ?= x86_64-w64-mingw32-g++
+PYTHON ?= python3
+XGR := shims/xgameruntime
+XGR_SRC := $(wildcard $(XGR)/runtime/*.cpp) $(wildcard $(XGR)/runtime/gtx/*.cpp)
+# test_accessibility reads the Windows caption settings through WinRT headers mingw cannot compile.
+XGR_TESTS := $(patsubst $(XGR)/tests/%.cpp,$(BUILD)/xgr/%.exe,$(filter-out %/test_accessibility.cpp,$(wildcard $(XGR)/tests/test_*.cpp)))
+
+$(BUILD)/xgr/table.json: $(XGR)/idl_table.py $(wildcard $(XODUS_IDL)/*.idl)
+	@mkdir -p $(BUILD)/xgr
+	$(PYTHON) -I $(XGR)/idl_table.py $(XODUS_IDL) $@
+
+$(BUILD)/xgr/gen/xgr_stub.cpp: $(BUILD)/xgr/table.json $(XGR)/gen_stub.py
+	$(PYTHON) -I $(XGR)/gen_stub.py $< $(BUILD)/xgr/gen
+
+$(BUILD)/xgameruntime.dll: $(BUILD)/xgr/gen/xgr_stub.cpp $(XGR_SRC) $(wildcard $(XGR)/runtime/*.h) $(wildcard $(XGR)/runtime/gtx/*.h)
+	$(MINGW_CXX) -std=c++20 -O2 -shared -DXGR_WITH_RUNTIME -I$(XGR)/runtime -o $@ $< $(XGR_SRC) \
+		$(BUILD)/xgr/gen/xgameruntime.def -static -static-libgcc -static-libstdc++ \
+		-lshell32 -lole32 -luser32 -ladvapi32 -ldxgi -luuid
+
+# Its tests (tools/xbox/platform/xgr in americas-recomp), run by tests/run-xgr.sh.
+xgr-tests: $(BUILD)/xgameruntime.dll $(XGR_TESTS)
+$(BUILD)/xgr/%.exe: $(XGR)/tests/%.cpp
+	$(MINGW_CXX) -std=c++20 -O1 "-DE_ILLEGAL_METHOD_CALL=((HRESULT)0x8000000EL)" -o $@ $< -static -static-libgcc -static-libstdc++ \
+		-ladvapi32 -luser32 -lole32 -lshell32 -lruntimeobject
+
+.PHONY: all shims xgr-tests
 
 # XMA2 decoding in xaudio2_9 needs FFMPEG_XMA2 (the flake's ffmpeg-xma2:
 # static mingw libavcodec/libavutil); without it XMA2 plays as silence.

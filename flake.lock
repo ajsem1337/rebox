@@ -19,7 +19,8 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
-        "winegdk-src": "winegdk-src"
+        "winegdk-src": "winegdk-src",
+        "xodus-xgameruntime": "xodus-xgameruntime"
       }
     },
     "winegdk-src": {
@@ -35,6 +36,23 @@
       "original": {
         "owner": "Weather-OS",
         "repo": "WineGDK",
+        "type": "github"
+      }
+    },
+    "xodus-xgameruntime": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794646520,
+        "narHash": "sha256-M50LsEPxG+Fw29BzglxCDTrrORAK/0l4vFs6Z8h3MK8=",
+        "owner": "xodus-gaming",
+        "repo": "xgameruntime",
+        "rev": "642e41c7617310c5d1b39d4e525b01ecae261f9e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "xodus-gaming",
+        "repo": "xgameruntime",
+        "rev": "642e41c7617310c5d1b39d4e525b01ecae261f9e",
         "type": "github"
       }
     }

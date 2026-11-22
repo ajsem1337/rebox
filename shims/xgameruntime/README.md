@@ -1,0 +1,61 @@
+# xgameruntime: the Gaming Runtime stand-in
+
+Titles load `xgameruntime.dll` with `LoadLibrary` and get every Gaming Runtime API family
+(XUser, XGameSave, XPackage, XStore, XTaskQueue, ...) as an interface from `QueryApiImpl`.
+WineGDK's runtime answers five of them, and its XUser is stubs. This directory is
+[americas-recomp](https://github.com/realdody/americas-recomp)'s replacement
+(`tools/xbox/platform/xgr` at a3c48315113391d93771f1121bff14cc12d2dbca, GPL-2.0-or-later), which
+vendors GrandTheftXbox's XTaskQueue/XAsync layer (MIT, `runtime/GTX_LICENSE.txt`). Its behaviour,
+offline answers and settings are described in `UPSTREAM-README.md`, with a summary below.
+
+`rebox-run` installs `build/xgameruntime.dll` like the other shims: system32 plus a native
+override, so it replaces WineGDK's builtin.
+
+## Build
+
+The interface table (60 interfaces, every vtable slot) is generated from the Xodus project's IDLs
+(`xodus-gaming/xgameruntime`, LGPL-2.1, pinned in `flake.nix`; the dev shell sets `XODUS_IDL`):
+`idl_table.py` makes `build/xgr/table.json` and `gen_stub.py` the stub source, whose
+`QueryApiImpl` hands out an object per interface ID. Methods the runtime implements replace the
+stub's slots, and every other slot logs its first call and fails. `make` builds it with mingw's
+g++ when `XODUS_IDL` is set.
+
+Local changes for mingw, each marked "rebox local change" in the file:
+
+- `runtime/impl_accessibility.cpp`: mingw's WinRT headers can't be included (they define
+  `IReference<unsigned char>` twice), so the Windows caption settings aren't read and
+  `XClosedCaptionGetProperties` reports the defaults.
+- `runtime/xgr_internal.h`: defines `E_ILLEGAL_METHOD_CALL`, which mingw lacks.
+- `runtime/gtx/log.h`, `gen_stub.py`: `_ReturnAddress` becomes `__builtin_return_address(0)`.
+
+## What titles get
+
+| Family | Answer |
+|---|---|
+| XTaskQueue, XAsync, XThread | Complete (GrandTheftXbox's layer) |
+| XUser | One offline local user, always signed in (`XGR_GAMERTAG`, `XGR_USER_ID`), every privilege granted. Tokens fail with `E_GAMEUSER_FAILED_TO_GET_TOKEN`, so nothing reaches Xbox Live |
+| XGameSave, XGameSaveFiles | Local storage under `%LOCALAPPDATA%\xgr\saves` in the prefix (`XGR_SAVE_ROOT`); each container is replaced atomically, nothing syncs |
+| XPersistentLocalStorage | A directory with the quota from `MicrosoftGame.Config` (2048 MB for the target title). `rebox-run` puts it in the prefix (`XGR_PLS_DIR`) |
+| XPackage | The title is one fully installed package: identity from `MicrosoftGame.Config`, every chunk Ready, install monitors complete |
+| XStore | An active, full, permanent game licence; no add-ons; anything that needs the Store service fails with `E_GAMESTORE_NETWORK_ERROR` |
+| XSystem, XSystemAnalytics, XDisplay, XNetworking | Series X device info, desktop HDR state, offline connectivity, port 3074 |
+| XGameUI | Headless: dialogs complete with `E_ABORT` unless the title draws them itself |
+| XAccessibility, XAppCapture, XGameStreaming, XLaunch, XGameEvent, XGameInvite | The documented offline or "not available" answers |
+
+`rebox-run` sends the runtime's logs to the prefix: `xgameruntime.log` (`XGR_LOG`: every
+interface asked for, each unimplemented method's first call, and interface IDs it doesn't know)
+and `xgameruntime-tasks.log` (`GTX_LOG`). After a title's first run, the unknown IDs and
+unimplemented methods in `xgameruntime.log` are what to implement next.
+
+## Tests
+
+`tests/run-xgr.sh` builds upstream's tests with mingw and runs them under Wine, `test_save`
+twice (the second run checks that saves survived). Under Wine 11.21 (2026-11-22), 9 of 12 pass
+outright:
+
+- `test_launch`: 5 checks fail. Launching a URI through the program registered for its scheme,
+  and `RegisterApplicationRestart`, aren't what Wine does.
+- `test_system`: the desktop HDR state through DXGI, which Wine doesn't report.
+- `test_package`: mounting the title's own persistent local storage as a package fails when the
+  test changes `XGR_PLS_DIR` within one process. Not investigated yet.
+- `test_accessibility` isn't built: it needs the WinRT headers too.

@@ -2,12 +2,11 @@
 
 Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 
-- **WineGDK** for Wine itself and the GDK runtime. Its `xgameruntime` answers `QueryApiImpl` for
-  XSystem, XSystemAnalytics, XGameRuntimeFeature, XNetworking and XThreading (XTaskQueue, XAsync)
-  only. Its XUser is stubs (every call but XUserGetMaxUsers returns E_NOTIMPL) that `QueryApiImpl`
-  doesn't hand out anyway, and it has no XGameSave,
-  XPackage, XStore, XPersistentLocalStorage, XGameUI, XAccessibility or Xbox Live services. With
-  `patches/wine/`: `VirtualAlloc` accepts the `MEM_LARGE_PAGES` and `MEM_4MB_PAGES` flags Xbox
+- **WineGDK** for Wine itself. Its Gaming Runtime (`xgameruntime`) answers only five API families
+  and its XUser is stubs, so `shims/xgameruntime` replaces it: americas-recomp's stand-in, with an
+  offline local user, local saves, persistent local storage, the title as one fully installed
+  package, an active store licence and complete task queues ([its README](shims/xgameruntime/README.md)).
+  WineGDK comes with `patches/wine/`: `VirtualAlloc` accepts the `MEM_LARGE_PAGES` and `MEM_4MB_PAGES` flags Xbox
   titles pass (ordinary pages back them). `rebox-run` also sets the `ConsoleMode` registry value
   the GDK's `XSystemGetDeviceType` reads, so the title knows it's on a Series X.
 - **vkd3d-proton** for D3D12 on Vulkan, built from source with our patches (`.#vkd3d-proton-rebox`,

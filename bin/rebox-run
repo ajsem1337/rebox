@@ -13,6 +13,8 @@
 #   WINEPREFIX            default: ~/.local/share/rebox/<TitleId>
 #   REBOX_SHADER_CACHE Unix path to the AnyPS5 cache; default: $WINEPREFIX/shader-cache
 #   REBOX_GPUVA_LAYER_DIR  directory holding VK_LAYER_REBOX_gpuva_identity's manifest (flake sets it)
+#   XGR_*                 Gaming Runtime stand-in settings (shims/xgameruntime/README.md); XGR_PLS_DIR,
+#                         XGR_LOG and GTX_LOG default to the prefix
 #   REBOX_CONSOLE_MODE ConsoleMode registry value the title reads (default 0x64, Series X)
 #   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
@@ -108,6 +110,15 @@ cache=${REBOX_SHADER_CACHE:-$WINEPREFIX/shader-cache}
 mkdir -p "$cache"
 cache=$(realpath "$cache")
 export REBOX_SHADER_CACHE="Z:${cache//\//\\}"
+
+# The Gaming Runtime stand-in (shims/xgameruntime). Persistent local storage lives in the prefix:
+# its default, next to the executable, is the shadow package directory, remade every run. Its
+# logs name every interface and method a title asks for that it doesn't implement.
+winpath() { local p; p=$(realpath -m "$1"); echo "Z:${p//\//\\}"; }
+mkdir -p "$WINEPREFIX/persistent-local-storage"
+export XGR_PLS_DIR=${XGR_PLS_DIR:-$(winpath "$WINEPREFIX/persistent-local-storage")\\}
+export XGR_LOG=${XGR_LOG:-$(winpath "$WINEPREFIX/xgameruntime.log")}
+export GTX_LOG=${GTX_LOG:-$(winpath "$WINEPREFIX/xgameruntime-tasks.log")}
 if [[ ${REBOX_LOG:-} == /* ]]; then
     export REBOX_LOG="Z:${REBOX_LOG//\//\\}"
 fi

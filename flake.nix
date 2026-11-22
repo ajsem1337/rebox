@@ -9,9 +9,15 @@
       url = "github:Weather-OS/WineGDK";
       flake = false;
     };
+    # The Xodus project's xgameruntime IDLs (LGPL-2.1): shims/xgameruntime's interface table is
+    # generated from them. Pinned to the commit americas-recomp's CI builds its runtime against.
+    xodus-xgameruntime = {
+      url = "github:xodus-gaming/xgameruntime/642e41c7617310c5d1b39d4e525b01ecae261f9e";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, winegdk-src }:
+  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -188,11 +194,14 @@
             fileset = lib.fileset.unions [
               ./Makefile
               ./shims
+              ./anyps5/rebox_anyps5.h
               (lib.fileset.maybeMissing ./generated)
             ];
           };
-          nativeBuildInputs = [ mingwCC ];
-          makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "FFMPEG_XMA2=${ffmpeg-xma2}" ];
+          nativeBuildInputs = [ mingwCC pkgs.python3 ];
+          makeFlags = [ "MINGW_CC=x86_64-w64-mingw32-gcc" "MINGW_CXX=x86_64-w64-mingw32-g++" "FFMPEG_XMA2=${ffmpeg-xma2}"
+                        "XODUS_IDL=${xodus-xgameruntime}/include" ];
+          buildFlags = [ "shims" ];
           installPhase = ''
             mkdir -p $out
             cp build/*.dll $out/
@@ -238,6 +247,7 @@
           export DXVK_DIR=${self.packages.${system}.dxvk-win}/x64
           export REBOX_SHIMS_DIR=$PWD/build
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
+          export XODUS_IDL=${xodus-xgameruntime}/include
           export REBOX_ANYPS5_DIR=${self.packages.${system}.rebox-anyps5}
           export WINE_DLL_DIR=${pkgs.wineWow64Packages.unstable}/lib/wine/x86_64-windows
           # Software Vulkan only for machines (or sandboxes) without a GPU;
