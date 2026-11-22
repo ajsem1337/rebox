@@ -2545,6 +2545,57 @@ done:
     VirtualFree(reserved, 0, MEM_RELEASE);
 }
 
+/* The older SDK's list has PC's query methods at 28-31 (XValkyrie; a UE5 title calls them): a
+ * timestamp through EndQuery (29) and ResolveQueryData (30) reaches a readback buffer. */
+static void test_list_queries(void *dev, void *queue)
+{
+    D3D12_QUERY_HEAP_DESC qd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0 };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *buf = NULL;
+    ID3D12Fence *fence = NULL;
+    void *qheap = NULL, *list = NULL;
+    UINT64 *out = NULL;
+    HRESULT hr;
+
+    hr = XSLOT(dev, 39, HRESULT, const D3D12_QUERY_HEAP_DESC *, REFIID, void **)(dev, &qd, &IID_ID3D12QueryHeap, &qheap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (SUCCEEDED(hr))
+    {
+        XSLOT(list, 29, void, void *, D3D12_QUERY_TYPE, UINT)(list, qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        XSLOT(list, 30, void, void *, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource *, UINT64)(list, qheap,
+              D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, buf, 0);
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+        for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+            Sleep(10);
+        ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+    }
+    CHECK(out && out[0], "a timestamp through list slots 29/30 (EndQuery, ResolveQueryData) -> %llu (%#lx)",
+          out ? (unsigned long long)out[0] : 0ull, hr);
+    if (out) ID3D12Resource_Unmap(buf, 0, NULL);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (qheap) XSLOT(qheap, 2, ULONG)(qheap);
+}
+
 /* d3d12_xs's struct detile_surface (shims/d3d12_xs/detile.h). */
 struct test_surface
 {
@@ -3017,6 +3068,7 @@ static void test_xbox(void)
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
     test_placed_texture_late(dev, queue);
+    test_list_queries(dev, queue);
     test_mip_major_layout();
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);

@@ -1354,6 +1354,11 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
  * by then the GPU work that read it has normally finished. */
 #define EMBEDDED_KEEP_RESETS 3
 
+/* Console methods with nothing to do on the host (cache flushes, depth bounds). */
+static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
+{
+}
+
 static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
     struct embedded **e, *keep = NULL, *drop = NULL;
@@ -1721,10 +1726,17 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     };
     /* Graphics list: PC through ResourceBarrier (26), then PC + 4 for PC
      * slots 28-58 (both sources agree at 32-48, 50-52 and 60-62). */
+    /* Graphics list for older SDKs. XValkyrie's June 2020 kit tables (the era of a UE5 title's
+     * SDK 0x20002) put PC's four query methods (52-55) at 28-31, which a UE5 title calls as
+     * BeginQuery(heap, 0, 0) and EndQuery/ResolveQueryData(heap, 2 timestamp, 2), and name 67
+     * FlushPipelineX and 68 OMSetDepthBoundsX, which have nothing to do here. */
     static struct slot list_slots[64] = {
         FN(7, child_GetDevice),
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
+        FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
+        FN(67, list_Ignore),                          /* FlushPipelineX */
+        FN(68, list_Ignore),                          /* OMSetDepthBoundsX */
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
         FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
@@ -1775,7 +1787,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
 
     if (slot_stats_interval())
         atexit(log_slot_stats_at_exit);
-    while (n < ARRAYSIZE(list_slots) && list_slots[n].custom)
+    while (n < ARRAYSIZE(list_slots) && list_slots[n].xbox)
         n++;
     customs = n;
     for (unsigned x = 33; x <= 62; x++)
