@@ -21,6 +21,16 @@
 
 static int failures;
 
+/* Heap slot 10 reports shadow-heap title addresses unless REBOX_HEAP_VA says real or virtual;
+ * the shadow-heap and deferred-shader tests need them. */
+static BOOL title_heap_va(void)
+{
+    const char *mode = getenv("REBOX_HEAP_VA"), *legacy = getenv("REBOX_REAL_HEAP_VA");
+    if (mode)
+        return !strcmp(mode, "title");
+    return !(legacy && legacy[0] == '0');
+}
+
 #define CHECK(cond, ...) do { \
     if (cond) printf("ok   " __VA_ARGS__); \
     else { printf("FAIL " __VA_ARGS__); failures++; } \
@@ -1202,7 +1212,7 @@ static void test_console_shader(void *dev, void *queue)
     CHECK(table == 0 || table == gpu + 2 * inc, "s6:s7 = descriptor table at the heap's slot-10 address %#llx (got %#llx)",
           (unsigned long long)(gpu + 2 * inc), (unsigned long long)table);
     printf("info console SGPR table address: %s\n", !table ? "0 (no title or real heap addresses)"
-           : table < 0x100000000ull ? "shadow-heap title address" : "real heap address");
+           : title_heap_va() ? "shadow-heap title address" : "real heap address");
     ID3D12Resource_Unmap(buf, 0, NULL);
 
 done:
@@ -1543,6 +1553,11 @@ static void test_shadow_heap(void *dev)
 
     CHECK(shadow_heap && shadow_read && shadow_find, "d3d12_xs exports the shadow heap functions");
     if (!shadow_heap || !shadow_read || !shadow_find) return;
+    if (!title_heap_va())
+    {
+        printf("skip shadow heap test: REBOX_HEAP_VA turns title addresses off\n");
+        return;
+    }
     hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
             &IID_ID3D12DescriptorHeap, &heap);
     if (SUCCEEDED(hr))
@@ -1680,6 +1695,11 @@ static void test_console_dispatch(void *dev, void *queue)
     HRESULT hr;
 
     memcpy(blob.code, rdna_uav_write, sizeof(blob.code));
+    if (!title_heap_va())
+    {
+        printf("skip deferred console dispatch: REBOX_HEAP_VA turns title addresses off\n");
+        return;
+    }
     if (!GetModuleHandleA("rebox_anyps5.dll") && !LoadLibraryA("rebox_anyps5.dll"))
     {
         printf("skip deferred console dispatch: no rebox_anyps5.dll\n");
