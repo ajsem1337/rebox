@@ -1774,6 +1774,23 @@ static void test_title_heap_properties(void *dev)
         IUnknown_Release((IUnknown *)heap);
 }
 
+/* A console depth texture that's also a UAV (Unreal 5's, flags 0x1000006): made, as a depth target. */
+static void test_depth_uav_texture(void *dev)
+{
+    D3D12_HEAP_PROPERTIES props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC tex = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, { 1, 0 },
+                                D3D12_TEXTURE_LAYOUT_UNKNOWN, (D3D12_RESOURCE_FLAGS)0x1000006 };
+    D3D12_CLEAR_VALUE clear = { DXGI_FORMAT_D32_FLOAT_S8X24_UINT, .DepthStencil = { 1.0f, 0 } };
+    void *resource = NULL;
+    HRESULT hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+            D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &props, D3D12_HEAP_FLAG_NONE, &tex,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, &IID_ID3D12Resource, &resource);
+    CHECK(SUCCEEDED(hr) && resource, "a depth texture with unordered access (console flags 0x1000006) is made (%#lx)",
+          (unsigned long)hr);
+    if (resource)
+        IUnknown_Release((IUnknown *)resource);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -4106,6 +4123,7 @@ static void test_xbox(void)
     test_stream_pso(dev);
     test_prebuild_info(dev);
     test_title_heap_properties(dev);
+    test_depth_uav_texture(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);

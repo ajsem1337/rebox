@@ -1092,15 +1092,31 @@ static const D3D12_HEAP_PROPERTIES *buffer_heap(const D3D12_HEAP_PROPERTIES *pro
  * value is logged once. */
 static const D3D12_RESOURCE_DESC *pc_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC *storage)
 {
-    static LONG seen[8];
+    static LONG seen[8], depth_uav;
+    const D3D12_RESOURCE_FLAGS both = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    if (!desc || desc->Layout < 0x100)
+    if (!desc || (desc->Layout < 0x100 && (desc->Flags & both) != both))
         return desc;
-    if (!InterlockedExchange(&seen[desc->Layout & 7], 1))
-        rebox_log("d3d12_xs: Xbox texture layout %#x (%ux%u, format %u) treated as UNKNOWN", desc->Layout,
-                     (UINT)desc->Width, desc->Height, desc->Format);
     *storage = *desc;
-    storage->Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (desc->Layout >= 0x100)
+    {
+        if (!InterlockedExchange(&seen[desc->Layout & 7], 1))
+            rebox_log("d3d12_xs: Xbox texture layout %#x (%ux%u, format %u) treated as UNKNOWN", desc->Layout,
+                         (UINT)desc->Width, desc->Height, desc->Format);
+        storage->Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
+    /* A console depth texture can also be a UAV of its float plane (Unreal 5's Nanite: R32G8X24
+     * with depth-stencil, UAV and console flag 0x1000000, a UE5 sample); the desktop refuses
+     * the pair. It stays a depth target; its UAV views fail, so writes through them are lost
+     * (TuxBox pairs it with an R32 image and copies the plane across instead: to do). */
+    if ((desc->Flags & both) == both)
+    {
+        if (!InterlockedExchange(&depth_uav, 1))
+            rebox_log("d3d12_xs: a depth texture with unordered access (%ux%u, format %u, flags %#x): a depth "
+                         "target only (its UAV writes are lost)", (UINT)desc->Width, desc->Height, desc->Format,
+                         (UINT)desc->Flags);
+        storage->Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     return storage;
 }
 

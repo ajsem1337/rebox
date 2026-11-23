@@ -244,6 +244,13 @@ down missing translations.
   DEFAULT from `GetHeapProperties` and a heap's `GetDesc` (Unreal 5 takes a CUSTOM heap's path that is
   broken on the console). Textures and mixed
   heaps keep ordinary GPU addresses.
+- **Ray tracing and depth UAVs are placeholders.** Console ray tracing pipelines
+  (`DeserializeStateObjectX`, `CreateStateObject`) get placeholder objects that trace nothing,
+  and their `DispatchRays` are skipped (`REBOX_DUMP_STATE_OBJECTS` saves the blobs to work out
+  their format); inline ray tracing in console shaders and the console BVH builder's output aren't
+  translated either. A depth texture that's also a UAV (Unreal 5's Nanite) is a depth target only,
+  so writes through its UAV views are lost; TuxBox pairs it with an R32 image and copies the
+  depth plane across, which is the fix. Both matter for the target title.
 - **Controllers SDL maps wrongly.** Wine reads controllers through SDL, by SDL's database of
   layouts. For an Xbox One S controller on Bluetooth (045e:02e0, version 0408) that entry has
   another axis order than the kernel's, so the right stick's Y read the right trigger, at full
