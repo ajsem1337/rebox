@@ -35,7 +35,8 @@
 
 #define TITLE_BASE 0x10000000ull
 #define TITLE_ALIGN 0x10000ull
-#define BUCKETS 4096
+#define BUCKETS (1u << 18)
+#define INDEXES 3 /* exact; loose (T#/S# with rewritable fields masked); loose V# (its first 3 words) */
 
 struct shadow_heap
 {
@@ -73,7 +74,7 @@ struct entry
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static struct shadow_heap *heaps;
-static struct entry *buckets[BUCKETS];
+static struct entry *buckets[INDEXES][BUCKETS];
 static UINT64 next_title_va = TITLE_BASE;
 
 /* REBOX_HEAP_VA: title (default), real or virtual; REBOX_REAL_HEAP_VA=0
@@ -158,40 +159,64 @@ static BOOL key_is_null(const UINT32 key[8])
 }
 
 /* Caller holds the lock exclusively. */
+/* The key of index `which`: 0 exact; 1 with the fields AnyPS5 may rewrite masked (a T#'s DST_SEL
+ * in word 3, an S#'s word 2 bits 20-27: loose_match's); 2 a buffer descriptor's first 3 words (a
+ * 4-word V# query ignores word 3). */
+static void index_key(const UINT32 key[8], BOOL sampler, int which, UINT32 out[8])
+{
+    memcpy(out, key, 8 * sizeof(*out));
+    if (which == 1 && sampler)
+        out[2] &= ~(0xffu << 20);
+    else if (which == 1)
+        out[3] &= ~0xfffu;
+    else if (which == 2)
+        memset(out + 3, 0, 5 * sizeof(*out));
+}
+
 static void unindex(struct shadow_heap *h, UINT index)
 {
-    UINT32 key[8];
+    BOOL sampler = h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    UINT32 key[8], k[8];
     struct entry **p;
 
     slot_key(h, index, key);
-    for (p = &buckets[hash_key(key)]; *p; p = &(*p)->next)
-        if ((*p)->heap == h && (*p)->index == index)
-        {
-            struct entry *e = *p;
-            *p = e->next;
-            free(e);
-            return;
-        }
+    if (key_is_null(key))
+        return;
+    for (int which = 0; which < (sampler ? 2 : INDEXES); which++)
+    {
+        index_key(key, sampler, which, k);
+        for (p = &buckets[which][hash_key(k)]; *p; p = &(*p)->next)
+            if ((*p)->heap == h && (*p)->index == index)
+            {
+                struct entry *e = *p;
+                *p = e->next;
+                free(e);
+                break;
+            }
+    }
 }
 
 static void index_slot(struct shadow_heap *h, UINT index)
 {
-    struct entry *e;
-    UINT b;
+    BOOL sampler = h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    UINT32 key[8];
 
-    if (!(e = malloc(sizeof(*e))))
+    slot_key(h, index, key);
+    if (key_is_null(key))
         return;
-    slot_key(h, index, e->key);
-    if (key_is_null(e->key))
+    for (int which = 0; which < (sampler ? 2 : INDEXES); which++)
     {
-        free(e);
-        return;
+        struct entry *e;
+        UINT b;
+        if (!(e = malloc(sizeof(*e))))
+            return;
+        index_key(key, sampler, which, e->key);
+        e->heap = h;
+        e->index = index;
+        b = hash_key(e->key);
+        e->next = buckets[which][b];
+        buckets[which][b] = e;
     }
-    e->heap = h;
-    e->index = index;
-    b = hash_key(e->key);
-    e->next = buckets[b];
-    buckets[b] = e;
 }
 
 static void heap_free(struct shadow_heap *h)
@@ -592,21 +617,28 @@ BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sample
         return FALSE;
     make_key(words, n, sampler, key);
     AcquireSRWLockShared(&lock);
-    for (struct entry *e = buckets[hash_key(key)]; e && !found; e = e->next)
+    for (struct entry *e = buckets[0][hash_key(key)]; e && !found; e = e->next)
         if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, key, sizeof(key)))
         {
             *index = e->index;
             found = TRUE;
         }
-    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
-        if (h->cpu_start == heap_cpu)
-            heap = h;
-    for (UINT i = 0; loose && heap && !found && i < heap->count; i++)
-        if (loose_match((const UINT32 *)(heap->data + (SIZE_T)i * heap->stride), words, n, sampler))
-        {
-            *index = i;
-            found = TRUE;
-        }
+    /* Loose: through the masked index, then loose_match on the candidates (heaps hold up to a
+     * million descriptors; scanning one per binding made compiles slow). */
+    if (loose && !found)
+    {
+        UINT32 k[8];
+        index_key(key, sampler, !sampler && n == 4 ? 2 : 1, k);
+        for (struct entry *e = buckets[!sampler && n == 4 ? 2 : 1][hash_key(k)]; e && !found; e = e->next)
+            if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, k, sizeof(k))
+                    && loose_match((const UINT32 *)(e->heap->data + (SIZE_T)e->index * e->heap->stride), words, n,
+                                   sampler))
+            {
+                *index = e->index;
+                found = TRUE;
+            }
+    }
+    (void)heap;
     ReleaseSRWLockShared(&lock);
     return found;
 }
@@ -889,7 +921,7 @@ BOOL WINAPI ReboxShadowFind(const UINT32 *words, UINT word_count, BOOL sampler, 
         return FALSE;
     make_key(words, word_count, sampler, key);
     AcquireSRWLockShared(&lock);
-    for (struct entry *e = buckets[hash_key(key)]; e; e = e->next)
+    for (struct entry *e = buckets[0][hash_key(key)]; e; e = e->next)
         if (!memcmp(e->key, key, sizeof(key)) && (sampler == (e->heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
                 && (!best || (e->heap->shader_visible && !best->heap->shader_visible)))
             best = e;
