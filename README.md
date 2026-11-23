@@ -251,7 +251,11 @@ down missing translations.
   so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out); the title still sees
   DEFAULT from `GetHeapProperties` and a heap's `GetDesc` (Unreal 5 takes a CUSTOM heap's path that is
   broken on the console). Textures and mixed
-  heaps keep ordinary GPU addresses.
+  heaps keep ordinary GPU addresses. The title's own memory becomes GPU memory where it is when a
+  buffer is placed over it or a descriptor heap lives in it (spans of 2 MiB to 256 MiB, through the
+  layer's mailbox); memory it never places anything over stays CPU-only, so a shader reading it
+  through a pointer the title built itself reads nothing, and physical pages mapped at two
+  addresses don't alias.
 - **Ray tracing and depth UAVs are placeholders.** Console ray tracing pipelines
   (`DeserializeStateObjectX`, `CreateStateObject`) get placeholder objects that trace nothing,
   and their `DispatchRays` are skipped, as are state objects the title sets that aren't ours
