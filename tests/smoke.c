@@ -3839,13 +3839,16 @@ static void test_list_queries(void *dev, void *queue)
             XSLOT(list, 88, void, UINT64, UINT32)(list, va + 4, 0xabcd);
             XSLOT(list, 71, void, UINT64, UINT32, UINT64, UINT64, UINT)(list, va, 3, 0x1234, ~0ull, 0);
             XSLOT(list, 69, void, UINT64, UINT32)(list, (UINT64)(ULONG_PTR)&cpu_only, 77);
-            CHECK(cpu_only == 77, "Write32BitValueBottomOfPipeX outside GPU memory is made when recorded");
+            CHECK(cpu_only == 0, "Write32BitValueBottomOfPipeX outside GPU memory isn't made when recorded");
             XSLOT(list, 9, HRESULT)(list);
             /* Submitted through queue slot 35, the console's ExecuteCommandLists. */
             XSLOT(queue, 35, HRESULT, UINT, void *const *, UINT64, UINT)(queue, 1, &list, 1, 3);
             XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
             for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
                 Sleep(10);
+            for (int i = 0; i < 200 && cpu_only != 77; i++)
+                Sleep(10);
+            CHECK(cpu_only == 77, "Write32BitValueBottomOfPipeX outside GPU memory is made by the CPU after the GPU's work");
             CHECK(mem[0] == 0x1234 && mem[1] == 0xabcd && *(UINT64 *)(mem + 2) == 0x1122334455667788ull,
                   "console memory writes (list slots 69/70/88, run by queue slot 35) -> %#x %#x %#llx", mem[0], mem[1],
                   (unsigned long long)*(UINT64 *)(mem + 2));

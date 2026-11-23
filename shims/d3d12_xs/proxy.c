@@ -63,6 +63,9 @@ struct embedded
     struct embedded *next;
 };
 
+struct cpu_write { UINT64 address; UINT32 values[2]; UINT count; };
+struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; };
+
 struct proxy
 {
     void **vtbl;
@@ -77,6 +80,14 @@ struct proxy
     UINT heap_count;
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
     int display_bound; /* lists: 1 + which display-sized target is bound, or 0 (counted for the log) */
+    struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
+    UINT cpu_write_count, cpu_write_capacity;
+    struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
+    UINT gpu_write_count, gpu_write_capacity;
+    struct memory_wait *waits;     /* lists: Wait*BitValueX, evaluated on the CPU before submission */
+    UINT wait_count, wait_capacity;
+    ID3D12Fence *cpu_fence;        /* queues: signalled after submissions that carry CPU writes */
+    UINT64 cpu_fence_value;
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
@@ -2588,12 +2599,17 @@ volatile UINT64 rebox_table_watch; /* console_compile.c: a table to show at the 
 volatile UINT64 rebox_value_watch; /* console_compile.c (REBOX_WATCH_STAGE): 4 floats to show at the next submission */
 BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
 
+static void lists_wait(UINT count, ID3D12CommandList *const *lists);
+static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists);
+
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
     ID3D12CommandList *stack[64] = { 0 }, **raw = count <= ARRAYSIZE(stack) ? stack : malloc(count * sizeof(*raw));
 
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(lists[i]);
+    /* Memory waits the lists start with, on the CPU (lists_wait). */
+    lists_wait(count, lists);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
     /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
@@ -2616,6 +2632,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
                       t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
     }
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
+    /* Their writes outside GPU memory, once the GPU is there (cpu_writes_after). */
+    cpu_writes_after(p, count, lists);
     if (raw != stack)
         free(raw);
 }
@@ -3042,10 +3060,13 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
                                                    base_vertex, first_instance);
 }
 
-/* Console memory writes and waits (xcl, list_x.rs; older layout 69-72 and 88-90, newer two later):
- * a value written to a GPU address at the bottom or top of the pipe, or a wait on one. A write to
- * our GPU memory (identity-mapped) is WriteBufferImmediate; anywhere else it is made on the CPU at
- * once, ahead of the GPU work before it. Waits are not kept yet (logged). */
+/* Console memory writes and waits (xcl, ivall/xcl, GPL-2.0-only, list_x.rs and cpu_writes.rs; older
+ * layout 69-72 and 88-90, newer two later): a value written to a GPU address at the bottom or top of
+ * the pipe, or a wait on one. A write to our GPU memory (identity-mapped) is WriteBufferImmediate.
+ * One anywhere else is kept with the list and made by the CPU once the GPU has finished the
+ * submission before it (cpu_writes_after): a title marks its GPU progress so, in its own memory,
+ * and waits on it. Waits are evaluated on the CPU before the list's submission, unless an earlier
+ * write in the same list covers them. */
 static void list_write_values(struct proxy *p, UINT64 address, const UINT32 *values, UINT count,
         D3D12_WRITEBUFFERIMMEDIATE_MODE mode, const char *what)
 {
@@ -3063,13 +3084,220 @@ static void list_write_values(struct proxy *p, UINT64 address, const UINT32 *val
         for (UINT i = 0; i < count; i++)
             params[i] = (D3D12_WRITEBUFFERIMMEDIATE_PARAMETER){ address + 4 * i, values[i] };
         ID3D12GraphicsCommandList2_WriteBufferImmediate(INNER(p, ID3D12GraphicsCommandList2), count, params, modes);
+        if (p->gpu_write_count == p->gpu_write_capacity)
+        {
+            UINT capacity = p->gpu_write_capacity ? p->gpu_write_capacity * 2 : 16;
+            struct cpu_write *grown = realloc(p->gpu_writes, capacity * sizeof(*grown));
+            if (!grown)
+                return;
+            p->gpu_writes = grown;
+            p->gpu_write_capacity = capacity;
+        }
+        p->gpu_writes[p->gpu_write_count++] = (struct cpu_write){ address, { values[0], count > 1 ? values[1] : 0 }, count };
+    }
+    else
+    {
+        if (p->cpu_write_count == p->cpu_write_capacity)
+        {
+            UINT capacity = p->cpu_write_capacity ? p->cpu_write_capacity * 2 : 16;
+            struct cpu_write *grown = realloc(p->cpu_writes, capacity * sizeof(*grown));
+            if (!grown)
+                return;
+            p->cpu_writes = grown;
+            p->cpu_write_capacity = capacity;
+        }
+        p->cpu_writes[p->cpu_write_count++] = (struct cpu_write){ address, { values[0], count > 1 ? values[1] : 0 }, count };
+        if (!InterlockedExchange(&logged_cpu, 1))
+            rebox_log("d3d12_xs: %s to %#llx, outside GPU memory: written by the CPU once the GPU is there",
+                      what, (unsigned long long)address);
+    }
+}
+
+static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value, UINT64 mask, UINT width)
+{
+    if (!address || comparison == D3D12_COMPARISON_FUNC_ALWAYS)
+        return;
+    /* A write earlier in this list satisfies it once the GPU is there; waiting before the
+     * submission would wait for ever. */
+    for (UINT i = 0; i < p->cpu_write_count; i++)
+        if (p->cpu_writes[i].address <= address && address < p->cpu_writes[i].address + 4 * p->cpu_writes[i].count)
+            return;
+    for (UINT i = 0; i < p->gpu_write_count; i++)
+        if (p->gpu_writes[i].address <= address && address < p->gpu_writes[i].address + 4 * p->gpu_writes[i].count)
+            return;
+    if (p->wait_count == p->wait_capacity)
+    {
+        UINT capacity = p->wait_capacity ? p->wait_capacity * 2 : 8;
+        struct memory_wait *grown = realloc(p->waits, capacity * sizeof(*grown));
+        if (!grown)
+            return;
+        p->waits = grown;
+        p->wait_capacity = capacity;
+    }
+    p->waits[p->wait_count++] = (struct memory_wait){ address, value, mask, comparison, width };
+}
+
+static void STDMETHODCALLTYPE list_Wait32BitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT32 value,
+        UINT32 mask, UINT flags)
+{
+    list_wait(p, address, comparison, value, mask, 4);
+}
+
+static void STDMETHODCALLTYPE list_Wait64BitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value,
+        UINT64 mask, UINT flags)
+{
+    list_wait(p, address, comparison, value, mask, 8);
+}
+
+/* (memory & mask) <comparison> value, D3D12_COMPARISON_FUNC; TRUE for what can't be read. */
+static BOOL wait_satisfied(const struct memory_wait *w)
+{
+    UINT64 now;
+    if (IsBadReadPtr((void *)(ULONG_PTR)w->address, w->width))
+        return TRUE;
+    now = (w->width == 8 ? *(volatile UINT64 *)(ULONG_PTR)w->address : *(volatile UINT32 *)(ULONG_PTR)w->address)
+          & w->mask;
+    switch (w->comparison)
+    {
+    case D3D12_COMPARISON_FUNC_NEVER: return TRUE; /* would never return: skipped */
+    case D3D12_COMPARISON_FUNC_LESS: return now < w->value;
+    case D3D12_COMPARISON_FUNC_EQUAL: return now == w->value;
+    case D3D12_COMPARISON_FUNC_LESS_EQUAL: return now <= w->value;
+    case D3D12_COMPARISON_FUNC_GREATER: return now > w->value;
+    case D3D12_COMPARISON_FUNC_NOT_EQUAL: return now != w->value;
+    case D3D12_COMPARISON_FUNC_GREATER_EQUAL: return now >= w->value;
+    default: return TRUE;
+    }
+}
+
+/* Before a submission: each list's waits, on the CPU (up to 2 s each, then logged and passed). */
+static void lists_wait(UINT count, ID3D12CommandList *const *lists)
+{
+    for (UINT i = 0; i < count; i++)
+    {
+        struct proxy *l = (struct proxy *)lists[i];
+        if (!is_proxy(l))
+            continue;
+        for (UINT k = 0; k < l->wait_count; k++)
+        {
+            const struct memory_wait *w = &l->waits[k];
+            LARGE_INTEGER start, now, freq;
+            BOOL ok;
+            QueryPerformanceCounter(&start);
+            QueryPerformanceFrequency(&freq);
+            while (!(ok = wait_satisfied(w)))
+            {
+                QueryPerformanceCounter(&now);
+                if (now.QuadPart - start.QuadPart > 2 * freq.QuadPart)
+                    break;
+                Sleep(0);
+            }
+            if (!ok)
+            {
+                static LONG logged;
+                if (InterlockedIncrement(&logged) <= 4)
+                    rebox_log("d3d12_xs: Wait%uBitValueX at %#llx (comparison %u, %#llx, mask %#llx) timed out after 2 s",
+                              w->width * 8, (unsigned long long)w->address, w->comparison,
+                              (unsigned long long)w->value, (unsigned long long)w->mask);
+            }
+        }
+    }
+}
+
+/* After a submission: the lists' CPU writes, made by a worker once the queue's fence passes the
+ * value signalled after them, in submission order (up to 10 s, then made anyway). */
+struct cpu_write_job { ID3D12Fence *fence; UINT64 value; struct cpu_write *writes; UINT count; struct cpu_write_job *next; };
+static struct cpu_write_job *write_jobs, **write_jobs_tail = &write_jobs;
+static CRITICAL_SECTION write_jobs_cs;
+static CONDITION_VARIABLE write_jobs_cv;
+
+static DWORD WINAPI cpu_write_worker(void *arg)
+{
+    HANDLE event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    for (;;)
+    {
+        struct cpu_write_job *job;
+        EnterCriticalSection(&write_jobs_cs);
+        while (!write_jobs)
+            SleepConditionVariableCS(&write_jobs_cv, &write_jobs_cs, INFINITE);
+        job = write_jobs;
+        if (!(write_jobs = job->next))
+            write_jobs_tail = &write_jobs;
+        LeaveCriticalSection(&write_jobs_cs);
+        if (ID3D12Fence_GetCompletedValue(job->fence) < job->value
+                && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(job->fence, job->value, event)))
+            WaitForSingleObject(event, 10000);
+        for (UINT i = 0; i < job->count; i++)
+        {
+            const struct cpu_write *w = &job->writes[i];
+            if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, 4 * w->count))
+            {
+                volatile UINT32 *to = (volatile UINT32 *)(ULONG_PTR)w->address;
+                for (UINT k = 0; k < w->count; k++)
+                    to[k] = w->values[k];
+            }
+        }
+        ID3D12Fence_Release(job->fence);
+        free(job->writes);
+        free(job);
+    }
+    return 0;
+}
+
+static BOOL CALLBACK cpu_writes_init(INIT_ONCE *once, void *param, void **ctx)
+{
+    HANDLE thread;
+    InitializeCriticalSection(&write_jobs_cs);
+    InitializeConditionVariable(&write_jobs_cv);
+    if ((thread = CreateThread(NULL, 0, cpu_write_worker, NULL, 0, NULL)))
+        CloseHandle(thread);
+    return thread != NULL;
+}
+
+static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    struct cpu_write_job *job;
+    UINT total = 0, at = 0;
+
+    for (UINT i = 0; i < count; i++)
+        if (is_proxy(lists[i]))
+            total += ((struct proxy *)lists[i])->cpu_write_count;
+    if (!total || !InitOnceExecuteOnce(&once, cpu_writes_init, NULL, NULL))
+        return;
+    if (!queue->cpu_fence)
+    {
+        ID3D12Device *device = NULL;
+        if (SUCCEEDED(ID3D12CommandQueue_GetDevice(INNER(queue, ID3D12CommandQueue), &IID_ID3D12Device, (void **)&device)))
+        {
+            ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&queue->cpu_fence);
+            ID3D12Device_Release(device);
+        }
+        if (!queue->cpu_fence)
+            return;
+    }
+    if (!(job = calloc(1, sizeof(*job))) || !(job->writes = malloc(total * sizeof(*job->writes))))
+    {
+        free(job);
         return;
     }
-    if (!IsBadWritePtr((void *)(ULONG_PTR)address, 4 * count))
-        memcpy((void *)(ULONG_PTR)address, values, 4 * count);
-    if (!InterlockedExchange(&logged_cpu, 1))
-        rebox_log("d3d12_xs: %s to %#llx, outside GPU memory: written on the CPU when recorded",
-                  what, (unsigned long long)address);
+    for (UINT i = 0; i < count; i++)
+        if (is_proxy(lists[i]))
+        {
+            struct proxy *l = (struct proxy *)lists[i];
+            memcpy(job->writes + at, l->cpu_writes, l->cpu_write_count * sizeof(*job->writes));
+            at += l->cpu_write_count;
+        }
+    job->count = total;
+    job->value = ++queue->cpu_fence_value;
+    job->fence = queue->cpu_fence;
+    ID3D12Fence_AddRef(job->fence);
+    ID3D12CommandQueue_Signal(INNER(queue, ID3D12CommandQueue), queue->cpu_fence, job->value);
+    EnterCriticalSection(&write_jobs_cs);
+    *write_jobs_tail = job;
+    write_jobs_tail = &job->next;
+    WakeConditionVariable(&write_jobs_cv);
+    LeaveCriticalSection(&write_jobs_cs);
 }
 
 static void STDMETHODCALLTYPE list_Write32BitValueBottomOfPipeX(struct proxy *p, UINT64 address, UINT32 value)
@@ -3094,13 +3322,6 @@ static void STDMETHODCALLTYPE list_Write64BitValueTopOfPipeX(struct proxy *p, UI
     list_write_values(p, address, v, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write64BitValueTopOfPipeX");
 }
 
-static void STDMETHODCALLTYPE list_WaitBitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value)
-{
-    static LONG logged;
-    if (!InterlockedExchange(&logged, 1))
-        rebox_log("d3d12_xs: Wait*BitValueX(%#llx, comparison %u, %#llx): GPU memory waits aren't kept yet",
-                  (unsigned long long)address, comparison, (unsigned long long)value);
-}
 
 /* Acceleration structure builds, postbuild info and copies (PC 72-74). Ray tracing isn't translated
  * (state_object.c), so no ray reads them, and building them faulted the GPU: a UE5 sample fills its
@@ -3159,6 +3380,10 @@ static void STDMETHODCALLTYPE list_CopyRaytracingAccelerationStructure(struct pr
 static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
     struct embedded **e, *keep = NULL, *drop = NULL;
+
+    p->cpu_write_count = 0;
+    p->gpu_write_count = 0;
+    p->wait_count = 0;
 
     p->resets++;
     p->ray_pipeline = FALSE;
@@ -3615,8 +3840,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(68, list_Ignore),                          /* OMSetDepthBoundsX */
         FN(69, list_Write32BitValueBottomOfPipeX),    /* xcl */
         FN(70, list_Write64BitValueBottomOfPipeX),
-        FN(71, list_WaitBitValueX),                   /* Wait32BitValueX */
-        FN(72, list_WaitBitValueX),                   /* Wait64BitValueX */
+        FN(71, list_Wait32BitValueX),
+        FN(72, list_Wait64BitValueX),
         FN(88, list_Write32BitValueTopOfPipeX),
         FN(89, list_Write64BitValueTopOfPipeX),
         FN(90, list_Write32BitValueBottomOfPipeX),    /* Write32BitValueBottomOfShaderX */
@@ -3650,8 +3875,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(122, list_SetPipelineState1),              /* PC 75 */
         FN(71, list_Write32BitValueBottomOfPipeX),    /* the older 69-72 and 88-90, two later (xcl) */
         FN(72, list_Write64BitValueBottomOfPipeX),
-        FN(73, list_WaitBitValueX),
-        FN(74, list_WaitBitValueX),
+        FN(73, list_Wait32BitValueX),
+        FN(74, list_Wait64BitValueX),
         FN(90, list_Write32BitValueTopOfPipeX),
         FN(91, list_Write64BitValueTopOfPipeX),
         FN(92, list_Write32BitValueBottomOfPipeX),
