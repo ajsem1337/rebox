@@ -750,7 +750,10 @@ UINT shadow_regions(struct shadow_region *out, UINT max)
     for (struct shadow_heap *h = heaps; h && n < max; h = h->next)
         if (h->title_va && h->mirror)
         {
-            /* Runs of pages: GPU memory where they are, or the mirror. */
+            /* Runs of pages: GPU memory where they are, or the mirror. The mirrored ones are also
+             * at the heap's own address: the console heap's GPU address is its memory's, and a
+             * title computes descriptor addresses from it (bindless lookups); the rest is GPU
+             * memory there already. */
             UINT64 base = (UINT64)(ULONG_PTR)h->data, size = (UINT64)h->count * h->stride, off = 0, end;
             while (off < size && n < max)
             {
@@ -768,6 +771,12 @@ UINT shadow_regions(struct shadow_region *out, UINT max)
                 out[n].data = h->data + off;
                 out[n].size = (SIZE_T)(next - off);
                 n++;
+                if (!there && n < max)
+                {
+                    out[n] = out[n - 1];
+                    out[n].title_va = base + off;
+                    n++;
+                }
                 off = next;
             }
         }
