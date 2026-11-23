@@ -75,6 +75,7 @@ struct proxy
     ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
     UINT heap_count;
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
+    BOOL display_bound; /* lists: a display render target is bound (counted for the log) */
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
@@ -1097,6 +1098,19 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
     shadow_write_cbv(cpu, desc);
 }
 
+/* Render target views of display-sized RGBA8 textures (what PresentX shows), and what lists do with
+ * them, counted for the log at each of the first presents (proxy_frame_presented). */
+static volatile SIZE_T display_rtvs[8];
+static volatile LONG display_binds, display_clears, display_draws;
+
+static BOOL is_display_rtv(SIZE_T cpu)
+{
+    for (UINT i = 0; i < ARRAYSIZE(display_rtvs); i++)
+        if (cpu && display_rtvs[i] == cpu)
+            return TRUE;
+    return FALSE;
+}
+
 /* Views of a display-sized texture (what PresentX shows), for finding how the title draws into it. */
 static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T cpu)
 {
@@ -1107,6 +1121,15 @@ static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T
         return;
     /* GetDesc (slot 10) returns its struct through a hidden pointer. */
     ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)resource)[10])(resource, &d);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
+            && d.Format == DXGI_FORMAT_R8G8B8A8_UNORM && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            && !strcmp(what, "render target view"))
+        for (UINT i = 0; i < ARRAYSIZE(display_rtvs); i++)
+            if (!display_rtvs[i] || display_rtvs[i] == cpu)
+            {
+                display_rtvs[i] = cpu;
+                break;
+            }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
             && InterlockedIncrement(&logged) <= 24)
         rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#llx", what, (void *)resource,
@@ -2819,6 +2842,46 @@ static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
 {
 }
 
+/* Slots 50 and 52 (PC 46 and 48): OMSetRenderTargets and ClearRenderTargetView, forwarded, with
+ * the display's render targets counted; slots 12 and 13 (draws) count while one is bound. */
+static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rts,
+        BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *ds)
+{
+    BOOL display = FALSE;
+    for (UINT i = 0; rts && i < (single ? 1 : count); i++)
+        display |= is_display_rtv(rts[i].ptr);
+    p->display_bound = display;
+    if (display)
+        InterlockedIncrement(&display_binds);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(INNER(p, ID3D12GraphicsCommandList), count, rts, single, ds);
+}
+
+static void STDMETHODCALLTYPE list_ClearRenderTargetView(struct proxy *p, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+        const FLOAT *color, UINT rect_count, const D3D12_RECT *rects)
+{
+    if (is_display_rtv(rtv.ptr))
+        InterlockedIncrement(&display_clears);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(INNER(p, ID3D12GraphicsCommandList), rtv, color, rect_count, rects);
+}
+
+static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices, UINT instances, UINT first_vertex,
+        UINT first_instance)
+{
+    if (p->display_bound)
+        InterlockedIncrement(&display_draws);
+    ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
+                                            first_instance);
+}
+
+static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT indices, UINT instances, UINT first_index,
+        INT base_vertex, UINT first_instance)
+{
+    if (p->display_bound)
+        InterlockedIncrement(&display_draws);
+    ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
+                                                   base_vertex, first_instance);
+}
+
 /* Console memory writes and waits (xcl, list_x.rs; older layout 69-72 and 88-90, newer two later):
  * a value written to a GPU address at the bottom or top of the pipe, or a wait on one. A write to
  * our GPU memory (identity-mapped) is WriteBufferImmediate; anywhere else it is made on the CPU at
@@ -3256,6 +3319,13 @@ void proxy_frame_presented(void)
     int interval = slot_stats_interval();
 
     pso_release_due();
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 12)
+            rebox_log("d3d12_xs: since the last present, the display's render targets were bound %ld times, cleared "
+                      "%ld times, drawn to %ld times", InterlockedExchange(&display_binds, 0),
+                      InterlockedExchange(&display_clears, 0), InterlockedExchange(&display_draws, 0));
+    }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
         proxy_log_slot_stats();
 }
@@ -3369,6 +3439,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(120, list_SetPipelineState1),              /* PC 75 (Unreal 5: 54 calls in a run) */
         FN(121, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
+        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
+        FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
         FN(67, list_Ignore),                          /* FlushPipelineX */
@@ -3417,6 +3489,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(92, list_Write32BitValueBottomOfPipeX),
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
+        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
+        FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
