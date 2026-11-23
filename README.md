@@ -239,6 +239,14 @@ down missing translations.
   heaps, and DEFAULT heaps that hold only buffers, are made CPU-visible (custom `WRITE_BACK`/`L0`),
   so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out). Textures and mixed
   heaps keep ordinary GPU addresses.
+- **Bluetooth Xbox One S controllers need hidraw access.** Wine reads controllers through SDL.
+  Without access to `/dev/hidraw*`, SDL maps an Xbox One S controller on Bluetooth (045e:02e0)
+  by its database, which expects an older kernel's axis order. The right stick's Y then reads the
+  right trigger, at full deflection at rest, and the left trigger reads the right stick's X; in
+  a GDK title the camera looks at the sky and turns. Over USB the controller is mapped correctly.
+  For Bluetooth, give your user the controllers' hidraw nodes (NixOS:
+  `hardware.steam-hardware.enable = true;` or `services.udev.packages = [ pkgs.game-devices-udev-rules ];`),
+  so that SDL's HIDAPI driver reads it. `REBOX_GAMEINPUT_LOG=1` shows what the title is given.
 - **Audio: XMA2 decoding is untested on real data.** Under WineGDK, FAudio sends XMA2 to Wine's
   WMA decoder, which accepts only WMA formats, so creating an XMA2 source voice fails.
   `shims/xaudio2_9` wraps Wine's `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM
