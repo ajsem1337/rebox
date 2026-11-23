@@ -121,7 +121,7 @@ method the title asked for that isn't implemented.
 | Variable | Meaning |
 |---|---|
 | `WINE`, `VKD3D_PROTON_DIR`, `DXVK_DIR`, `REBOX_SHIMS_DIR` | Set by the flake wrapper; override to use local builds |
-| `WINEPREFIX` | Default `~/.local/share/rebox/<TitleId>` |
+| `WINEPREFIX` | Default `~/.local/share/rebox/<TitleId>`. A prefix made by another Wine build is updated (`wineboot -u`) on the next run; `.rebox-wine` records the build |
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
 | `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |

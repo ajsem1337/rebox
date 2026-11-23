@@ -78,6 +78,18 @@ if [[ ! -d $WINEPREFIX/drive_c ]]; then
     mkdir -p "$WINEPREFIX"
     "$WINE" wineboot -i >/dev/null 2>&1 || die "wineboot failed for $WINEPREFIX"
 fi
+# A prefix made by another Wine build is updated for this one. Wine decides that from wine.inf's
+# modification time, which is the same for every build in the Nix store, so it never would: a
+# prefix made before winegstreamer was built had Media Foundation's H.264 and AAC decoders
+# registered to a DLL whose classes weren't (CoCreateInstance: REGDB_E_CLASSNOTREG).
+wine_build=$(readlink -f "$(command -v "$WINE")")
+if [[ $(cat "$WINEPREFIX/.rebox-wine" 2>/dev/null) != "$wine_build" ]]; then
+    if [[ -f $WINEPREFIX/.rebox-wine ]] || [[ -f $WINEPREFIX/system.reg ]]; then
+        echo "rebox-run: updating $WINEPREFIX for this Wine build" >&2
+        "$WINE" wineboot -u >/dev/null 2>&1 || die "wineboot -u failed for $WINEPREFIX"
+    fi
+    echo "$wine_build" > "$WINEPREFIX/.rebox-wine"
+fi
 
 # Which console this is: the GDK's XSystemGetDeviceType is compiled into the title and reads
 # ConsoleMode under this key (0x64 Series X, 0x50 Xbox One X). Without it the title is told it's
