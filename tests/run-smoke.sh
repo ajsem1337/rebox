@@ -90,7 +90,7 @@ echo "== fake.bin, no cache entry, fallback shaders"
 out=$(REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
 echo "$out"
 grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were not used"; exit 1; }
-grep -Eq "slot stats GraphicsCommandList:.* 12=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
+grep -Eq "slot stats GraphicsCommandList:.* 12c?=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
 grep -Eq "slot stats Device:.* 100T=1" <<<"$out" || { echo "FAIL slot stats lack the trapped device slot 100"; exit 1; }
 echo "ok   slot stats count forwarded, custom and trapped slots"
 grep -q "ok   an assertion (int3) in the exe was stepped over" <<<"$out" && grep -q "assertion 1 skipped at smoke.exe+" <<<"$out" \
