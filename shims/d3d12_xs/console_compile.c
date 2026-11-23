@@ -169,6 +169,56 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
     return h;
 }
 
+/* ------------------------------------------------------------ late T#s */
+
+/* T#s a title writes after recording the draw that reads them (the target title fills a per-draw
+ * descriptor table between recording and submitting; the console GPU reads it when it runs). A
+ * graphics stage's heap slots are in its draw block, which the GPU reads: such a texture's slot
+ * is written at submission instead (console_resolve_late), from the descriptor at its address
+ * then. Until resolved, it holds the dummy texture. */
+struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; };
+static struct late_texture late[4096];
+static UINT late_count;
+static SRWLOCK late_lock = SRWLOCK_INIT;
+
+void console_resolve_late(void)
+{
+    BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+    UINT kept = 0, resolved = 0;
+    static LONG logged;
+
+    if (!late_count)
+        return;
+    AcquireSRWLockExclusive(&late_lock);
+    for (UINT i = 0; i < late_count; i++)
+    {
+        struct late_texture *t = &late[i];
+        UINT32 w[8] = { 0 };
+        UINT index;
+        BOOL done = FALSE;
+        if (ReboxShadowRead(t->source, w, sizeof(w)) && (w[0] || w[1] || w[2] || w[3]))
+        {
+            ID3D12Resource *res;
+            if ((shadow_find_index(t->heap, w, 8, FALSE, TRUE, &index)
+                        && shadow_slot_view(t->heap, index) != SHADOW_VIEW_NONE)
+                    || ((res = console_texture_of(w)) && shadow_reserve_srv(t->heap, res, &index)))
+            {
+                if (shadow_slot_view(t->heap, index) == SHADOW_VIEW_UAV_TEXTURE)
+                    shadow_reserve_srv_for_uav(t->heap, index, &index);
+                *t->slot = index;
+                resolved++;
+                done = TRUE;
+            }
+        }
+        if (!done && ++t->tries < 8)
+            late[kept++] = *t;
+    }
+    late_count = kept;
+    ReleaseSRWLockExclusive(&late_lock);
+    if (resolved && InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: %u texture(s) the title wrote after recording their draws bound at submission", resolved);
+}
+
 /* ------------------------------------------------------------ host buffers */
 
 static SRWLOCK buffers_lock = SRWLOCK_INIT;
@@ -182,7 +232,7 @@ static struct host_buffer { UINT64 hash, gpu; SIZE_T size; const void *cpu; stru
  * DRAW_RING / 256 slots). */
 #define DRAW_RING (128u << 20)
 
-static UINT64 draw_buffer(const void *data, SIZE_T size)
+static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 {
     static SRWLOCK ring_lock = SRWLOCK_INIT;
     static BYTE *ring_cpu;
@@ -205,6 +255,8 @@ static UINT64 draw_buffer(const void *data, SIZE_T size)
     at = ring_head;
     ring_head += aligned;
     memcpy(ring_cpu + at, data, size);
+    if (cpu)
+        *cpu = ring_cpu + at;
     ReleaseSRWLockExclusive(&ring_lock);
     return ring_gpu + at;
 }
@@ -631,6 +683,40 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
 }
 
+/* The address of the n-th texture slot (T#) in a graphics stage's descriptor tables that reads as
+ * empty now (sa5_analyse; table t is the pointer in user SGPR table_sgprs[t], or s8 + t), or 0. */
+static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
+{
+    BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+    static struct sa5_slot slots[64]; /* under compile_lock */
+    struct sa5_layout layout;
+    char ignored[64];
+    UINT seen = 0;
+
+    memset(&layout, 0, sizeof(layout));
+    if (!sa5.analyse || sa5.analyse((const UINT32 *)((const BYTE *)h + h->code_offset), h->code_dwords,
+                                    user_sgprs(h, TRUE), &layout, slots, ARRAYSIZE(slots), ignored, sizeof(ignored)))
+        return 0;
+    for (UINT32 i = 0; i < layout.slot_count && i < ARRAYSIZE(slots); i++)
+    {
+        UINT32 sgpr, words[8] = { 0 };
+        UINT64 address;
+        if (slots[i].kind != SA5_SLOT_TEXTURE || slots[i].size != 8 || slots[i].table >= layout.table_count)
+            continue;
+        sgpr = layout.table_sgprs[slots[i].table];
+        if (sgpr >= 16)
+            sgpr = 8 + slots[i].table;
+        if (!in->user_sgprs[sgpr])
+            continue;
+        address = (UINT64)in->user_sgprs[sgpr] + slots[i].dword * 4ull;
+        if (ReboxShadowRead(address, words, sizeof(words))
+                && !(words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7])
+                && seen++ == n)
+            return address;
+    }
+    return 0;
+}
+
 /* REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS: only the compute programs whose code address hashes
  * to VALUE in its low BITS bits run; the rest are skipped (their dispatch dropped). Each program run
  * is logged once. Halving the set run by run finds a program that faults the GPU (The Matrix
@@ -881,6 +967,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     UINT32 pushed_count = 0;
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
     static UINT32 indices[MAX_ELEMENTS]; /* under compile_lock */
+    static struct { UINT position; UINT64 source; SIZE_T heap; } pending[64]; /* late T#s of this stage */
+    UINT pending_count = 0, zero_textures = 0;
+    BYTE *block_cpu = NULL;
     static SRWLOCK compile_lock = SRWLOCK_INIT;
     struct sa5_compute_request req;
     struct sa5_result *result = NULL;
@@ -1263,7 +1352,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             }
             {
                 LONG64 t = ticks_now();
-                va = draw_buffer(table, (b.count ? b.count : 1) * 16);
+                va = draw_buffer(table, (b.count ? b.count : 1) * 16, NULL);
                 InterlockedAdd64(&part_ticks[3], ticks_now() - t);
             }
             free(table);
@@ -1363,6 +1452,20 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
                 if ((b.kind == 4 || b.kind == 5) && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
                     null_view = shadow_reserve_null(heap, b.kind == 5, index);
+                /* An empty T# of a graphics stage: maybe one the title writes before it submits. Its
+                 * address is the n-th texture slot of the code's tables that is empty now. */
+                if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])
+                        && pending_count < ARRAYSIZE(pending))
+                {
+                    UINT64 source = late_source(h, in, zero_textures++);
+                    if (source)
+                    {
+                        pending[pending_count].position = index_count + e;
+                        pending[pending_count].source = source;
+                        pending[pending_count].heap = heap;
+                        pending_count++;
+                    }
+                }
                 if (null_view)
                 {
                     static LONG logged;
@@ -1468,7 +1571,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             case ROLE_SHADER_DATA:
             {
                 LONG64 t = ticks_now();
-                va = b.word_count ? draw_buffer(b.words, bytes) : zero_buffer(bytes = 16);
+                va = b.word_count ? draw_buffer(b.words, bytes, NULL) : zero_buffer(bytes = 16);
                 InterlockedAdd64(&part_ticks[3], ticks_now() - t);
                 break;
             }
@@ -1589,12 +1692,21 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
         memcpy(block, pushed_va, pushed_count * sizeof(UINT64));
         memcpy(block + 2 * SA5_DRAW_ADDRESSES, indices, index_count * sizeof(UINT32));
-        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32))))
+        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32), &block_cpu)))
         {
             log_failure(h, "no GPU memory for the draw block", NULL);
             goto done;
         }
         memcpy(&out->push[GRAPHICS_PUSH_DATA / 4], &va, sizeof(UINT64));
+        if (pending_count && block_cpu)
+        {
+            AcquireSRWLockExclusive(&late_lock);
+            for (UINT i = 0; i < pending_count && late_count < ARRAYSIZE(late); i++)
+                late[late_count++] = (struct late_texture){
+                        (UINT32 *)(block_cpu + (2 * SA5_DRAW_ADDRESSES + pending[i].position) * sizeof(UINT32)),
+                        pending[i].source, pending[i].heap, 0 };
+            ReleaseSRWLockExclusive(&late_lock);
+        }
     }
     if (graphics && h->stage == 0x1)
     {

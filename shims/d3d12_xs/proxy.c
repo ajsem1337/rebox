@@ -31,6 +31,7 @@
 #include "../common/rebox_log.h"
 #include "gpu_memory.h"
 #include "shadow.h"
+#include "console_compile.h"
 #include "pacing.h"
 #include "present.h"
 #include "proxy.h"
@@ -2503,6 +2504,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     title_textures_upload(INNER(p, ID3D12CommandQueue));
     /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
     shadow_sync_mirrors();
+    /* Textures the title wrote after recording their draws (console_compile.c). */
+    console_resolve_late();
     {
         UINT64 at = InterlockedExchange64((volatile LONG64 *)&rebox_table_watch, 0);
         UINT32 t[16];

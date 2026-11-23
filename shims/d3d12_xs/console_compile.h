@@ -83,3 +83,7 @@ struct rebox_compile_out
 };
 
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out);
+
+/* Before a submission: binds the textures graphics draws read whose T#s the title wrote after
+ * recording them (console_compile.c). */
+void console_resolve_late(void);
