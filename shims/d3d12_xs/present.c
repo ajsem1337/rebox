@@ -361,9 +361,12 @@ static HWND title_window(void)
  * screen. The window is left as the title made it (a tiling compositor sizes it anyway, and the
  * swapchain stretches the plane into whatever size it gets). REBOX_PRESENT_FIT=1 makes a window
  * larger than its monitor's work area borderless over the monitor, which Wine shows fullscreen;
- * REBOX_PRESENT_FIT=WxH gives it that size. */
-static void fit_to_monitor(HWND hwnd)
+ * REBOX_PRESENT_FIT=WxH gives it that size. Done on a thread of its own: a style change sends
+ * messages to the window's thread, the title's, which can be waiting on the thread presenting
+ * (a UE5 title deadlocked so with this on the present path). */
+static DWORD WINAPI fit_thread(void *param)
 {
+    HWND hwnd = param;
     const char *fit = getenv("REBOX_PRESENT_FIT");
     MONITORINFO mi = { sizeof(mi) };
     HMONITOR monitor;
@@ -373,7 +376,7 @@ static void fit_to_monitor(HWND hwnd)
 
     if (!(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
             || !GetMonitorInfoW(monitor, &mi) || !GetWindowRect(hwnd, &r))
-        return;
+        return 0;
     rebox_log("d3d12_xs: PresentX: window %ldx%ld; monitor %ldx%ld (work area %ldx%ld), window DPI %u, system DPI %u",
                  r.right - r.left, r.bottom - r.top, mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top, mi.rcWork.right - mi.rcWork.left,
@@ -383,11 +386,11 @@ static void fit_to_monitor(HWND hwnd)
         rebox_log("d3d12_xs: PresentX: sizing the window to %ux%u (REBOX_PRESENT_FIT)", w, h);
         SetWindowPos(hwnd, NULL, mi.rcWork.left, mi.rcWork.top, w, h,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        return;
+        return 0;
     }
     if (!fit || strcmp(fit, "1")
             || (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top))
-        return;
+        return 0;
     rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; making it borderless "
                  "over the monitor, %ldx%ld", r.right - r.left, r.bottom - r.top,
                  mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
@@ -397,6 +400,14 @@ static void fit_to_monitor(HWND hwnd)
     SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top,
                  SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    return 0;
+}
+
+static void fit_to_monitor(HWND hwnd)
+{
+    HANDLE thread = CreateThread(NULL, 0, fit_thread, hwnd, 0, NULL);
+    if (thread)
+        CloseHandle(thread);
 }
 
 static HWND create_window(UINT width, UINT height)
