@@ -69,7 +69,9 @@
     in
     {
       packages.${system} = rec {
-        winegdk = pkgs.wineWow64Packages.unstable.overrideAttrs (old: {
+        # gstreamerSupport: winegstreamer, which Media Foundation's H.264 and AAC decoders are
+        # (Unreal 5's Electra player creates them; without it they aren't registered).
+        winegdk = (pkgs.wineWow64Packages.unstable.override { gstreamerSupport = true; }).overrideAttrs (old: {
           pname = "winegdk";
           version = "11.14-gdk-${winegdk-src.shortRev}";
           src = winegdk-src;
