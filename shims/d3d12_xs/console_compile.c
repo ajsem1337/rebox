@@ -75,6 +75,10 @@ static struct
  * into statics): from DllMain. */
 static void set_anyps5_environment(void)
 {
+    /* Xbox Series vertex shaders take the vertex ID in v0 and the instance ID in v3 (the legacy
+     * layout; AnyPS5 patch 0008), not PS5's v5 and v8. */
+    if (!getenv("ANYPS5_LEGACY_VERTEX_INPUTS"))
+        _putenv("ANYPS5_LEGACY_VERTEX_INPUTS=1");
     const char *local = getenv("LOCALAPPDATA");
 
     /* AnyPS5 keeps compiled variants on disk, by default in shader_cache next to the exe: the
@@ -673,6 +677,27 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
          * fills v[4+4r..7+4r]. The V#s only steer AnyPS5's grouping; the attributes' formats and
          * buffers come from the PSO's input layout (patch 0006). s[4:5] holds a fetch address
          * outside the program, as the console driver's. */
+        /* REBOX_GRAPHICS_DEBUG=fullscreen: a full-screen triangle from the vertex ID instead
+         * (x = 4 * (vid & 1) - 1, y = 4 * ((vid >> 1) & 1) - 1, z = w = 1: nearest with reversed depth), with
+         * magenta pixel shaders: tells vertex shaders that put everything off-screen apart from
+         * draws that never reach the presented image. */
+        static const UINT32 fullscreen[] = {
+            0x36020081,             /* v_and_b32 v1, 1, v0 */
+            0x2c040081,             /* v_lshrrev_b32 v2, 1, v0 */
+            0x36040481,             /* v_and_b32 v2, 1, v2 */
+            0x7e020d01,             /* v_cvt_f32_u32 v1, v1 */
+            0x7e040d02,             /* v_cvt_f32_u32 v2, v2 */
+            0x100202f6,             /* v_mul_f32 v1, 4.0, v1 */
+            0x100404f6,             /* v_mul_f32 v2, 4.0, v2 */
+            0x060202f3,             /* v_add_f32 v1, -1.0, v1 */
+            0x060404f3,             /* v_add_f32 v2, -1.0, v2 */
+            0x7e0a02f2,             /* v_mov_b32 v5, 1.0 */
+            0x7e0c02f2,             /* v_mov_b32 v6, 1.0 */
+            0xf80008cf, 0x06050201, /* exp pos0 v1, v2, v5, v6 done */
+            0xbf810000,             /* s_endpgm */
+        };
+        const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
+        BOOL replace = debug && !strcmp(debug, "fullscreen");
         struct sa5_vertex_request vreq;
         UINT32 user[32];
         memset(&vreq, 0, sizeof(vreq));
@@ -680,14 +705,14 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         memcpy(user, req.user_data, min(req.user_data_count, 32u) * 4);
         user[4] = 0x30000000u;
         user[5] = 0;
-        vreq.code = req.code;
-        vreq.code_dwords = req.code_dwords;
+        vreq.code = replace ? fullscreen : req.code;
+        vreq.code_dwords = replace ? ARRAYSIZE(fullscreen) : req.code_dwords;
         vreq.code_address = req.code_address;
         vreq.wave = req.wave;
         vreq.user_data = user;
         vreq.user_data_count = max(req.user_data_count, 6u);
         vreq.rsrc1 = h->rsrc1;
-        vreq.input_count = min(g->input_count, 32u);
+        vreq.input_count = replace ? 0 : min(g->input_count, 32u);
         for (UINT32 r = 0; r < vreq.input_count; r++)
         {
             vreq.inputs[r].vsharp[0] = 0x20000000u + r * 0x100000u;
@@ -725,7 +750,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             0xbf810000,             /* s_endpgm */
         };
         const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
-        BOOL solid = debug && !strcmp(debug, "magenta");
+        BOOL solid = debug && (!strcmp(debug, "magenta") || !strcmp(debug, "fullscreen"));
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
         preq.code = solid ? magenta : req.code;

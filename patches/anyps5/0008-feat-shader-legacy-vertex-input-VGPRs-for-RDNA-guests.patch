@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Mon, 23 Nov 2026 04:10:00 +0000
+Subject: [PATCH] feat(shader): legacy vertex input VGPRs for RDNA guests
+
+Vertex shaders get the vertex index in v5 and the instance index in v8
+(PS5's layout) unless the guest is GCN. Xbox Series vertex shaders are
+RDNA2 with the legacy layout: vertex ID in v0, instance ID in v3. Read as
+v5, a full-screen pass built from the vertex ID collapsed to one point.
+ANYPS5_LEGACY_VERTEX_INPUTS=1 selects the legacy layout for RDNA guests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/shader/recompiler/Recompiler.cpp b/core/shader/recompiler/Recompiler.cpp
+index 3455521..6f88ccd 100644
+--- a/core/shader/recompiler/Recompiler.cpp
++++ b/core/shader/recompiler/Recompiler.cpp
+@@ -67,6 +67,16 @@ namespace ShaderRecompiler {
+ 
+ namespace {
+ 
++// ANYPS5_LEGACY_VERTEX_INPUTS=1: vertex shaders get the legacy (non-NGG) input VGPRs, vertex index in
++// v0, instance index in v1-v3, for RDNA guests too (Xbox Series vertex shaders), not only GCN ones.
++[[maybe_unused]] bool LegacyVertexInputs() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("ANYPS5_LEGACY_VERTEX_INPUTS");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ ShaderStageKind toShaderStageKind(ShaderStage stage) {
+     switch (stage) {
+     case ShaderStage::Compute:
+@@ -265,7 +275,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
+     translateOptions.shaderHash = request.shader.codeAddress;
+     translateOptions.waveSize = request.context.waveSize;
+     translateOptions.userDataBaseRegister = request.context.userDataBaseRegister;
+-    translateOptions.gcnLegacyVertexInputs = GcnGuestShaders() && request.context.userDataBaseRegister == 0u;
++    translateOptions.gcnLegacyVertexInputs = (GcnGuestShaders() || LegacyVertexInputs()) && request.context.userDataBaseRegister == 0u;
+     translateOptions.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
+     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
+     const auto sharedVectors = GuestSharedVectorRegisters(request.context);
+-- 
+2.47.0
