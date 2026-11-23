@@ -37,6 +37,7 @@
 #include "title_textures.h"
 #include "dxgi_device.h"
 #include "derived_pso.h"
+#include "state_object.h"
 
 #define INNER_OFFSET 0x1000
 #define DEVICE_OUT_OF_LINE_FLAG 0x18
@@ -881,6 +882,14 @@ static D3D12_INDIRECT_ARGUMENT_TYPE desktop_argument_type(D3D12_INDIRECT_ARGUMEN
         rebox_log("d3d12_xs: command signature argument type %u (the console's) taken as desktop type %u",
                      (UINT)type, (UINT)desktop);
     return desktop;
+}
+
+/* Slot 115: ID3D12Device8::DeserializeStateObjectX(blob, length, root signature, flags, riid, out),
+ * a ray tracing state object from console code (state_object.c). */
+static HRESULT STDMETHODCALLTYPE device_DeserializeStateObjectX(struct proxy *p, const void *code, SIZE_T length,
+        void *root_signature, UINT flags, REFIID riid, void **out)
+{
+    return state_object_deserialize((IUnknown *)p, code, length, root_signature, flags, riid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, const D3D12_COMMAND_SIGNATURE_DESC *desc,
@@ -2080,6 +2089,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(30, device_CreateReservedResource),
         FN(38, device_GetCopyableFootprints),
         FN(41, device_CreateCommandSignature),
+        FN(115, device_DeserializeStateObjectX),
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */

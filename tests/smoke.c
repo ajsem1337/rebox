@@ -1626,6 +1626,38 @@ static void test_console_command_signature(void *dev)
     }
 }
 
+/* Device slot 115, DeserializeStateObjectX: a placeholder ray tracing state object for a console
+ * blob (Unreal 5 stops if it fails), with its properties, zero identifiers and the device. */
+static void test_state_object_placeholder(void *dev)
+{
+    static const UINT blob[8] = { 2 };
+    void *so = NULL, *props = NULL, *device = NULL;
+    const BYTE *id;
+    BOOL zero = TRUE;
+    HRESULT hr = XSLOT(dev, 115, HRESULT, const void *, SIZE_T, void *, UINT, REFIID, void **)(dev, blob, sizeof(blob),
+            NULL, 0, &IID_ID3D12StateObject, &so);
+
+    CHECK(SUCCEEDED(hr) && so, "DeserializeStateObjectX gives a state object (%#lx)", (unsigned long)hr);
+    if (!so) return;
+    CHECK(SUCCEEDED(XSLOT(so, 0, HRESULT, REFIID, void **)(so, &IID_ID3D12StateObjectProperties, &props)) && props,
+          "the state object has properties");
+    if (props)
+    {
+        id = XSLOT(props, 3, const BYTE *, const WCHAR *)(props, L"RayGen");
+        for (int i = 0; id && i < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES; i++)
+            zero &= !id[i];
+        CHECK(id && zero && XSLOT(props, 4, UINT64, const WCHAR *)(props, L"RayGen") == 0,
+              "its shader identifiers are zero (no shader), stack sizes 0");
+        CHECK(XSLOT(props, 7, UINT64, UINT64)(props, 0) == 0, "the console's properties slot 7 answers 0");
+        XSLOT(props, 2, ULONG)(props);
+    }
+    CHECK(SUCCEEDED(XSLOT(so, 7, HRESULT, REFIID, void **)(so, &IID_IUnknown, &device)) && device,
+          "GetDevice gives the device");
+    if (device)
+        IUnknown_Release((IUnknown *)device);
+    CHECK(XSLOT(so, 2, ULONG)(so) == 0, "the state object is freed on its last release");
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -3937,6 +3969,7 @@ static void test_xbox(void)
     test_console_draw(dev, queue, FALSE, TRUE);
     test_xbox_root_flags(dev);
     test_console_command_signature(dev);
+    test_state_object_placeholder(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
