@@ -393,9 +393,36 @@ std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base,
         if (Op(inst) != OpVariable || inst[3] != StorageClassPushConstant) continue;
         const std::uint32_t var = inst[2];
         const std::uint32_t block = m.Def(m.Def(inst[1])[3])[1];
-        // The block gains a member (every existing one ends by byte 128: AnyPS5's push data is at
-        // most 32 dwords). It now uses the address array, so it moves to the end of the global
-        // section, with the pointer types to it and the variable.
+        // AnyPS5 declares its push data as a full 32-dword array whatever the stage's push size; a
+        // graphics stage's addresses go right after its 28 (base = offset + 112), so a member that
+        // runs past the base is cut to end there (AnyPS5 was told its data ends there too).
+        {
+            std::map<std::uint32_t, std::uint32_t> offsets, strides;
+            for (const auto& d : m.insts) {
+                if (Op(d) == OpMemberDecorate && d[1] == block && d[3] == DecorationOffset) offsets[d[2]] = d[4];
+                if (Op(d) == OpDecorate && d[2] == DecorationArrayStride) strides[d[1]] = d[3];
+            }
+            Inst structDef = m.Def(block);
+            for (std::uint32_t k = 0; k + 2 < structDef.size(); k++) {
+                const std::uint32_t type = structDef[2 + k];
+                const Inst arr = m.Def(type);
+                if (Op(arr) != OpTypeArray || !offsets.count(k) || !strides.count(type) || offsets[k] >= base) continue;
+                const Inst length = m.Def(arr[3]);
+                if (Op(length) != OpConstant) continue;
+                const std::uint32_t stride = strides[type];
+                if (offsets[k] + length[3] * stride <= base) continue;
+                const std::uint32_t shorter = m.NewId();
+                m.AddGlobal(Make(OpTypeArray, {shorter, arr[2], m.Constant((base - offsets[k]) / stride)}));
+                m.AddDecoration(Make(OpDecorate, {shorter, DecorationArrayStride, stride}));
+                for (auto& def : m.insts)
+                    if (Op(def) == OpTypeStruct && def[1] == block) {
+                        def[2 + k] = shorter;
+                        break;
+                    }
+            }
+        }
+        // The block gains a member. It now uses the address array, so it moves to the end of the
+        // global section, with the pointer types to it and the variable.
         std::vector<Inst> moved, kept;
         std::set<std::uint32_t> movedIds{block};
         for (auto& inst2 : m.insts) {
