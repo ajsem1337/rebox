@@ -62,15 +62,72 @@ static SIZE_T attr_page_bytes(XALLOC_ATTRIBUTES attr)
     }
 }
 
+/* The console's addresses are 46-bit: a title packs them so (a GPU fault at an adopted buffer's
+ * address with bit 46 cleared), while Wine hands out reservations near the top of the 47-bit user
+ * space. So new reservations, the title's own VirtualAlloc included (import_fixup.c), are asked
+ * below 2^46 with VirtualAlloc2's address requirement, and get Wine's choice if that fails. */
+#define TITLE_ADDRESS_LIMIT 0x3fffffffffffull
+
+#define MEM_RESERVE_PLACEHOLDER_BIT 0x40000
+struct address_requirements { void *lowest, *highest; SIZE_T alignment; };
+struct extended_parameter { ULONG64 type; union { ULONG64 ulong64; void *pointer; }; };
+
+void *xmem_low_alloc2(void *address, SIZE_T size, DWORD type, DWORD protect)
+{
+    static PVOID (WINAPI *va2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
+    struct address_requirements req = { NULL, (void *)TITLE_ADDRESS_LIMIT, 0 };
+    struct extended_parameter param = { 1 /* MemExtendedParameterAddressRequirements */, { .pointer = &req } };
+    static LONG failed;
+    void *p;
+
+    if (!va2 && !(va2 = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2")))
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return NULL;
+    }
+    if (address || !(type & (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER_BIT)))
+        return va2(NULL, address, size, type, protect, NULL, 0);
+    if ((p = va2(NULL, NULL, size, type, protect, &param, 1)))
+        return p;
+    if (!InterlockedExchange(&failed, 1))
+        rebox_log("xmem: no reservation of %#zx bytes below %#llx (error %lu): Wine places it", size,
+                  TITLE_ADDRESS_LIMIT, GetLastError());
+    return va2(NULL, NULL, size, type, protect, NULL, 0);
+}
+
+/* VirtualAlloc for the title (import_fixup.c) and xmem: reservations below 2^46. Anything else
+ * goes to ntdll directly, never through kernel32's VirtualAlloc, which may be this (xmem loads from
+ * outside the Windows directory in the smoke test, so import_fixup.c replaces its imports, and
+ * GetProcAddress, too). */
+void *WINAPI xmem_low_virtual_alloc(void *address, SIZE_T size, DWORD type, DWORD protect)
+{
+    static NTSTATUS (WINAPI *nt_alloc)(HANDLE, void **, ULONG_PTR, SIZE_T *, ULONG, ULONG);
+    NTSTATUS status;
+
+    if (!address && (type & MEM_RESERVE))
+        return xmem_low_alloc2(NULL, size, type, protect);
+    if (!nt_alloc)
+        nt_alloc = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory");
+    if ((status = nt_alloc(GetCurrentProcess(), &address, 0, &size, type, protect)))
+    {
+        static ULONG (WINAPI *to_error)(NTSTATUS);
+        if (!to_error)
+            to_error = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlNtStatusToDosError");
+        SetLastError(to_error ? to_error(status) : ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    return address;
+}
+
 /* VirtualAlloc only guarantees 64 KiB: reserve extra, then re-reserve the
  * aligned part (another thread can take it in between, so retry). */
 static void *virtual_alloc_aligned(SIZE_T size, SIZE_T alignment)
 {
     if (alignment <= (64 << 10))
-        return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        return xmem_low_virtual_alloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     for (int i = 0; i < 8; i++)
     {
-        BYTE *probe = VirtualAlloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS), *p;
+        BYTE *probe = xmem_low_virtual_alloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS), *p;
         if (!probe)
             return NULL;
         p = (BYTE *)(((ULONG_PTR)probe + alignment - 1) & ~(ULONG_PTR)(alignment - 1));
@@ -491,6 +548,8 @@ static void *virtual_alloc2(void *address, SIZE_T size, DWORD type, DWORD protec
         SetLastError(ERROR_NOT_SUPPORTED);
         return NULL;
     }
+    if (!address)
+        return xmem_low_alloc2(NULL, size, type, protect);
     return va2(NULL, address, size, type, protect, NULL, 0);
 }
 
@@ -509,7 +568,7 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
         p = virtual_alloc2(address, size, host_type | (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)),
                            host_protect);
     else
-        p = VirtualAlloc(address, size, host_type, host_protect);
+        p = xmem_low_virtual_alloc(address, size, host_type, host_protect);
 
     if (!p ? InterlockedIncrement(&failures) <= 16 : InterlockedIncrement(&calls) <= 4)
         rebox_log("xmem: XMemVirtualAlloc(%p, %#zx, type %#lx, flags %#llx, protect %#lx) -> %p (error %lu)", address,

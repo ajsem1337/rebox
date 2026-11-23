@@ -315,6 +315,9 @@ static struct
 } replacements[] = {
     /* A replaced function the title looks up by name (GameChat2.dll loads its audio state monitor
      * so) is replaced as well. */
+    /* The title's reservations below 2^46, the console's address width (xmem.c). */
+    { "kernelbase.dll", "VirtualAlloc", xmem_low_virtual_alloc },
+    { "kernel32.dll", "VirtualAlloc", xmem_low_virtual_alloc },
     { "kernelbase.dll", "GetProcAddress", get_proc_address },
     { "kernel32.dll", "GetProcAddress", get_proc_address },
     { "user32.dll", "CreateWindowExW", create_window_w },

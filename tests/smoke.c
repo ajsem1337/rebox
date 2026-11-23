@@ -354,6 +354,17 @@ static void test_xmem(void)
             v = valloc(NULL, 1 << 20, MEM_RESERVE | MEM_COMMIT | 0x20000000 /* MEM_LARGE_PAGES */,
                        0x1234567800000000ull, PAGE_READWRITE);
             CHECK(v != NULL, "XMemVirtualAlloc with large pages and XMem flags -> %p", v);
+            /* The console's addresses are 46-bit: big reservations, the title's own VirtualAlloc
+             * included (an import xmem replaces), stay below 2^46. */
+            {
+                void *big = valloc(NULL, 16ull << 30, MEM_RESERVE, 0, PAGE_NOACCESS);
+                void *own = VirtualAlloc(NULL, 16ull << 30, MEM_RESERVE, PAGE_NOACCESS);
+                CHECK(big && (ULONG_PTR)big < (1ull << 46) && own && (ULONG_PTR)own < (1ull << 46),
+                      "16 GiB reservations through XMemVirtualAlloc and the title's VirtualAlloc are below 2^46 "
+                      "(%p, %p)", big, own);
+                if (big) VirtualFree(big, 0, MEM_RELEASE);
+                if (own) VirtualFree(own, 0, MEM_RELEASE);
+            }
             if (v) { v[(1 << 20) - 1] = 1; VirtualFree(v, 0, MEM_RELEASE); }
             /* A UE5 title's two calls: reserve 112 MiB for physical pages with console protection
              * bits, then commit 64 KiB of it the same way. */
@@ -375,6 +386,7 @@ static void test_xmem(void)
                 BYTE *ph = valloc(NULL, 0xb900000, 0x42000, 0x7, PAGE_NOACCESS), *in;
                 ULONG_PTR one = 1, page[1];
                 CHECK(ph != NULL, "XMemVirtualAlloc reserves a placeholder (type 0x42000) -> %p", ph);
+                CHECK((ULONG_PTR)ph < (1ull << 46), "the placeholder is below 2^46, the console's address width (%p)", ph);
                 if (ph && vfree)
                 {
                     CHECK(VirtualFree(ph, 1 << 16, MEM_RELEASE | 0x2 /* PRESERVE_PLACEHOLDER */)
