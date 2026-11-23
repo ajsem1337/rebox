@@ -380,8 +380,8 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 32)
-            rebox_log("d3d12_xs: a descriptor heap of %u descriptors (%Iu bytes) is in the title's memory at %p",
-                      count, size, memory);
+            rebox_log("d3d12_xs: a descriptor heap of %u descriptors (%llu bytes) is in the title's memory at %p",
+                      count, (unsigned long long)size, memory);
     }
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h; h = h->next)

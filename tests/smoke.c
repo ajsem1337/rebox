@@ -4504,6 +4504,18 @@ static void test_xbox(void)
                   "GetResourceAllocationInfo (slot 25) called in the console order, result first (%llu)",
                   (unsigned long long)console_info.SizeInBytes);
         }
+        /* A depth texture that is also a UAV, layout 0 with console flags (the target title). */
+        {
+            D3D12_RESOURCE_DESC dd = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 144, 1, 1,
+                                       DXGI_FORMAT_R32G8X24_TYPELESS, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                       (D3D12_RESOURCE_FLAGS)0x80300006 };
+            D3D12_RESOURCE_ALLOCATION_INFO depth_info = { 0 };
+            XSLOT(dev, 25, D3D12_RESOURCE_ALLOCATION_INFO *, void *, UINT, UINT,
+                  const D3D12_RESOURCE_DESC *)(&depth_info, dev, 0, 1, &dd);
+            CHECK(depth_info.SizeInBytes >= 256 * 144 * 8 && depth_info.SizeInBytes != ~(UINT64)0,
+                  "GetResourceAllocationInfo (slot 25) of a depth texture with unordered access (%#llx)",
+                  (unsigned long long)depth_info.SizeInBytes);
+        }
     }
 
     /* DEFAULT-heap buffers become CPU-visible, so a title can write through

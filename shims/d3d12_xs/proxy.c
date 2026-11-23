@@ -1324,13 +1324,16 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
     }
 
     for (UINT i = 0; descs && i < count; i++)
-        if (descs[i].Layout >= 0x100)
+    {
+        D3D12_RESOURCE_DESC storage;
+        if (pc_desc(&descs[i], &storage) != &descs[i])
         {
             if (!copy && (copy = malloc(count * sizeof(*copy))))
                 memcpy(copy, descs, count * sizeof(*copy));
             if (copy)
-                pc_desc(&descs[i], &copy[i]);
+                copy[i] = storage;
         }
+    }
     ((fn)PC_SLOT(p->inner, 25))(p->inner, ret, visible_mask, count, copy ? copy : descs);
     if (ret->SizeInBytes == ~(UINT64)0 && descs)
     {
