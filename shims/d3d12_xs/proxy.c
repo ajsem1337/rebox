@@ -1097,6 +1097,22 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
     shadow_write_cbv(cpu, desc);
 }
 
+/* Views of a display-sized texture (what PresentX shows), for finding how the title draws into it. */
+static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T cpu)
+{
+    static LONG logged;
+    D3D12_RESOURCE_DESC d;
+
+    if (!resource)
+        return;
+    /* GetDesc (slot 10) returns its struct through a hidden pointer. */
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)resource)[10])(resource, &d);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
+            && InterlockedIncrement(&logged) <= 24)
+        rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#llx", what, (void *)resource,
+                  (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, (unsigned long long)cpu);
+}
+
 static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SIZE_T cpu)
 {
@@ -1112,21 +1128,6 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, 
     note_display_view("unordered access view", resource, cpu);
     ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), resource, counter, desc, h);
     shadow_write_uav(cpu, resource, desc);
-}
-
-/* Views of a display-sized texture (what PresentX shows), for finding how the title draws into it. */
-static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T cpu)
-{
-    static LONG logged;
-    D3D12_RESOURCE_DESC d;
-
-    if (!resource)
-        return;
-    d = ID3D12Resource_GetDesc(resource);
-    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
-            && InterlockedIncrement(&logged) <= 24)
-        rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#Ix", what, (void *)resource,
-                  (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, cpu);
 }
 
 /* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
