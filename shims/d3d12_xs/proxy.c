@@ -1817,8 +1817,12 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     /* Graphics list for older SDKs. XValkyrie's June 2020 kit tables (the era of a UE5 title's
      * SDK 0x20002) put PC's four query methods (52-55) at 28-31, which a UE5 title calls as
      * BeginQuery(heap, 0, 0) and EndQuery/ResolveQueryData(heap, 2 timestamp, 2), and name 67
-     * FlushPipelineX and 68 OMSetDepthBoundsX, which have nothing to do here. */
-    static struct slot list_slots[64] = {
+     * FlushPipelineX and 68 OMSetDepthBoundsX, which have nothing to do here. The same tables
+     * have PC's SetMarker, BeginEvent, EndEvent and ExecuteIndirect in place at 56-59,
+     * DispatchX (78) and CopyResourceX (84) as Dispatch and CopyResource with a flags argument,
+     * PC 60-76 at 105-121, and the shading rate methods and DispatchMesh at 124, 125 and 127
+     * (a UE5 title calls 124 as RSSetShadingRate(1x1, combiners)). 60 and 62 are console methods. */
+    static struct slot list_slots[96] = {
         FN(7, child_GetDevice),
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
@@ -1878,14 +1882,21 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     while (n < ARRAYSIZE(list_slots) && list_slots[n].xbox)
         n++;
     customs = n;
-    for (unsigned x = 33; x <= 62; x++)
+    for (unsigned x = 33; x <= 59; x++)
     {
         BOOL taken = FALSE;
         for (unsigned j = 0; j < customs; j++)
             taken |= list_slots[j].xbox == x;
         if (!taken)
-            list_slots[n++] = (struct slot)FWD(x, x - 4);
+            list_slots[n++] = (struct slot)FWD(x, x < 56 ? x - 4 : x);
     }
+    list_slots[n++] = (struct slot)FWD(78, 14);  /* DispatchX */
+    list_slots[n++] = (struct slot)FWD(84, 17);  /* CopyResourceX */
+    for (unsigned pc = 60; pc <= 76; pc++)
+        list_slots[n++] = (struct slot)FWD(pc + 45, pc);
+    list_slots[n++] = (struct slot)FWD(124, 77); /* RSSetShadingRate */
+    list_slots[n++] = (struct slot)FWD(125, 78); /* RSSetShadingRateImage */
+    list_slots[n++] = (struct slot)FWD(127, 79); /* DispatchMesh */
 
     build(&device_class, 44, device_slots, ARRAYSIZE(device_slots));
     build(&queue_class, 18, queue_slots, ARRAYSIZE(queue_slots));

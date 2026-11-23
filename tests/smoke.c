@@ -1317,6 +1317,30 @@ static void test_real_heap_va(void *dev, void *queue)
             {
                 CHECK(mapped[0] == 0x5ca71e77, "list slot 61 with a command signature runs ExecuteIndirect (%#x)",
                       mapped[0]);
+                mapped[0] = 0;
+                ID3D12Resource_Unmap(buf, 0, NULL);
+            }
+        }
+        /* The older layout (SDK 0x20002, a UE5 title's) has ExecuteIndirect in PC's place, 59
+         * (XValkyrie's June 2020 kit tables), and RSSetShadingRate at 124. */
+        if (SUCCEEDED(hr = ID3D12CommandAllocator_Reset(alloc)))
+            hr = XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        if (SUCCEEDED(hr))
+        {
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, pso);
+            XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+            XSLOT(list, 124, void, UINT, const void *)(list, 0, NULL);
+            XSLOT(list, 59, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 0, NULL, 0);
+            hr = XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 3);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 3; i++)
+                Sleep(10);
+            if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
+            {
+                CHECK(mapped[0] == 0x5ca71e77, "list slot 59 runs ExecuteIndirect, after slot 124 (%#x)", mapped[0]);
                 ID3D12Resource_Unmap(buf, 0, NULL);
             }
         }
