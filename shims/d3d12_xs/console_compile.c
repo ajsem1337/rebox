@@ -205,21 +205,48 @@ static int compare_ranges(const void *a, const void *b)
 }
 
 /* Returns the table's GPU address and its size in *bytes (AnyPS5 checks that its length in words
- * is exactly 4 + 8 * count, through OpArrayLength). */
+ * is exactly 4 + 8 * count, through OpArrayLength). The table has one address and a fixed length
+ * (PAGE_TABLE_CAPACITY ranges, the unused ones empty at the top of the address space), and is
+ * rebuilt in place only when what it maps changes: its address is baked into modules, and a table
+ * per change (a UE5 title views new constant buffers all the time) made new modules and pipelines
+ * for the same shaders, and cost milliseconds of sorting at every compile. */
+#define PAGE_TABLE_CAPACITY 16384u
+
 static UINT64 page_table(UINT32 *bytes)
 {
+    static SRWLOCK table_lock = SRWLOCK_INIT;
+    static UINT64 table_va, table_key;
+    static BYTE *table_cpu;
     struct shadow_region regions[MAX_REGIONS];
     struct gpu_memory_region chunks[MAX_REGIONS];
-    UINT64 (*buffers)[2] = malloc(65536 * sizeof(*buffers));
+    UINT64 (*buffers)[2];
     UINT n = shadow_regions(regions, MAX_REGIONS), nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
-    UINT nbuffers = buffers ? shadow_buffer_ranges(buffers, 65536) : 0, count = 0, merged = 0;
-    struct page_range *ranges = malloc((n + nchunks + nbuffers) * sizeof(*ranges));
-    BYTE *table;
+    UINT nbuffers, count = 0, merged = 0;
+    UINT64 key = hash_bytes(hash_bytes(0xcbf29ce484222325ull, regions, n * sizeof(*regions)), chunks,
+                            nchunks * sizeof(*chunks)) ^ (UINT64)shadow_buffer_ranges_generation() * 0x9e3779b97f4a7c15ull;
+    struct page_range *ranges;
     UINT64 va = 0;
 
-    if (!ranges)
+    *bytes = 16 + PAGE_TABLE_CAPACITY * sizeof(struct page_range);
+    AcquireSRWLockExclusive(&table_lock);
+    if (table_va && key == table_key)
+    {
+        va = table_va;
+        ReleaseSRWLockExclusive(&table_lock);
+        return va;
+    }
+    if (!table_cpu && FAILED(ReboxGpuAlloc(*bytes, 256, (void **)&table_cpu, &table_va)))
+    {
+        table_cpu = NULL;
+        ReleaseSRWLockExclusive(&table_lock);
+        return 0;
+    }
+    buffers = malloc(65536 * sizeof(*buffers));
+    nbuffers = buffers ? shadow_buffer_ranges(buffers, 65536) : 0;
+    if (!(ranges = malloc((n + nchunks + nbuffers) * sizeof(*ranges))))
     {
         free(buffers);
+        ReleaseSRWLockExclusive(&table_lock);
         return 0;
     }
     /* Memory that exists: GPU memory chunks and buffers the title viewed, at their GPU VAs, and
@@ -258,19 +285,26 @@ static UINT64 page_table(UINT32 *bytes)
         ranges[count++] = (struct page_range){ begin, end, regions[i].gpu_va, 3, 0 };
     }
     qsort(ranges, count, sizeof(*ranges), compare_ranges);
-    if (!(table = malloc(16 + count * sizeof(*ranges))))
+    if (count > PAGE_TABLE_CAPACITY)
     {
-        free(ranges);
-        return 0;
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: AnyPS5 page table: %u ranges, %u kept", count, PAGE_TABLE_CAPACITY);
+        count = PAGE_TABLE_CAPACITY;
     }
-    ((UINT32 *)table)[0] = 1;            /* version */
-    ((UINT32 *)table)[1] = count;
-    ((UINT32 *)table)[2] = sizeof(struct page_range);
-    ((UINT32 *)table)[3] = 0;
-    memcpy(table + 16, ranges, count * sizeof(*ranges));
-    va = host_buffer(table, 16 + count * sizeof(*ranges));
-    *bytes = (UINT32)(16 + count * sizeof(*ranges));
-    free(table);
+    {
+        struct page_range *out = (struct page_range *)(table_cpu + 16);
+        ((UINT32 *)table_cpu)[0] = 1;            /* version */
+        ((UINT32 *)table_cpu)[1] = PAGE_TABLE_CAPACITY;
+        ((UINT32 *)table_cpu)[2] = sizeof(struct page_range);
+        ((UINT32 *)table_cpu)[3] = 0;
+        memcpy(out, ranges, count * sizeof(*ranges));
+        for (UINT i = count; i < PAGE_TABLE_CAPACITY; i++) /* empty, sorted after every real range */
+            out[i] = (struct page_range){ ~0ull, ~0ull, 0, 0, 0 };
+    }
+    table_key = key;
+    va = table_va;
+    ReleaseSRWLockExclusive(&table_lock);
     free(ranges);
     return va;
 }

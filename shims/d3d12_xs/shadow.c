@@ -336,6 +336,13 @@ static SRWLOCK ranges_lock = SRWLOCK_INIT;
 static struct { UINT64 begin, end; } *buffer_ranges;
 static UINT buffer_range_count, buffer_range_capacity;
 
+static volatile LONG ranges_generation;
+
+LONG shadow_buffer_ranges_generation(void)
+{
+    return ranges_generation;
+}
+
 static void note_buffer_range(UINT64 va, UINT64 size)
 {
     if (!va || !size)
@@ -345,7 +352,10 @@ static void note_buffer_range(UINT64 va, UINT64 size)
         if (buffer_ranges[i].begin == va)
         {
             if (buffer_ranges[i].end < va + size)
+            {
                 buffer_ranges[i].end = va + size;
+                InterlockedIncrement(&ranges_generation);
+            }
             ReleaseSRWLockExclusive(&ranges_lock);
             return;
         }
@@ -363,6 +373,7 @@ static void note_buffer_range(UINT64 va, UINT64 size)
     }
     buffer_ranges[buffer_range_count].begin = va;
     buffer_ranges[buffer_range_count++].end = va + size;
+    InterlockedIncrement(&ranges_generation);
     ReleaseSRWLockExclusive(&ranges_lock);
 }
 
