@@ -21,6 +21,7 @@
 
 #define COBJMACROS
 #include <winsock2.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -101,6 +102,60 @@ static ULONG WINAPI object_Release(struct object *self)
         return 0; \
     }
 
+/* REBOX_SLOT_STATS (or REBOX_DSTORAGE_STATS=seconds): what was enqueued and what has run,
+ * logged every few seconds while it changes or something is still waiting, to see how a title
+ * waits for its reads (status entries, events or fences) and whether any never complete. */
+enum { ST_REQUEST, ST_STATUS, ST_SIGNAL, ST_EVENT, ST_KINDS };
+static struct
+{
+    volatile LONG64 enqueued[ST_KINDS], done[ST_KINDS], submitted, failed, polls, polls_pending;
+} stats;
+
+static const char *const stat_names[ST_KINDS] = { "requests", "status entries", "fence signals", "events" };
+
+static DWORD WINAPI stats_thread(void *param)
+{
+    DWORD seconds = (DWORD)(ULONG_PTR)param;
+    LONG64 last = -1;
+
+    for (;;)
+    {
+        char line[512];
+        int at = 0;
+        LONG64 sum = 0, waiting = 0;
+
+        Sleep(seconds * 1000);
+        for (int k = 0; k < ST_KINDS; k++)
+        {
+            LONG64 e = stats.enqueued[k], d = stats.done[k];
+            sum += e + d;
+            waiting += e - d;
+            at += snprintf(line + at, sizeof(line) - at, "%s%s %lld/%lld", k ? ", " : "", stat_names[k], d, e);
+        }
+        sum += stats.polls;
+        if (sum == last && !waiting)
+            continue;
+        last = sum;
+        rebox_log("xcrdapi: run/enqueued: %s; %lld failed, %lld still unsubmitted; status polls %lld (%lld "
+                     "pending)", line, (long long)stats.failed,
+                     (long long)(stats.enqueued[0] + stats.enqueued[1] + stats.enqueued[2] + stats.enqueued[3]
+                                 - stats.submitted),
+                     (long long)stats.polls, (long long)stats.polls_pending);
+    }
+    return 0;
+}
+
+static void start_stats(void)
+{
+    const char *env = getenv("REBOX_DSTORAGE_STATS");
+    int seconds = env ? atoi(env) : getenv("REBOX_SLOT_STATS") ? 10 : 0;
+
+    if (env && seconds <= 0)
+        seconds = 10;
+    if (seconds > 0)
+        CloseHandle(CreateThread(NULL, 0, stats_thread, (void *)(ULONG_PTR)seconds, 0, NULL));
+}
+
 /* ---------------------------------------------------------------------- status arrays */
 
 struct status_entry
@@ -125,7 +180,12 @@ static void status_destroy(struct object *self)
 
 static BOOL WINAPI status_IsComplete(struct status_array *a, UINT32 index)
 {
-    return index < a->capacity && a->entries[index].complete;
+    BOOL complete = index < a->capacity && a->entries[index].complete;
+
+    InterlockedIncrement64(&stats.polls);
+    if (!complete)
+        InterlockedIncrement64(&stats.polls_pending);
+    return complete;
 }
 
 static HRESULT WINAPI status_GetHResult(struct status_array *a, UINT32 index)
@@ -497,6 +557,8 @@ static DWORD WINAPI queue_worker(void *param)
         else
         {
             HRESULT hr = run_request(q, &e);
+            if (FAILED(hr))
+                InterlockedIncrement64(&stats.failed);
             if (SUCCEEDED(hr))
                 report_written(e.request.destination, e.request.destination_size);
             if (FAILED(hr))
@@ -510,6 +572,7 @@ static DWORD WINAPI queue_worker(void *param)
                                  e.request.source_size, e.request.destination_size);
             }
         }
+        InterlockedIncrement64(&stats.done[e.kind]);
         release_entry(&e);
         EnterCriticalSection(&q->cs);
     }
@@ -520,6 +583,7 @@ static DWORD WINAPI queue_worker(void *param)
 /* Caller holds q->cs. */
 static void submit_locked(struct queue *q)
 {
+    InterlockedAdd64(&stats.submitted, q->pending_count);
     for (UINT32 i = 0; i < q->pending_count; i++)
         push(&q->submitted, &q->submitted_count, &q->submitted_size, &q->pending[i]);
     q->pending_count = 0;
@@ -531,6 +595,7 @@ static void submit_locked(struct queue *q)
 /* Caller holds q->cs. The console submits by itself once more than half the queue is waiting. */
 static void enqueue_locked(struct queue *q, const struct entry *e)
 {
+    InterlockedIncrement64(&stats.enqueued[e->kind]);
     push(&q->pending, &q->pending_count, &q->pending_size, e);
     if (!q->manual_submit || q->pending_count * 2 > q->capacity)
         submit_locked(q);
@@ -759,7 +824,10 @@ HRESULT WINAPI DStorageGetFactory(REFIID riid, void **out)
     if (!out)
         return E_POINTER;
     if (!InterlockedExchange(&logged, 1))
+    {
         rebox_log("xcrdapi: DirectStorage factory requested");
+        start_stats();
+    }
     object_AddRef(&factory);
     *out = &factory;
     return S_OK;
