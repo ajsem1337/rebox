@@ -9,8 +9,13 @@
  *   WASD left stick, arrows right stick, Space A, Left Ctrl B, R X, F Y,
  *   Q/E shoulders, Z/C triggers, Enter menu, Tab view, I/K/J/L D-pad, Shift/V stick clicks.
  *
+ * The gamepad is also a UI navigation device (menus written against GameInputKindUiNavigation).
+ * Readings are kept while the state changes, so a title that steps through them with
+ * GetNextReading (an event loop: a GDK title's UI screens) sees every press.
+ *
  * Keyboard and mouse readings, raw reports, force feedback and the other device kinds report
- * that they have no readings or do nothing. */
+ * that they have no readings or do nothing. The first call of each method with each input kind
+ * is logged. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,6 +29,8 @@
 
 #define GAMEINPUT_E_READING_NOT_FOUND ((HRESULT)0x838a0003)
 #define KIND_GAMEPAD 0x00040000u
+#define KIND_UI_NAVIGATION 0x01000000u
+#define KINDS (KIND_GAMEPAD | KIND_UI_NAVIGATION)
 #define STATUS_CONNECTED 0x1u
 
 typedef struct
@@ -182,7 +189,7 @@ static const BYTE gamepad_info[56]; /* GameInputGamepadInfo: every label GameInp
 static GameInputDeviceInfo device_info = {
     sizeof(GameInputDeviceInfo), 0x045e, 0x0b12, 1, 0, 0, { 0x01, 0x05 }, { 1 }, { 1 },
     { { 's', 'c', 'a', 'r', 'l', 'e', 't', 't', 1 } }, { { 's', 'c', 'a', 'r', 'l', 'e', 't', 't', 1 } },
-    1 /* GameInputFamilyXboxOne */, 0, KIND_GAMEPAD,
+    1 /* GameInputFamilyXboxOne */, 0, KINDS,
     0xf /* low, high, left and right trigger motors */,
     .controllerAxisCount = 6, .controllerButtonCount = 14, .gamepadInfo = gamepad_info,
 };
@@ -287,7 +294,7 @@ static ULONG WINAPI reading_Release(struct object *o)
     return left;
 }
 
-static uint32_t WINAPI reading_GetInputKind(struct reading *r) { return KIND_GAMEPAD; }
+static uint32_t WINAPI reading_GetInputKind(struct reading *r) { return KINDS; }
 static uint64_t WINAPI reading_GetSequenceNumber(struct reading *r, uint32_t kind) { return r->sequence; }
 static uint64_t WINAPI reading_GetTimestamp(struct reading *r) { return r->timestamp; }
 static void WINAPI reading_GetDevice(struct reading *r, void **device)
@@ -309,6 +316,37 @@ static bool WINAPI reading_GetGamepadState(struct reading *r, GameInputGamepadSt
     return true;
 }
 
+/* GameInputUiNavigationButtons from the gamepad: A accept, B cancel, D-pad or left stick
+ * directions, X/Y context 1/2, shoulders page left/right, triggers page up/down, right stick
+ * scrolls. */
+static uint32_t ui_navigation(const GameInputGamepadState *g)
+{
+    uint32_t b = g->buttons & 0x3; /* menu, view */
+    if (g->buttons & 0x4) b |= 0x4;
+    if (g->buttons & 0x8) b |= 0x8;
+    if ((g->buttons & 0x40) || g->leftThumbstickY > 0.5f) b |= 0x10;
+    if ((g->buttons & 0x80) || g->leftThumbstickY < -0.5f) b |= 0x20;
+    if ((g->buttons & 0x100) || g->leftThumbstickX < -0.5f) b |= 0x40;
+    if ((g->buttons & 0x200) || g->leftThumbstickX > 0.5f) b |= 0x80;
+    if (g->buttons & 0x10) b |= 0x100;
+    if (g->buttons & 0x20) b |= 0x200;
+    if (g->leftTrigger > 0.5f) b |= 0x1000;
+    if (g->rightTrigger > 0.5f) b |= 0x2000;
+    if (g->buttons & 0x400) b |= 0x4000;
+    if (g->buttons & 0x800) b |= 0x8000;
+    if (g->rightThumbstickY > 0.5f) b |= 0x10000;
+    if (g->rightThumbstickY < -0.5f) b |= 0x20000;
+    if (g->rightThumbstickX < -0.5f) b |= 0x40000;
+    if (g->rightThumbstickX > 0.5f) b |= 0x80000;
+    return b;
+}
+
+static bool WINAPI reading_GetUiNavigationState(struct reading *r, uint32_t *state)
+{
+    *state = ui_navigation(&r->state);
+    return true;
+}
+
 static void *const reading_vtbl[] = {
     reading_QueryInterface, obj_AddRef, reading_Release, reading_GetInputKind, reading_GetSequenceNumber,
     reading_GetTimestamp, reading_GetDevice, reading_GetRawReport,
@@ -319,7 +357,7 @@ static void *const reading_vtbl[] = {
     reading_no_state,                       /* mouse */
     reading_zero_count, reading_zero_state, /* touch */
     reading_no_state, reading_no_state, reading_no_state, /* motion, arcade stick, flight stick */
-    reading_GetGamepadState, reading_no_state, reading_no_state, /* gamepad, racing wheel, UI navigation */
+    reading_GetGamepadState, reading_no_state, reading_GetUiNavigationState, /* gamepad, racing wheel, UI navigation */
 };
 
 /* ---------------------------------------------------------------------------- GameInput */
@@ -336,30 +374,138 @@ static HRESULT WINAPI input_QueryInterface(struct object *o, REFIID iid, void **
 static ULONG WINAPI input_Release(struct object *o) { return 1; }
 static uint64_t WINAPI input_GetCurrentTimestamp(void *self) { return timestamp_us(); }
 
+/* The first call of each method with each kind (and with each answer), for finding out how a
+ * title reads its input. */
+static void log_call(const char *method, uint32_t kind, HRESULT hr)
+{
+    static struct { const char *method; uint32_t kind; HRESULT hr; } seen[64];
+    static LONG count;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    BOOL known = FALSE;
+
+    AcquireSRWLockExclusive(&lock);
+    for (LONG i = 0; i < count && !known; i++)
+        known = seen[i].method == method && seen[i].kind == kind && seen[i].hr == hr;
+    if (!known && count < ARRAYSIZE(seen))
+    {
+        seen[count].method = method;
+        seen[count].kind = kind;
+        seen[count++].hr = hr;
+        rebox_log("gameinput: %s(kind %#x): %#lx", method, kind, (unsigned long)hr);
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* The readings while the state changed, oldest first: each holds a reference here. */
+#define HISTORY 64
+static struct reading *history[HISTORY];
+static unsigned history_count;
+static SRWLOCK history_lock = SRWLOCK_INIT;
+
+/* Reads the gamepad; a changed state becomes a new reading. Caller holds history_lock. */
+static void sample(void)
+{
+    GameInputGamepadState now;
+    struct reading *r, *latest = history_count ? history[history_count - 1] : NULL;
+
+    read_gamepad(&now);
+    if (latest && !memcmp(&latest->state, &now, sizeof(now)))
+        return;
+    if (!(r = calloc(1, sizeof(*r))))
+        return;
+    r->obj = (struct object){ reading_vtbl, 1 };
+    r->timestamp = timestamp_us();
+    r->sequence = InterlockedIncrement64(&sequence);
+    r->state = now;
+    if (history_count == HISTORY)
+    {
+        reading_Release(&history[0]->obj);
+        memmove(history, history + 1, (HISTORY - 1) * sizeof(*history));
+        history_count--;
+    }
+    history[history_count++] = r;
+}
+
+static BOOL wanted(uint32_t kind, void *device)
+{
+    return (kind & KINDS) && (!device || device == &gamepad);
+}
+
 static HRESULT WINAPI input_GetCurrentReading(void *self, uint32_t kind, void *device, void **out)
 {
-    struct reading *r;
+    HRESULT hr = GAMEINPUT_E_READING_NOT_FOUND;
 
     if (!out)
         return E_POINTER;
     *out = NULL;
-    if (!(kind & KIND_GAMEPAD) || (device && device != &gamepad))
-        return GAMEINPUT_E_READING_NOT_FOUND;
-    if (!(r = calloc(1, sizeof(*r))))
-        return E_OUTOFMEMORY;
-    r->obj = (struct object){ reading_vtbl, 1 };
-    r->timestamp = timestamp_us();
-    r->sequence = InterlockedIncrement64(&sequence);
-    read_gamepad(&r->state);
-    *out = r;
-    return S_OK;
+    if (wanted(kind, device))
+    {
+        AcquireSRWLockExclusive(&history_lock);
+        sample();
+        if (history_count)
+        {
+            struct reading *r = history[history_count - 1];
+            obj_AddRef(&r->obj);
+            *out = r;
+            hr = S_OK;
+        }
+        ReleaseSRWLockExclusive(&history_lock);
+    }
+    log_call("GetCurrentReading", kind, hr);
+    return hr;
 }
 
-/* Only the current reading is kept: there's no history to step through. */
+/* The reading after (or before) a reference one, from the history. */
+static HRESULT step(const char *method, void *reference, uint32_t kind, void *device, void **out, BOOL forward)
+{
+    struct reading *ref = reference;
+    HRESULT hr = GAMEINPUT_E_READING_NOT_FOUND;
+
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
+    if (!ref)
+        hr = E_INVALIDARG;
+    else if (wanted(kind, device))
+    {
+        AcquireSRWLockExclusive(&history_lock);
+        sample();
+        if (forward)
+        {
+            for (unsigned i = 0; i < history_count; i++)
+                if (history[i]->sequence > ref->sequence)
+                {
+                    *out = history[i];
+                    break;
+                }
+        }
+        else
+        {
+            for (unsigned i = history_count; i-- > 0;)
+                if (history[i]->sequence < ref->sequence)
+                {
+                    *out = history[i];
+                    break;
+                }
+        }
+        if (*out)
+        {
+            obj_AddRef(*out);
+            hr = S_OK;
+        }
+        ReleaseSRWLockExclusive(&history_lock);
+    }
+    log_call(method, kind, hr);
+    return hr;
+}
+
 static HRESULT WINAPI input_GetNextReading(void *self, void *reference, uint32_t kind, void *device, void **out)
 {
-    if (out) *out = NULL;
-    return GAMEINPUT_E_READING_NOT_FOUND;
+    return step("GetNextReading", reference, kind, device, out, TRUE);
+}
+static HRESULT WINAPI input_GetPreviousReading(void *self, void *reference, uint32_t kind, void *device, void **out)
+{
+    return step("GetPreviousReading", reference, kind, device, out, FALSE);
 }
 static HRESULT WINAPI input_GetTemporalReading(void *self, uint64_t timestamp, void *device, void **out)
 {
@@ -370,6 +516,7 @@ static HRESULT WINAPI input_GetTemporalReading(void *self, uint64_t timestamp, v
 static HRESULT WINAPI input_RegisterReadingCallback(void *self, void *device, uint32_t kind, float threshold,
                                                     void *context, void *callback, uint64_t *token)
 {
+    log_call("RegisterReadingCallback (never called back)", kind, S_OK);
     if (token) *token = InterlockedIncrement64(&next_token);
     return S_OK;
 }
@@ -383,7 +530,8 @@ static HRESULT WINAPI input_RegisterDeviceCallback(void *self, void *device, uin
 
     if (token)
         *token = t;
-    if (callback && enum_kind && (kind & KIND_GAMEPAD) && (filter & STATUS_CONNECTED)
+    log_call("RegisterDeviceCallback", kind, S_OK);
+    if (callback && enum_kind && (kind & KINDS) && (filter & STATUS_CONNECTED)
             && (!device || device == &gamepad))
         callback(t, context, &gamepad, timestamp_us(), STATUS_CONNECTED, 0);
     return S_OK;
@@ -412,7 +560,7 @@ static HRESULT WINAPI input_CreateAggregateDevice(void *self, uint32_t kind, voi
 {
     if (!out)
         return E_POINTER;
-    if (!(kind & KIND_GAMEPAD))
+    if (!(kind & KINDS))
     {
         *out = NULL;
         return E_NOTIMPL;
@@ -435,7 +583,7 @@ static void WINAPI input_SetFocusPolicy(void *self, uint32_t policy) {}
 
 static void *const input_vtbl[] = {
     input_QueryInterface, obj_AddRef, input_Release, input_GetCurrentTimestamp, input_GetCurrentReading,
-    input_GetNextReading, input_GetNextReading /* previous */, input_GetTemporalReading,
+    input_GetNextReading, input_GetPreviousReading, input_GetTemporalReading,
     input_RegisterReadingCallback, input_RegisterDeviceCallback, input_register_other /* system buttons */,
     input_RegisterKeyboardLayoutCallback, input_StopCallback, input_UnregisterCallback, input_CreateDispatcher,
     input_CreateAggregateDevice, input_find /* id */, input_find /* object */, input_find /* platform handle */,
