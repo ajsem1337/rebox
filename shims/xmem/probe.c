@@ -7,7 +7,8 @@
  * later hits are counted, not logged); REBOX_PROBE_FROM=N skips each probe's first N-1 hits, for
  * looking at a loop late in a run. Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
  * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA);
- * REBOX_PROBE_DUMP=N:rdx (or r8, r9) dumps at that register instead.
+ * REBOX_PROBE_DUMP=N:rdx (or r8, r9, rsi, rdi, rbx, rax) dumps at that register instead, which with a
+ * probe inside a function shows an object it is working on.
  * REBOX_PROBE_MEMORY=RVA:BYTES[,...] (hex, relative to the exe) also logs those ranges of the exe's
  * memory (its globals) at each logged hit, as dwords. This is how to see what a title's own code
  * is called with without changing its file: xcl's XCL_PROBE does the same with hardware
@@ -34,7 +35,8 @@ static struct probe
 } probes[MAX_PROBES];
 static UINT probe_count;
 static LONG probe_max = 20, probe_from = 1;
-static UINT dump_qwords, dump_register; /* 0 rcx, 1 rdx, 2 r8, 3 r9 */
+static UINT dump_qwords, dump_register; /* an index into register_names */
+static const char *const register_names[] = { "rcx", "rdx", "r8", "r9", "rsi", "rdi", "rbx", "rax" };
 static struct { ULONG_PTR rva, bytes; } memory_ranges[8];
 static UINT memory_range_count;
 static DWORD rearm_slot = TLS_OUT_OF_INDEXES; /* the probe a thread is single-stepping past, plus one */
@@ -196,9 +198,8 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                              (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rsi,
                              (unsigned long long)c->Rdi, (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
                              (unsigned long long)c->Rsp, caller);
-                ULONG_PTR base = dump_register == 1 ? c->Rdx : dump_register == 2 ? c->R8 : dump_register == 3 ? c->R9
-                        : c->Rcx;
-                static const char *const register_names[] = { "rcx", "rdx", "r8", "r9" };
+                const ULONG_PTR registers[] = { c->Rcx, c->Rdx, c->R8, c->R9, c->Rsi, c->Rdi, c->Rbx, c->Rax };
+                ULONG_PTR base = registers[dump_register];
                 if (dump_qwords && base && !IsBadReadPtr((void *)base, dump_qwords * 8))
                 {
                     char line[900], where[MAX_PATH + 32];
@@ -375,8 +376,10 @@ void probe_install(void)
         {
             const char *colon = strchr(dump, ':');
             dump_qwords = min(atoi(dump), 64);
-            dump_register = !colon ? 0 : !_stricmp(colon + 1, "rdx") ? 1 : !_stricmp(colon + 1, "r8") ? 2
-                    : !_stricmp(colon + 1, "r9") ? 3 : 0;
+            dump_register = 0;
+            for (UINT i = 0; colon && i < ARRAYSIZE(register_names); i++)
+                if (!_stricmp(colon + 1, register_names[i]))
+                    dump_register = i;
         }
         free(dump);
         for (t = memory ? strtok_s(memory, ",", &ctx) : NULL; t && memory_range_count < ARRAYSIZE(memory_ranges);
