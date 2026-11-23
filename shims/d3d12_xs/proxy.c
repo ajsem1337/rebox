@@ -2631,6 +2631,23 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     return ID3D12GraphicsCommandList_Reset(INNER(p, ID3D12GraphicsCommandList), proxy_unwrap(alloc), pso);
 }
 
+/* Newer-layout slot 139: (allocator, NULL, NULL), HRESULT checked; the target title calls it on
+ * a pooled list with its allocator where Reset would be. Taken as Reset with a third argument;
+ * a list still recording (fresh from creation) is closed first, which the desktop requires. */
+static HRESULT STDMETHODCALLTYPE list_ResetX(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
+        UINT64 extra)
+{
+    static LONG logged;
+    HRESULT hr;
+
+    if (extra && !InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: command list slot 139 (a Reset) with a third argument %#llx", (unsigned long long)extra);
+    if (FAILED(hr = list_Reset(p, alloc, pso))
+            && SUCCEEDED(ID3D12GraphicsCommandList_Close(INNER(p, ID3D12GraphicsCommandList))))
+        hr = list_Reset(p, alloc, pso);
+    return hr;
+}
+
 /* Slot 148 (XboxBvhBuilder.dll 0x180020ed6): allocate(size, alignment)
  * returns memory the title fills and then binds by address, so it must be
  * GPU-visible and, for the title, its own GPU VA. */
@@ -3072,6 +3089,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FWD(56, 56), FWD(57, 57), FWD(58, 58),        /* SetMarker, BeginEvent, EndEvent */
         FN(61, list_Slot61),                          /* ExecuteIndirect (PC 59) */
         FN(85, list_CopyTextureRegionX),
+        FN(139, list_ResetX),
         FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
     };

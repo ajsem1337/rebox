@@ -4251,6 +4251,16 @@ static void test_xbox(void)
             CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence4) == 8,
                   "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder's and a stranger state object's rays, barriers with nothing to "
                   "transition, executed (%#lx)", hr);
+            if (SUCCEEDED(hr))
+            {
+                /* Slot 139: Reset with a third argument, on a closed list and on one still recording. */
+                HRESULT closed, open;
+                ID3D12CommandAllocator_Reset(alloc4);
+                closed = XSLOT(list4, 139, HRESULT, void *, void *, UINT64)(list4, alloc4, NULL, 0);
+                open = XSLOT(list4, 139, HRESULT, void *, void *, UINT64)(list4, alloc4, NULL, 0);
+                CHECK(SUCCEEDED(closed) && SUCCEEDED(open) && SUCCEEDED(XSLOT(list4, 9, HRESULT)(list4)),
+                      "SDK 0x20004 command list slot 139 resets it, closed (%#lx) or recording (%#lx)", closed, open);
+            }
             if (list4) XSLOT(list4, 2, ULONG)(list4);
             if (alloc4) ID3D12CommandAllocator_Release(alloc4);
         }
