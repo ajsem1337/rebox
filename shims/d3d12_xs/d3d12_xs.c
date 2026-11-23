@@ -65,7 +65,7 @@ SUBOBJ(uint, UINT)
 SUBOBJ(rasterizer, D3D12_RASTERIZER_DESC)
 SUBOBJ(depth_stencil, D3D12_DEPTH_STENCIL_DESC)
 SUBOBJ(input_layout, D3D12_INPUT_LAYOUT_DESC)
-SUBOBJ(rt_formats, struct struct rt_format_array) /* no typedef in mingw headers */
+SUBOBJ(rt_formats, struct D3D12_RT_FORMAT_ARRAY) /* no typedef in mingw headers */
 SUBOBJ(sample_desc, DXGI_SAMPLE_DESC)
 SUBOBJ(cached_pso, D3D12_CACHED_PIPELINE_STATE)
 SUBOBJ(depth_stencil1, D3D12_DEPTH_STENCIL_DESC1)
@@ -508,9 +508,6 @@ static void stream_fallbacks(BYTE *stream, const SIZE_T *stages, UINT stage_coun
         *(UINT *)(stream + topology) = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 }
 
-/* D3D12_RT_FORMAT_ARRAY, which these headers lack: a stream's render target formats. */
-struct rt_format_array { DXGI_FORMAT RTFormats[8]; UINT NumRenderTargets; };
-
 static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pso)
 {
@@ -525,7 +522,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC console = { 0 };
     BOOL other_stages = FALSE;
     const D3D12_BLEND_DESC *blend = NULL;
-    const struct rt_format_array *rt_formats = NULL;
+    const struct D3D12_RT_FORMAT_ARRAY *rt_formats = NULL;
     BYTE *stream;
     HRESULT hr;
 
@@ -585,7 +582,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND)
             blend = (const D3D12_BLEND_DESC *)(stream + offset + subobj_layouts[type].offset);
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS)
-            rt_formats = (const struct rt_format_array *)(stream + offset + subobj_layouts[type].offset);
+            rt_formats = (const struct D3D12_RT_FORMAT_ARRAY *)(stream + offset + subobj_layouts[type].offset);
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
             console.InputLayout = *(const D3D12_INPUT_LAYOUT_DESC *)(stream + offset + subobj_layouts[type].offset);
         offset += subobj_layouts[type].size;
