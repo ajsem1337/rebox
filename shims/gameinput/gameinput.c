@@ -31,7 +31,10 @@
 #define GAMEINPUT_E_READING_NOT_FOUND ((HRESULT)0x838a0003)
 #define KIND_GAMEPAD 0x00040000u
 #define KIND_UI_NAVIGATION 0x01000000u
-#define KINDS (KIND_GAMEPAD | KIND_UI_NAVIGATION)
+#define KIND_CONTROLLER 0x0000000eu
+/* What the gamepad is and each reading reports, as in xcl: a controller, a gamepad and a UI
+ * navigation device (menus may take only a device that can navigate them). */
+#define KINDS (KIND_CONTROLLER | KIND_GAMEPAD | KIND_UI_NAVIGATION)
 #define STATUS_CONNECTED 0x1u
 /* GameInputDeviceStatus as xcl reports it: connected, input enabled, output enabled,
  * synchronized. A screen that wants input enabled ignores a device that's only connected. */
@@ -194,7 +197,7 @@ static const BYTE gamepad_info[56]; /* GameInputGamepadInfo: every label GameInp
 static GameInputDeviceInfo device_info = {
     sizeof(GameInputDeviceInfo), 0x045e, 0x0b12, 1, 0, 0, { 0x01, 0x05 }, { 1 }, { 1 },
     { { 's', 'c', 'a', 'r', 'l', 'e', 't', 't', 1 } }, { { 's', 'c', 'a', 'r', 'l', 'e', 't', 't', 1 } },
-    1 /* GameInputFamilyXboxOne */, 0, KIND_GAMEPAD,
+    1 /* GameInputFamilyXboxOne */, 8 /* GameInputDeviceCapabilities: synchronization */, KINDS,
     0xf /* low, high, left and right trigger motors */,
     .controllerAxisCount = 6, .controllerButtonCount = 14, .gamepadInfo = gamepad_info,
 };
@@ -417,8 +420,7 @@ static struct reading *new_reading(uint32_t kind)
     if (!r)
         return NULL;
     r->obj = (struct object){ reading_vtbl, 1 };
-    /* A gamepad reading says it's a gamepad, as before; one asked for as UI navigation is both. */
-    r->kind = (kind & KIND_GAMEPAD) ? KIND_GAMEPAD : KINDS;
+    r->kind = KINDS;
     r->timestamp = timestamp_us();
     r->sequence = InterlockedIncrement64(&sequence);
     read_gamepad(&r->state);
@@ -548,18 +550,48 @@ static HRESULT WINAPI input_RegisterReadingCallback(void *self, void *device, ui
 }
 
 /* Enumeration reports the gamepad as connected, on this thread; it never disconnects. */
+/* An asynchronous enumeration reports the gamepad from a thread of its own, after the
+ * registration has returned its token (xcl); a blocking one at once. */
+struct enumeration
+{
+    device_callback callback;
+    void *context;
+    uint64_t token;
+};
+
+static DWORD WINAPI enumerate_async(void *param)
+{
+    struct enumeration *e = param;
+    e->callback(e->token, e->context, &gamepad, timestamp_us(), STATUS_ALL, 0);
+    free(e);
+    return 0;
+}
+
 static HRESULT WINAPI input_RegisterDeviceCallback(void *self, void *device, uint32_t kind, uint32_t filter,
                                                    uint32_t enum_kind, void *context, device_callback callback,
                                                    uint64_t *token)
 {
     uint64_t t = InterlockedIncrement64(&next_token);
+    struct enumeration *e;
+    HANDLE thread;
 
     if (token)
         *token = t;
-    log_call("RegisterDeviceCallback", kind, S_OK);
-    if (callback && enum_kind && (kind & KINDS) && (filter & STATUS_CONNECTED)
-            && (!device || device == &gamepad))
+    log_call(enum_kind == 2 ? "RegisterDeviceCallback (blocking enumeration)"
+             : enum_kind ? "RegisterDeviceCallback (asynchronous enumeration)" : "RegisterDeviceCallback (no enumeration)",
+             kind, S_OK);
+    if (!callback || !enum_kind || !(kind & KINDS) || !(filter & STATUS_CONNECTED) || (device && device != &gamepad))
+        return S_OK;
+    if (enum_kind == 2 /* GameInputBlockingEnumeration */ || !(e = malloc(sizeof(*e))))
+    {
         callback(t, context, &gamepad, timestamp_us(), STATUS_ALL, 0);
+        return S_OK;
+    }
+    *e = (struct enumeration){ callback, context, t };
+    if ((thread = CreateThread(NULL, 0, enumerate_async, e, 0, NULL)))
+        CloseHandle(thread);
+    else
+        enumerate_async(e);
     return S_OK;
 }
 

@@ -3109,7 +3109,7 @@ static void test_gameinput(void)
                       == (HRESULT)0x838a0003 && !next, "GameInput GetNextReading: nothing newer while the state holds");
             CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x00040000, NULL, &again))
                       && XSLOT(again, 4, UINT64, UINT32)(again, 0x00040000) > XSLOT(reading, 4, UINT64, UINT32)(reading, 0x00040000)
-                      && XSLOT(again, 3, UINT32)(again) == 0x00040000,
+                      && (XSLOT(again, 3, UINT32)(again) & 0x00040000),
                   "each GetCurrentReading is a new gamepad reading (a GDK title polls it)");
             if (again) XSLOT(again, 2, ULONG)(again);
             CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x01000000 /* UI navigation */, NULL, &nav))
