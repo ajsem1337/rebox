@@ -152,12 +152,25 @@ if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
         $(command -v x86_64-w64-mingw32-gcc >/dev/null && echo --prototypes-from x86_64-w64-mingw32-gcc) \
         > "$WINEPREFIX/imports.txt" 2>&1 || true  # exits 1 when it found gaps
     if [[ -d $gen/dlls ]] || grep -qs . "$gen"/*_stubs.def; then
-        key=$( (echo "$REBOX_SRC"; cd "$gen" && find . -type f -print0 | sort -z | xargs -0 cat) | sha256sum | cut -d' ' -f1)
+        # A git checkout (a local build: rebox-run-local) is keyed by its files' contents and copied
+        # without build output; a store path by its path, which changes with its contents.
+        if [[ -e $REBOX_SRC/.git ]]; then
+            src_files() { git -C "$REBOX_SRC" ls-files -z -co --exclude-standard; }
+            src_key=$(cd "$REBOX_SRC" && src_files | xargs -0 cat 2>/dev/null | sha256sum)
+        else
+            src_key=$REBOX_SRC
+        fi
+        key=$( (echo "$src_key"; cd "$gen" && find . -type f -print0 | sort -z | xargs -0 cat) | sha256sum | cut -d' ' -f1)
         rebuilt="$WINEPREFIX/shim-build"
         if [[ $(cat "$rebuilt/.key" 2>/dev/null) != "$key" ]]; then
             echo "rebox-run: stubbing imports nothing provides (see $WINEPREFIX/imports.txt); rebuilding the shims" >&2
             rm -rf "$rebuilt"
-            cp -r "$REBOX_SRC" "$rebuilt"
+            if [[ -e $REBOX_SRC/.git ]]; then
+                mkdir -p "$rebuilt"
+                (cd "$REBOX_SRC" && src_files | tar --null -T - -cf -) | tar -C "$rebuilt" -xf -
+            else
+                cp -r "$REBOX_SRC" "$rebuilt"
+            fi
             chmod -R u+w "$rebuilt"
             mkdir -p "$rebuilt/generated"
             cp -r "$gen"/. "$rebuilt/generated/"
