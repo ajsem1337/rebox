@@ -74,6 +74,7 @@ struct proxy
     struct present_queue *present; /* queues that have presented */
     ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
     UINT heap_count;
+    BOOL placeholder_pipeline; /* lists: the ray tracing pipeline set is a placeholder (state_object.c) */
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -890,6 +891,13 @@ static HRESULT STDMETHODCALLTYPE device_DeserializeStateObjectX(struct proxy *p,
         void *root_signature, UINT flags, REFIID riid, void **out)
 {
     return state_object_deserialize((IUnknown *)p, code, length, root_signature, flags, riid, out);
+}
+
+/* Slot 101: CreateStateObject (desktop 62), a ray tracing pipeline from collections (state_object.c). */
+static HRESULT STDMETHODCALLTYPE device_CreateStateObject(struct proxy *p, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid,
+        void **out)
+{
+    return state_object_create((IUnknown *)p, desc, riid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, const D3D12_COMMAND_SIGNATURE_DESC *desc,
@@ -1761,6 +1769,27 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
 #define EMBEDDED_KEEP_RESETS 3
 
 /* Console methods with nothing to do on the host (cache flushes, depth bounds). */
+/* Ray tracing on a list (0x20004 slots 114 and 115, PC 67 and 68): a placeholder pipeline
+ * (state_object.c) never reaches vkd3d-proton, and rays dispatched with one are skipped. */
+static void STDMETHODCALLTYPE list_SetPipelineState1(struct proxy *p, ID3D12StateObject *state_object)
+{
+    if ((p->placeholder_pipeline = state_object_is_placeholder(state_object)))
+        return;
+    ID3D12GraphicsCommandList4_SetPipelineState1(INNER(p, ID3D12GraphicsCommandList4), state_object);
+}
+
+static void STDMETHODCALLTYPE list_DispatchRays(struct proxy *p, const D3D12_DISPATCH_RAYS_DESC *desc)
+{
+    if (p->placeholder_pipeline)
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: DispatchRays with a placeholder pipeline: skipped (console ray tracing isn't translated)");
+        return;
+    }
+    ID3D12GraphicsCommandList4_DispatchRays(INNER(p, ID3D12GraphicsCommandList4), desc);
+}
+
 static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
 {
 }
@@ -2089,6 +2118,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(30, device_CreateReservedResource),
         FN(38, device_GetCopyableFootprints),
         FN(41, device_CreateCommandSignature),
+        FN(101, device_CreateStateObject),
         FN(115, device_DeserializeStateObjectX),
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),
@@ -2174,6 +2204,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * past the end of the older table. docs/d3d12x.md. */
     static struct slot list_v4_slots[96] = {
         FN(7, child_GetDevice),
+        FN(114, list_SetPipelineState1),              /* PC 67 */
+        FN(115, list_DispatchRays),                   /* PC 68 */
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
@@ -2241,7 +2273,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
             list_v4_slots[n++] = (struct slot)FWD(x, x - 4);
     }
     for (unsigned pc = 60; pc <= 76; pc++)          /* PC 60-76: 105-121 before, 107-123 here */
-        list_v4_slots[n++] = (struct slot)FWD(pc + 47, pc);
+    {
+        BOOL taken = FALSE;
+        for (unsigned j = 0; j < customs; j++)
+            taken |= list_v4_slots[j].xbox == pc + 47;
+        if (!taken)
+            list_v4_slots[n++] = (struct slot)FWD(pc + 47, pc);
+    }
     list_v4_slots[n++] = (struct slot)FWD(126, 77); /* RSSetShadingRate */
     list_v4_slots[n++] = (struct slot)FWD(127, 78); /* RSSetShadingRateImage */
     list_v4_slots[n++] = (struct slot)FWD(129, 79); /* DispatchMesh */

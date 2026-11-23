@@ -235,12 +235,62 @@ static void dump(const void *code, SIZE_T length)
     }
 }
 
+BOOL state_object_is_placeholder(const void *object)
+{
+    return object && *(void *const *const *)object == so_vtbl;
+}
+
+static HRESULT placeholder(IUnknown *device, REFIID riid, void **out)
+{
+    struct state_object *so;
+    HRESULT hr;
+    if (!(so = calloc(1, sizeof(*so))))
+        return E_OUTOFMEMORY;
+    so->vtbl = so_vtbl;
+    so->properties_vtbl = props_vtbl;
+    so->refs = 1;
+    if ((so->device = device))
+        IUnknown_AddRef(device);
+    hr = so_QueryInterface(so, riid, out);
+    so_Release(so);
+    return hr;
+}
+
+/* Device slot 101 (CreateStateObject, desktop 62): Unreal links its deserialized collections into a
+ * ray tracing pipeline (D3D12RayTracing.cpp). Everything in it is console code or placeholders, so
+ * the pipeline is a placeholder too; the subobject types are logged at first. */
+HRESULT state_object_create(IUnknown *device, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **out)
+{
+    static LONG count;
+    LONG n;
+
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
+    if (!desc)
+        return E_INVALIDARG;
+    n = InterlockedIncrement(&count);
+    if (n == 1 || !(n & (n - 1)))
+    {
+        char types[160];
+        int at = 0, collections = 0;
+        types[0] = 0;
+        for (UINT i = 0; i < desc->NumSubobjects && desc->pSubobjects && at < 140; i++)
+        {
+            at += snprintf(types + at, sizeof(types) - at, " %u", (UINT)desc->pSubobjects[i].Type);
+            if (desc->pSubobjects[i].Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION)
+                collections++;
+        }
+        rebox_log("d3d12_xs: CreateStateObject #%ld (type %u, %u subobjects:%s; %d collections): a placeholder that "
+                     "traces nothing", n, (UINT)desc->Type, desc->NumSubobjects, types, collections);
+    }
+    return placeholder(device, riid, out);
+}
+
 HRESULT state_object_deserialize(IUnknown *device, const void *code, SIZE_T length, void *root_signature, UINT flags,
                                  REFIID riid, void **out)
 {
     static LONG count;
-    struct state_object *so;
-    HRESULT hr;
     LONG n;
 
     if (!out)
@@ -254,14 +304,5 @@ HRESULT state_object_deserialize(IUnknown *device, const void *code, SIZE_T leng
                      "placeholder that traces nothing (console ray tracing code isn't translated yet)", n, (size_t)length,
                      length >= 4 ? *(const UINT *)code : 0, root_signature, flags);
     dump(code, length);
-    if (!(so = calloc(1, sizeof(*so))))
-        return E_OUTOFMEMORY;
-    so->vtbl = so_vtbl;
-    so->properties_vtbl = props_vtbl;
-    so->refs = 1;
-    if ((so->device = device))
-        IUnknown_AddRef(device);
-    hr = so_QueryInterface(so, riid, out);
-    so_Release(so);
-    return hr;
+    return placeholder(device, riid, out);
 }

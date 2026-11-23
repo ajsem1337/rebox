@@ -3878,6 +3878,23 @@ static void test_xbox(void)
                 XSLOT(list4, 57, void, UINT, const void *, UINT)(list4, 0, NULL, 0);
                 XSLOT(list4, 109, void, FLOAT, FLOAT)(list4, 0.0f, 1.0f);
                 XSLOT(list4, 58, void)(list4);
+                /* A ray tracing pipeline from device slot 101 (CreateStateObject): a placeholder,
+                 * set (list 114) and dispatched (115) without reaching vkd3d-proton. */
+                {
+                    D3D12_STATE_SUBOBJECT sub = { D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, NULL };
+                    D3D12_STATE_OBJECT_DESC sod = { D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 1, &sub };
+                    D3D12_DISPATCH_RAYS_DESC rays = { .Width = 1, .Height = 1, .Depth = 1 };
+                    void *pipeline = NULL;
+                    HRESULT so_hr = XSLOT(dev, 101, HRESULT, const D3D12_STATE_OBJECT_DESC *, REFIID, void **)(dev, &sod,
+                            &IID_ID3D12StateObject, &pipeline);
+                    CHECK(SUCCEEDED(so_hr) && pipeline, "CreateStateObject (device slot 101) gives a placeholder pipeline");
+                    if (pipeline)
+                    {
+                        XSLOT(list4, 114, void, void *)(list4, pipeline);
+                        XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                        XSLOT(pipeline, 2, ULONG)(pipeline);
+                    }
+                }
                 hr = XSLOT(list4, 9, HRESULT)(list4);
             }
             if (SUCCEEDED(hr))
@@ -3888,7 +3905,7 @@ static void test_xbox(void)
             for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 8; i++)
                 Sleep(10);
             CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence4) == 8,
-                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, executed (%#lx)", hr);
+                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder pipeline's rays, executed (%#lx)", hr);
             if (list4) XSLOT(list4, 2, ULONG)(list4);
             if (alloc4) ID3D12CommandAllocator_Release(alloc4);
         }
