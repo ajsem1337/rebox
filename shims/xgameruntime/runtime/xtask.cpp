@@ -585,7 +585,7 @@ HRESULT call(AsyncState* s, AsyncOp op, void* buf = nullptr, size_t size = 0) {
 
 void CALLBACK completion_thunk(void* p, bool) {
   auto* s = static_cast<AsyncState*>(p);
-  s->callback(s->block);  // always notify, even when the queue is terminating
+  if (s->callback) s->callback(s->block);  // always notify, even when the queue is terminating
   release(s);
 }
 
@@ -621,13 +621,13 @@ void complete_state(AsyncState* s, HRESULT hr, size_t required) {
   if (trace_async())
     gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XAsync", nullptr, "%s completed: %#lx (queue %p, %s)",
                     s->name ? s->name : "a call", static_cast<unsigned long>(hr), static_cast<void*>(s->queue),
-                    s->callback ? "callback queued on the completion port" : "no callback");
+                    s->callback ? "callback queued on the completion port" : "no callback; completion queued all the same");
   if (no_payload) call(s, AsyncOp::Cleanup);
   SetEvent(s->done);
-  if (s->callback) {
-    add_ref(s);
-    if (FAILED(Submit(s->queue, PortId::Completion, s, completion_thunk))) completion_thunk(s, true);
-  }
+  // The completion goes to the completion port even when the block has no callback: a title may
+  // dispatch that port until it sees the call done (a UE5 sample after XUserAddAsync).
+  add_ref(s);
+  if (FAILED(Submit(s->queue, PortId::Completion, s, completion_thunk))) completion_thunk(s, true);
   if (no_payload) release(s);  // the block's reference
 }
 

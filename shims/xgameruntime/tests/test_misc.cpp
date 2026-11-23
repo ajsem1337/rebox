@@ -274,6 +274,26 @@ static void CheckThreadPool() {
   g_tq.Close(q);
 }
 
+// A call whose block has no callback still completes on its queue's completion port: The Matrix
+// Awakens dispatches that port after XUserAddAsync until the completion comes.
+static void CheckCompletionWithoutCallback() {
+  void* q = nullptr;
+  Check(g_tq.Create(kThreadPool, kManual, &q) == S_OK && q, "XTaskQueueCreate (thread pool work, manual completion)");
+  Api user = Get("IXUserImpl", kUser);
+  AsyncBlock add{};
+  add.queue = q;
+  user.At<HRESULT (*)(void*, uint32_t, AsyncBlock*)>(7, "XUserAddAsync")(user.self, 1, &add);
+  bool dispatched = g_tq.Dispatch(q, kCompletion, 5000);
+  Check(dispatched && g_tq.WaitAsync(&add) == S_OK,
+        "a call with no completion callback still completes through the completion port");
+  void* handle = nullptr;
+  Check(user.At<HRESULT (*)(void*, AsyncBlock*, void**)>(8, "XUserAddResult")(user.self, &add, &handle) == S_OK && handle,
+        "and its result is there");
+  user.At<void (*)(void*, void*)>(4, "XUserCloseHandle")(user.self, handle);
+  Check(!g_tq.Dispatch(q, kCompletion, 0), "one completion only");
+  g_tq.Close(q);
+}
+
 static void CheckGameEvent() {
   Api user = Get("IXUserImpl", kUser);
   AsyncBlock add{};
@@ -461,6 +481,7 @@ int main() {
   }
   g_tq.api = Get("IXThreadingImpl", kThreading);
   CheckManualQueue();
+  CheckCompletionWithoutCallback();
   CheckTermination();
   CheckComposite();
   CheckThreadPool();
