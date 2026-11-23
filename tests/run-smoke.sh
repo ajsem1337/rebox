@@ -98,6 +98,11 @@ grep -q "title: rebox smoke boot line" <<<"$out" && grep -q "title: second line"
 echo "ok   the title's OutputDebugString text is in the log, a line each"
 grep -q "network: looking up example.com blocked" <<<"$out" || { echo "FAIL a blocked lookup is not logged"; exit 1; }
 echo "ok   a blocked network attempt is logged"
+grep -q "a shader view of a depth buffer as format 56 is format 46, plane 0" <<<"$out" \
+    && grep -q "a shader view of a depth buffer as format 62 is format 47, plane 1" <<<"$out" \
+    && grep -q "an unordered access view of a 256x144 texture (format 45) without unordered access here: a null view" <<<"$out" \
+    || { echo "FAIL views of a D16S8 depth buffer are not the desktop's plane views and a null UAV"; exit 1; }
+echo "ok   views of a D16S8 depth buffer: depth and stencil plane formats, a null UAV"
 grep -q "ok   an assertion (int3) in the exe was stepped over" <<<"$out" && grep -q "assertion 1 skipped at smoke.exe+" <<<"$out" \
     || { echo "FAIL REBOX_SKIP_ASSERTS did not step over the exe's int3"; exit 1; }
 echo "ok   REBOX_SKIP_ASSERTS steps over the exe's assertions and logs them"

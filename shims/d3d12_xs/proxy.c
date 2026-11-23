@@ -80,6 +80,9 @@ struct proxy
     UINT heap_count;
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
     int display_bound; /* lists: 1 + which display-sized target is bound, or 0 (counted for the log) */
+    BOOL rect_list;    /* lists: the console's rectangle list (topology 17) is set */
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffers[8]; /* lists: as bound, for rect lists (list_DrawInstanced) */
+    UINT vertex_buffer_mask;
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
     UINT cpu_write_count, cpu_write_capacity;
     struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
@@ -1194,15 +1197,65 @@ static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T
                   (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, (unsigned long long)cpu);
 }
 
+static D3D12_RESOURCE_DESC resource_desc(ID3D12Resource *resource)
+{
+    D3D12_RESOURCE_DESC d;
+    /* GetDesc (slot 10) returns its struct through a hidden pointer. */
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)resource)[10])(resource, &d);
+    return d;
+}
+
+/* A console shader view of a depth buffer names its plane by a colour format: R16_UNORM for a
+ * D16S8 buffer's depth, R8_UINT for its stencil, R32_FLOAT for a D32S8's depth. The desktop has
+ * those buffers as D24S8 (pc_format) and D32S8, whose planes' view formats are their own, the
+ * stencil's in plane 1 (after xcl, Robin Snyders, ivall/xcl#163): what format a view of plane
+ * `format` of a buffer of `resource` format takes, and which plane; FALSE if it isn't one. */
+static BOOL depth_plane_view(DXGI_FORMAT resource, DXGI_FORMAT format, DXGI_FORMAT *view, UINT *plane)
+{
+    BOOL d24 = resource == DXGI_FORMAT_R24G8_TYPELESS || resource == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    BOOL d32 = resource == DXGI_FORMAT_R32G8X24_TYPELESS || resource == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    BOOL stencil = format == DXGI_FORMAT_R8_UINT || format == DXGI_FORMAT_R8_TYPELESS || format == 120
+            || format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    BOOL depth = d24 ? format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_TYPELESS
+                       || format == DXGI_FORMAT_D16_UNORM || format == 119 || format == 118
+                       || format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+                 : format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_D32_FLOAT
+                       || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+
+    if (!(d24 || d32) || !(depth || stencil))
+        return FALSE;
+    *plane = stencil;
+    *view = d24 ? (stencil ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS)
+                : (stencil ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+    return TRUE;
+}
+
 static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SIZE_T cpu)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     D3D12_SHADER_RESOURCE_VIEW_DESC pc;
+    DXGI_FORMAT view;
+    UINT plane;
     if (desc && pc_format(desc->Format) != desc->Format)
     {
         pc = *desc;
         pc.Format = pc_format(desc->Format);
+        desc = &pc;
+    }
+    if (desc && resource && depth_plane_view(resource_desc(resource).Format, desc->Format, &view, &plane)
+            && view != desc->Format)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: a shader view of a depth buffer as format %u is format %u, plane %u", desc->Format,
+                      view, plane);
+        pc = *desc;
+        pc.Format = view;
+        if (pc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+            pc.Texture2D.PlaneSlice = plane;
+        else if (pc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+            pc.Texture2DArray.PlaneSlice = plane;
         desc = &pc;
     }
     ID3D12Device_CreateShaderResourceView(INNER(p, ID3D12Device), resource, desc, h);
@@ -1214,6 +1267,31 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, 
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     note_display_view("unordered access view", resource, cpu);
+    /* A resource the desktop has without unordered access (a depth buffer that is a UAV on the
+     * console, pc_desc) gets a null view of the same dimension: the driver would be handed an
+     * invalid one (after xcl, ivall/xcl#170). Writes through it are lost. */
+    if (resource)
+    {
+        D3D12_RESOURCE_DESC d = resource_desc(resource);
+        if (!(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        {
+            static LONG logged;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC null = { DXGI_FORMAT_R32_UINT };
+            null.ViewDimension = desc ? desc->ViewDimension
+                    : d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_UAV_DIMENSION_TEXTURE3D
+                    : d.DepthOrArraySize > 1 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
+            if (null.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                null.Texture2DArray.ArraySize = 1;
+            if (null.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D)
+                null.Texture3D.WSize = 1;
+            if (InterlockedIncrement(&logged) <= 4)
+                rebox_log("d3d12_xs: an unordered access view of a %llux%u texture (format %u) without unordered "
+                          "access here: a null view", (unsigned long long)d.Width, d.Height, d.Format);
+            ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), NULL, NULL, &null, h);
+            shadow_write_uav(cpu, resource, desc);
+            return;
+        }
+    }
     ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), resource, counter, desc, h);
     shadow_write_uav(cpu, resource, desc);
 }
@@ -1467,22 +1545,32 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(struct proxy *p, UINT star
 {
     for (UINT i = 0; views && i < count; i++)
         ia_adopt("a vertex buffer", views[i].BufferLocation, views[i].SizeInBytes);
+    for (UINT i = 0; i < count && start + i < ARRAYSIZE(p->vertex_buffers); i++)
+        if (views && views[i].BufferLocation)
+        {
+            p->vertex_buffers[start + i] = views[i];
+            p->vertex_buffer_mask |= 1u << (start + i);
+        }
+        else
+            p->vertex_buffer_mask &= ~(1u << (start + i));
     ID3D12GraphicsCommandList_IASetVertexBuffers(INNER(p, ID3D12GraphicsCommandList), start, count, views);
 }
 
 /* Slot 20: IASetPrimitiveTopology. The console's topology 17 is a rectangle list: three corners of a
  * screen-aligned rectangle per primitive, the fourth made by the hardware. Unreal 5 draws its
  * full-screen passes so (xcl; a UE5 sample), and vkd3d-proton drops a draw with a topology it
- * doesn't know (its image stayed black). For now they're triangle lists: each rectangle draws its
- * first triangle, half of it. */
+ * doesn't know (its image stayed black). They're triangle lists: list_DrawInstanced makes each
+ * rectangle two triangles where its vertices come from vertex buffers, otherwise each rectangle
+ * draws its first triangle, half of it. */
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12_PRIMITIVE_TOPOLOGY topology)
 {
+    p->rect_list = topology == 17;
     if (topology == 17)
     {
         static LONG logged;
         if (!InterlockedExchange(&logged, 1))
-            rebox_log("d3d12_xs: the console's rectangle lists (topology 17) are drawn as triangle lists: each "
-                         "rectangle's first triangle");
+            rebox_log("d3d12_xs: the console's rectangle lists (topology 17) are drawn as triangle lists (two a "
+                      "rectangle where its corners come from vertex buffers, else its first triangle)");
         topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     }
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(INNER(p, ID3D12GraphicsCommandList), topology);
@@ -1644,6 +1732,17 @@ static const D3D12_RESOURCE_DESC *pc_desc(const D3D12_RESOURCE_DESC *desc, D3D12
     return storage;
 }
 
+/* A console depth buffer that is also a UAV may start in the UAV state; the desktop has it without
+ * unordered access (pc_desc), so it starts as a depth target (after xcl, ivall/xcl#163). */
+static D3D12_RESOURCE_STATES pc_state(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state)
+{
+    const D3D12_RESOURCE_FLAGS both = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (desc && (desc->Flags & both) == both && state != (D3D12_RESOURCE_STATES)0xffffffff
+            && (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    return state;
+}
+
 /* Slot 25, through the hidden return pointer as on PC (16-byte result). */
 static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAllocationInfo(struct proxy *p,
         D3D12_RESOURCE_ALLOCATION_INFO *ret, UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC *descs)
@@ -1767,6 +1866,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p,
 
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         props = buffer_heap(props, &storage);
+    state = pc_state(desc, state);
     desc = pc_desc(desc, &desc_storage);
     /* Console titles put 256-byte constant buffer views on smaller buffers (XValkyrie: 256 on
      * 80 bytes, which got the device removed on Windows). Committed buffers are rounded up to
@@ -1802,8 +1902,10 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID
 {
     D3D12_RESOURCE_DESC storage;
     D3D12_CLEAR_VALUE clear_storage;
-    HRESULT hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, pc_desc(desc, &storage),
-                                                   state, pc_clear(clear, &clear_storage), riid, out);
+    HRESULT hr;
+    state = pc_state(desc, state);
+    hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, pc_desc(desc, &storage),
+                                           state, pc_clear(clear, &clear_storage), riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -3080,11 +3182,85 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(struct proxy *p, D3D12_
     ID3D12GraphicsCommandList_ClearRenderTargetView(INNER(p, ID3D12GraphicsCommandList), rtv, color, rect_count, rects);
 }
 
+/* A DrawInstanced of a rect list as two triangles a rectangle (after xcl, ivall/xcl#195,
+ * theaustinayers): each bound vertex buffer's vertices are copied as v0 v1 v2, v0 v2 v3, the fourth
+ * corner made on the CPU as v3 = v0 + v2 - v1. The layout isn't looked at: a 4-byte word the same
+ * in all three vertices is kept (a packed colour), any other is taken as a float (a retail title's
+ * full-screen passes: (-1,1) (-1,-1) (1,-1), texture coordinates (0,0) (0,1) (1,1)). FALSE: no
+ * vertex buffers (a shader that makes its vertices from the index) or one this can't read. */
+static BOOL draw_rects(struct proxy *p, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
+{
+    D3D12_VERTEX_BUFFER_VIEW expanded[ARRAYSIZE(p->vertex_buffers)];
+    UINT rects = vertices / 3, mask = p->vertex_buffer_mask;
+    static LONG logged;
+
+    if (!mask || !rects || rects > 4096)
+        return FALSE;
+    for (UINT slot = 0; slot < ARRAYSIZE(p->vertex_buffers); slot++)
+    {
+        const D3D12_VERTEX_BUFFER_VIEW *v = &p->vertex_buffers[slot];
+        SIZE_T s = v->StrideInBytes, len = (SIZE_T)rects * 3 * s;
+        const BYTE *at = (const BYTE *)(ULONG_PTR)v->BufferLocation + (SIZE_T)first_vertex * s;
+        BYTE *out;
+
+        if (!(mask & (1u << slot)))
+            continue;
+        if (!s || s % 4 || (UINT64)first_vertex * s + len > v->SizeInBytes || IsBadReadPtr(at, len)
+                || !(out = malloc(rects * 6 * s)))
+            return FALSE;
+        for (UINT r = 0; r < rects; r++)
+        {
+            const BYTE *src = at + r * 3 * s;
+            BYTE *dst = out + r * 6 * s;
+            memcpy(dst, src, 3 * s);
+            memcpy(dst + 3 * s, src, s);
+            memcpy(dst + 4 * s, src + 2 * s, s);
+            for (SIZE_T w = 0; w < s / 4; w++)
+            {
+                UINT32 a, b, c, d;
+                float fa, fb, fc, fd;
+                memcpy(&a, src + w * 4, 4);
+                memcpy(&b, src + s + w * 4, 4);
+                memcpy(&c, src + 2 * s + w * 4, 4);
+                if (a == b && b == c)
+                    d = a;
+                else
+                {
+                    memcpy(&fa, &a, 4), memcpy(&fb, &b, 4), memcpy(&fc, &c, 4);
+                    fd = fa + fc - fb;
+                    memcpy(&d, &fd, 4);
+                }
+                memcpy(dst + 5 * s + w * 4, &d, 4);
+            }
+        }
+        expanded[slot].BufferLocation = console_draw_buffer(out, rects * 6 * s);
+        free(out);
+        if (!expanded[slot].BufferLocation)
+            return FALSE;
+        expanded[slot].SizeInBytes = rects * 6 * s;
+        expanded[slot].StrideInBytes = s;
+    }
+    for (UINT slot = 0; slot < ARRAYSIZE(p->vertex_buffers); slot++)
+        if (mask & (1u << slot))
+            ID3D12GraphicsCommandList_IASetVertexBuffers(INNER(p, ID3D12GraphicsCommandList), slot, 1, &expanded[slot]);
+    ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), rects * 6, instances, 0, first_instance);
+    for (UINT slot = 0; slot < ARRAYSIZE(p->vertex_buffers); slot++)
+        if (mask & (1u << slot))
+            ID3D12GraphicsCommandList_IASetVertexBuffers(INNER(p, ID3D12GraphicsCommandList), slot, 1,
+                                                         &p->vertex_buffers[slot]);
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU "
+                  "(first: %u rectangles)", rects);
+    return TRUE;
+}
+
 static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices, UINT instances, UINT first_vertex,
         UINT first_instance)
 {
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
+    if (p->rect_list && draw_rects(p, vertices, instances, first_vertex, first_instance))
+        return;
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
 }
@@ -3422,6 +3598,8 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     p->cpu_write_count = 0;
     p->gpu_write_count = 0;
     p->wait_count = 0;
+    p->rect_list = FALSE;
+    p->vertex_buffer_mask = 0;
 
     p->resets++;
     p->ray_pipeline = FALSE;

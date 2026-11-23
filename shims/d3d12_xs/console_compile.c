@@ -285,6 +285,11 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
     return ring_gpu + at;
 }
 
+UINT64 console_draw_buffer(const void *data, SIZE_T size)
+{
+    return draw_buffer(data, size, NULL);
+}
+
 /* GPU memory holding these bytes; equal contents share it. */
 static UINT64 host_buffer(const void *data, SIZE_T size)
 {

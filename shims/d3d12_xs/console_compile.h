@@ -87,3 +87,6 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 /* Before a submission: binds the textures graphics draws read whose T#s the title wrote after
  * recording them (console_compile.c). */
 void console_resolve_late(void);
+
+/* GPU memory for one draw's data (a ring reused long after the GPU read it): its address, or 0. */
+UINT64 console_draw_buffer(const void *data, SIZE_T size);

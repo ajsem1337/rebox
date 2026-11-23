@@ -1034,7 +1034,7 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
  * shader exports red, as 32-bit floats or (packed) as two FP16 pairs, which every UE5 pixel
  * shader exports. One full-screen triangle over a blue clear: the centre turns red (blue: fell
  * back, or the constant read 0 and the triangle collapsed). */
-static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
+static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked, BOOL rect)
 {
     /* Linked: the vertex shader writes black to param0 and red to param1, whose registers are
      * TEXCOORD0 and COLOR0 (the FSSM table and OSG1); the pixel shader reads its one input, COLOR0,
@@ -1082,7 +1082,11 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
         0xf8001c0f, 0x00000100, /* exp mrt0 v0, v0, v1, v1 done compr vm */
         0xbf810000,             /* s_endpgm */
     };
-    static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
+    static const float full[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
+    /* rect: the console's rectangle list as a retail title's full-screen pass gives it, three corners;
+     * its first triangle is the lower left half, the top right is the fourth corner's. */
+    static const float corners[3][4] = { { -1, 1, 0, 1 }, { -1, -1, 0, 1 }, { 1, -1, 0, 1 } };
+    const float (*tri)[4] = rect ? corners : full;
     D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
     D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, up = { D3D12_HEAP_TYPE_UPLOAD },
                           rb = { D3D12_HEAP_TYPE_READBACK };
@@ -1176,7 +1180,7 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                 D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &def, D3D12_HEAP_FLAG_NONE,
                 &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, &IID_ID3D12Resource, (void **)&tex);
-    bd.Width = sizeof(tri);
+    bd.Width = sizeof(full);
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                 D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
@@ -1209,7 +1213,7 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
         goto done;
     if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, &mapped)))
     {
-        memcpy(mapped, tri, sizeof(tri));
+        memcpy(mapped, tri, sizeof(full));
         ID3D12Resource_Unmap(vb, 0, NULL);
     }
     if (SUCCEEDED(ID3D12Resource_Map(cb, 0, NULL, &mapped)))
@@ -1227,14 +1231,15 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
     XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
     XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
     XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
-    XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, rect ? (D3D12_PRIMITIVE_TOPOLOGY)17
+                                                                : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     XSLOT(list, 32, void, UINT, void *const *)(list, 1, &cbv_heap);
     XSLOT(list, 34, void, void *)(list, rs);
     XSLOT(list, 36, void, UINT, UINT64)(list, 0, XSLOT(cbv_heap, 10, UINT64)(cbv_heap));
     XSLOT(list, 25, void, void *)(list, pso);
     vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vb);
-    vbv.SizeInBytes = sizeof(tri);
-    vbv.StrideInBytes = sizeof(tri[0]);
+    vbv.SizeInBytes = sizeof(full);
+    vbv.StrideInBytes = sizeof(full[0]);
     XSLOT(list, 48, void, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW *)(list, 0, 1, &vbv); /* PC 44 */
     XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
     barrier.Transition.pResource = tex;
@@ -1256,6 +1261,16 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
     if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, &mapped)))
     {
         px = (BYTE *)mapped + 24 * 256 + 32 * 4;
+        if (rect)
+        {
+            const BYTE *top_right = (BYTE *)mapped + 6 * 256 + 56 * 4, *bottom_left = (BYTE *)mapped + 42 * 256 + 8 * 4;
+            CHECK(bottom_left[0] == 255 && bottom_left[1] == 0 && top_right[0] == 255 && top_right[1] == 0
+                  && top_right[2] == 0,
+                  "a console rect list draws the whole rectangle: its fourth corner is made (bottom left RGB %u %u %u, "
+                  "top right %u %u %u)", bottom_left[0], bottom_left[1], bottom_left[2], top_right[0], top_right[1],
+                  top_right[2]);
+        }
+        else
         CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0,
               "console vertex and pixel shaders draw through AnyPS5, %s (centre RGB %u %u %u; blue: fell back)",
               linked ? "pixel attr0 linked to vertex param1 by semantic (black: attr n = param n)"
@@ -4498,9 +4513,10 @@ static void test_xbox(void)
     test_pacing(dev, queue);
     test_texture_va_upload(dev, queue, FALSE);
     test_texture_va_upload(dev, queue, TRUE);
-    test_console_draw(dev, queue, FALSE, FALSE);
-    test_console_draw(dev, queue, TRUE, FALSE);
-    test_console_draw(dev, queue, FALSE, TRUE);
+    test_console_draw(dev, queue, FALSE, FALSE, FALSE);
+    test_console_draw(dev, queue, TRUE, FALSE, FALSE);
+    test_console_draw(dev, queue, FALSE, TRUE, FALSE);
+    test_console_draw(dev, queue, FALSE, FALSE, TRUE);
     test_xbox_root_flags(dev);
     test_console_command_signature(dev);
     test_state_object_placeholder(dev);
@@ -4678,6 +4694,39 @@ static void test_xbox(void)
                         void **)(dev, &dh, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
                         &IID_ID3D12Resource, &tex);
                 CHECK(SUCCEEDED(thr) && tex, "a D16_UNORM_S8_UINT depth texture with its clear value is made (%#lx)", thr);
+                if (tex) IUnknown_Release((IUnknown *)tex);
+            }
+            /* The same with unordered access, in the UAV state (the target title's shadow maps): a
+             * depth target here, its plane views in the desktop's formats, its UAV a null view. */
+            {
+                D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT };
+                D3D12_DESCRIPTOR_HEAP_DESC vh = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+                D3D12_SHADER_RESOURCE_VIEW_DESC sv = { DXGI_FORMAT_R16_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uv = { DXGI_FORMAT_R16_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D };
+                void *tex = NULL, *views = NULL;
+                HRESULT thr;
+                SIZE_T at;
+                dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                thr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS,
+                        const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID,
+                        void **)(dev, &dh, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
+                        &IID_ID3D12Resource, &tex);
+                CHECK(SUCCEEDED(thr) && tex, "a D16S8 depth texture with unordered access in the UAV state is made (%#lx)",
+                      thr);
+                if (tex && SUCCEEDED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev,
+                        &vh, &IID_ID3D12DescriptorHeap, &views)))
+                {
+                    UINT inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    sv.Texture2D.MipLevels = 1;
+                    at = XSLOT(views, 9, SIZE_T)(views);
+                    XSLOT(dev, 18, void, void *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, tex, &sv, at);
+                    sv.Format = DXGI_FORMAT_R8_UINT;
+                    XSLOT(dev, 18, void, void *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, tex, &sv, at + inc);
+                    XSLOT(dev, 19, void, void *, void *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev, tex, NULL,
+                            &uv, at + 2 * inc);
+                    XSLOT(views, 2, ULONG)(views);
+                }
                 if (tex) IUnknown_Release((IUnknown *)tex);
             }
         }
