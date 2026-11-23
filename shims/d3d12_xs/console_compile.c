@@ -1367,10 +1367,19 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 {
                     static LONG logged;
                     if (InterlockedIncrement(&logged) <= 8)
+                    {
+                        BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+                        UINT32 table[8] = { 0 };
+                        BOOL read = in->user_sgprs[8] && ReboxShadowRead(in->user_sgprs[8], table, sizeof(table));
                         rebox_log("d3d12_xs: console shader %016llx: binding %u (%s) gets a dummy texture: "
-                                     "the descriptor %s", (unsigned long long)hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u), b.binding,
+                                     "the descriptor %s (T# %08x %08x %08x %08x; s8 %#x %s %08x %08x %08x %08x %08x "
+                                     "%08x %08x %08x)", (unsigned long long)hash_bytes(0xcbf29ce484222325ull,
+                                     (const BYTE *)h + h->code_offset, h->code_dwords * 4u), b.binding,
                                      b.kind == 5 ? "storage image" : "sampled image",
-                                     found ? "slot is empty" : "isn't in the bound heap");
+                                     found ? "slot is empty" : "isn't in the bound heap", w[0], w[1], w[2], w[3],
+                                     in->user_sgprs[8], read ? "holds" : "unreadable", table[0], table[1], table[2],
+                                     table[3], table[4], table[5], table[6], table[7]);
+                    }
                     found = TRUE;
                 }
                 if (!found)
