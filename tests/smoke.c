@@ -1110,7 +1110,7 @@ static void test_dxgi_device(void *dev)
     IDXGIDevice_Release(dxgi);
 }
 
-static void test_pacing(void *dev)
+static void test_pacing(void *dev, void *queue)
 {
     typedef HRESULT (STDMETHODCALLTYPE *wait_fn)(void *, UINT, UINT, void *, UINT, UINT64 *);
     wait_fn wait = (wait_fn)(*(void ***)dev)[80];
@@ -1136,12 +1136,13 @@ static void test_pacing(void *dev)
     CHECK(ok && ms > 90 && ms < 200, "WaitFrameEventX (slot 80) paces 5 frames at 20 ms: %.1f ms, tokens %llu..%llu",
           ms, (unsigned long long)tok[0], (unsigned long long)tok[5]);
 
-    /* A late title gets the newest missed frame at once, not a burst. */
+    /* A late title gets the newest missed frame at once, not a burst; tokens stay consecutive
+     * (one per call, as a UE5 title needs: XValkyrie). */
     Sleep(70);
     QueryPerformanceCounter(&t0);
     wait(dev, 0, INFINITE, NULL, 0, &late);
     ms = ms_since(t0);
-    CHECK(ms < 10 && late >= tok[5] + 3, "late WaitFrameEventX returns at once (%.1f ms) and skips to frame %llu",
+    CHECK(ms < 10 && late == tok[5] + 1, "late WaitFrameEventX returns at once (%.1f ms) with the next token %llu",
           ms, (unsigned long long)late);
 
     hr = wait(dev, 0, 0, NULL, 0, &late);
@@ -1157,11 +1158,11 @@ static void test_pacing(void *dev)
     CHECK(ok && ms > 25 && ms < 120, "ScheduleFrameEventX (slot 79) sets its event each frame: 3 in %.1f ms", ms);
 
     /* GetFrameStatisticsX (slot 81): interval and frame event at once, rendering, presenting and
-     * display once the next origin has passed. */
+     * display once a PresentX named the token (the first plane's first field). */
     {
         BYTE stats[5][56];
         UINT count = 5, types[5];
-        UINT64 token = 0;
+        UINT64 token = 0, plane[8] = { 0 };
         wait(dev, 0, INFINITE, NULL, 0, &token);
         hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
         CHECK(SUCCEEDED(hr) && count == 2 && *(UINT *)stats[0] == 1 && *(UINT *)(stats[0] + 8) == 20000,
@@ -1169,10 +1170,18 @@ static void test_pacing(void *dev)
         Sleep(45);
         count = 5;
         hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
+        CHECK(SUCCEEDED(hr) && count == 2, "GetFrameStatisticsX before the frame's PresentX: %u entries", count);
+        count = 5;
+        hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token + 50, 0x11103, &count, stats);
+        CHECK(SUCCEEDED(hr) && count == 0, "GetFrameStatisticsX for a token never given: %u entries", count);
+        plane[0] = token;
+        XSLOT(queue, 30, HRESULT, UINT, const void *, const void *)(queue, 1, plane, NULL);
+        count = 5;
+        hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
         for (i = 0; i < 5; i++)
             types[i] = *(UINT *)stats[i];
         CHECK(SUCCEEDED(hr) && count == 5 && types[2] == 0x100 && types[3] == 0x1000 && types[4] == 0x10000,
-              "GetFrameStatisticsX a frame later: %u entries", count);
+              "GetFrameStatisticsX after the frame's PresentX: %u entries", count);
         count = 2;
         hr = XSLOT(dev, 81, HRESULT, UINT64, UINT, UINT *, void *)(dev, token, 0x11103, &count, stats);
         CHECK(SUCCEEDED(hr) && count == 2, "GetFrameStatisticsX fills no more than the room it has (%u)", count);
@@ -3138,7 +3147,7 @@ static void test_xbox(void)
     CHECK(hr == E_NOTIMPL, "unidentified device slot traps with E_NOTIMPL (%#lx)", hr);
 
     test_dxgi_device(dev);
-    test_pacing(dev);
+    test_pacing(dev, queue);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);

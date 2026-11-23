@@ -8,3 +8,5 @@ HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, HANDLE event);
 HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token);
 HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *statistics);
 void pacing_report(void);
+void pacing_presented(UINT64 token, LONGLONG call, LONGLONG ret);
+LONGLONG pacing_now(void);

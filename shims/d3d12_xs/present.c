@@ -658,7 +658,6 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
     if (!s && !(s = *state = present_create(queue)))
         return S_OK;
-    frame = ++s->frames;
 
     if (!planes || !(plane = plane_resource(s->device, plane_params)))
     {
@@ -667,6 +666,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
             rebox_log("d3d12_xs: PresentX: no plane resource found in the plane params; nothing shown");
         return S_OK;
     }
+    frame = ++s->frames; /* frames shown, as REBOX_DUMP_FRAMES_AT counts them */
     if (planes > 1)
     {
         static LONG once;

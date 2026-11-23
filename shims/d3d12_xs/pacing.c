@@ -13,8 +13,19 @@
  * behaves like an auto-reset event: a wait returns at once if an occurrence
  * has passed since the last wait returned (the newest one, so a late title
  * doesn't burst through missed frames), otherwise it sleeps until the next.
- * The token is the frame number. Win32 events passed to ScheduleFrameEventX
- * are set by a thread at each occurrence.
+ * Win32 events passed to ScheduleFrameEventX are set by a thread at each
+ * occurrence; the flip's (type 2) only when a frame was presented since.
+ *
+ * Tokens and statistics follow what XValkyrie found a UE5 title to need (its
+ * present.cpp, facts only): WaitFrameEventX gives consecutive tokens, one per
+ * call, and a PresentX names its frame's token in the first plane's first
+ * field. GetFrameStatisticsX answers from a record per token: when the wait
+ * happened, and, once that frame has been presented, when its PresentX ran,
+ * which stands for rendering, presenting and the display. A token that was
+ * never given, or a frame not presented yet, has nothing beyond that to say,
+ * as on the console. Our earlier answers came from the clock alone, with
+ * the frame number as the token; a UE5 title then stopped after a dozen frames,
+ * still asking about its first.
  *
  * REBOX_FRAME_PACING=0 makes the calls no-ops again. */
 
@@ -37,6 +48,27 @@ static struct
     LONGLONG next_signal;
 } types[MAX_TYPES];
 static HANDLE signal_thread, wake;
+static volatile LONG presented_since_flip;
+
+#define FLIP_TYPE 2
+
+/* What became of each frame, by its token (see the top). */
+static struct record
+{
+    UINT64 token;
+    LONGLONG wait_call, wait_return, present_call, present_return;
+    BOOL presented;
+} records[256];
+static SRWLOCK records_lock = SRWLOCK_INIT;
+
+/* Caller holds records_lock exclusively. */
+static struct record *record_of(UINT64 token)
+{
+    struct record *r = &records[token % ARRAYSIZE(records)];
+    if (r->token != token)
+        *r = (struct record){ token };
+    return r;
+}
 static UINT interval_us_set = DEFAULT_INTERVAL_US;
 static BOOL disabled;
 
@@ -121,7 +153,8 @@ static DWORD WINAPI signal_proc(void *arg)
                 continue;
             if (types[i].next_signal <= t)
             {
-                SetEvent(types[i].event);
+                if (i != FLIP_TYPE || InterlockedExchange(&presented_since_flip, 0))
+                    SetEvent(types[i].event);
                 types[i].next_signal = due(i, frame_at(i, t) + 1);
             }
             if (types[i].next_signal < next)
@@ -193,6 +226,7 @@ HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
 {
     static LONG64 counter;
     LONGLONG start, frame, t;
+    UINT64 given;
 
     if (!ready())
     {
@@ -218,10 +252,39 @@ HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
     ReleaseSRWLockExclusive(&lock);
 
     sleep_until(t);
+    given = InterlockedIncrement64(&counter);
+    AcquireSRWLockExclusive(&records_lock);
+    {
+        struct record *r = record_of(given);
+        r->wait_call = start;
+        r->wait_return = now();
+    }
+    ReleaseSRWLockExclusive(&records_lock);
     if (token)
-        *token = (UINT64)frame + 1;
-    InterlockedExchange64(&last_wait_token, frame + 1);
+        *token = given;
+    InterlockedExchange64(&last_wait_token, given);
     return S_OK;
+}
+
+/* A PresentX for the frame of this token ran from call to ret (QPC). */
+void pacing_presented(UINT64 token, LONGLONG call, LONGLONG ret)
+{
+    if (!token)
+        return;
+    AcquireSRWLockExclusive(&records_lock);
+    {
+        struct record *r = record_of(token);
+        r->present_call = call;
+        r->present_return = ret;
+        r->presented = TRUE;
+    }
+    ReleaseSRWLockExclusive(&records_lock);
+    InterlockedExchange(&presented_since_flip, 1);
+}
+
+LONGLONG pacing_now(void)
+{
+    return now();
 }
 
 /* Device slot 81, GetFrameStatisticsX(token, types, count, statistics) (XValkyrie: an Unreal
@@ -240,8 +303,8 @@ HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *sta
 {
     static const UINT kinds[] = { 0x1, 0x2, 0x100, 0x1000, 0x10000 };
     BYTE *out = statistics;
+    struct record r;
     UINT room;
-    LONGLONG origin, next, t = now();
 
     if (!count)
         return E_POINTER;
@@ -249,17 +312,17 @@ HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *sta
     *count = 0;
     if (!ready() || !token)
         return S_OK;
-    AcquireSRWLockShared(&lock);
-    origin = due(0, (LONGLONG)token - 1);
-    next = origin + period_ticks;
-    for (UINT i = 0; i < ARRAYSIZE(kinds) && *count < room; i++)
+    AcquireSRWLockShared(&records_lock);
+    r = records[token % ARRAYSIZE(records)];
+    ReleaseSRWLockShared(&records_lock);
+    for (UINT i = 0; i < ARRAYSIZE(kinds) && *count < room && r.token == token; i++)
     {
         BYTE *e = out + *count * 56;
         LONGLONG v;
         UINT32 u;
         UINT16 one = 1;
 
-        if (!(types & kinds[i]) || (kinds[i] >= 0x100 && t < next) || (kinds[i] == 0x2 && t < origin))
+        if (!(types & kinds[i]) || (kinds[i] >= 0x100 && !r.presented))
             continue;
         memset(e, 0, 56);
         memcpy(e, &kinds[i], 4);
@@ -272,33 +335,32 @@ HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *sta
             memcpy(e + 12, &u, 4);
             break;
         case 0x2:
-            memcpy(e + 16, &origin, 8);
-            memcpy(e + 24, &origin, 8);
-            memcpy(e + 32, &origin, 8);
+            memcpy(e + 16, &r.wait_call, 8);
+            memcpy(e + 24, &r.wait_return, 8);
+            memcpy(e + 32, &r.wait_return, 8);
             break;
         case 0x100:
-            v = next - origin;
-            memcpy(e + 16, &next, 8);
+            v = r.present_return - r.present_call;
+            memcpy(e + 16, &r.present_return, 8);
             memcpy(e + 24, &v, 8);
             break;
         case 0x1000:
             e[9] = 1;
             e[10] = 1;
-            v = 0;
-            memcpy(e + 16, &next, 8);
-            memcpy(e + 24, &next, 8);
-            memcpy(e + 32, &next, 8);
+            v = r.present_return - r.present_call;
+            memcpy(e + 16, &r.present_call, 8);
+            memcpy(e + 24, &r.present_call, 8);
+            memcpy(e + 32, &r.present_return, 8);
             memcpy(e + 40, &v, 8);
             memcpy(e + 50, &one, 2);
             break;
         default:
-            memcpy(e + 16, &next, 8);
-            memcpy(e + 24, &next, 8);
+            memcpy(e + 16, &r.present_return, 8);
+            memcpy(e + 24, &r.present_return, 8);
             break;
         }
         (*count)++;
     }
-    ReleaseSRWLockShared(&lock);
     InterlockedIncrement64(&queries);
     InterlockedExchange64(&last_query_token, (LONG64)token);
     InterlockedExchange(&last_query_types, (LONG)types);

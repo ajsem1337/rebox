@@ -1358,7 +1358,13 @@ static D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_GetDesc(struct proxy *p
 static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, const void *plane_params,
         const void *params)
 {
-    return present_x(INNER(p, ID3D12CommandQueue), &p->present, planes, plane_params, params);
+    /* The first plane's first field is the token WaitFrameEventX gave for this frame (pacing.c). */
+    UINT64 token = planes && plane_params ? *(const UINT64 *)plane_params : 0;
+    LONGLONG call = pacing_now();
+    HRESULT hr = present_x(INNER(p, ID3D12CommandQueue), &p->present, planes, plane_params, params);
+
+    pacing_presented(token, call, pacing_now());
+    return hr;
 }
 
 /* ---------------------------------------------------------- command list */
