@@ -94,9 +94,10 @@ grep -Eq "slot stats GraphicsCommandList:.* 12=" <<<"$out" || { echo "FAIL slot 
 grep -Eq "slot stats Device:.* 100T=1" <<<"$out" || { echo "FAIL slot stats lack the trapped device slot 100"; exit 1; }
 echo "ok   slot stats count forwarded, custom and trapped slots"
 # Ray tracing list methods are ours, not forwarded: a state object that isn't vkd3d-proton's must
-# never reach it (SetPipelineState1/DispatchRays at 120/121, and 122/123 from SDK 0x20004).
-grep -Eq "slot stats GraphicsCommandList:.* 120c=.* 121c=" <<<"$out" \
-    && grep -Eq "slot stats GraphicsCommandList \(SDK 0x20004\):.* 122c=.* 123c=" <<<"$out" \
+# never reach it (SetPipelineState1/DispatchRays at 120/121, and 122/123 from SDK 0x20004), and
+# acceleration structure copies (119, 121) are skipped.
+grep -Eq "slot stats GraphicsCommandList:.* 119c=.* 120c=.* 121c=" <<<"$out" \
+    && grep -Eq "slot stats GraphicsCommandList \(SDK 0x20004\):.* 121c=.* 122c=.* 123c=" <<<"$out" \
     || { echo "FAIL ray tracing list slots are forwarded, not handled"; exit 1; }
 echo "ok   ray tracing list slots are handled by d3d12_xs on both layouts"
 # xmem's fault reporter (test_crash_report): module+RVA, target, GPU window, stack.

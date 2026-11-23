@@ -2164,6 +2164,8 @@ static void test_real_heap_va(void *dev, void *queue)
                 D3D12_DISPATCH_RAYS_DESC rays = { .Width = 1, .Height = 1, .Depth = 1 };
                 XSLOT(list, 120, void, void *)(list, &stranger);
                 XSLOT(list, 121, void, const D3D12_DISPATCH_RAYS_DESC *)(list, &rays);
+                /* An acceleration structure copy (119, PC 74) into nothing: skipped. */
+                XSLOT(list, 119, void, UINT64, UINT64, UINT)(list, 0, 0, 4);
                 XSLOT(list, 25, void, void *)(list, pso);
             }
             XSLOT(list, 59, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 0, NULL, 0);
@@ -3907,6 +3909,7 @@ static void test_xbox(void)
                             static struct { void *const *vtbl; BYTE junk[256]; } stranger = { no_methods };
                             XSLOT(list4, 122, void, void *)(list4, &stranger);
                             XSLOT(list4, 123, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                            XSLOT(list4, 121, void, UINT64, UINT64, UINT)(list4, 0, 0, 4); /* copy, skipped */
                         }
                         /* ... and indirectly (list slot 61 with a rays signature, as Unreal 5 does). */
                         {

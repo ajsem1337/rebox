@@ -2183,6 +2183,60 @@ static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
 {
 }
 
+/* Acceleration structure builds, postbuild info and copies (PC 72-74). Ray tracing isn't translated
+ * (state_object.c), so no ray reads them, and building them faulted the GPU: a UE5 sample fills its
+ * bottom levels by copies in a mode vkd3d-proton doesn't support (4), and the top-level build then
+ * read instances pointing at unbuilt memory (device lost, breadcrumbs in run 39).
+ * REBOX_ACCELERATION_STRUCTURES=1 passes them on. */
+static BOOL acceleration_structures(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        char *env = rebox_getenv("REBOX_ACCELERATION_STRUCTURES");
+        on = env && env[0] == '1';
+        free(env);
+    }
+    return on;
+}
+
+static void note_skipped_acceleration_structures(void)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: acceleration structure builds and copies are skipped: ray tracing isn't translated "
+                     "(REBOX_ACCELERATION_STRUCTURES=1 passes them on)");
+}
+
+static void STDMETHODCALLTYPE list_BuildRaytracingAccelerationStructure(struct proxy *p,
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT count,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *info)
+{
+    if (!acceleration_structures())
+        return note_skipped_acceleration_structures();
+    ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(INNER(p, ID3D12GraphicsCommandList4), desc, count,
+            info);
+}
+
+static void STDMETHODCALLTYPE list_EmitRaytracingAccelerationStructurePostbuildInfo(struct proxy *p,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc, UINT count,
+        const D3D12_GPU_VIRTUAL_ADDRESS *sources)
+{
+    if (!acceleration_structures())
+        return note_skipped_acceleration_structures();
+    ID3D12GraphicsCommandList4_EmitRaytracingAccelerationStructurePostbuildInfo(INNER(p, ID3D12GraphicsCommandList4),
+            desc, count, sources);
+}
+
+static void STDMETHODCALLTYPE list_CopyRaytracingAccelerationStructure(struct proxy *p,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode)
+{
+    if (!acceleration_structures())
+        return note_skipped_acceleration_structures();
+    ID3D12GraphicsCommandList4_CopyRaytracingAccelerationStructure(INNER(p, ID3D12GraphicsCommandList4), dst, src, mode);
+}
+
 static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
     struct embedded **e, *keep = NULL, *drop = NULL;
@@ -2573,6 +2627,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(117, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
+        FN(118, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
+        FN(119, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
         FN(120, list_SetPipelineState1),              /* PC 75 (Unreal 5: 54 calls in a run) */
         FN(121, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
@@ -2604,6 +2661,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(119, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
+        FN(120, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
+        FN(121, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
         FN(122, list_SetPipelineState1),              /* PC 75 */
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
