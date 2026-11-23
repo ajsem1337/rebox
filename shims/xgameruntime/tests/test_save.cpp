@@ -300,8 +300,8 @@ void test_basic(void* provider) {
   check_hr(create_container(provider, "slot1", &c), S_OK, "CreateContainer slot1");
   check(list_containers(provider, nullptr).names.empty(), "unsubmitted container is not enumerated");
   Listing info;
-  check_hr(g_save.call<HRESULT>(slot::GetContainerInfo, provider, "slot1", static_cast<void*>(&info), static_cast<ContainerCallback>(&collect_container)), S_OK,
-           "GetContainerInfo on unsubmitted container");
+  check_hr(g_save.call<HRESULT>(slot::GetContainerInfo, provider, "slot1", static_cast<void*>(&info), static_cast<ContainerCallback>(&collect_container)), static_cast<HRESULT>(0x80830010),
+           "GetContainerInfo on unsubmitted container: E_GS_CONTAINER_NOT_FOUND (rebox local change, xcl's answer)");
   check(info.names.empty(), "GetContainerInfo reports nothing for unsubmitted container");
   BlobListing empty = list_blobs(c, nullptr);
   check(empty.names.empty(), "unsubmitted container has no blobs");

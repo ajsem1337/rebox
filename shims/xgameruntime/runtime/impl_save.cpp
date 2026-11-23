@@ -843,7 +843,12 @@ HRESULT XGameSaveGetContainerInfo_impl(void*, void* provider, const char* contai
   auto p = lookup<ProviderObject>(Kind::Provider, provider);
   if (!p || !containerName || !callback) return E_INVALIDARG;
   if (!valid_container_name(containerName)) return kGsInvalidContainerName;
-  return report_containers(summarize(*p->store, nullptr, containerName), context, callback);
+  // rebox local change: a container that doesn't exist is E_GS_CONTAINER_NOT_FOUND, not S_OK with no
+  // callback (xcl's answer; a title that reads its settings container at boot gets the error it
+  // handles, not success with nothing in it).
+  auto found = summarize(*p->store, nullptr, containerName);
+  if (found.empty()) return static_cast<HRESULT>(0x80830010);
+  return report_containers(found, context, callback);
 }
 
 HRESULT XGameSaveEnumerateContainerInfoByName_impl(void*, void* provider, const char* prefix, void* context, ContainerInfoCallback callback) {

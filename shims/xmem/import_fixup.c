@@ -579,8 +579,26 @@ static BOOL is_wine_stub(const void *p)
             && s->jmpq_rax[0] == 0xff && s->jmpq_rax[1] == 0xe0;
 }
 
+/* xg_xs!XGSuggestSwizzleMode(desc, what, layout *out), a newer XG library's: the dump's xg_xs.dll
+ * doesn't export it, and a retail title calls it while building texture descs, passing the desc's
+ * own Layout field as out. Layout 0 is the library choosing the swizzle mode itself, which the real
+ * xg_xs.dll then does whenever the title asks it about that texture (xcl answers S_OK with the mode
+ * it computes; the same choice, made by the library instead of here). */
+static HRESULT WINAPI xg_suggest_swizzle_mode(const void *desc, UINT what, UINT *out)
+{
+    static LONG logged;
+    if (!desc || !out)
+        return E_POINTER;
+    *out = 0;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("xg_xs!XGSuggestSwizzleMode: layout 0 (the library chooses the swizzle mode)");
+    return S_OK;
+}
+
 static void *make_stub(const struct wine_stub *wine)
 {
+    if (wine->name && !IsBadStringPtrA(wine->name, 64) && !strcmp(wine->name, "XGSuggestSwizzleMode"))
+        return (void *)xg_suggest_swizzle_mode;
     static struct our_stub *code;
     static struct stub_info *infos;
     static UINT used, capacity;
@@ -652,8 +670,9 @@ static UINT fix_module(HMODULE module)
                 continue;
             if (!VirtualProtect(iat, sizeof(*iat), PAGE_READWRITE, &old))
                 continue;
-            rebox_log("import fixup: %s!%s, imported by %s, has no implementation in Wine; it will return E_NOTIMPL",
-                         ((struct wine_stub *)*iat)->dll, ((struct wine_stub *)*iat)->name, file);
+            rebox_log("import fixup: %s!%s, imported by %s, has no implementation in Wine; %s",
+                         ((struct wine_stub *)*iat)->dll, ((struct wine_stub *)*iat)->name, file,
+                         ours == (void *)xg_suggest_swizzle_mode ? "answered here" : "it will return E_NOTIMPL");
             *iat = ours;
             VirtualProtect(iat, sizeof(*iat), old, &old);
             fixed++;

@@ -78,3 +78,7 @@ Local changes that follow xcl's (ivall/xcl) answers, with which a retail title b
   `HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT)` (no Xbox network) rather than
   `E_GAMEUSER_FAILED_TO_GET_TOKEN`.
 - `runtime/impl_system.cpp`: the connectivity hint is internet access (`XGR_CONNECTIVITY=none`: none).
+- `runtime/impl_save.cpp`: `XGameSaveGetContainerInfo` of a container that doesn't exist returns
+  `E_GS_CONTAINER_NOT_FOUND` (0x80830010), not S_OK with no callback.
+- `runtime/impl_user.cpp`: `XUserCheckPrivilege` takes its fifth argument and writes the deny reason
+  (none); `XUserGetGamertag` tells a size probe (no buffer, or a short one) the size it needs.

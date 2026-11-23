@@ -143,18 +143,25 @@ HRESULT XUserGetAgeGroup_impl(void*, void* h, uint32_t* out) {
   *out = 3;   // XUserAgeGroup_Adult
   return S_OK;
 }
-HRESULT XUserCheckPrivilege_impl(void*, void* h, uint32_t, uint32_t, uint8_t* has) {
+HRESULT XUserCheckPrivilege_impl(void*, void* h, uint32_t, uint32_t, uint8_t* has, uint32_t* reason) {
   if (!h || !has) return E_INVALIDARG;
   *has = 1;   // offline profile: every privilege granted, so no title is blocked on a missing one
+  // rebox local change: the deny reason (XUserPrivilegeDenyReason) is written too, None.
+  if (reason) *reason = 0;
   return S_OK;
 }
 HRESULT XUserGetGamertag_impl(void*, void* h, uint32_t component, size_t size, char* out, size_t* used) {
-  if (!h || !out || component > 3) return E_INVALIDARG;
+  // rebox local change: a size probe (no buffer, or one too short) learns the size it needs in
+  // *used, as xcl answers, instead of E_INVALIDARG.
+  if (!h || (!out && size) || component > 3) return E_INVALIDARG;
   const char* e = std::getenv("XGR_GAMERTAG");
   const char* tag = e && *e ? e : "Player";
   size_t n = component == 2 ? 0 : std::strlen(tag);
   if (component == 0 && n > 15) n = 15;
-  if (size < n + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+  if (!out || size < n + 1) {
+    if (used) *used = n + 1;
+    return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+  }
   std::memcpy(out, tag, n);
   out[n] = 0;
   if (used) *used = n + 1;
