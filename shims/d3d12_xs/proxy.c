@@ -2490,6 +2490,9 @@ static HRESULT STDMETHODCALLTYPE device_GetFrameStatisticsX(struct proxy *p, UIN
 
 /* ------------------------------------------------------------------ queue */
 
+volatile UINT64 rebox_table_watch; /* console_compile.c: a table to show at the next submission */
+BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
     ID3D12CommandList *stack[64] = { 0 }, **raw = count <= ARRAYSIZE(stack) ? stack : malloc(count * sizeof(*raw));
@@ -2500,6 +2503,14 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     title_textures_upload(INNER(p, ID3D12CommandQueue));
     /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
     shadow_sync_mirrors();
+    {
+        UINT64 at = InterlockedExchange64((volatile LONG64 *)&rebox_table_watch, 0);
+        UINT32 t[16];
+        if (at && ReboxShadowRead(at, t, sizeof(t)))
+            rebox_log("d3d12_xs: at submission, table %#llx holds %08x %08x %08x %08x %08x %08x %08x %08x  %08x %08x "
+                      "%08x %08x %08x %08x %08x %08x", (unsigned long long)at, t[0], t[1], t[2], t[3], t[4], t[5], t[6],
+                      t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+    }
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
     if (raw != stack)
         free(raw);

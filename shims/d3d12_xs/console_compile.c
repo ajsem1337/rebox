@@ -1379,6 +1379,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                      found ? "slot is empty" : "isn't in the bound heap", w[0], w[1], w[2], w[3],
                                      in->user_sgprs[8], read ? "holds" : "unreadable", table[0], table[1], table[2],
                                      table[3], table[4], table[5], table[6], table[7]);
+                        /* The table again at the next submission (proxy.c): whether the title fills it
+                         * between recording the draw and submitting it. */
+                        {
+                            extern volatile UINT64 rebox_table_watch;
+                            if (in->user_sgprs[8])
+                                rebox_table_watch = in->user_sgprs[8];
+                        }
                         /* With REBOX_DUMP_SPIRV, the stage's code and the buffer the table's first V# names,
                          * for disassembly. */
                         if (getenv("REBOX_DUMP_SPIRV") && logged == 1)
