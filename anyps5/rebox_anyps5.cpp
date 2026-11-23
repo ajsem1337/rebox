@@ -161,7 +161,7 @@ SA5_API int sa5_compile_pixel(const sa5_pixel_request* request, sa5_result** out
         compile.context.memory = MemoryRegionView(std::span<const MemoryRegion>(regions));
         compile.context.floatMode = floatMode;
         compile.target = DefaultTarget(compile.context.waveSize);
-        compile.layout = {0, 0, 0, 128};
+        compile.layout = {0, 0, request->push_offset, request->push_size ? request->push_size : 128u};
         compile.useCache = request->use_cache != 0;
 
         auto* result = new sa5_result{Recompile(compile), {}};
@@ -217,7 +217,7 @@ SA5_API int sa5_compile_vertex(const sa5_vertex_request* request, sa5_result** o
         compile.context.memory = MemoryRegionView(std::span<const MemoryRegion>(regions));
         compile.context.floatMode = floatMode;
         compile.target = DefaultTarget(compile.context.waveSize);
-        compile.layout = {0, 0, request->push_offset, 128};
+        compile.layout = {0, 0, request->push_offset, request->push_size ? request->push_size : 128u};
         compile.useCache = request->use_cache != 0;
 
         auto* result = new sa5_result{Recompile(compile), {}};

@@ -33,6 +33,11 @@
 #define MAX_REGIONS 64
 #define MAX_BINDINGS 64
 #define MAX_ELEMENTS 4096
+/* Graphics stages share the push block, 128 bytes each: AnyPS5's push data, then the addresses of
+ * up to two host buffers whose contents change per draw (baked addresses made a module and a
+ * pipeline per draw: a UE5 title's render thread spent its frames compiling). */
+#define GRAPHICS_PUSH_DATA 112u
+#define GRAPHICS_PUSHED_MAX 2u
 
 enum role { ROLE_GDS = 3, ROLE_BDA_PAGETABLE = 4, ROLE_FAULT_BUFFER = 5, ROLE_FLATTENED_SRT = 6, ROLE_SHADER_DATA = 7,
             ROLE_IMAGE_TABLE = 8, ROLE_SAMPLER_TABLE = 9, ROLE_IMAGE_TABLE_MAP = 10, ROLE_IMAGE_STORAGE_TABLE = 11 };
@@ -495,7 +500,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     struct shadow_region shadows[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
-    UINT64 host_va[8], key[2];
+    UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX];
+    UINT32 pushed_count = 0;
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
     static UINT32 indices[MAX_ELEMENTS]; /* under compile_lock */
     static SRWLOCK compile_lock = SRWLOCK_INIT;
@@ -626,6 +632,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             vreq.inputs[r].register_count = 4;
         }
         vreq.push_offset = in->push_offset;
+        vreq.push_size = GRAPHICS_PUSH_DATA;
         vreq.regions = regions;
         vreq.region_count = n;
         vreq.use_cache = 1;
@@ -652,6 +659,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         memcpy(preq.interpolator_settings, g->interpolators, sizeof(preq.interpolator_settings));
         preq.col_format = g->col_format;
         preq.depth_export = g->depth_export;
+        preq.push_offset = in->push_offset;
+        preq.push_size = GRAPHICS_PUSH_DATA;
         preq.regions = regions;
         preq.region_count = n;
         preq.use_cache = 1;
@@ -711,9 +720,15 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 goto done;
             }
             host_va[host_count] = va;
-            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, 0, 1, 0, graphics ? va : 0 };
-            if (graphics)
-                key[0] = hash_bytes(key[0], &va, sizeof(va));
+            /* Per-draw contents: pushed (graphics: after the stage's push data). */
+            if (graphics && pushed_count == GRAPHICS_PUSHED_MAX)
+            {
+                log_failure(h, "more per-draw host buffers than a graphics stage has push room for", NULL);
+                goto done;
+            }
+            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, graphics ? pushed_count : host_count, 0, 1,
+                    graphics ? in->push_offset + GRAPHICS_PUSH_DATA : 0, 0 };
+            pushed_va[pushed_count++] = va;
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
         }
@@ -848,10 +863,27 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 goto done;
             }
             host_va[host_count] = va;
-            /* Graphics stages share the push block (128 bytes each): their addresses are baked in. */
-            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, bytes / 4, 0, 0, graphics ? va : 0 };
-            if (graphics)
-                key[0] = hash_bytes(key[0], &va, sizeof(va));
+            /* Graphics stages share the push block (128 bytes each): buffers whose contents change per
+             * draw (the flattened SRT, shader data, image table maps) are pushed after the stage's
+             * push data; the process-wide ones (fault buffer, GDS, page table) are baked in. */
+            if (graphics && (b.role == ROLE_IMAGE_TABLE_MAP || b.role == ROLE_FLATTENED_SRT || b.role == ROLE_SHADER_DATA))
+            {
+                if (pushed_count == GRAPHICS_PUSHED_MAX)
+                {
+                    log_failure(h, "more per-draw host buffers than a graphics stage has push room for", NULL);
+                    goto done;
+                }
+                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, pushed_count, bytes / 4, 0,
+                        in->push_offset + GRAPHICS_PUSH_DATA, 0 };
+                pushed_va[pushed_count++] = va;
+            }
+            else
+            {
+                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, bytes / 4, 0, 0,
+                        graphics ? va : 0 };
+                if (graphics)
+                    key[0] = hash_bytes(key[0], &va, sizeof(va));
+            }
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
         }
@@ -890,9 +922,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     out->subgroup_size = sa5.subgroup_size(result);
     memcpy(out->key, key, sizeof(key));
     push = sa5.push_constants(result, &push_size);
-    memcpy(out->push, push, min(push_size, 128u));
+    memcpy(out->push, push, min(push_size, graphics ? GRAPHICS_PUSH_DATA : 128u));
     for (UINT32 i = 0; i < host_count && !graphics; i++)
         memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
+    for (UINT32 i = 0; i < pushed_count && graphics; i++)
+        memcpy(&out->push[GRAPHICS_PUSH_DATA / 4 + 2 * i], &pushed_va[i], sizeof(UINT64));
     if (graphics && h->stage == 0x1)
     {
         out->vertex_input_count = min(sa5.vertex_input_count(result), 32u);

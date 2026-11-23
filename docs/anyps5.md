@@ -266,8 +266,12 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      are compiled through `ReboxConsoleCompile` with user SGPRs as TomBox reads the console's
      graphics layout (root parameters from s8, the fetch shader's address at s[4:5]); the vertex
      stage via `sa5_compile_vertex`, whose attributes (location r = input layout element r) make
-     the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's (host buffer
-     addresses are baked into the modules, `sa5_host_buffer.address`). The pipeline is
+     the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's: AnyPS5's 112
+     bytes, then the addresses of up to two host buffers whose contents change per draw (the guest
+     buffer table, the flattened SRT, shader data, image table maps; `sa5_host_buffer.push_base`).
+     The process-wide host buffers (fault buffer, GDS, page table) are baked into the modules
+     (`sa5_host_buffer.address`). Baking everything made a module and a pipeline per draw, and
+     a UE5 title's render thread stopped presenting while it compiled them. The pipeline is
      vkd3d-proton's own variant with those two modules and that vertex input, cached per PSO by
      both compiles' keys and the pipeline key. A failed compile draws with the fallback pipeline.
    - `test_console_draw` (smoke): a console vertex shader that calls the fetch and exports input 0

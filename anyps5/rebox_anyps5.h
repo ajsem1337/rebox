@@ -69,6 +69,7 @@ struct sa5_pixel_request
     const struct sa5_region *regions;
     uint32_t region_count;
     uint32_t use_cache;
+    uint32_t push_offset, push_size;  /* this stage's push data (graphics: one block per stage); 0, 0: 0, 128 */
 };
 
 /* A vertex shader whose first instruction calls the console's fetch shader (s_swappc_b64 into a pair
@@ -96,6 +97,7 @@ struct sa5_vertex_request
     const struct sa5_region *regions;
     uint32_t region_count;
     uint32_t use_cache;
+    uint32_t push_size;               /* 0: 128 */
 };
 
 struct sa5_result;
@@ -147,9 +149,10 @@ struct sa5_host_buffer
      * a 16-byte entry per element, {64-bit address, u32 length in dwords, 0}. Each element becomes
      * a pointer to its address, and OpArrayLength on it reads the length. */
     uint32_t guest_array;
-    uint32_t pad;
-    /* Nonzero: the buffer's address, baked into the module as a constant; push_slot is then unused
-     * and the push block untouched (graphics stages share it: 128 bytes each). */
+    /* Where the address array starts in the push block, in bytes (0: 128). Every pushed buffer of a
+     * module shares one array; graphics stages put it after their push data (e.g. 112, 240). */
+    uint32_t push_base;
+    /* Nonzero: the buffer's address, baked into the module as a constant; push_slot is then unused. */
     uint64_t address;
 };
 

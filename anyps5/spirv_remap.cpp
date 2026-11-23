@@ -381,12 +381,12 @@ void Rebind(Module& m, const sa5_remap& remap)
 
 // The push block, with room for the host buffer addresses at byte 128: returns the variable and
 // the member index of the address array.
-std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m)
+std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base, std::uint32_t slots)
 {
     const std::uint32_t uintType = m.UintType();
     const std::uint32_t uvec2 = m.Type(OpTypeVector, {uintType, 2});
     const std::uint32_t addresses = m.NewId();
-    m.AddGlobal(Make(OpTypeArray, {addresses, uvec2, m.Constant(MaxHostBuffers)}));
+    m.AddGlobal(Make(OpTypeArray, {addresses, uvec2, m.Constant(slots)}));
     m.AddDecoration(Make(OpDecorate, {addresses, DecorationArrayStride, 8}));
 
     for (auto& inst : m.insts) {
@@ -424,17 +424,17 @@ std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m)
             Seal(s);
             break;
         }
-        m.AddDecoration(Make(OpMemberDecorate, {block, member, DecorationOffset, HostPushOffset}));
+        m.AddDecoration(Make(OpMemberDecorate, {block, member, DecorationOffset, base}));
         return {var, member};
     }
-    // No push data: a block of 32 unused dwords, then the addresses.
-    const std::uint32_t pad = m.Type(OpTypeArray, {uintType, m.Constant(32)});
+    // No push data: unused dwords up to the base, then the addresses.
+    const std::uint32_t pad = m.Type(OpTypeArray, {uintType, m.Constant(base / 4u)});
     const std::uint32_t block = m.NewId(), var = m.NewId();
     m.AddGlobal(Make(OpTypeStruct, {block, pad, addresses}));
     m.AddDecoration(Make(OpDecorate, {pad, DecorationArrayStride, 4}));
     m.AddDecoration(Make(OpDecorate, {block, DecorationBlock}));
     m.AddDecoration(Make(OpMemberDecorate, {block, 0, DecorationOffset, 0}));
-    m.AddDecoration(Make(OpMemberDecorate, {block, 1, DecorationOffset, HostPushOffset}));
+    m.AddDecoration(Make(OpMemberDecorate, {block, 1, DecorationOffset, base}));
     m.AddGlobal(Make(OpVariable, {m.Pointer(StorageClassPushConstant, block), var, StorageClassPushConstant}));
     m.AddInterface(var);
     return {var, 1};
@@ -447,9 +447,17 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     const std::uint32_t uintType = m.UintType();
     const std::uint32_t uvec2 = m.Type(OpTypeVector, {uintType, 2});
     bool pushed = false;
-    for (std::uint32_t i = 0; i < count; i++) pushed |= buffers[i].address == 0;
+    std::uint32_t base = HostPushOffset, slots = 0;
+    for (std::uint32_t i = 0; i < count; i++) {
+        if (buffers[i].address) continue;
+        pushed = true;
+        if (buffers[i].push_base) base = buffers[i].push_base;
+        slots = std::max(slots, buffers[i].push_slot + 1u);
+    }
+    if (base % 8u) Fail("host buffer addresses must be 8-byte aligned in the push block");
     // Only buffers without a baked address need the push block's address array.
-    const auto [pushVar, member] = pushed ? PushBlock(m) : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
+    const auto [pushVar, member] = pushed ? PushBlock(m, base, base == HostPushOffset ? MaxHostBuffers : slots)
+                                          : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
     const std::uint32_t pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
 
     struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; std::uint32_t address; };
