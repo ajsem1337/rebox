@@ -2136,6 +2136,20 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
         free(raw);
 }
 
+/* Older-layout slot 35: the target title submits batches of up to 256 lists through it,
+ * (count, lists, value, flags 0 or 3), not checking the result. Taken as ExecuteCommandLists;
+ * the value and flags are logged once. */
+static HRESULT STDMETHODCALLTYPE queue_ExecuteCommandListsX(struct proxy *p, UINT count, ID3D12CommandList *const *lists,
+        UINT64 value, UINT flags)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: queue slot 35 (ExecuteCommandLists, %u lists) with %#llx, flags %#x",
+                  count, (unsigned long long)value, flags);
+    queue_ExecuteCommandLists(p, count, lists);
+    return S_OK;
+}
+
 /* SignalX(fence, value, flush flags): Signal; the flags (cache flushes before the signal, e.g.
  * 0x8000000 from Unreal) have nothing to do here, the queue is already ordered. */
 /* The last value each fence was told to reach, for ReboxHangReport: a fence whose GPU value
@@ -2998,6 +3012,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(23, queue_SignalX),
         FN(26, queue_GetDesc),
         FN(30, queue_PresentX),
+        FN(35, queue_ExecuteCommandListsX),
     };
     /* Queue for titles built against SDK 0x20004 or later (ScarlettX 1e5473d, from a title's
      * calls): two methods were added ahead of Signal, so Signal is 16 and PresentX 32. Where they

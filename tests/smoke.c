@@ -3771,12 +3771,13 @@ static void test_list_queries(void *dev, void *queue)
             XSLOT(list, 69, void, UINT64, UINT32)(list, (UINT64)(ULONG_PTR)&cpu_only, 77);
             CHECK(cpu_only == 77, "Write32BitValueBottomOfPipeX outside GPU memory is made when recorded");
             XSLOT(list, 9, HRESULT)(list);
-            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            /* Submitted through queue slot 35, the console's ExecuteCommandLists. */
+            XSLOT(queue, 35, HRESULT, UINT, void *const *, UINT64, UINT)(queue, 1, &list, 1, 3);
             XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
             for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
                 Sleep(10);
             CHECK(mem[0] == 0x1234 && mem[1] == 0xabcd && *(UINT64 *)(mem + 2) == 0x1122334455667788ull,
-                  "console memory writes (list slots 69/70/88) -> %#x %#x %#llx", mem[0], mem[1],
+                  "console memory writes (list slots 69/70/88, run by queue slot 35) -> %#x %#x %#llx", mem[0], mem[1],
                   (unsigned long long)*(UINT64 *)(mem + 2));
         }
     }
