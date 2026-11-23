@@ -699,10 +699,21 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
     else if (graphics)
     {
+        /* REBOX_GRAPHICS_DEBUG=magenta: every console pixel shader exports magenta to MRT0 instead,
+         * to tell whether draws reach the render targets at all (vertices, pipelines) from whether
+         * the real pixel shaders' output is right. */
+        static const UINT32 magenta[] = {
+            0x7e0002f2,             /* v_mov_b32 v0, 1.0 */
+            0x7e020280,             /* v_mov_b32 v1, 0 */
+            0xf800180f, 0x00000100, /* exp mrt0 v0, v1, v0, v0 done vm */
+            0xbf810000,             /* s_endpgm */
+        };
+        const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
+        BOOL solid = debug && !strcmp(debug, "magenta");
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
-        preq.code = req.code;
-        preq.code_dwords = req.code_dwords;
+        preq.code = solid ? magenta : req.code;
+        preq.code_dwords = solid ? ARRAYSIZE(magenta) : req.code_dwords;
         preq.code_address = req.code_address;
         preq.wave = req.wave;
         preq.user_data = req.user_data;
@@ -710,9 +721,9 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         preq.rsrc1 = h->rsrc1;
         preq.rsrc2 = h->rsrc2;
         preq.input_ena = g->input_ena;
-        preq.interpolator_count = min(g->interpolator_count, 32u);
+        preq.interpolator_count = solid ? 0 : min(g->interpolator_count, 32u);
         memcpy(preq.interpolator_settings, g->interpolators, sizeof(preq.interpolator_settings));
-        preq.col_format = g->col_format;
+        preq.col_format = solid ? 9 : g->col_format;
         preq.depth_export = g->depth_export;
         preq.push_offset = in->push_offset;
         preq.push_size = GRAPHICS_PUSH_DATA;
