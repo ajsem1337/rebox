@@ -361,18 +361,31 @@ static HWND title_window(void)
  * screen: the compositor then cuts the frame off (and a frame fitted to the work area still
  * overflowed it with decorations). A window larger than its monitor's work area becomes borderless
  * and covers the monitor, which Wine's display drivers show fullscreen; the swapchain stretches the
- * plane into it. REBOX_PRESENT_FIT=0 leaves it as it is. */
+ * plane into it. REBOX_PRESENT_FIT=0 leaves it as it is; REBOX_PRESENT_FIT=WxH sizes it so
+ * (window pixels, for when the display's scaling makes Wine's pixels larger than the screen's). */
 static void fit_to_monitor(HWND hwnd)
 {
     const char *fit = getenv("REBOX_PRESENT_FIT");
     MONITORINFO mi = { sizeof(mi) };
     HMONITOR monitor;
     LONG_PTR style;
+    UINT w, h;
     RECT r;
 
     if ((fit && *fit == '0') || !(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
             || !GetMonitorInfoW(monitor, &mi) || !GetWindowRect(hwnd, &r))
         return;
+    rebox_log("d3d12_xs: PresentX: window %ldx%ld; monitor %ldx%ld (work area %ldx%ld), window DPI %u, system DPI %u",
+                 r.right - r.left, r.bottom - r.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, mi.rcWork.right - mi.rcWork.left,
+                 mi.rcWork.bottom - mi.rcWork.top, GetDpiForWindow(hwnd), GetDpiForSystem());
+    if (fit && sscanf(fit, "%ux%u", &w, &h) == 2 && w && h)
+    {
+        rebox_log("d3d12_xs: PresentX: sizing the window to %ux%u (REBOX_PRESENT_FIT)", w, h);
+        SetWindowPos(hwnd, NULL, mi.rcWork.left, mi.rcWork.top, w, h,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        return;
+    }
     if (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top)
         return;
     rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; making it borderless "
