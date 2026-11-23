@@ -400,9 +400,9 @@ static BOOL committed_run(UINT64 address, UINT64 *start, UINT64 *end)
 }
 
 /* Makes [address, address + size) of the title's own memory GPU-visible at the same address: a
- * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address and maps over the
- * title's pages (asked through the mailbox, layers/gpuva_mailbox.h), with the title's bytes
- * copied across. TRUE if the range is GPU memory now. */
+ * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address, fills with the
+ * title's bytes and maps over the title's pages in one go (asked through the mailbox,
+ * layers/gpuva_mailbox.h). TRUE if the range is GPU memory now. */
 BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
 {
     static struct gpuva_mailbox *(WINAPI *get_mailbox)(void);
@@ -411,7 +411,6 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     UINT64 end = address + size, run_start, run_end, base, limit, bytes;
     struct gpuva_mailbox *box;
     struct chunk *c;
-    void *saved;
     BOOL ok = FALSE;
 
     if (!get_mailbox)
@@ -467,12 +466,7 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         return FALSE;
     }
     bytes = limit - base;
-    if (!(saved = VirtualAlloc(NULL, bytes, MEM_COMMIT, PAGE_READWRITE)))
-    {
-        ReleaseSRWLockExclusive(&lock);
-        return FALSE;
-    }
-    memcpy(saved, (void *)(ULONG_PTR)base, bytes);
+    /* The layer copies the title's bytes in before it maps the memory over them. */
     box->result = 0;
     box->size = bytes;
     MemoryBarrier();
@@ -481,7 +475,6 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     box->address = 0;
     if (c && (UINT64)(ULONG_PTR)c->cpu == base && c->gpu == base && box->result == base)
     {
-        memcpy((void *)(ULONG_PTR)base, saved, bytes);
         c->adopted = TRUE;
         c->used = bytes;
         c->free_count = 0; /* nothing to suballocate */
@@ -489,17 +482,9 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         chunks = c;
         ok = TRUE;
     }
-    else if (c)
-    {
-        /* Mapped elsewhere: the title's pages are untouched. Mapped there with another device
-         * address can't happen (the layer uses one address for both). */
-        BOOL there = (UINT64)(ULONG_PTR)c->cpu == base;
-        chunk_destroy(c); /* if it was there, the layer puts plain pages back */
-        if (there)
-            memcpy((void *)(ULONG_PTR)base, saved, bytes);
-    }
+    else if (c) /* mapped elsewhere: the title's pages are untouched */
+        chunk_destroy(c);
     ReleaseSRWLockExclusive(&lock);
-    VirtualFree(saved, 0, MEM_RELEASE);
     if (InterlockedIncrement(&logged) <= 8)
         rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place (for %#llx+%#llx)",
                   (unsigned long long)base, (unsigned long long)bytes, ok ? "made" : "could not be made",
