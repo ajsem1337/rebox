@@ -47,6 +47,8 @@ void shadow_copy_ranges(UINT dst_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_s
 /* Shader-visible shadows, for the recompiler's guest memory and the BDA page table. */
 struct shadow_region { UINT64 title_va, gpu_va; const void *data; SIZE_T size; };
 UINT shadow_regions(struct shadow_region *out, UINT max);
+/* Before a submission: refreshes the GPU mirrors of heaps placed in title memory (shadow.c). */
+void shadow_sync_mirrors(void);
 /* The slot of the heap starting at heap_cpu that holds these console words (4 or 8); with loose,
  * also allowing the fields AnyPS5 rewrites in bound descriptors. */
 BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT *index);

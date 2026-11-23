@@ -2405,6 +2405,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
         raw[i] = proxy_unwrap(lists[i]);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
+    /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
+    shadow_sync_mirrors();
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
     if (raw != stack)
         free(raw);

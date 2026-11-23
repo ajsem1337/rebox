@@ -7,9 +7,9 @@
  * filled in console format (console_desc.c) whenever the title writes a
  * descriptor through the API (Create*View, CreateSampler, CopyDescriptors*).
  * A heap placed in title memory (shadow_place_heap) keeps its shadow there, as the console keeps
- * descriptors in the heap's memory: bytes the title writes into it itself are seen too. A
- * shader-visible one needs that memory GPU-visible (gpu_memory_adopt); if it can't be, the shadow
- * stays apart and those bytes aren't seen.
+ * descriptors in the heap's memory: bytes the title writes into it itself are seen too. For the
+ * GPU, a shader-visible one's pages that are GPU memory where they are (gpu_memory_adopt) are read
+ * there; the rest from a mirror refreshed before each submission (shadow_sync_mirrors).
  *
  * Shader-visible heaps also get a title address: a 32-bit address of our
  * choosing (from 0x10000000, 64 KiB aligned) that descriptor-table pointers
@@ -49,6 +49,8 @@ struct shadow_heap
     D3D12_DESCRIPTOR_HEAP_TYPE type;
     BOOL shader_visible, gpu_memory;
     BOOL data_in_title;            /* data is title_cpu's memory: not ours to free */
+    BYTE *mirror;                  /* GPU memory for the pages of it that aren't GPU memory, or NULL */
+    UINT64 mirror_va;
     SIZE_T cpu_start;              /* vkd3d-proton's CPU handle for descriptor 0 */
     SIZE_T title_cpu;              /* the title's CPU handle for it, when its memory is the title's
                                     * (shadow_place_heap), else 0 */
@@ -232,6 +234,8 @@ static void heap_free(struct shadow_heap *h)
 {
     for (UINT i = 0; i < h->count; i++)
         unindex(h, i);
+    if (h->mirror)
+        ReboxGpuFree(h->mirror);
     if (h->data_in_title)
         ;
     else if (h->gpu_memory)
@@ -390,8 +394,8 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
             rebox_log("d3d12_xs: a descriptor heap of %u descriptors (%llu bytes) is in the title's memory at %p",
                       count, (unsigned long long)size, memory);
     }
-    /* A shader-visible heap's memory is made GPU-visible first (outside the lock: it makes D3D12
-     * objects). */
+    /* A shader-visible heap's memory is made GPU memory where it is, as far as it can be (outside
+     * the lock: that makes D3D12 objects). */
     {
         BOOL visible = FALSE;
         AcquireSRWLockShared(&lock);
@@ -399,7 +403,28 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
             if (h->inner == inner)
                 visible = h->shader_visible;
         ReleaseSRWLockShared(&lock);
-        adopted = visible && gpu_memory_adopt((UINT64)(ULONG_PTR)memory, size);
+        adopted = FALSE;
+        if (visible && !(adopted = gpu_memory_adopt((UINT64)(ULONG_PTR)memory, size)))
+        {
+            /* Part of it may be GPU memory already (a buffer the title placed over its pool): the
+             * rest as far as it goes, then the remainder through a mirror. */
+            UINT64 at = (UINT64)(ULONG_PTR)memory, end = at + size, chunk_end;
+            while (at < end)
+            {
+                UINT64 run = at;
+                if (gpu_memory_identity_extent(at, &chunk_end))
+                {
+                    at = chunk_end;
+                    continue;
+                }
+                while (run < end && !gpu_memory_identity_extent(run, &chunk_end))
+                    run += 0x10000;
+                if (run > end)
+                    run = end;
+                gpu_memory_adopt(at, run - at);
+                at = run;
+            }
+        }
     }
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h; h = h->next)
@@ -410,24 +435,31 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
             InterlockedIncrement(&placed_heaps);
             /* The shadow becomes the heap's memory (GPU-visible where it is, for a shader-visible
              * heap), so descriptors the title writes there itself are read as well. */
-            if (h->stride == increment && (!h->shader_visible || adopted))
+            if (h->stride == increment)
             {
                 static LONG logged;
                 memcpy(memory, h->data, size);
-                if (h->gpu_memory)
+                /* Not wholly GPU memory: the old GPU copy becomes the mirror. */
+                if (h->shader_visible && !adopted && h->gpu_memory)
+                {
+                    h->mirror = h->data;
+                    h->mirror_va = h->gpu_va;
+                }
+                else if (h->gpu_memory)
                     ReboxGpuFree(h->data);
                 else
                     free(h->data);
                 h->data = memory;
                 h->data_in_title = TRUE;
-                if (h->shader_visible)
+                if (h->shader_visible && adopted)
                 {
                     h->gpu_memory = TRUE;
                     h->gpu_va = (UINT64)(ULONG_PTR)memory;
                 }
                 if (InterlockedIncrement(&logged) <= 8)
                     rebox_log("d3d12_xs: the %u-descriptor heap's console descriptors are its memory at %p%s", count,
-                              memory, h->shader_visible ? " (GPU-visible there)" : "");
+                              memory, !h->shader_visible ? "" : adopted ? " (GPU memory there)"
+                              : h->mirror ? " (the GPU reads a mirror where it isn't GPU memory)" : " (not seen by the GPU)");
             }
             memory = NULL;
             break;
@@ -716,7 +748,30 @@ UINT shadow_regions(struct shadow_region *out, UINT max)
 
     AcquireSRWLockShared(&lock);
     for (struct shadow_heap *h = heaps; h && n < max; h = h->next)
-        if (h->title_va)
+        if (h->title_va && h->mirror)
+        {
+            /* Runs of pages: GPU memory where they are, or the mirror. */
+            UINT64 base = (UINT64)(ULONG_PTR)h->data, size = (UINT64)h->count * h->stride, off = 0, end;
+            while (off < size && n < max)
+            {
+                UINT64 next = off;
+                BOOL there = gpu_memory_identity_extent(base + off, &end);
+                if (there)
+                    next = end - base < size ? end - base : size;
+                else
+                    while (next < size && !gpu_memory_identity_extent(base + next, &end))
+                        next = ((base + next + 0x10000) & ~0xffffull) - base;
+                if (next > size)
+                    next = size;
+                out[n].title_va = h->title_va + off;
+                out[n].gpu_va = there ? base + off : h->mirror_va + off;
+                out[n].data = h->data + off;
+                out[n].size = (SIZE_T)(next - off);
+                n++;
+                off = next;
+            }
+        }
+        else if (h->title_va)
         {
             out[n].title_va = h->title_va;
             out[n].gpu_va = h->gpu_memory ? h->gpu_va : 0;
@@ -726,6 +781,32 @@ UINT shadow_regions(struct shadow_region *out, UINT max)
         }
     ReleaseSRWLockShared(&lock);
     return n;
+}
+
+/* Before a submission: the mirrored pages of heaps placed in title memory, from that memory. */
+void shadow_sync_mirrors(void)
+{
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->mirror)
+        {
+            UINT64 base = (UINT64)(ULONG_PTR)h->data, size = (UINT64)h->count * h->stride, off = 0, end;
+            while (off < size)
+            {
+                UINT64 next;
+                if (gpu_memory_identity_extent(base + off, &end))
+                {
+                    off = end - base;
+                    continue;
+                }
+                next = ((base + off + 0x10000) & ~0xffffull) - base;
+                if (next > size)
+                    next = size;
+                memcpy(h->mirror + off, h->data + off, (SIZE_T)(next - off));
+                off = next;
+            }
+        }
+    ReleaseSRWLockShared(&lock);
 }
 
 /* Fields AnyPS5 may rewrite in the words it binds: a T#'s DST_SEL (word 3 bits 0-11, made
