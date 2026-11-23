@@ -44,7 +44,12 @@ static struct
 {
     LONGLONG offset_ticks;
     LONGLONG last;   /* frame number the last wait returned, -1 for none */
-    HANDLE event;    /* signalled at each occurrence, may be NULL */
+    /* Signalled at each occurrence: handles read through the title's pointer each time (it
+     * points at the title's own HANDLE fields, which it may replace), or one given directly. */
+    HANDLE *const volatile *handles;
+    UINT count;
+    HANDLE event;
+    BOOL enabled;
     LONGLONG next_signal;
 } types[MAX_TYPES];
 static HANDLE signal_thread, wake;
@@ -149,12 +154,21 @@ static DWORD WINAPI signal_proc(void *arg)
         AcquireSRWLockExclusive(&lock);
         for (UINT i = 0; i < MAX_TYPES; i++)
         {
-            if (!types[i].event)
+            if (!types[i].enabled)
                 continue;
             if (types[i].next_signal <= t)
             {
                 if (i != FLIP_TYPE || InterlockedExchange(&presented_since_flip, 0))
-                    SetEvent(types[i].event);
+                {
+                    if (types[i].event)
+                        SetEvent(types[i].event);
+                    for (UINT k = 0; k < types[i].count; k++)
+                    {
+                        HANDLE h = (*types[i].handles)[k];
+                        if (h && !SetEvent(h))
+                            ReleaseSemaphore(h, 1, NULL);
+                    }
+                }
                 types[i].next_signal = due(i, frame_at(i, t) + 1);
             }
             if (types[i].next_signal < next)
@@ -200,7 +214,15 @@ HRESULT pacing_set_interval(UINT interval_us, UINT period)
     return S_OK;
 }
 
-HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, HANDLE event)
+/* Device slot 79, ScheduleFrameEventX(type, offset_us, list, flags). The list is
+ * { UINT32 count; HANDLE *handles } (TomBox, from a UE5 title's
+ * XboxCommonGDKUpdateFrameEvents: count 1, the address of the RHI's flip
+ * event field that RHIWaitForFlip waits on; XValkyrie reads it the same way):
+ * the handles are read through it at each occurrence. A null list moves only
+ * the offset; flag bit 0 turns signalling off. A value too small to be a
+ * pointer is taken as a HANDLE itself. Until this read the list, a UE5 title's
+ * flip event was never set and its game thread stopped in frame-end sync. */
+HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, const void *list, UINT flags)
 {
     if (!ready())
         return S_OK;
@@ -208,9 +230,27 @@ HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, HANDLE event)
         return E_INVALIDARG;
     AcquireSRWLockExclusive(&lock);
     types[type].offset_ticks = us_to_ticks((LONGLONG)offset_us) % period_ticks;
-    types[type].event = event;
+    if ((ULONG_PTR)list >= 0x10000)
+    {
+        const struct { UINT32 count; UINT32 pad; HANDLE *handles; } *l = list;
+        types[type].count = l->handles ? min(l->count, 8) : 0;
+        types[type].handles = types[type].count ? (HANDLE *const volatile *)&l->handles : NULL;
+        types[type].event = NULL;
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 4)
+                rebox_log("d3d12_xs: ScheduleFrameEventX(type %u, %llu us): %u handles read through %p, flags %#x",
+                             type, (unsigned long long)offset_us, l->count, (void *)l->handles, flags);
+        }
+    }
+    else if (list)
+    {
+        types[type].event = (HANDLE)list;
+        types[type].count = 0;
+    }
+    types[type].enabled = !(flags & 1) && (types[type].event || types[type].count);
     types[type].next_signal = due(type, frame_at(type, now()) + 1);
-    if (event && !signal_thread)
+    if (types[type].enabled && !signal_thread)
         signal_thread = CreateThread(NULL, 0, signal_proc, NULL, 0, NULL);
     ReleaseSRWLockExclusive(&lock);
     if (wake)

@@ -1159,14 +1159,32 @@ static void test_pacing(void *dev, void *queue)
     hr = wait(dev, 0, 0, NULL, 0, &late);
     CHECK(hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT), "WaitFrameEventX with timeout 0 between frames times out (%#lx)", hr);
 
-    /* An event scheduled 5 ms after the origin is set once per frame. */
-    hr = XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, HANDLE)(dev, 1, 5000, event);
-    ok = SUCCEEDED(hr);
-    QueryPerformanceCounter(&t0);
-    for (i = 0; i < 3; i++)
-        ok &= WaitForSingleObject(event, 200) == WAIT_OBJECT_0;
-    ms = ms_since(t0);
-    CHECK(ok && ms > 25 && ms < 120, "ScheduleFrameEventX (slot 79) sets its event each frame: 3 in %.1f ms", ms);
+    /* ScheduleFrameEventX(type, offset, list, flags): the list is { count, HANDLE * }, a UE5 title's
+     * pointing at its own flip-event field (TomBox), which is read at each occurrence. An event
+     * scheduled 5 ms after the origin is set once per frame. */
+    {
+        static HANDLE field;
+        static struct { UINT32 count, pad; HANDLE *handles; } list = { 1, 0, &field };
+        HANDLE other = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+        field = event;
+        hr = XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, const void *, UINT)(dev, 1, 5000, &list, 0);
+        ok = SUCCEEDED(hr);
+        QueryPerformanceCounter(&t0);
+        for (i = 0; i < 3; i++)
+            ok &= WaitForSingleObject(event, 200) == WAIT_OBJECT_0;
+        ms = ms_since(t0);
+        CHECK(ok && ms > 25 && ms < 120, "ScheduleFrameEventX (slot 79) sets the list's event each frame: 3 in %.1f ms",
+              ms);
+        field = other;
+        CHECK(WaitForSingleObject(other, 200) == WAIT_OBJECT_0,
+              "ScheduleFrameEventX reads the title's handle field at each occurrence");
+        XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, const void *, UINT)(dev, 1, 0, NULL, 1);
+        Sleep(50);
+        ResetEvent(other);
+        CHECK(WaitForSingleObject(other, 100) == WAIT_TIMEOUT, "ScheduleFrameEventX flag 1 stops the signals");
+        CloseHandle(other);
+    }
 
     /* GetFrameStatisticsX (slot 81): interval and frame event at once, rendering, presenting and
      * display once a PresentX named the token (the first plane's first field). */
@@ -1198,7 +1216,7 @@ static void test_pacing(void *dev, void *queue)
         CHECK(SUCCEEDED(hr) && count == 2, "GetFrameStatisticsX fills no more than the room it has (%u)", count);
     }
 
-    XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, HANDLE)(dev, 1, 0, NULL);
+    XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, const void *, UINT)(dev, 1, 0, NULL, 1);
     XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 16667, 1);
     CloseHandle(event);
 }

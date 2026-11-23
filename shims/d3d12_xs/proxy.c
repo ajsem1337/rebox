@@ -1258,9 +1258,10 @@ static HRESULT STDMETHODCALLTYPE device_SetFrameIntervalX(struct proxy *p, void 
     return pacing_set_interval(interval_us, period);
 }
 
-static HRESULT STDMETHODCALLTYPE device_ScheduleFrameEventX(struct proxy *p, UINT type, UINT_PTR offset_us, HANDLE event)
+static HRESULT STDMETHODCALLTYPE device_ScheduleFrameEventX(struct proxy *p, UINT type, UINT_PTR offset_us,
+        const void *list, UINT flags)
 {
-    return pacing_schedule(type, offset_us, event);
+    return pacing_schedule(type, offset_us, list, flags);
 }
 
 static HRESULT STDMETHODCALLTYPE device_WaitFrameEventX(struct proxy *p, UINT type, UINT timeout_ms, void *event,
