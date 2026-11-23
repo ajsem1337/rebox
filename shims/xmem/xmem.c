@@ -75,7 +75,9 @@ struct extended_parameter { ULONG64 type; union { ULONG64 ulong64; void *pointer
 void *xmem_low_alloc2(void *address, SIZE_T size, DWORD type, DWORD protect)
 {
     static PVOID (WINAPI *va2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
-    struct address_requirements req = { NULL, (void *)TITLE_ADDRESS_LIMIT, 0 };
+    /* From 4 GiB: lower addresses are RADV's 32-bit range, or below its VA space, so memory there
+     * can't be made GPU memory at its own address (gpu_memory_adopt). */
+    struct address_requirements req = { (void *)0x100000000ull, (void *)TITLE_ADDRESS_LIMIT, 0 };
     struct extended_parameter param = { 1 /* MemExtendedParameterAddressRequirements */, { .pointer = &req } };
     static LONG failed;
     void *p;

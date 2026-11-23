@@ -426,6 +426,8 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
     base = address & ~(ADOPT_GRANULE - 1);
     limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
+    if (limit - end < ADOPT_MIN) /* near the granule's end: into the next one too */
+        limit += ADOPT_GRANULE;
     if (base < run_start)
         base = run_start;
     if (limit > run_end)
