@@ -258,12 +258,13 @@ down missing translations.
   submission re-checks a fingerprint of 32 points in up to 512 textures (round robin), which sees
   a texture rewritten but not a small edit between the points (`REBOX_TEXTURE_WATCH=0` turns
   it off). A texture placed on memory that isn't committed yet waits until it is (rechecked after
-  1, 2, 4, ... up to 1024 submissions). Which console layout
-  means which swizzle mode isn't known: `REBOX_TEXTURE_SWIZZLE=auto` (default) follows the target title's
-  texture pools: cubemaps and volumes `SW_4KB_S`, other arrays `SW_64KB_D`, and single textures
-  `SW_64KB_D` from 1 MiB of mip 0, or with no mip chain from 64 KiB padded, `SW_4KB_S` otherwise
-  (true of all but one of the pools' 351,795 2D textures); each
-  distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one.
+  1, 2, 4, ... up to 1024 submissions). `REBOX_TEXTURE_SWIZZLE=auto` (default): a console
+  `Layout` from 0x100 is 0x100 plus the swizzle mode (0x100 linear, 0x105 `SW_4KB_S`, 0x10A
+  `SW_64KB_D`); Layout 2 or desc flag 0x08000000 `SW_64KB_D`; otherwise cubemaps, volumes and
+  plain 2D textures `SW_4KB_S` and other arrays `SW_64KB_D` (xcl, TuxBox, the target title's pools); each
+  distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one. A texture a GPU copy
+  writes (a UE5 title's font atlas) stops being uploaded from title memory, and textures up to 4 MiB
+  are compared whole, so small edits are seen.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
   ignores them, and the smoke test checks that it still does. Their meaning is unknown. Pipeline

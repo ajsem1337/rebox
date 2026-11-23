@@ -1450,6 +1450,44 @@ static void STDMETHODCALLTYPE list_Barrier(struct proxy *p, UINT32 count, const 
             count, groups);
 }
 
+/* Copies into a title texture (one filled from title memory) make it the GPU's: a UE5 title's font
+ * atlas is zeros in memory and gets its glyphs by CopyTextureRegion (xcl's finding), so uploading
+ * memory over it would wipe them. */
+static void note_copy_dest(ID3D12Resource *dst)
+{
+    D3D12_RESOURCE_DESC rd;
+    if (!dst)
+        return;
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)dst)[10])(dst, &rd);
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        title_texture_gpu_written(dst);
+}
+
+/* Slot 16 (and the copy list's 12): CopyTextureRegion. */
+static void STDMETHODCALLTYPE list_CopyTextureRegion(struct proxy *p, const D3D12_TEXTURE_COPY_LOCATION *dst,
+        UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box)
+{
+    if (dst)
+        note_copy_dest(dst->pResource);
+    if (dst)
+        note_copy_dest(dst->pResource);
+    ID3D12GraphicsCommandList_CopyTextureRegion(INNER(p, ID3D12GraphicsCommandList), dst, x, y, z, src, box);
+}
+
+/* Slot 17: CopyResource; 84: CopyResourceX, the same with a flags argument. */
+static void STDMETHODCALLTYPE list_CopyResource(struct proxy *p, ID3D12Resource *dst, ID3D12Resource *src)
+{
+    note_copy_dest(dst);
+    ID3D12GraphicsCommandList_CopyResource(INNER(p, ID3D12GraphicsCommandList), dst, src);
+}
+
+static void STDMETHODCALLTYPE list_CopyResourceX(struct proxy *p, ID3D12Resource *dst, ID3D12Resource *src,
+        UINT flags)
+{
+    note_copy_dest(dst);
+    ID3D12GraphicsCommandList_CopyResource(INNER(p, ID3D12GraphicsCommandList), dst, src);
+}
+
 /* Slot 83 (ScarlettX): CopyTextureRegion plus a trailing dword, 0 at every
  * call they saw. */
 static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D12_TEXTURE_COPY_LOCATION *dst,
@@ -1861,7 +1899,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
         FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
         FN(61, list_Slot61),                          /* PC 59 or 57 */
+        FN(16, list_CopyTextureRegion),
+        FN(17, list_CopyResource),
         FN(83, list_CopyTextureRegionX),
+        FN(84, list_CopyResourceX),
         FN(146, list_Barrier),
         FN(148, list_AllocateEmbeddedX),
     };
@@ -1892,7 +1933,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(10, list_Reset),
         FWD(11, 15), /* CopyBufferRegion */
-        FWD(12, 16), /* CopyTextureRegion */
+        FN(12, list_CopyTextureRegion),
         FN(15, list_ResourceBarrier),
     };
     static const struct slot heap_slots[] = {
@@ -1917,7 +1958,6 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
             list_slots[n++] = (struct slot)FWD(x, x < 56 ? x - 4 : x);
     }
     list_slots[n++] = (struct slot)FWD(78, 14);  /* DispatchX */
-    list_slots[n++] = (struct slot)FWD(84, 17);  /* CopyResourceX */
     for (unsigned pc = 60; pc <= 76; pc++)
         list_slots[n++] = (struct slot)FWD(pc + 45, pc);
     list_slots[n++] = (struct slot)FWD(124, 77); /* RSSetShadingRate */

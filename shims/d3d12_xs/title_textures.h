@@ -9,5 +9,8 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
 void title_textures_upload(ID3D12CommandQueue *queue);
 UINT64 title_texture_size(const D3D12_RESOURCE_DESC *desc);
 /* Whether a texture is filled from title memory: its address and how often it was uploaded. */
+/* A GPU copy writes the texture (recorded): from then on its texels are the GPU's, and title memory
+ * is no longer uploaded over them. */
+void title_texture_gpu_written(ID3D12Resource *resource);
 BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads);
 void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size);

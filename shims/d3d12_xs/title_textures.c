@@ -16,9 +16,11 @@
  * which sees a texture rewritten (a streaming slot refilled), not a small edit between samples.
  * REBOX_TEXTURE_WATCH=0 turns the sampling off.
  *
- * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
- * picks: "auto" (default: ROW_MAJOR descs linear; cubemaps and volumes SW_4KB_S, other arrays
- * SW_64KB_D; single 2D textures by single_texture_mode: what the target title's texture pools show),
+ * The swizzle mode: a console Layout from 0x100 is 0x100 plus the AMD swizzle mode (0x100 linear,
+ * 0x105 SW_4KB_S, 0x10A SW_64KB_D; xcl and TuxBox, xcl checked against xg_xs.dll on 29,700 descs).
+ * Layout 2, or desc flag 0x08000000 (TuxBox), is SW_64KB_D; Layout 0 (the driver's choice) is
+ * SW_4KB_S for a plain single 2D texture whatever its size (the same two). REBOX_TEXTURE_SWIZZLE picks: "auto" (default: those; ROW_MAJOR descs linear;
+ * cubemaps and volumes SW_4KB_S, other arrays SW_64KB_D, what the target title's texture pools show),
  * "64KB_D", "4KB_S", "linear",
  * or "off" (no uploads). Each distinct console layout is logged once with what it got. */
 
@@ -48,6 +50,7 @@ struct title_texture
     UINT check_at, backoff;     /* in submissions */
     UINT64 fingerprint;
     UINT uploads;
+    BOOL gpu_written;           /* a GPU copy wrote it: title memory isn't its contents (font atlases) */
     UINT callback;
     struct title_texture *next;
 };
@@ -161,7 +164,7 @@ static void watch(void)
     for (; t && checked < WATCH_BUDGET && hashed < FULL_HASH_BUDGET; t = t->next, checked++)
         if (t->unreadable)
             recheck(t);
-        else if (sample && !t->dirty && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, TRUE)
+        else if (sample && !t->dirty && !t->gpu_written && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, TRUE)
                  && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
@@ -190,21 +193,6 @@ static int mode_setting(void)
     return setting;
 }
 
-/* A single 2D texture's swizzle mode, by the rule the target title's pools follow for all but one of their
- * 351,795 2D textures (helpers/textures): SW_64KB_D when mip 0 is 1 MiB or more, or when there is
- * only mip 0 and it takes more than 64 KiB in SW_4KB_S (padding included: a 4x2048 BC1 texture
- * is one block wide but pads to 128 KiB); SW_4KB_S otherwise. */
-static enum detile_mode single_texture_mode(const struct detile_surface *s, UINT block, UINT bytes)
-{
-    struct detile_surface one = *s;
-    UINT64 mip0 = (UINT64)((s->width + block - 1) / block) * ((s->height + block - 1) / block) * bytes;
-
-    if (mip0 >= (1u << 20))
-        return DETILE_64KB_D;
-    one.mode = DETILE_4KB_S;
-    one.mips = 1;
-    return s->mips == 1 && detile_size(&one) > 65536 ? DETILE_64KB_D : DETILE_4KB_S;
-}
 
 /* 2D arrays are read a mip (all its slices) at a time: the target title's pools store them that way, and a
  * pool is the texture's memory image (helpers/textures: every array matches Leonida's decoder
@@ -295,8 +283,12 @@ static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12
     surface->mip_major = arrays_mip_major();
     if (setting >= 0)
         surface->mode = setting;
-    else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+    else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || console_desc->Layout == 0x100)
         surface->mode = DETILE_LINEAR;
+    else if (console_desc->Layout == 0x105)
+        surface->mode = DETILE_4KB_S;
+    else if (console_desc->Layout == 0x10a || console_desc->Layout == 2 || (console_desc->Flags & 0x08000000))
+        surface->mode = DETILE_64KB_D;
     /* By shape, as Leonida's census of the pools found (docs/textures_arrays.md): cubemaps (6
      * faces) and volumes SW_4KB_S, other 2D arrays SW_64KB_D, whatever their size. */
     else if (surface->volume || surface->layers == 6)
@@ -304,8 +296,33 @@ static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12
     else if (surface->layers > 1)
         surface->mode = DETILE_64KB_D;
     else
-        surface->mode = single_texture_mode(surface, block, bytes);
+        surface->mode = DETILE_4KB_S;
     return TRUE;
+}
+
+void title_texture_gpu_written(ID3D12Resource *resource)
+{
+    struct title_texture *t;
+
+    if (!resource || !textures)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    for (t = textures; t && t->resource != resource; t = t->next)
+        ;
+    if (t && !t->gpu_written)
+    {
+        static LONG logged;
+        t->gpu_written = TRUE;
+        if (t->dirty)
+        {
+            t->dirty = FALSE;
+            InterlockedDecrement(&dirty_count);
+        }
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: texture at %#llx (%ux%u) is written by GPU copies; title memory is no longer "
+                         "uploaded over it", (unsigned long long)t->address, t->surface.width, t->surface.height);
+    }
+    ReleaseSRWLockExclusive(&lock);
 }
 
 BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads)
