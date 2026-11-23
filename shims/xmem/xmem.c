@@ -220,6 +220,25 @@ static BOOL is_gpu(const void *address)
 
 static struct gpuva_mailbox *mailbox;
 
+/* A write into title memory the layer is making GPU memory (layers/gpuva_mailbox.h) waits until the
+ * new pages are mapped there, then is retried in them. */
+static LONG CALLBACK hold_busy_writes(EXCEPTION_POINTERS *ep)
+{
+    const EXCEPTION_RECORD *r = ep->ExceptionRecord;
+    UINT64 address, start;
+
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1
+            || !mailbox || !mailbox->busy_size)
+        return EXCEPTION_CONTINUE_SEARCH;
+    address = r->ExceptionInformation[1];
+    start = mailbox->busy_address;
+    if (address < start || address - start >= mailbox->busy_size)
+        return EXCEPTION_CONTINUE_SEARCH;
+    while (mailbox->busy_size && mailbox->busy_address == start)
+        Sleep(0);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 /* The mailbox for making title memory GPU-visible (layers/gpuva_mailbox.h), or NULL. */
 void *WINAPI ReboxGpuvaMailbox(void)
 {
@@ -250,7 +269,10 @@ static void reserve_gpu_window(void)
                      (unsigned long long)base, (unsigned long long)size, GetLastError());
     else if ((mailbox = VirtualAlloc((void *)(base + size - GPUVA_MAILBOX_SIZE), GPUVA_MAILBOX_SIZE, MEM_COMMIT,
                                      PAGE_READWRITE)))
+    {
         mailbox->magic = GPUVA_MAILBOX_MAGIC;
+        AddVectoredExceptionHandler(1, hold_busy_writes);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)

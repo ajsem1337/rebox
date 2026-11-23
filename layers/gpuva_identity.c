@@ -840,11 +840,21 @@ static VkResult map_identity(struct device_data *d, VkDeviceMemory memory, VkDev
         uint64_t temp = window_alloc(m->size, 64 << 10);
         void *p = NULL;
 
+        struct gpuva_mailbox *box = mailbox_get();
+
         if (temp)
         {
             pi.pPlacedAddress = (void *)(uintptr_t)temp;
             if ((vr = d->map2(d->device, &mi, &p)) == VK_SUCCESS)
             {
+                /* Writes wait (xmem.dll's handler) from here until the new pages are in place, so
+                 * none is lost; reads go on. */
+                if (box)
+                {
+                    box->busy_address = m->address;
+                    __atomic_store_n(&box->busy_size, m->size, __ATOMIC_RELEASE);
+                    mprotect((void *)(uintptr_t)m->address, m->size, PROT_READ);
+                }
                 memcpy((void *)(uintptr_t)temp, (void *)(uintptr_t)m->address, m->size);
                 d->unmap2(d->device, &ui);
                 if (!d->unmap_reserve)
@@ -860,7 +870,11 @@ static VkResult map_identity(struct device_data *d, VkDeviceMemory memory, VkDev
             pi.pPlacedAddress = (void *)(uintptr_t)m->address;
             if ((vr = d->map2(d->device, &mi, &p)) == VK_SUCCESS)
                 m->mapped = 1;
+            else if (box) /* the title's own pages, writable again */
+                mprotect((void *)(uintptr_t)m->address, m->size, PROT_READ | PROT_WRITE);
         }
+        if (box)
+            __atomic_store_n(&box->busy_size, 0, __ATOMIC_RELEASE);
         if (vr != VK_SUCCESS)
             layer_log("placed map of title memory at %#" PRIx64 " failed: %d", m->address, vr);
     }
