@@ -1379,6 +1379,30 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                      found ? "slot is empty" : "isn't in the bound heap", w[0], w[1], w[2], w[3],
                                      in->user_sgprs[8], read ? "holds" : "unreadable", table[0], table[1], table[2],
                                      table[3], table[4], table[5], table[6], table[7]);
+                        /* With REBOX_DUMP_SPIRV, the stage's code and the buffer the table's first V# names,
+                         * for disassembly. */
+                        if (getenv("REBOX_DUMP_SPIRV") && logged == 1)
+                        {
+                            char path[MAX_PATH];
+                            FILE *f;
+                            UINT64 base = read ? ((UINT64)(table[1] & 0xffff) << 32 | table[0]) : 0;
+                            UINT64 bytes = (UINT64)table[2] * ((table[1] >> 16) & 0x3fff ? (table[1] >> 16) & 0x3fff : 1);
+                            snprintf(path, sizeof(path), "%s\\%016llx.code.bin", getenv("REBOX_DUMP_SPIRV"),
+                                     (unsigned long long)stage_id);
+                            if ((f = fopen(path, "wb")))
+                            {
+                                fwrite((const BYTE *)h + h->code_offset, 4, h->code_dwords, f);
+                                fclose(f);
+                            }
+                            snprintf(path, sizeof(path), "%s\\%016llx.cb.bin", getenv("REBOX_DUMP_SPIRV"),
+                                     (unsigned long long)stage_id);
+                            if (base && bytes && bytes <= 65536 && !IsBadReadPtr((void *)(ULONG_PTR)base, bytes)
+                                    && (f = fopen(path, "wb")))
+                            {
+                                fwrite((void *)(ULONG_PTR)base, 1, bytes, f);
+                                fclose(f);
+                            }
+                        }
                     }
                     found = TRUE;
                 }
