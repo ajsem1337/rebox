@@ -56,6 +56,7 @@
 #include "../common/rebox_log.h"
 #include "blit.h"
 #include "present.h"
+#include "title_textures.h"
 #include "proxy.h"
 
 #define RING 3
@@ -821,6 +822,24 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
 
     desc = ID3D12Resource_GetDesc(plane);
+    {
+        /* Which resource is shown, and whether it is one filled from title memory. */
+        static ID3D12Resource *last_plane;
+        static LONG logged;
+        UINT64 address = 0;
+        UINT uploads = 0;
+        if (plane != last_plane && InterlockedIncrement(&logged) <= 8)
+        {
+            BOOL title = title_texture_info(plane, &address, &uploads);
+            rebox_log("d3d12_xs: PresentX plane %p: %llux%u, format %u, flags %#x, %s%s", (void *)plane,
+                      (unsigned long long)desc.Width, desc.Height, desc.Format, (UINT)desc.Flags,
+                      title ? "a placed texture filled from title memory" : "GPU memory of its own",
+                      title && !uploads ? " (never uploaded)" : "");
+            if (title)
+                rebox_log("d3d12_xs:   at title address %#llx, uploaded %u times", (unsigned long long)address, uploads);
+        }
+        last_plane = plane;
+    }
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
     {
         static LONG once;
