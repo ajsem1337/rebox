@@ -6,7 +6,10 @@
  * only reports these. So at load, after the title's imports are bound, every IAT entry pointing at
  * one of Wine's stubs is pointed at our own, which logs the name once and returns E_NOTIMPL, like
  * the generated stubs. DLLs loaded later (LoadLibrary of the package's Bink, BVH builder or
- * FidelityFX DLLs) are fixed up from a loader notification, before their DllMain runs. */
+ * FidelityFX DLLs) are fixed up from a loader notification, before their DllMain runs.
+ *
+ * Some functions Wine has but only as failing stubs, where a console title stops if they fail, are
+ * replaced the same way, by the address Wine's export resolves to (replacements[]). */
 
 #include <windows.h>
 #include <psapi.h>
@@ -53,6 +56,42 @@ static ULONG_PTR __attribute__((ms_abi)) unimplemented(struct stub_info *info)
     if (!InterlockedExchange(&info->called, 1))
         rebox_log("unimplemented %s!%s (Wine's host DLL lacks it; returning E_NOTIMPL)", info->dll, info->name);
     return E_NOTIMPL;
+}
+
+/* Process lifetime notifications (api-ms-win-core-psm-appnotify): Wine's returns
+ * ERROR_CALL_NOT_IMPLEMENTED, and a GDK title then exits a second after creating its window.
+ * Registered here, never called: a title isn't suspended or resumed under Wine. */
+static int app_state_registration;
+
+static ULONG WINAPI app_state_register(void *routine, void *context, void **registration)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("RegisterAppStateChangeNotification: registered (the title is never suspended here)");
+    if (registration)
+        *registration = &app_state_registration;
+    return ERROR_SUCCESS;
+}
+
+static void WINAPI app_state_unregister(void *registration)
+{
+}
+
+static struct
+{
+    const char *dll, *name;
+    void *ours, *wine;
+} replacements[] = {
+    { "twinapi.appcore.dll", "RegisterAppStateChangeNotification", app_state_register },
+    { "twinapi.appcore.dll", "UnregisterAppStateChangeNotification", app_state_unregister },
+};
+
+static void *replacement(void *target)
+{
+    for (UINT i = 0; i < ARRAYSIZE(replacements); i++)
+        if (replacements[i].wine && replacements[i].wine == target)
+            return replacements[i].ours;
+    return NULL;
 }
 
 static BOOL is_wine_stub(const void *p)
@@ -120,6 +159,16 @@ static UINT fix_module(HMODULE module)
             DWORD old;
             void *ours;
 
+            if ((ours = replacement(*iat)))
+            {
+                if (VirtualProtect(iat, sizeof(*iat), PAGE_READWRITE, &old))
+                {
+                    *iat = ours;
+                    VirtualProtect(iat, sizeof(*iat), old, &old);
+                    fixed++;
+                }
+                continue;
+            }
             if (!is_wine_stub(*iat) || !(ours = make_stub(*iat)))
                 continue;
             if (!VirtualProtect(iat, sizeof(*iat), PAGE_READWRITE, &old))
@@ -166,6 +215,11 @@ void import_fixup_run(void)
     DWORD bytes;
 
     InitializeCriticalSection(&stub_lock);
+    for (UINT i = 0; i < ARRAYSIZE(replacements); i++)
+    {
+        HMODULE dll = LoadLibraryA(replacements[i].dll);
+        replacements[i].wine = dll ? (void *)GetProcAddress(dll, replacements[i].name) : NULL;
+    }
     register_notification = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
     if (!register_notification || register_notification(0, dll_loaded, NULL, &cookie))
         rebox_log("import fixup: no DLL load notifications; DLLs loaded later keep Wine's stubs");
