@@ -428,6 +428,16 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
      * filled from title memory, which would overwrite what the GPU drew into it. */
     t->gpu_written = (console_desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
             | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
+    /* A console-only format made a desktop one (proxy.c's pc_format) has another layout than the
+     * console memory's: it isn't uploaded (detiling it overran the upload buffer). */
+    if (desc->Format != console_desc->Format)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: placed texture at %#llx in console format %u (desktop %u): not filled from title memory",
+                      (unsigned long long)address, console_desc->Format, desc->Format);
+        t->gpu_written = TRUE;
+    }
     t->dirty = !t->unreadable && !t->gpu_written;
     AcquireSRWLockExclusive(&lock);
     t->next = textures;
