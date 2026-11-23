@@ -1044,6 +1044,30 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
+    /* REBOX_WATCH_STAGE=<id>[:<offset>]: at that stage's draws, the 16 bytes at the offset (hex,
+     * default 0x20) of the buffer its s8 table's first V# names: the first 16 draws, then every 100th. */
+    if (graphics && getenv("REBOX_WATCH_STAGE"))
+    {
+        BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+        const char *watch = getenv("REBOX_WATCH_STAGE"), *colon = strchr(watch, ':');
+        char id[24];
+        snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+        if (!strncmp(watch, id, 16))
+        {
+            static LONG draws;
+            LONG n = InterlockedIncrement(&draws);
+            UINT32 v[4];
+            UINT64 offset = colon ? strtoull(colon + 1, NULL, 16) : 0x20;
+            if ((n <= 16 || !(n % 100)) && in->user_sgprs[8] && ReboxShadowRead(in->user_sgprs[8], v, sizeof(v)))
+            {
+                UINT64 base = (UINT64)(v[1] & 0xffff) << 32 | v[0];
+                const float *f = (const float *)(ULONG_PTR)(base + offset);
+                if (base && !IsBadReadPtr(f, 16))
+                    rebox_log("d3d12_xs: stage %s draw %ld: buffer %#llx + %#llx holds %g %g %g %g", id, n,
+                              (unsigned long long)base, (unsigned long long)offset, f[0], f[1], f[2], f[3]);
+            }
+        }
+    }
     /* REBOX_DUMP_STAGES=<id>,... (with REBOX_DUMP_SPIRV): those stages' code and the first 256 bytes
      * of the table their s8 points at, once each, for disassembly. */
     if (graphics && getenv("REBOX_DUMP_STAGES") && getenv("REBOX_DUMP_SPIRV"))
