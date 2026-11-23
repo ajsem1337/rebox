@@ -2156,6 +2156,16 @@ static void test_real_heap_va(void *dev, void *queue)
             XSLOT(list, 25, void, void *)(list, pso);
             XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
             XSLOT(list, 124, void, UINT, const void *)(list, 0, NULL);
+            /* SetPipelineState1 at 120 and DispatchRays at 121 (PC 75 and 76): a state object that
+             * isn't ours (Unreal 5 sets some) is skipped, and so are its rays. */
+            {
+                static void *const no_methods[16];
+                static struct { void *const *vtbl; BYTE junk[256]; } stranger = { no_methods };
+                D3D12_DISPATCH_RAYS_DESC rays = { .Width = 1, .Height = 1, .Depth = 1 };
+                XSLOT(list, 120, void, void *)(list, &stranger);
+                XSLOT(list, 121, void, const D3D12_DISPATCH_RAYS_DESC *)(list, &rays);
+                XSLOT(list, 25, void, void *)(list, pso);
+            }
             XSLOT(list, 59, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 0, NULL, 0);
             hr = XSLOT(list, 9, HRESULT)(list);
             XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
@@ -2164,7 +2174,7 @@ static void test_real_heap_va(void *dev, void *queue)
                 Sleep(10);
             if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
             {
-                CHECK(mapped[0] == 0x5ca71e77, "list slot 59 runs ExecuteIndirect, after slot 124 (%#x)", mapped[0]);
+                CHECK(mapped[0] == 0x5ca71e77, "list slot 59 runs ExecuteIndirect, after slots 124, 120 and 121 (%#x)", mapped[0]);
                 ID3D12Resource_Unmap(buf, 0, NULL);
             }
         }
@@ -3888,15 +3898,15 @@ static void test_xbox(void)
                     CHECK(SUCCEEDED(so_hr) && pipeline, "CreateStateObject (device slot 101) gives a placeholder pipeline");
                     if (pipeline)
                     {
-                        XSLOT(list4, 114, void, void *)(list4, pipeline);
-                        XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                        XSLOT(list4, 122, void, void *)(list4, pipeline);
+                        XSLOT(list4, 123, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
                         /* A state object that isn't ours (Unreal 5 passed some): skipped too, not
                          * handed to vkd3d-proton, which would take it for one of its own. */
                         {
                             static void *const no_methods[16];
                             static struct { void *const *vtbl; BYTE junk[256]; } stranger = { no_methods };
-                            XSLOT(list4, 114, void, void *)(list4, &stranger);
-                            XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                            XSLOT(list4, 122, void, void *)(list4, &stranger);
+                            XSLOT(list4, 123, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
                         }
                         /* ... and indirectly (list slot 61 with a rays signature, as Unreal 5 does). */
                         {

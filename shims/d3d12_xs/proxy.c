@@ -2140,7 +2140,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
 #define EMBEDDED_KEEP_RESETS 3
 
 /* Console methods with nothing to do on the host (cache flushes, depth bounds). */
-/* Ray tracing on a list (0x20004 slots 114 and 115, PC 67 and 68): a placeholder pipeline
+/* Ray tracing on a list (PC 75 and 76: slots 120 and 121, 122 and 123 from SDK 0x20004): a placeholder pipeline
  * (state_object.c) never reaches vkd3d-proton, and rays dispatched with one are skipped. Every
  * state object we hand out is a placeholder, so anything else isn't vkd3d-proton's either: Unreal 5
  * passed such objects here, which vkd3d-proton's breadcrumbs read as one of its own and crashed on
@@ -2573,6 +2573,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(120, list_SetPipelineState1),              /* PC 75 (Unreal 5: 54 calls in a run) */
+        FN(121, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
@@ -2602,8 +2604,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(20, list_IASetPrimitiveTopology),
-        FN(114, list_SetPipelineState1),              /* PC 67 */
-        FN(115, list_DispatchRays),                   /* PC 68 */
+        FN(122, list_SetPipelineState1),              /* PC 75 */
+        FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
