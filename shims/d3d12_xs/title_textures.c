@@ -501,6 +501,27 @@ static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommand
         free(rows);
         return NULL;
     }
+    /* The console surface has to fit the desktop resource's footprints: detiling writes each of
+     * its mips' rows at the footprint's pitch, unchecked (a mismatch overran the upload buffer). */
+    if (t->subresources > (UINT)desc.MipLevels * (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize))
+        ok = FALSE;
+    for (UINT i = 0; i < t->subresources && ok; i++)
+    {
+        UINT mip = i % t->surface.mips;
+        UINT w = max(1u, t->surface.width >> mip), h = max(1u, t->surface.height >> mip);
+        if (fp[i].Footprint.Width < w || fp[i].Footprint.Height < h)
+            ok = FALSE;
+    }
+    if (!ok)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: placed texture at %#llx (%ux%u, %u mips): its console layout doesn't fit the "
+                      "resource (%llux%u, %u mips, format %u); not filled from title memory",
+                      (unsigned long long)t->address, t->surface.width, t->surface.height, t->surface.mips,
+                      (unsigned long long)desc.Width, desc.Height, desc.MipLevels, desc.Format);
+        t->gpu_written = TRUE;
+    }
     for (UINT i = 0; i < t->subresources && ok; i++)
     {
         UINT mip = i % t->surface.mips, layer = i / t->surface.mips;
