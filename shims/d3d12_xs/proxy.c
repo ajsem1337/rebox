@@ -2283,15 +2283,38 @@ UINT WINAPI ReboxDesktopStreamTypes(const void *stream, SIZE_T size, UINT *types
 /* Slot 86: ID3D12Device2::CreatePipelineState (PC 47), a pipeline from a stream of subobjects, as
  * Unreal 5's Xbox RHI makes them (a UE5 sample, XboxCommonD3D12PipelineState.cpp). Forwarded
  * without the console's own subobjects (desktop_stream): vkd3d-proton takes the console shaders in
- * it as in the other pipeline paths. A stream it still refuses has its first type logged. */
+ * it as in the other pipeline paths. A stream it still refuses has its first type logged.
+ *
+ * A stream whose console mesh shader sits in the amplification slot with no mesh shader of its own
+ * (the target title's minimap: a 24 and a pixel shader) is refused, E_INVALIDARG: xcl (ivall/xcl)
+ * found that the title renders nothing from then on when they're made (translated, black every
+ * run), and gets to its menus refusing them. REBOX_MESH_PIPELINES=1 makes them, with the console
+ * stages renumbered (and fallback shaders where they don't translate). */
 static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
         REFIID riid, void **out)
 {
     D3D12_PIPELINE_STATE_STREAM_DESC storage;
     ID3D12Device2 *device2 = NULL;
     BYTE *copy = NULL;
-    HRESULT hr = IUnknown_QueryInterface(p->inner, &IID_ID3D12Device2, (void **)&device2);
+    HRESULT hr;
 
+    if (desc && desc->pPipelineStateSubobjectStream && desc->SizeInBytes
+            && console_mesh_numbering(desc->pPipelineStateSubobjectStream,
+                                      (const BYTE *)desc->pPipelineStateSubobjectStream + desc->SizeInBytes))
+    {
+        const char *make = getenv("REBOX_MESH_PIPELINES");
+        if (!make || *make != '1')
+        {
+            static LONG refused;
+            if (InterlockedIncrement(&refused) <= 4)
+                rebox_log("d3d12_xs: a mesh pipeline with the console's numbering refused (REBOX_MESH_PIPELINES=1 "
+                          "makes it)");
+            if (out)
+                *out = NULL;
+            return E_INVALIDARG;
+        }
+    }
+    hr = IUnknown_QueryInterface(p->inner, &IID_ID3D12Device2, (void **)&device2);
     if (FAILED(hr))
         return hr;
     hr = ID3D12Device2_CreatePipelineState(device2, desc && desc->pPipelineStateSubobjectStream
