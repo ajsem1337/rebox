@@ -261,13 +261,33 @@ void queue_association(uint64_t token, task::Queue* queue) {
 }
 
 // The title has the user: every registered callback hears of the gamepad, once.
-void user_handed_over() {
-  if (g_user_handed_over.exchange(true)) return;
+void associate_all() {
   std::vector<std::pair<uint64_t, task::Queue*>> due;
   AcquireSRWLockShared(&g_associations_lock);
   for (auto& [token, r] : g_associations) due.emplace_back(token, r.queue);
   ReleaseSRWLockShared(&g_associations_lock);
   for (auto& [token, queue] : due) queue_association(token, queue);
+}
+
+// XGR_REASSOCIATE_SECONDS=N (diagnostic): the association again every N seconds, for a screen
+// that only counts controllers that connect while it is open.
+DWORD WINAPI reassociate(void* param) {
+  DWORD ms = static_cast<DWORD>(reinterpret_cast<uintptr_t>(param)) * 1000;
+  for (;;) {
+    Sleep(ms);
+    associate_all();
+  }
+}
+
+void user_handed_over() {
+  if (g_user_handed_over.exchange(true)) return;
+  associate_all();
+  if (const char* e = std::getenv("XGR_REASSOCIATE_SECONDS")) {
+    uintptr_t seconds = std::strtoul(e, nullptr, 10);
+    if (seconds) {
+      if (HANDLE t = CreateThread(nullptr, 0, reassociate, reinterpret_cast<void*>(seconds), 0, nullptr)) CloseHandle(t);
+    }
+  }
 }
 
 HRESULT XUserRegisterForDeviceAssociationChanged_impl(void*, task::Queue* queue, void* context, const void* callback,
