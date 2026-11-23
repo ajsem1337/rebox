@@ -134,10 +134,15 @@ if [[ -n ${REBOX_SRC:-} && ${REBOX_AUTO_STUBS:-1} == 1 ]]; then
             ( [[ -n ${REBOX_BUILD_ENV:-} ]] && . "$REBOX_BUILD_ENV"
               make -C "$rebuilt" -j"$(nproc)" shims ${REBOX_MAKE_FLAGS:-} ) > "$rebuilt/build.log" 2>&1 \
                 || die "rebuilding the shims with stubs failed: $rebuilt/build.log"
-            cp "$REBOX_SHIMS_DIR"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null \
-                || cp "${REBOX_ANYPS5_DIR:-/nonexistent}"/rebox_anyps5.dll "$rebuilt/build/" 2>/dev/null || true
             echo "$key" > "$rebuilt/.key"
         fi
+        # AnyPS5 is its own package, outside the key, so it's refreshed on every launch.
+        for anyps5 in "$REBOX_SHIMS_DIR" "${REBOX_ANYPS5_DIR:-/nonexistent}"; do
+            if [[ -f $anyps5/rebox_anyps5.dll ]]; then
+                install -m 644 "$anyps5"/rebox_anyps5.dll "$rebuilt/build/"
+                break
+            fi
+        done
         REBOX_SHIMS_DIR="$rebuilt/build"
         grep -E '^generated' "$WINEPREFIX/imports.txt" | sed 's/^/rebox-run: /' >&2
     fi
