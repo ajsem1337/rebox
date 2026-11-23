@@ -460,12 +460,31 @@ static void CheckUser() {
   HRESULT hr = device.At<HRESULT (*)(void*, const DeviceId*, void**)>(3, "XUserFindForDevice")(device.self, &anyDevice, &found);
   Check(hr == kUserNotFound && !found, "XUserFindForDevice finds nobody before XUserAddAsync");
 
+  // Registered before the title has the user: nothing until XUserAddResult, then one change.
+  void* early = nullptr;
+  g_threading.At<HRESULT (*)(void*, uint32_t, uint32_t, void**)>(12, "XTaskQueueCreate")(g_threading.self, 0, 0, &early);
+  auto dispatchEarly = [&] {
+    while (g_threading.At<BOOLEAN (*)(void*, void*, uint32_t, uint32_t)>(16, "XTaskQueueDispatch")(g_threading.self, early, 1, 0)) {
+    }
+  };
+  Token earlyToken{};
+  HRESULT earlyHr = device.At<HRESULT (*)(void*, void*, void*, void*, Token*)>(4, "XUserRegisterForDeviceAssociationChanged")(
+      device.self, early, nullptr, reinterpret_cast<void*>(&AssociationCallback), &earlyToken);
+  dispatchEarly();
+  Check(earlyHr == S_OK && g_association_calls == 0, "XUserRegisterForDeviceAssociationChanged waits for the user to be added");
+
   AsyncBlock add{};
   hr = user.At<HRESULT (*)(void*, uint32_t, AsyncBlock*)>(7, "XUserAddAsync")(user.self, 1, &add);
   WaitAsync(&add);
   void* handle = nullptr;
   hr = user.At<HRESULT (*)(void*, AsyncBlock*, void**)>(8, "XUserAddResult")(user.self, &add, &handle);
   Check(hr == S_OK && handle, "XUserAddAsync gives the local user");
+  dispatchEarly();
+  Check(g_association_calls == 1 && g_association.newUser.value != 0,
+        "XUserAddResult associates the gamepad for a callback registered before");
+  device.At<BOOLEAN (*)(void*, Token, BOOLEAN)>(5, "XUserUnregisterForDeviceAssociationChanged")(device.self, earlyToken, TRUE);
+  g_threading.At<void (*)(void*, void*)>(17, "XTaskQueueCloseHandle")(g_threading.self, early);
+  g_association_calls = 0;
 
   hr = device.At<HRESULT (*)(void*, const DeviceId*, void**)>(3, "XUserFindForDevice")(device.self, &anyDevice, &found);
   Check(hr == S_OK && found == handle, "XUserFindForDevice associates the local user with any device");

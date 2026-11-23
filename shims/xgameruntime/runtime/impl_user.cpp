@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <set>
+#include <map>
+#include <utility>
+#include <vector>
 
 #include "gtx/log.h"
 #include "xgr_internal.h"
@@ -80,8 +82,11 @@ HRESULT XUserAddAsync_impl(void*, uint32_t options, task::AsyncBlock* a) {
   if (FAILED(hr)) return hr;
   return task::AsyncSchedule(a, 0);
 }
+void user_handed_over();
 HRESULT XUserAddResult_impl(void*, task::AsyncBlock* a, void** out) {
-  return task::AsyncGetResult(a, reinterpret_cast<const void*>(&XUserAddAsync_impl), sizeof(void*), out, nullptr);
+  HRESULT hr = task::AsyncGetResult(a, reinterpret_cast<const void*>(&XUserAddAsync_impl), sizeof(void*), out, nullptr);
+  if (SUCCEEDED(hr)) user_handed_over();
+  return hr;
 }
 
 HRESULT XUserDuplicateHandle_impl(void*, void* h, void** out) {
@@ -194,72 +199,104 @@ HRESULT register_never_fired(const void* callback, task::RegistrationToken* tok)
 }
 
 // Device association: the gamepad (gameinput's device, id "rebox" 1) belongs to the local user.
-// a GDK title marks a controller connected only from this callback (xcl, GPL-2.0-only), so on
-// registration it gets one change on its queue: that device, from no user to ours.
+// a GDK title marks a controller connected only from this callback, and its UI screens (create
+// world) take gamepad input only from a connected controller. As in xcl (GPL-2.0-only), the change
+// (that device, from no user to ours) goes to each registered callback, on its queue, once the
+// title has the user (XUserAddResult): delivered earlier, a GDK title dropped it. A callback
+// registered after that gets it at once.
 struct DeviceAssociationChange {
   AppLocalDeviceId deviceId;
   LocalId oldUser;
   LocalId newUser;
 };
 using DeviceAssociationCallback = void(CALLBACK*)(void* context, const DeviceAssociationChange* change);
-struct AssociationDelivery {
-  task::Queue* queue;
+struct AssociationRegistration {
+  task::Queue* queue;  // our own handle: the title's queue, or the process queue
   void* context;
   DeviceAssociationCallback callback;
+};
+struct AssociationDelivery {
+  task::Queue* queue;
   uint64_t token;
 };
-// Registrations still live: a change queued before the title unregisters is dropped.
-std::set<uint64_t> g_associations;
+std::map<uint64_t, AssociationRegistration> g_associations;
 SRWLOCK g_associations_lock = SRWLOCK_INIT;
-
-bool association_live(uint64_t token) {
-  AcquireSRWLockShared(&g_associations_lock);
-  bool live = g_associations.count(token) != 0;
-  ReleaseSRWLockShared(&g_associations_lock);
-  return live;
-}
+std::atomic<bool> g_user_handed_over{false};
 
 void CALLBACK deliver_device_association(void* p, bool canceled) {
   auto* d = static_cast<AssociationDelivery*>(p);
-  if (!canceled && association_live(d->token)) {
+  AssociationRegistration r{};
+  bool live = false;
+  AcquireSRWLockShared(&g_associations_lock);
+  auto it = g_associations.find(d->token);
+  if (it != g_associations.end()) {
+    r = it->second;
+    live = true;
+  }
+  ReleaseSRWLockShared(&g_associations_lock);
+  if (!canceled && live) {  // a change queued before the title unregisters is dropped
     DeviceAssociationChange change{};
     static const uint8_t id[] = {'s', 'c', 'a', 'r', 'l', 'e', 't', 't', 1};
     std::memcpy(change.deviceId.value, id, sizeof(id));
     change.oldUser.value = 0;
     change.newUser.value = the_user()->localId;
     gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XUserRegisterForDeviceAssociationChanged", nullptr,
-                    "the gamepad is associated with the local user");
-    d->callback(d->context, &change);
+                    "the gamepad is associated with the local user (callback %llu)",
+                    static_cast<unsigned long long>(d->token));
+    r.callback(r.context, &change);
   }
   task::Close(d->queue);
   delete d;
+}
+
+// Queue the association for one registration (the caller holds no lock).
+void queue_association(uint64_t token, task::Queue* queue) {
+  task::Queue* target = nullptr;
+  if (FAILED(task::Duplicate(queue, &target))) return;
+  auto* d = new AssociationDelivery{target, token};
+  if (FAILED(task::Submit(target, task::PortId::Completion, d, deliver_device_association))) {
+    task::Close(target);
+    delete d;
+  }
+}
+
+// The title has the user: every registered callback hears of the gamepad, once.
+void user_handed_over() {
+  if (g_user_handed_over.exchange(true)) return;
+  std::vector<std::pair<uint64_t, task::Queue*>> due;
+  AcquireSRWLockShared(&g_associations_lock);
+  for (auto& [token, r] : g_associations) due.emplace_back(token, r.queue);
+  ReleaseSRWLockShared(&g_associations_lock);
+  for (auto& [token, queue] : due) queue_association(token, queue);
 }
 
 HRESULT XUserRegisterForDeviceAssociationChanged_impl(void*, task::Queue* queue, void* context, const void* callback,
                                                       task::RegistrationToken* tok) {
   HRESULT hr = register_never_fired(callback, tok);
   if (FAILED(hr)) return hr;
-  AcquireSRWLockExclusive(&g_associations_lock);
-  g_associations.insert(tok->token);
-  ReleaseSRWLockExclusive(&g_associations_lock);
-  task::Queue* target = nullptr;
+  task::Queue* own = nullptr;
   if (queue) {
-    if (FAILED(task::Duplicate(queue, &target))) return S_OK;
-  } else if (!task::GetProcessQueue(&target)) {
+    if (FAILED(task::Duplicate(queue, &own))) return S_OK;
+  } else if (!task::GetProcessQueue(&own)) {
     return S_OK;
   }
-  auto* d = new AssociationDelivery{target, context, reinterpret_cast<DeviceAssociationCallback>(const_cast<void*>(callback)),
-                                    tok->token};
-  if (FAILED(task::Submit(target, task::PortId::Completion, d, deliver_device_association))) {
-    task::Close(target);
-    delete d;
-  }
+  AcquireSRWLockExclusive(&g_associations_lock);
+  g_associations[tok->token] =
+      AssociationRegistration{own, context, reinterpret_cast<DeviceAssociationCallback>(const_cast<void*>(callback))};
+  ReleaseSRWLockExclusive(&g_associations_lock);
+  if (g_user_handed_over) queue_association(tok->token, own);
   return S_OK;
 }
 uint8_t XUserUnregisterForDeviceAssociationChanged_impl(void*, task::RegistrationToken tok, uint8_t) {
+  task::Queue* queue = nullptr;
   AcquireSRWLockExclusive(&g_associations_lock);
-  g_associations.erase(tok.token);
+  auto it = g_associations.find(tok.token);
+  if (it != g_associations.end()) {
+    queue = it->second.queue;
+    g_associations.erase(it);
+  }
   ReleaseSRWLockExclusive(&g_associations_lock);
+  if (queue) task::Close(queue);
   return 1;
 }
 
