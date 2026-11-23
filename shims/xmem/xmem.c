@@ -424,16 +424,29 @@ BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
 #define HOST_PROTECT_BITS 0x1ff
 
 /* Placeholders (the target title reserves 185 MiB with type 0x42000, MEM_RESERVE |
- * MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS): VirtualAlloc refuses them, and only VirtualAlloc2 and
- * mapped views can fill one. They're ordinary reservations here, so XMemMapPhysicalPages and
- * commits work inside them: MEM_REPLACE_PLACEHOLDER commits in the reservation (or just succeeds
- * for a reservation alone), and freeing with MEM_PRESERVE_PLACEHOLDER decommits, keeping it. */
+ * MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, then splits it with kernel32's VirtualFree(MEM_RELEASE |
+ * MEM_PRESERVE_PLACEHOLDER) itself): VirtualAlloc refuses the flags, so they go to VirtualAlloc2,
+ * whose placeholders Wine has. A placeholder takes no plain commit: XMemMapPhysicalPages replaces
+ * one with committed memory. */
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x40000
 #define MEM_REPLACE_PLACEHOLDER 0x4000
 #define MEM_COALESCE_PLACEHOLDERS 0x1
 #define MEM_PRESERVE_PLACEHOLDER 0x2
 #endif
+
+static void *virtual_alloc2(void *address, SIZE_T size, DWORD type, DWORD protect)
+{
+    static PVOID (WINAPI *va2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
+    if (!va2)
+        va2 = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2");
+    if (!va2)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return NULL;
+    }
+    return va2(NULL, address, size, type, protect, NULL, 0);
+}
 
 void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
 {
@@ -445,14 +458,10 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
     if ((protect & ~HOST_PROTECT_BITS & ~0x600) && !InterlockedExchange(&graphics, 1))
         rebox_log("xmem: XMemVirtualAlloc with GPU access bits (protect %#lx): plain CPU memory here", protect);
     if ((type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)) && !InterlockedExchange(&placeholders, 1))
-        rebox_log("xmem: XMemVirtualAlloc with placeholders (type %#lx): ordinary reservations here", type);
-    if ((type & MEM_REPLACE_PLACEHOLDER) && address)
-    {
-        /* The range is reserved already (the placeholder): commit it, or there's nothing to do. */
-        host_type &= ~MEM_RESERVE;
-        p = host_type & MEM_COMMIT ? VirtualAlloc(address, size, MEM_COMMIT, host_protect ? host_protect : PAGE_READWRITE)
-                                   : address;
-    }
+        rebox_log("xmem: XMemVirtualAlloc with placeholders (type %#lx): real ones, through VirtualAlloc2", type);
+    if (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER))
+        p = virtual_alloc2(address, size, host_type | (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)),
+                           host_protect);
     else
         p = VirtualAlloc(address, size, host_type, host_protect);
 
@@ -464,12 +473,6 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
 
 BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
 {
-    /* Placeholders are ordinary reservations here (XMemVirtualAlloc): splitting or coalescing them
-     * changes nothing, and releasing a part as a placeholder decommits it. */
-    if ((type & MEM_RELEASE) && (type & MEM_PRESERVE_PLACEHOLDER))
-        return VirtualFree(address, size, MEM_DECOMMIT) || GetLastError() == ERROR_INVALID_ADDRESS;
-    if ((type & MEM_RELEASE) && (type & MEM_COALESCE_PLACEHOLDERS))
-        return TRUE;
     return VirtualFree(address, size, type);
 }
 
@@ -531,9 +534,11 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
         return TRUE;
     }
     size = count * token_page_size(pages[0]);
-    /* The range is normally reserved already; if not, reserve it too. */
+    /* The range is normally reserved already; if not, reserve it too. A placeholder of exactly
+     * this size takes no commit, but can be replaced by committed memory. */
     if (VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE)
-            || VirtualAlloc(address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+            || VirtualAlloc(address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            || virtual_alloc2(address, size, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE))
         return TRUE;
     if (InterlockedIncrement(&logged) <= 8)
         rebox_log("xmem: XMemMapPhysicalPages(%p, %lu pages of %lu KiB) failed (error %lu)", address,

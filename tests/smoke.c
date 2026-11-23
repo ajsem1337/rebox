@@ -336,20 +336,29 @@ static void test_xmem(void)
                 VirtualFree(v, 0, MEM_RELEASE);
             }
             /* A placeholder reservation (the target title's: 185 MiB, type 0x42000, PAGE_NOACCESS),
-             * then a placeholder replaced by committed memory, released as a placeholder again. */
+             * split with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) as the title does, then one
+             * piece replaced by committed memory and another given physical pages. */
             {
                 typedef BOOL (WINAPI *vfree_fn)(void *, SIZE_T, DWORD);
                 vfree_fn vfree = (vfree_fn)(void *)GetProcAddress(m, "XMemVirtualFree");
                 BYTE *ph = valloc(NULL, 0xb900000, 0x42000, 0x7, PAGE_NOACCESS), *in;
+                ULONG_PTR one = 1, page[1];
                 CHECK(ph != NULL, "XMemVirtualAlloc reserves a placeholder (type 0x42000) -> %p", ph);
                 if (ph && vfree)
                 {
-                    in = valloc(ph + (1 << 20), 1 << 16, MEM_RESERVE | MEM_COMMIT | 0x4000 /* REPLACE_PLACEHOLDER */, 0,
+                    CHECK(VirtualFree(ph, 1 << 16, MEM_RELEASE | 0x2 /* PRESERVE_PLACEHOLDER */)
+                          && VirtualFree(ph + (1 << 16), 1 << 16, MEM_RELEASE | 0x2),
+                          "the placeholder splits with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)");
+                    in = valloc(ph, 1 << 16, MEM_RESERVE | MEM_COMMIT | 0x4000 /* REPLACE_PLACEHOLDER */, 0,
                                 PAGE_READWRITE);
-                    CHECK(in == ph + (1 << 20), "XMemVirtualAlloc replaces part of it with committed memory -> %p", in);
+                    CHECK(in == ph, "XMemVirtualAlloc replaces a split placeholder with committed memory -> %p", in);
                     if (in) in[0xffff] = 1;
-                    CHECK(vfree(ph + (1 << 20), 1 << 16, MEM_RELEASE | 0x2 /* PRESERVE_PLACEHOLDER */)
-                          && vfree(ph, 0, MEM_RELEASE), "XMemVirtualFree preserves and then releases the placeholder");
+                    CHECK(palloc(0, &one, page) && pmap(ph + (1 << 16), 1, page),
+                          "XMemMapPhysicalPages fills a split placeholder");
+                    if (in) ph[(1 << 16) + 0xffff] = 2;
+                    vfree(ph, 0, MEM_RELEASE);
+                    vfree(ph + (1 << 16), 0, MEM_RELEASE);
+                    vfree(ph + (2 << 16), 0, MEM_RELEASE);
                 }
             }
             range = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
