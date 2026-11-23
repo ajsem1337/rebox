@@ -400,15 +400,16 @@ static void patch_child(void *object)
     ReleaseSRWLockExclusive(&child_lock);
 }
 
-/* ------------------------------------------ texture GPU VAs (mitigation)
+/* ------------------------------------------ texture GPU VAs
  *
  * On the console a texture's GPU VA is the address of its memory, and titles
  * write texel data through it (ScarlettX saw this in a retail title).
- * vkd3d-proton returns 0 for textures, so such a write would crash. Until
- * textures are backed by identity memory with detiling, each texture that is
- * asked gets a scratch block of GPU memory its size: writes land
- * harmlessly, the texture doesn't see them, and it is logged once. The block
- * is freed with the texture. */
+ * vkd3d-proton returns 0 for textures, so each texture that is asked gets a
+ * block of GPU memory at least its console size, registered as a title texture
+ * (title_textures.c): what the title writes there, tiled as on the console, is
+ * detiled into the texture before the queue runs, as for CreatePlacedResourceX.
+ * Render targets, depth and UAV textures keep plain scratch. The block is freed
+ * with the texture. */
 
 typedef UINT64 (STDMETHODCALLTYPE *get_va_fn)(void *);
 typedef ULONG (STDMETHODCALLTYPE *release_fn)(void *);
@@ -430,6 +431,7 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
     D3D12_RESOURCE_DESC desc;
     struct scratch *sc;
     void *cpu = NULL;
+    UINT64 size;
     static LONG logged;
 
     if (va || !device_proxy)
@@ -449,12 +451,28 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
 
     ((D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT,
             const D3D12_RESOURCE_DESC *))PC_SLOT(device_proxy->inner, 25))(device_proxy->inner, &info, 0, 1, &desc);
-    if (FAILED(ReboxGpuAlloc(info.SizeInBytes ? info.SizeInBytes : 65536, 64 << 10, &cpu, NULL)))
+    size = max(info.SizeInBytes, title_texture_size(&desc));
+    if (FAILED(ReboxGpuAlloc(size ? size : 65536, 64 << 10, &cpu, NULL)))
         return 0;
-    if (!InterlockedExchange(&logged, 1))
-        rebox_log("d3d12_xs: title asked for a texture's GPU VA (%ux%u, format %u); giving scratch memory: "
-                     "texel writes through it are not seen by the texture yet", (UINT)desc.Width, desc.Height,
-                     desc.Format);
+    memset(cpu, 0, size);
+    /* Render targets, depth and UAV textures are the GPU's to write: uploading over them would
+     * lose what it drew, so their blocks stay scratch. */
+    if (!(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+    {
+        /* Registered with a zeroed console desc tail (+0x34, +0x38: only logged). */
+        BYTE console_desc[0x40] = { 0 };
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        memcpy(console_desc, &desc, sizeof(desc));
+        present_tracked_state(self, &state);
+        title_texture_register(self, (UINT64)(ULONG_PTR)cpu, (const D3D12_RESOURCE_DESC *)console_desc, &desc, state);
+    }
+    if (InterlockedIncrement(&logged) <= 4)
+        rebox_log("d3d12_xs: title asked for a texture's GPU VA (%ux%u, format %u, flags %#x); %llu bytes of GPU "
+                     "memory there%s", (UINT)desc.Width, desc.Height, desc.Format, desc.Flags, (unsigned long long)size,
+                     desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                   | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+                     ? " (scratch: the GPU writes it)" : ", uploaded into the texture when it changes");
     sc = calloc(1, sizeof(*sc));
     sc->resource = self;
     sc->cpu = cpu;

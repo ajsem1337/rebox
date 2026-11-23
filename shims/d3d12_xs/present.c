@@ -159,6 +159,16 @@ void present_track_state(void *resource, D3D12_RESOURCE_STATES state)
     track(resource, TRACK_LEGACY, state);
 }
 
+/* The state the title's barriers last left a resource in (as recorded, not as executed). */
+BOOL present_tracked_state(void *resource, D3D12_RESOURCE_STATES *state)
+{
+    UINT kind, value;
+    if (!lookup(resource, &kind, &value) || kind != TRACK_LEGACY)
+        return FALSE;
+    *state = value;
+    return TRUE;
+}
+
 void present_track_barriers(UINT count, const D3D12_RESOURCE_BARRIER *barriers)
 {
     for (UINT i = 0; barriers && i < count; i++)

@@ -617,6 +617,84 @@ static void test_gpu_memory(HMODULE m)
     gfree(cpu);
 }
 
+/* Texels a title writes through a texture's GPU VA (console textures are their memory) reach the
+ * texture: d3d12_xs backs the VA with GPU memory it detiles into the texture before the queue
+ * runs. One colour everywhere, so the result doesn't depend on which tiling is assumed. */
+static void test_texture_va_upload(void *dev, void *queue)
+{
+    D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, rb = { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 1024 * 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_RESOURCE_BARRIER barrier = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+    D3D12_TEXTURE_COPY_LOCATION dst = { 0 }, src = { 0 };
+    ID3D12Resource *tex = NULL, *readback = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *list = NULL, *mapped;
+    UINT32 *texels;
+    UINT64 va = 0;
+    HRESULT hr;
+
+    hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+            D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &def, D3D12_HEAP_FLAG_NONE,
+            &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &rb, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&readback);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr) && !(va = ID3D12Resource_GetGPUVirtualAddress(tex)))
+        hr = E_FAIL;
+    CHECK(SUCCEEDED(hr), "texture, readback and list for texels written through a GPU VA (%#lx)", hr);
+    if (FAILED(hr))
+        goto done;
+    texels = (UINT32 *)(ULONG_PTR)va;
+    for (UINT i = 0; i < 256 * 256; i++)
+        texels[i] = 0xff20c040;
+
+    barrier.Transition.pResource = tex;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, &barrier);
+    dst.pResource = readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 1024 };
+    src.pResource = tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+          const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, &mapped)))
+    {
+        UINT32 a = ((UINT32 *)mapped)[0], b = ((UINT32 *)mapped)[100 * 256 + 37];
+        CHECK(a == 0xff20c040 && b == 0xff20c040,
+              "texels written through a texture's GPU VA reach the texture (%08x %08x, want ff20c040)", a, b);
+        ID3D12Resource_Unmap(readback, 0, NULL);
+    }
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (readback) ID3D12Resource_Release(readback);
+    if (tex) ID3D12Resource_Release(tex);
+}
+
 /* Reads pixel (0,0) of a 32-bit BMP written by PresentX's frame dump. */
 static BOOL read_dump_pixel(const char *dir, int frame, BYTE bgra[4])
 {
@@ -3445,6 +3523,7 @@ static void test_xbox(void)
 
     test_dxgi_device(dev);
     test_pacing(dev, queue);
+    test_texture_va_upload(dev, queue);
     test_console_draw(dev, queue, FALSE);
     test_console_draw(dev, queue, TRUE);
     test_xbox_root_flags(dev);

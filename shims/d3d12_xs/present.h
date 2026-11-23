@@ -16,5 +16,6 @@ void present_queue_destroy(struct present_queue *state);
  * state the title left it in. Fed from resource creation and from the
  * barriers the title records. */
 void present_track_state(void *resource, D3D12_RESOURCE_STATES state);
+BOOL present_tracked_state(void *resource, D3D12_RESOURCE_STATES *state);
 void present_track_barriers(UINT count, const D3D12_RESOURCE_BARRIER *barriers);
 void present_track_enhanced(UINT32 count, const D3D12_BARRIER_GROUP *groups);

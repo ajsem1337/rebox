@@ -248,6 +248,47 @@ static BOOL readable(UINT64 address, UINT64 size)
     return TRUE;
 }
 
+/* The console surface for a texture: its shape from the PC desc, its swizzle mode from the setting,
+ * the console layout or the shape. FALSE for what isn't uploaded (buffers, MSAA, unknown formats). */
+static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12_RESOURCE_DESC *desc,
+                            struct detile_surface *surface)
+{
+    int setting = mode_setting();
+    UINT block, bytes;
+
+    if (setting == -3 || !desc || desc->Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc->SampleDesc.Count > 1 || !(bytes = detile_element(desc->Format, &block)))
+        return FALSE;
+    memset(surface, 0, sizeof(*surface));
+    surface->format = desc->Format;
+    surface->width = (UINT)desc->Width;
+    surface->height = desc->Height;
+    surface->layers = desc->DepthOrArraySize;
+    surface->volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    surface->mips = desc->MipLevels ? desc->MipLevels : 1;
+    surface->mip_major = arrays_mip_major();
+    if (setting >= 0)
+        surface->mode = setting;
+    else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+        surface->mode = DETILE_LINEAR;
+    /* By shape, as Leonida's census of the pools found (docs/textures_arrays.md): cubemaps (6
+     * faces) and volumes SW_4KB_S, other 2D arrays SW_64KB_D, whatever their size. */
+    else if (surface->volume || surface->layers == 6)
+        surface->mode = DETILE_4KB_S;
+    else if (surface->layers > 1)
+        surface->mode = DETILE_64KB_D;
+    else
+        surface->mode = single_texture_mode(surface, block, bytes);
+    return TRUE;
+}
+
+/* The bytes a texture takes in console memory (0 if it isn't uploaded). */
+UINT64 title_texture_size(const D3D12_RESOURCE_DESC *desc)
+{
+    struct detile_surface surface;
+    return console_surface(desc, desc, &surface) ? detile_size(&surface) : 0;
+}
+
 void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D12_RESOURCE_DESC *console_desc,
                             const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state)
 {
@@ -255,37 +296,19 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     static LONG seen_count;
     struct title_texture *t;
     ID3DDestructionNotifier *notifier;
-    int setting = mode_setting();
-    UINT block, bytes, x34 = *(const UINT *)((const BYTE *)console_desc + 0x34);
+    UINT x34 = *(const UINT *)((const BYTE *)console_desc + 0x34);
     BOOL logged = FALSE;
 
-    if (setting == -3 || !resource || !desc || desc->Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || desc->SampleDesc.Count > 1 || !(bytes = detile_element(desc->Format, &block)))
+    if (!resource || !(t = calloc(1, sizeof(*t))))
         return;
-    if (!(t = calloc(1, sizeof(*t))))
+    if (!console_surface(console_desc, desc, &t->surface))
+    {
+        free(t);
         return;
+    }
     t->resource = resource;
     t->address = address;
     t->state = state;
-    t->surface.format = desc->Format;
-    t->surface.width = (UINT)desc->Width;
-    t->surface.height = desc->Height;
-    t->surface.layers = desc->DepthOrArraySize;
-    t->surface.volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    t->surface.mips = desc->MipLevels ? desc->MipLevels : 1;
-    t->surface.mip_major = arrays_mip_major();
-    if (setting >= 0)
-        t->surface.mode = setting;
-    else if (console_desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
-        t->surface.mode = DETILE_LINEAR;
-    /* By shape, as Leonida's census of the pools found (docs/textures_arrays.md): cubemaps (6
-     * faces) and volumes SW_4KB_S, other 2D arrays SW_64KB_D, whatever their size. */
-    else if (t->surface.volume || t->surface.layers == 6)
-        t->surface.mode = DETILE_4KB_S;
-    else if (t->surface.layers > 1)
-        t->surface.mode = DETILE_64KB_D;
-    else
-        t->surface.mode = single_texture_mode(&t->surface, block, bytes);
     t->subresources = t->surface.mips * (t->surface.volume ? 1 : t->surface.layers);
     t->size = detile_size(&t->surface);
 
