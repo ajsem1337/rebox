@@ -335,6 +335,23 @@ static void test_xmem(void)
                 if (c) c[0xffff] = 1;
                 VirtualFree(v, 0, MEM_RELEASE);
             }
+            /* A placeholder reservation (the target title's: 185 MiB, type 0x42000, PAGE_NOACCESS),
+             * then a placeholder replaced by committed memory, released as a placeholder again. */
+            {
+                typedef BOOL (WINAPI *vfree_fn)(void *, SIZE_T, DWORD);
+                vfree_fn vfree = (vfree_fn)(void *)GetProcAddress(m, "XMemVirtualFree");
+                BYTE *ph = valloc(NULL, 0xb900000, 0x42000, 0x7, PAGE_NOACCESS), *in;
+                CHECK(ph != NULL, "XMemVirtualAlloc reserves a placeholder (type 0x42000) -> %p", ph);
+                if (ph && vfree)
+                {
+                    in = valloc(ph + (1 << 20), 1 << 16, MEM_RESERVE | MEM_COMMIT | 0x4000 /* REPLACE_PLACEHOLDER */, 0,
+                                PAGE_READWRITE);
+                    CHECK(in == ph + (1 << 20), "XMemVirtualAlloc replaces part of it with committed memory -> %p", in);
+                    if (in) in[0xffff] = 1;
+                    CHECK(vfree(ph + (1 << 20), 1 << 16, MEM_RELEASE | 0x2 /* PRESERVE_PLACEHOLDER */)
+                          && vfree(ph, 0, MEM_RELEASE), "XMemVirtualFree preserves and then releases the placeholder");
+                }
+            }
             range = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
             CHECK(palloc(0x20000000, &count, pages) && count == 16 && pages[0] != pages[15],
                   "XMemAllocatePhysicalPages hands out 16 distinct pages");

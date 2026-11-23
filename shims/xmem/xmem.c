@@ -423,15 +423,38 @@ BOOL WINAPI XMemGetWorkingSetStatistics(ULONG selector, void *stats)
  * business (docs/d3d12x.md). */
 #define HOST_PROTECT_BITS 0x1ff
 
+/* Placeholders (the target title reserves 185 MiB with type 0x42000, MEM_RESERVE |
+ * MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS): VirtualAlloc refuses them, and only VirtualAlloc2 and
+ * mapped views can fill one. They're ordinary reservations here, so XMemMapPhysicalPages and
+ * commits work inside them: MEM_REPLACE_PLACEHOLDER commits in the reservation (or just succeeds
+ * for a reservation alone), and freeing with MEM_PRESERVE_PLACEHOLDER decommits, keeping it. */
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x40000
+#define MEM_REPLACE_PLACEHOLDER 0x4000
+#define MEM_COALESCE_PLACEHOLDERS 0x1
+#define MEM_PRESERVE_PLACEHOLDER 0x2
+#endif
+
 void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
 {
-    DWORD host_type = type & ~(CONSOLE_PAGE_FLAGS | MEM_PHYSICAL), host_protect = protect & HOST_PROTECT_BITS;
+    DWORD host_type = type & ~(CONSOLE_PAGE_FLAGS | MEM_PHYSICAL | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER),
+          host_protect = protect & HOST_PROTECT_BITS;
     void *p;
-    static LONG calls, failures, graphics;
+    static LONG calls, failures, graphics, placeholders;
 
     if ((protect & ~HOST_PROTECT_BITS & ~0x600) && !InterlockedExchange(&graphics, 1))
         rebox_log("xmem: XMemVirtualAlloc with GPU access bits (protect %#lx): plain CPU memory here", protect);
-    p = VirtualAlloc(address, size, host_type, host_protect);
+    if ((type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)) && !InterlockedExchange(&placeholders, 1))
+        rebox_log("xmem: XMemVirtualAlloc with placeholders (type %#lx): ordinary reservations here", type);
+    if ((type & MEM_REPLACE_PLACEHOLDER) && address)
+    {
+        /* The range is reserved already (the placeholder): commit it, or there's nothing to do. */
+        host_type &= ~MEM_RESERVE;
+        p = host_type & MEM_COMMIT ? VirtualAlloc(address, size, MEM_COMMIT, host_protect ? host_protect : PAGE_READWRITE)
+                                   : address;
+    }
+    else
+        p = VirtualAlloc(address, size, host_type, host_protect);
 
     if (!p ? InterlockedIncrement(&failures) <= 16 : InterlockedIncrement(&calls) <= 4)
         rebox_log("xmem: XMemVirtualAlloc(%p, %#zx, type %#lx, flags %#llx, protect %#lx) -> %p (error %lu)", address,
@@ -441,6 +464,12 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
 
 BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
 {
+    /* Placeholders are ordinary reservations here (XMemVirtualAlloc): splitting or coalescing them
+     * changes nothing, and releasing a part as a placeholder decommits it. */
+    if ((type & MEM_RELEASE) && (type & MEM_PRESERVE_PLACEHOLDER))
+        return VirtualFree(address, size, MEM_DECOMMIT) || GetLastError() == ERROR_INVALID_ADDRESS;
+    if ((type & MEM_RELEASE) && (type & MEM_COALESCE_PLACEHOLDERS))
+        return TRUE;
     return VirtualFree(address, size, type);
 }
 
