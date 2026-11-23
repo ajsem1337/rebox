@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../common/rebox_log.h"
@@ -60,22 +61,150 @@ static ULONG_PTR __attribute__((ms_abi)) unimplemented(struct stub_info *info)
 
 /* Process lifetime and constrained-mode notifications (api-ms-win-core-psm-appnotify): Wine's
  * return ERROR_CALL_NOT_IMPLEMENTED, and a GDK title then stops its game thread and exits
- * with 1 a second after creating its window. Registered here, never called: a title isn't
- * suspended, resumed or constrained under Wine. */
+ * with 1 a second after creating its window. Registered here; a title is never resumed or
+ * constrained under Wine, and it is suspended only when it is closed (below), so it can save. */
+typedef void (CALLBACK *app_state_routine)(BOOLEAN quiesced, void *context);
+static struct app_state { app_state_routine routine; void *context; } app_states[16];
 static int app_state_registration;
+static SRWLOCK app_state_lock = SRWLOCK_INIT;
 
 static ULONG WINAPI app_state_register(void *routine, void *context, void **registration)
 {
     static LONG logged;
     if (!InterlockedExchange(&logged, 1))
-        rebox_log("RegisterAppStateChangeNotification: registered (the title is never suspended here)");
+        rebox_log("RegisterAppStateChangeNotification: registered (the title is suspended only when it's closed)");
+    if (!routine)
+        return ERROR_INVALID_PARAMETER;
+    AcquireSRWLockExclusive(&app_state_lock);
+    for (UINT i = 0; i < ARRAYSIZE(app_states); i++)
+        if (!app_states[i].routine)
+        {
+            app_states[i].routine = routine;
+            app_states[i].context = context;
+            if (registration)
+                *registration = &app_states[i];
+            ReleaseSRWLockExclusive(&app_state_lock);
+            return ERROR_SUCCESS;
+        }
+    ReleaseSRWLockExclusive(&app_state_lock);
     if (registration)
-        *registration = &app_state_registration;
+        *registration = &app_state_registration; /* full: registered, never called */
     return ERROR_SUCCESS;
 }
 
 static void WINAPI app_state_unregister(void *registration)
 {
+    AcquireSRWLockExclusive(&app_state_lock);
+    for (UINT i = 0; i < ARRAYSIZE(app_states); i++)
+        if (registration == &app_states[i])
+            app_states[i].routine = NULL;
+    ReleaseSRWLockExclusive(&app_state_lock);
+}
+
+/* For tests: register an app state routine as the title would. */
+ULONG WINAPI ReboxAppStateRegister(void *routine, void *context, void **registration)
+{
+    return app_state_register(routine, context, registration);
+}
+
+/* Closing the title (its window closed, or Escape): on a console the title is suspended before
+ * it ends, and saves then (a GDK title writes its world). Each app state routine is told the title
+ * is quiescing, on a thread of its own, for up to REBOX_QUIT_TIMEOUT seconds (default 5);
+ * then the process ends. REBOX_QUIT_EXIT=0 only suspends (tests); REBOX_ESCAPE_QUITS=0
+ * leaves Escape to the title. */
+static DWORD env_number(const char *name, DWORD fallback)
+{
+    char v[16];
+    DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+    return n && n < sizeof(v) ? (DWORD)strtoul(v, NULL, 10) : fallback;
+}
+
+static DWORD WINAPI quiesce_title(void *unused)
+{
+    struct app_state copy[ARRAYSIZE(app_states)];
+    AcquireSRWLockShared(&app_state_lock);
+    memcpy(copy, app_states, sizeof(copy));
+    ReleaseSRWLockShared(&app_state_lock);
+    for (UINT i = 0; i < ARRAYSIZE(copy); i++)
+        if (copy[i].routine)
+            copy[i].routine(TRUE, copy[i].context);
+    return 0;
+}
+
+static DWORD quit_timeout, quit_exit; /* read when the quit is asked for */
+
+static DWORD WINAPI quit_title(void *why)
+{
+    DWORD timeout = quit_timeout;
+    HANDLE t;
+
+    rebox_log("quit: %s; suspending the title (up to %lu ms) so it can save", (const char *)why, timeout);
+    if ((t = CreateThread(NULL, 0, quiesce_title, NULL, 0, NULL)))
+    {
+        if (WaitForSingleObject(t, timeout) == WAIT_TIMEOUT)
+            rebox_log("quit: the title is still suspending after %lu ms; ending it anyway", timeout);
+        CloseHandle(t);
+    }
+    if (!quit_exit)
+    {
+        rebox_log("quit: suspended; not ending the process (REBOX_QUIT_EXIT=0)");
+        return 0;
+    }
+    rebox_log("quit: ending the process");
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
+
+static void request_quit(const char *why)
+{
+    static LONG quitting;
+    HANDLE t;
+    if (InterlockedExchange(&quitting, 1))
+        return;
+    quit_timeout = env_number("REBOX_QUIT_TIMEOUT", 5) * 1000;
+    quit_exit = env_number("REBOX_QUIT_EXIT", 1);
+    if ((t = CreateThread(NULL, 0, quit_title, (void *)why, 0, NULL)))
+        CloseHandle(t);
+}
+
+/* The title's top-level windows are subclassed for this: their own window procedures, written for
+ * the console, ignore closing. */
+static const WCHAR old_proc_prop[] = L"rebox.wndproc";
+
+static LRESULT CALLBACK quit_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC old = (WNDPROC)GetPropW(hwnd, old_proc_prop);
+    if (msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wp & 0xfff0) == SC_CLOSE))
+    {
+        request_quit("the window was closed");
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE && env_number("REBOX_ESCAPE_QUITS", 1))
+    {
+        request_quit("Escape was pressed");
+        return 0;
+    }
+    if (!old)
+        return IsWindowUnicode(hwnd) ? DefWindowProcW(hwnd, msg, wp, lp) : DefWindowProcA(hwnd, msg, wp, lp);
+    return IsWindowUnicode(hwnd) ? CallWindowProcW(old, hwnd, msg, wp, lp) : CallWindowProcA(old, hwnd, msg, wp, lp);
+}
+
+static HWND subclass_for_quit(HWND hwnd, HWND parent, DWORD style)
+{
+    LONG_PTR old;
+    if (!hwnd || parent || (style & WS_CHILD))
+        return hwnd;
+    old = IsWindowUnicode(hwnd) ? SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)quit_wndproc)
+                                : SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)quit_wndproc);
+    SetPropW(hwnd, old_proc_prop, (HANDLE)old);
+    return hwnd;
+}
+
+/* For tests (the smoke test has no display, so no top-level window): what a title's top-level
+ * window gets. */
+HWND WINAPI ReboxQuitSubclass(HWND hwnd)
+{
+    return subclass_for_quit(hwnd, NULL, 0);
 }
 
 static ULONG WINAPI app_constrained_register(void *routine, void *context, void **registration)
@@ -119,17 +248,17 @@ static void *real_create_window_w, *real_create_window_a;
 static HWND WINAPI create_window_w(DWORD ex, const WCHAR *cls, const WCHAR *name, DWORD style, int x, int y, int w,
         int h, HWND parent, HMENU menu, HINSTANCE inst, void *param)
 {
-    return ((HWND (WINAPI *)(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
-            void *))real_create_window_w)(ex, cls, name, frameless_style(style, parent), x, y, w, h, parent, menu, inst,
-            param);
+    return subclass_for_quit(((HWND (WINAPI *)(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND,
+            HMENU, HINSTANCE, void *))real_create_window_w)(ex, cls, name, frameless_style(style, parent), x, y, w, h,
+            parent, menu, inst, param), parent, style);
 }
 
 static HWND WINAPI create_window_a(DWORD ex, const char *cls, const char *name, DWORD style, int x, int y, int w,
         int h, HWND parent, HMENU menu, HINSTANCE inst, void *param)
 {
-    return ((HWND (WINAPI *)(DWORD, const char *, const char *, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
-            void *))real_create_window_a)(ex, cls, name, frameless_style(style, parent), x, y, w, h, parent, menu, inst,
-            param);
+    return subclass_for_quit(((HWND (WINAPI *)(DWORD, const char *, const char *, DWORD, int, int, int, int, HWND,
+            HMENU, HINSTANCE, void *))real_create_window_a)(ex, cls, name, frameless_style(style, parent), x, y, w, h,
+            parent, menu, inst, param), parent, style);
 }
 
 static struct
