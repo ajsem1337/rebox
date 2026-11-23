@@ -19,8 +19,17 @@
  *
  * Environment:
  *   REBOX_PRESENT=0        no window or swapchain (frame dumps still work)
- *   REBOX_VSYNC=N          Present sync interval, default 1 (there is no
- *                             other frame pacing yet)
+ *   REBOX_VSYNC=N          Present sync interval, default 1
+ *
+ * A present never blocks the title. vkd3d-proton waits for each present to
+ * reach the screen without a timeout, so when the compositor stops taking
+ * frames (a Wayland window that is hidden or on another workspace gets no
+ * frame callbacks) Present would block the title's render thread for good:
+ * a UE5 title stopped after its first frames that way, and Unreal's garbage
+ * collector then gave up on textures waiting for the render thread. The
+ * swapchain has a frame-latency waitable object instead; when no frame slot
+ * frees within 100 ms the frame is dropped, and later ones are dropped
+ * without waiting until a slot is free again.
  *   REBOX_DUMP_FRAMES=DIR  write presented frames to DIR\frame_<n>.bmp
  *                             (8-bit RGBA/BGRA planes) or .bin
  *   REBOX_DUMP_FRAMES_AT   which frames, comma-separated; default 1,60,600 */
@@ -68,6 +77,9 @@ struct present_queue
     UINT width, height;
     DXGI_FORMAT format;
     BOOL swapchain_failed;
+    HANDLE latency;   /* the swapchain's frame-latency waitable object */
+    BOOL dropping;    /* the last present found no free frame slot */
+    UINT64 dropped;
 };
 
 /* ------------------------------------------------------------- tracking */
@@ -339,6 +351,32 @@ static void wait_idle(struct present_queue *s)
     }
 }
 
+/* A frame slot to present into, or FALSE to drop this frame (see the top). */
+static BOOL frame_slot_free(struct present_queue *s)
+{
+    if (!s->latency)
+        return TRUE;
+    if (WaitForSingleObject(s->latency, s->dropping ? 0 : 100) == WAIT_OBJECT_0)
+    {
+        if (s->dropping)
+            rebox_log("d3d12_xs: PresentX: frames are shown again after %llu dropped",
+                         (unsigned long long)s->dropped);
+        s->dropping = FALSE;
+        return TRUE;
+    }
+    if (!s->dropping)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: PresentX: the display isn't taking frames (window hidden?); dropping them "
+                         "instead of blocking the title");
+        s->dropped = 0;
+    }
+    s->dropping = TRUE;
+    s->dropped++;
+    return FALSE;
+}
+
 static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, DXGI_FORMAT format)
 {
     HRESULT (WINAPI *create_factory)(UINT, REFIID, void **);
@@ -346,7 +384,7 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
         .Width = width, .Height = height, .Format = format, .SampleDesc = { 1, 0 },
         .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT, .BufferCount = RING,
         .Scaling = DXGI_SCALING_STRETCH, .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        .AlphaMode = DXGI_ALPHA_MODE_IGNORE,
+        .AlphaMode = DXGI_ALPHA_MODE_IGNORE, .Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     };
     IDXGIFactory2 *factory = NULL;
     IDXGISwapChain1 *sc1 = NULL;
@@ -364,6 +402,9 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
         wait_idle(s);
         IDXGISwapChain3_Release(s->swapchain);
         s->swapchain = NULL;
+        if (s->latency)
+            CloseHandle(s->latency);
+        s->latency = NULL;
     }
     if (!s->hwnd && !(s->hwnd = create_window(width, height)))
     {
@@ -392,6 +433,9 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
         s->swapchain_failed = TRUE;
         return FALSE;
     }
+    if (FAILED(IDXGISwapChain3_SetMaximumFrameLatency(s->swapchain, RING - 1))
+            || !(s->latency = IDXGISwapChain3_GetFrameLatencyWaitableObject(s->swapchain)))
+        rebox_log("d3d12_xs: PresentX: no frame-latency waitable object; a present may block the title");
     s->width = width;
     s->height = height;
     s->format = format;
@@ -652,7 +696,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
     lookup(plane, &kind, &from);
 
-    show = ensure_swapchain(s, (UINT)desc.Width, desc.Height, format);
+    show = ensure_swapchain(s, (UINT)desc.Width, desc.Height, format) && frame_slot_free(s);
     dump = dump_wanted(frame);
     if (!show && !dump)
         return S_OK;
@@ -742,6 +786,8 @@ void present_queue_destroy(struct present_queue *s)
         wait_idle(s);
     if (s->swapchain)
         IDXGISwapChain3_Release(s->swapchain);
+    if (s->latency)
+        CloseHandle(s->latency);
     if (s->convert)
         ID3D12Resource_Release(s->convert);
     if (s->hwnd)
