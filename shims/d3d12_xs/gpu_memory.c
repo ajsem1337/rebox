@@ -359,18 +359,56 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
     return n;
 }
 
+/* Spans of title memory made GPU memory: 2 MiB-aligned (RADV gives allocations of 2 MiB and more
+ * the PTE fragment's alignment, and libdrm refuses a required address that isn't aligned to it),
+ * and as much of the committed run around the request as ADOPT_GRANULE allows, so neighbouring
+ * placements land in one chunk instead of straddling two. */
+#define ADOPT_ALIGN (2ull << 20)
+#define ADOPT_GRANULE (256ull << 20)
+
+/* The run of committed, writable pages around address: [*start, *end). */
+static BOOL committed_run(UINT64 address, UINT64 *start, UINT64 *end)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    UINT64 at, run_start = 0, run_end = 0;
+
+    if (!VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) || !mbi.AllocationBase)
+        return FALSE;
+    for (at = (UINT64)(ULONG_PTR)mbi.AllocationBase;
+         VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) && mbi.AllocationBase;
+         at = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize)
+    {
+        BOOL usable = mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
+                && !(mbi.Protect & PAGE_GUARD);
+        if (!usable)
+        {
+            if (run_end > address)
+                break;
+            run_start = run_end = 0;
+            continue;
+        }
+        if (!run_end)
+            run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+        run_end = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+    }
+    if (!run_end || address < run_start || address >= run_end)
+        return FALSE;
+    *start = run_start;
+    *end = run_end;
+    return TRUE;
+}
+
 /* Makes [address, address + size) of the title's own memory GPU-visible at the same address: a
  * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address and maps over the
  * title's pages (asked through the mailbox, layers/gpuva_mailbox.h), with the title's bytes
- * copied across. The range is widened to 64 KiB pages. TRUE if the range is GPU memory now. */
+ * copied across. TRUE if the range is GPU memory now. */
 BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
 {
     static struct gpuva_mailbox *(WINAPI *get_mailbox)(void);
     static LONG logged;
     ID3D12Device *device = rebox_shared_device();
-    UINT64 base = address & ~0xffffull, end = (address + size + 0xffff) & ~0xffffull, bytes = end - base;
+    UINT64 end = address + size, run_start, run_end, base, limit, bytes;
     struct gpuva_mailbox *box;
-    MEMORY_BASIC_INFORMATION mbi;
     struct chunk *c;
     void *saved;
     BOOL ok = FALSE;
@@ -382,24 +420,65 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     }
     if (!device || !size || !get_mailbox || !(box = get_mailbox()) || box->magic != GPUVA_MAILBOX_MAGIC)
         return FALSE;
-    /* Only committed, writable memory of the title's: one region, as the console's would be. */
-    for (UINT64 at = base; at < end; at = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize)
-        if (!VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
-                || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
-            return FALSE;
-    if (!(saved = VirtualAlloc(NULL, bytes, MEM_COMMIT, PAGE_READWRITE)))
+    if (!committed_run(address, &run_start, &run_end) || end > run_end)
         return FALSE;
+    /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
+    base = address & ~(ADOPT_GRANULE - 1);
+    limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
+    if (base < run_start)
+        base = run_start;
+    if (limit > run_end)
+        limit = run_end;
+    base = (base + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1);
+    limit &= ~(ADOPT_ALIGN - 1);
 
     AcquireSRWLockExclusive(&lock);
+    /* Already GPU memory, wholly; otherwise keep clear of the chunks there are. */
     for (c = chunks; c; c = c->next)
-        if (base < c->gpu + c->size && c->gpu < end)
-            break;
-    if (c) /* already GPU memory, or partly: only if wholly */
     {
-        ok = address >= c->gpu && address + size <= c->gpu + c->size;
+        if (address >= c->gpu && end <= c->gpu + c->size)
+        {
+            ReleaseSRWLockExclusive(&lock);
+            return TRUE;
+        }
+        if (c->gpu < limit && base < c->gpu + c->size)
+        {
+            if (c->gpu + c->size <= address)
+                base = (c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1);
+            else if (c->gpu >= end)
+                limit = c->gpu & ~(ADOPT_ALIGN - 1);
+            else
+                limit = base; /* the request straddles a chunk: nothing to do */
+        }
+    }
+    if (base > address || limit < end)
+    {
+        /* Below 2 MiB RADV keeps the page alignment: the request's own 64 KiB pages will do. */
+        UINT64 small_base = address & ~0xffffull, small_limit = (end + 0xffff) & ~0xffffull;
+        if (small_limit - small_base < ADOPT_ALIGN && small_base >= run_start && small_limit <= run_end)
+        {
+            base = small_base;
+            limit = small_limit;
+            for (c = chunks; c; c = c->next)
+                if (c->gpu < limit && base < c->gpu + c->size)
+                    limit = base;
+        }
+    }
+    if (base > address || limit < end)
+    {
         ReleaseSRWLockExclusive(&lock);
-        VirtualFree(saved, 0, MEM_RELEASE);
-        return ok;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: title memory %#llx+%#llx can't be made GPU-visible in place (committed run "
+                      "%#llx-%#llx, span %#llx-%#llx)", (unsigned long long)address, (unsigned long long)size,
+                      (unsigned long long)run_start, (unsigned long long)run_end, (unsigned long long)base,
+                      (unsigned long long)limit);
+        return FALSE;
+    }
+    bytes = limit - base;
+    if (!(saved = VirtualAlloc(NULL, bytes, MEM_COMMIT, PAGE_READWRITE)))
+    {
+        ReleaseSRWLockExclusive(&lock);
+        return FALSE;
     }
     memcpy(saved, (void *)(ULONG_PTR)base, bytes);
     box->result = 0;
@@ -430,8 +509,9 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     ReleaseSRWLockExclusive(&lock);
     VirtualFree(saved, 0, MEM_RELEASE);
     if (InterlockedIncrement(&logged) <= 8)
-        rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place", (unsigned long long)base,
-                  (unsigned long long)bytes, ok ? "made" : "could not be made");
+        rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place (for %#llx+%#llx)",
+                  (unsigned long long)base, (unsigned long long)bytes, ok ? "made" : "could not be made",
+                  (unsigned long long)address, (unsigned long long)size);
     return ok;
 }
 
