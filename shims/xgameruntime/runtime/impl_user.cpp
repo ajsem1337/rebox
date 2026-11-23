@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 #include "gtx/log.h"
 #include "xgr_internal.h"
@@ -192,10 +193,75 @@ HRESULT register_never_fired(const void* callback, task::RegistrationToken* tok)
   return S_OK;
 }
 
-HRESULT XUserRegisterForDeviceAssociationChanged_impl(void*, void*, void*, const void* callback, task::RegistrationToken* tok) {
-  return register_never_fired(callback, tok);
+// Device association: the gamepad (gameinput's device, id "rebox" 1) belongs to the local user.
+// a GDK title marks a controller connected only from this callback (xcl, GPL-2.0-only), so on
+// registration it gets one change on its queue: that device, from no user to ours.
+struct DeviceAssociationChange {
+  AppLocalDeviceId deviceId;
+  LocalId oldUser;
+  LocalId newUser;
+};
+using DeviceAssociationCallback = void(CALLBACK*)(void* context, const DeviceAssociationChange* change);
+struct AssociationDelivery {
+  task::Queue* queue;
+  void* context;
+  DeviceAssociationCallback callback;
+  uint64_t token;
+};
+// Registrations still live: a change queued before the title unregisters is dropped.
+std::set<uint64_t> g_associations;
+SRWLOCK g_associations_lock = SRWLOCK_INIT;
+
+bool association_live(uint64_t token) {
+  AcquireSRWLockShared(&g_associations_lock);
+  bool live = g_associations.count(token) != 0;
+  ReleaseSRWLockShared(&g_associations_lock);
+  return live;
 }
-uint8_t XUserUnregisterForDeviceAssociationChanged_impl(void*, task::RegistrationToken, uint8_t) { return 1; }
+
+void CALLBACK deliver_device_association(void* p, bool canceled) {
+  auto* d = static_cast<AssociationDelivery*>(p);
+  if (!canceled && association_live(d->token)) {
+    DeviceAssociationChange change{};
+    static const uint8_t id[] = {'s', 'c', 'a', 'r', 'l', 'e', 't', 't', 1};
+    std::memcpy(change.deviceId.value, id, sizeof(id));
+    change.oldUser.value = 0;
+    change.newUser.value = the_user()->localId;
+    gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XUserRegisterForDeviceAssociationChanged", nullptr,
+                    "the gamepad is associated with the local user");
+    d->callback(d->context, &change);
+  }
+  task::Close(d->queue);
+  delete d;
+}
+
+HRESULT XUserRegisterForDeviceAssociationChanged_impl(void*, task::Queue* queue, void* context, const void* callback,
+                                                      task::RegistrationToken* tok) {
+  HRESULT hr = register_never_fired(callback, tok);
+  if (FAILED(hr)) return hr;
+  AcquireSRWLockExclusive(&g_associations_lock);
+  g_associations.insert(tok->token);
+  ReleaseSRWLockExclusive(&g_associations_lock);
+  task::Queue* target = nullptr;
+  if (queue) {
+    if (FAILED(task::Duplicate(queue, &target))) return S_OK;
+  } else if (!task::GetProcessQueue(&target)) {
+    return S_OK;
+  }
+  auto* d = new AssociationDelivery{target, context, reinterpret_cast<DeviceAssociationCallback>(const_cast<void*>(callback)),
+                                    tok->token};
+  if (FAILED(task::Submit(target, task::PortId::Completion, d, deliver_device_association))) {
+    task::Close(target);
+    delete d;
+  }
+  return S_OK;
+}
+uint8_t XUserUnregisterForDeviceAssociationChanged_impl(void*, task::RegistrationToken tok, uint8_t) {
+  AcquireSRWLockExclusive(&g_associations_lock);
+  g_associations.erase(tok.token);
+  ReleaseSRWLockExclusive(&g_associations_lock);
+  return 1;
+}
 
 constexpr uint32_t kAudioEndpointKindCount = 2;
 

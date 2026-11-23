@@ -401,6 +401,56 @@ static void CheckAccessibility() {
   Check(access.At<HRESULT (*)(void*, uint32_t*)>(5, "XHighContrastGetMode")(access.self, nullptr) == E_INVALIDARG, "XHighContrastGetMode rejects null");
 }
 
+struct DeviceAssociationChange { DeviceId device; LocalId oldUser; LocalId newUser; };
+static int g_association_calls = 0;
+static DeviceAssociationChange g_association{};
+static void CALLBACK AssociationCallback(void* context, const DeviceAssociationChange* change) {
+  g_association_calls++;
+  if (change) g_association = *change;
+  if (context) SetEvent(static_cast<HANDLE>(context));
+}
+
+// The gamepad is associated with the local user once, on registration (a GDK title waits for this
+// before it treats a controller as connected); an unregistration before dispatch drops it.
+static void CheckDeviceAssociation(const Api& user, const Api& device, void* handle) {
+  typedef HRESULT (*Register)(void*, void*, void*, void*, Token*);
+  typedef BOOLEAN (*Unregister)(void*, Token, BOOLEAN);
+  auto reg = device.At<Register>(4, "XUserRegisterForDeviceAssociationChanged");
+  auto unreg = device.At<Unregister>(5, "XUserUnregisterForDeviceAssociationChanged");
+  LocalId local{};
+  user.At<HRESULT (*)(void*, void*, LocalId*)>(9, "XUserGetLocalId")(user.self, handle, &local);
+
+  HANDLE delivered = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+  Token first{}, second{};
+  HRESULT hr1 = reg(device.self, nullptr, delivered, reinterpret_cast<void*>(&AssociationCallback), &first);
+  bool fired = WaitForSingleObject(delivered, 5000) == WAIT_OBJECT_0;
+  Check(hr1 == S_OK && first.value && fired && g_association_calls == 1,
+        "XUserRegisterForDeviceAssociationChanged delivers one association on the process queue");
+  Check(std::memcmp(g_association.device.value, "rebox\x01", 9) == 0 && g_association.oldUser.value == 0
+            && g_association.newUser.value == local.value && local.value,
+        "the association moves the gamepad from no user to the local user");
+  Sleep(50);
+  Check(g_association_calls == 1, "XUserRegisterForDeviceAssociationChanged sends nothing more");
+
+  void* manual = nullptr;
+  g_threading.At<HRESULT (*)(void*, uint32_t, uint32_t, void**)>(12, "XTaskQueueCreate")(g_threading.self, 0, 0, &manual);
+  HRESULT hr2 = reg(device.self, manual, nullptr, reinterpret_cast<void*>(&AssociationCallback), &second);
+  BOOLEAN removed = unreg(device.self, second, FALSE);
+  auto dispatch = g_threading.At<BOOLEAN (*)(void*, void*, uint32_t, uint32_t)>(16, "XTaskQueueDispatch");
+  while (dispatch(g_threading.self, manual, 1, 0)) {
+  }
+  g_threading.At<void (*)(void*, void*)>(17, "XTaskQueueCloseHandle")(g_threading.self, manual);
+  Check(hr2 == S_OK && second.value != first.value && removed && g_association_calls == 1,
+        "XUserUnregisterForDeviceAssociationChanged before dispatch drops the association");
+
+  Token unused{};
+  Check(reg(device.self, nullptr, nullptr, nullptr, &unused) == E_INVALIDARG
+            && reg(device.self, nullptr, nullptr, reinterpret_cast<void*>(&AssociationCallback), nullptr) == E_INVALIDARG,
+        "XUserRegisterForDeviceAssociationChanged rejects a null callback or token");
+  Check(unreg(device.self, first, TRUE) == 1, "XUserUnregisterForDeviceAssociationChanged unregisters");
+  CloseHandle(delivered);
+}
+
 static void CheckUser() {
   Api user = Get(kUser);
   Api device = Get(kUserDevice);
@@ -422,7 +472,7 @@ static void CheckUser() {
   user.At<void (*)(void*, void*)>(4, "XUserCloseHandle")(user.self, found);
   Check(device.At<HRESULT (*)(void*, const DeviceId*, void**)>(3, "XUserFindForDevice")(device.self, nullptr, &found) == E_INVALIDARG,
         "XUserFindForDevice rejects a null device id");
-  CheckSilentEvent(device, 4, "XUserRegisterForDeviceAssociationChanged", 5, "XUserUnregisterForDeviceAssociationChanged");
+  CheckDeviceAssociation(user, device, handle);
   CheckSilentEvent(device, 7, "XUserRegisterForDefaultAudioEndpointUtf16Changed", 8, "XUserUnregisterForDefaultAudioEndpointUtf16Changed");
 
   wchar_t endpoint[64] = L"unchanged";
@@ -575,7 +625,7 @@ int main() {
   CheckAccessibility();
   CheckUser();
   CheckGameUi();
-  Check(g_silent_calls == 0, "no registered activation, invite, device or endpoint callback ever fired");
+  Check(g_silent_calls == 0, "no registered activation, invite or endpoint callback ever fired");
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
   return g_failures ? 1 : 0;
 }
