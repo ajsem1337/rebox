@@ -123,7 +123,13 @@ words (16 dwords), which the dispatch path will have to fill.
    vkd3d-proton calls `d3d12_xs`'s `ReboxConsoleCompile` with the blob, the SGPRs, the bound
    heaps and, for each AnyPS5 descriptor kind, the bindless set and binding that holds it (as
    `vkd3d_bindless_state_find_binding` numbers them).
-3. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps (at their title
+3. **Background compile.** A program's first compile (by its blob's hash) goes to a worker thread,
+   and the call fails at once (`E_PENDING`): vkd3d-proton skips the dispatch, or draws with the
+   PSO's fallback. Once the worker has compiled it, AnyPS5's memo and the caches here make later
+   calls quick, and they compile in the calling thread; a call that would wait for the worker's
+   lock is skipped too. `REBOX_CONSOLE_ASYNC=0` compiles in the calling thread every time (the
+   smoke test does, but for one check of the background path).
+4. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps (at their title
    addresses) and `d3d12_xs`'s GPU memory chunks (xmem's allocations, at their GPU VAs) through its
    in-memory cache, which parses the code once and makes a variant per new set of descriptors.
    Each guest binding's elements are found in the bound heap's shadow (`shadow_find_index`),

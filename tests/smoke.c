@@ -3166,6 +3166,36 @@ static void test_rdna_repros(void *dev, void *queue)
             CHECK(faults() == before, "%s reports no fault", image_cases[i].name);
     }
 
+    /* Background compiles (as titles run): a program's first dispatch is skipped while a worker
+     * compiles it, and a later one runs it. The program is the first image case with an extra
+     * s_nop, so it's new to the caches. */
+    {
+        UINT32 *fresh = malloc((image_cases[0].dwords + 1) * 4);
+        HRESULT first = S_OK;
+        int tries = 0;
+        if (fresh)
+        {
+            fresh[0] = 0xbf800000; /* s_nop 0 */
+            memcpy(fresh + 1, image_cases[0].code, image_cases[0].dwords * 4);
+            SetEnvironmentVariableA("REBOX_CONSOLE_ASYNC", "1");
+            sgprs[0] = (UINT32)gpu;
+            sgprs[1] = 0;
+            first = hr = dispatch_rdna(dev, queue, heap, fresh, image_cases[0].dwords + 1, 2 << 1 | 1 << 7, 32, sgprs, 2,
+                                       msg, sizeof(msg));
+            while (FAILED(hr) && ++tries < 100)
+            {
+                Sleep(50);
+                hr = dispatch_rdna(dev, queue, heap, fresh, image_cases[0].dwords + 1, 2 << 1 | 1 << 7, 32, sgprs, 2,
+                                   msg, sizeof(msg));
+            }
+            SetEnvironmentVariableA("REBOX_CONSOLE_ASYNC", "0");
+            CHECK(first == E_PENDING && SUCCEEDED(hr),
+                  "a program's first dispatch waits for its background compile (%#lx), a later one runs it (%#lx after %d "
+                  "tries: %s)", (unsigned long)first, (unsigned long)hr, tries, msg);
+            free(fresh);
+        }
+    }
+
     /* Two exec-masked loops through LDS: s4 = a table with the output V# (slot 1), s5 = n1,
      * s6 = n2. out[x] = (x & 63) + 101 if (x & 63) < n1, else 0, for x < n2. */
     memset(out, 0xcc, 4096);

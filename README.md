@@ -141,6 +141,7 @@ method the title asked for that isn't implemented.
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
 | `REBOX_CONSOLE_COMPUTE=0` | Console compute shaders (FSSM containers) keep the old path (translation cache, then fallback shaders) instead of AnyPS5 at dispatch ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS` | Run only the console compute programs whose code address hashes to VALUE in its low BITS bits (the rest are skipped), logging each one run: halve the set run by run to find a program that faults the GPU |
+| `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw, as before. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback (Unreal 5's large shaders took hundreds of milliseconds each, and a UE5 sample's game thread gave up waiting for its render thread) |
 | `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
 | `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
 | `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |

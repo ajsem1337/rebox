@@ -515,8 +515,8 @@ static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
 
 /* The last compile's outcome, for test harnesses (ReboxConsoleLastResult). */
 static SRWLOCK last_lock = SRWLOCK_INIT;
-static HRESULT last_hr;
-static char last_message[512];
+static __thread HRESULT last_hr; /* per thread: the background compiler has its own */
+static __thread char last_message[512];
 
 static void set_last(HRESULT hr, const char *what, const char *detail)
 {
@@ -526,7 +526,7 @@ static void set_last(HRESULT hr, const char *what, const char *detail)
     ReleaseSRWLockExclusive(&last_lock);
 }
 
-/* The most recent ReboxConsoleCompile's result and a one-line description. */
+/* The calling thread's most recent ReboxConsoleCompile result and a one-line description. */
 HRESULT WINAPI ReboxConsoleLastResult(char *message, SIZE_T size)
 {
     HRESULT hr;
@@ -701,7 +701,176 @@ static BOOL compute_bisect_skips(const struct rebox_deferred_shader *h, const st
     return FALSE;
 }
 
+/* Background compiles. A program's first compile (AnyPS5's translation, hundreds of milliseconds
+ * for Unreal 5's large shaders) used to run in the title's render thread at the dispatch or draw;
+ * a UE5 sample's game thread gave up waiting for it (120 s). Now the first call for a program
+ * queues the compile for a worker thread and fails (the dispatch is skipped, the draw uses the
+ * fallback); once the worker has compiled it once, AnyPS5's memo and the caches here make later
+ * calls quick, and they compile in the calling thread as before. REBOX_CONSOLE_ASYNC=0 turns it
+ * off. */
+static BOOL async_compiles(void)
+{
+    char v[8];
+    DWORD n = GetEnvironmentVariableA("REBOX_CONSOLE_ASYNC", v, sizeof(v)); /* each call: tests change it */
+    return !(n && n < sizeof(v) && v[0] == '0');
+}
+
+enum program_state { PROGRAM_COLD, PROGRAM_PENDING, PROGRAM_WARM, PROGRAM_FAILED };
+#define PROGRAMS 16384
+static struct { UINT64 key; LONG state; } programs[PROGRAMS];
+static SRWLOCK programs_lock = SRWLOCK_INIT;
+
+/* The state of a program (by its blob's hash), claiming it as pending if it was cold. */
+static enum program_state program_claim(UINT64 key, BOOL claim)
+{
+    UINT slot = (UINT)(key % PROGRAMS);
+    enum program_state state = PROGRAM_COLD;
+
+    AcquireSRWLockExclusive(&programs_lock);
+    for (UINT i = 0; i < 64; i++)
+    {
+        UINT at = (slot + i) % PROGRAMS;
+        if (programs[at].state != PROGRAM_COLD && programs[at].key == key)
+        {
+            state = programs[at].state;
+            break;
+        }
+        if (programs[at].state == PROGRAM_COLD)
+        {
+            if (claim)
+            {
+                programs[at].key = key;
+                programs[at].state = PROGRAM_PENDING;
+            }
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&programs_lock);
+    return state;
+}
+
+static void program_set(UINT64 key, enum program_state state)
+{
+    UINT slot = (UINT)(key % PROGRAMS);
+    AcquireSRWLockExclusive(&programs_lock);
+    for (UINT i = 0; i < 64; i++)
+    {
+        UINT at = (slot + i) % PROGRAMS;
+        if (programs[at].state != PROGRAM_COLD && programs[at].key == key)
+        {
+            programs[at].state = state;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&programs_lock);
+}
+
+struct compile_job
+{
+    struct compile_job *next;
+    UINT64 key;
+    struct rebox_compile_in in;
+    UINT32 user_sgprs[64];
+    BYTE shader[];
+};
+static struct compile_job *jobs_head, *jobs_tail;
+static SRWLOCK jobs_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE jobs_ready = CONDITION_VARIABLE_INIT;
+static LONG jobs_queued, jobs_done;
+
+static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background);
+
+static DWORD WINAPI compile_worker(void *unused)
+{
+    for (;;)
+    {
+        struct compile_job *job;
+        struct rebox_compile_out out;
+        HRESULT hr;
+        LONG done;
+
+        AcquireSRWLockExclusive(&jobs_lock);
+        while (!jobs_head)
+            SleepConditionVariableSRW(&jobs_ready, &jobs_lock, INFINITE, 0);
+        job = jobs_head;
+        if (!(jobs_head = job->next))
+            jobs_tail = NULL;
+        ReleaseSRWLockExclusive(&jobs_lock);
+
+        memset(&out, 0, sizeof(out));
+        hr = compile_now(&job->in, &out, TRUE);
+        program_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        done = InterlockedIncrement(&jobs_done);
+        if (!(done & (done - 1)))
+            rebox_log("d3d12_xs: console shaders: %ld background compiles done of %ld queued", done, jobs_queued);
+        free(job);
+    }
+    return 0;
+}
+
+static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
+{
+    static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    struct compile_job *job = malloc(sizeof(*job) + in->shader_size);
+
+    if (!job)
+    {
+        program_set(key, PROGRAM_COLD);
+        return;
+    }
+    memset(job, 0, sizeof(*job));
+    job->key = key;
+    job->in = *in;
+    memcpy(job->shader, in->shader, in->shader_size);
+    job->in.shader = job->shader;
+    job->in.user_sgpr_count = min(in->user_sgpr_count, (UINT32)ARRAYSIZE(job->user_sgprs));
+    if (in->user_sgprs)
+        memcpy(job->user_sgprs, in->user_sgprs, job->in.user_sgpr_count * 4u);
+    job->in.user_sgprs = job->user_sgprs;
+    if (InitOnceBeginInitialize(&started, 0, &pending, NULL) && pending)
+    {
+        HANDLE t = CreateThread(NULL, 0, compile_worker, NULL, 0, NULL);
+        if (t)
+            CloseHandle(t);
+        InitOnceComplete(&started, 0, NULL);
+    }
+    InterlockedIncrement(&jobs_queued);
+    AcquireSRWLockExclusive(&jobs_lock);
+    if (jobs_tail)
+        jobs_tail->next = job;
+    else
+        jobs_head = job;
+    jobs_tail = job;
+    ReleaseSRWLockExclusive(&jobs_lock);
+    WakeConditionVariable(&jobs_ready);
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
+{
+    UINT64 key;
+
+    if (!async_compiles() || !in || !in->shader || !in->shader_size || !out)
+        return compile_now(in, out, FALSE);
+    key = hash_bytes(0xcbf29ce484222325ull, in->shader, in->shader_size);
+    switch (program_claim(key, TRUE))
+    {
+    case PROGRAM_COLD: /* claimed: compile it in the background */
+        queue_compile(key, in);
+        set_last(E_PENDING, "compiling in the background", NULL);
+        return E_PENDING;
+    case PROGRAM_PENDING:
+        set_last(E_PENDING, "compiling in the background", NULL);
+        return E_PENDING;
+    case PROGRAM_FAILED:
+        set_last(E_FAIL, "its background compile failed", NULL);
+        return E_FAIL;
+    default:
+        return compile_now(in, out, FALSE);
+    }
+}
+
+static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
     struct sa5_region regions[MAX_REGIONS];
@@ -873,8 +1042,16 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     req.use_cache = 1;
 
     /* One compile at a time: AnyPS5's caches are thread-safe, but this keeps the static index
-     * table simple and compiles are rare once warm. */
-    AcquireSRWLockExclusive(&compile_lock);
+     * table simple and compiles are rare once warm. The render thread never waits for a background
+     * compile (see ReboxConsoleCompile): if one holds the lock, this call is skipped. */
+    if (background || !async_compiles())
+        AcquireSRWLockExclusive(&compile_lock);
+    else if (!TryAcquireSRWLockExclusive(&compile_lock))
+    {
+        free(code);
+        set_last(E_PENDING, "a background compile holds the compiler", NULL);
+        return E_PENDING;
+    }
     if (graphics)
         phase_end(&mark, 0);
     if (graphics && h->stage == 0x1)

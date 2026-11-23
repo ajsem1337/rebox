@@ -48,6 +48,9 @@ export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9,gameinput=n"
 # The hand-written console compute programs here read their table at s[0:1], the earlier layout
 # (vkd3d-proton patch 0007 defaults to the console's, measured on a UE5 sample).
 export REBOX_CONSOLE_COMPUTE_LAYOUT=pairs
+# Its checks read a dispatch's results at once: compiles in the calling thread (one test turns
+# background compiles on itself).
+export REBOX_CONSOLE_ASYNC=0
 # AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
 if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
     install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/
