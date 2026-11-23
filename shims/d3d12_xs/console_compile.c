@@ -697,6 +697,20 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
     if (!sa5.analyse || sa5.analyse((const UINT32 *)((const BYTE *)h + h->code_offset), h->code_dwords,
                                     user_sgprs(h, TRUE), &layout, slots, ARRAYSIZE(slots), ignored, sizeof(ignored)))
         return 0;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+        {
+            char line[256];
+            int at = 0;
+            for (UINT32 i = 0; i < layout.slot_count && i < ARRAYSIZE(slots) && at < 200; i++)
+                at += snprintf(line + at, sizeof(line) - at, " t%u+%u:k%u/%u", slots[i].table, slots[i].dword,
+                               slots[i].kind, slots[i].size);
+            line[at] = 0;
+            rebox_log("d3d12_xs: late T# search: %u tables (first in s%u), slots%s", layout.table_count,
+                      layout.table_count ? layout.table_sgprs[0] : 0, at ? line : " none");
+        }
+    }
     for (UINT32 i = 0; i < layout.slot_count && i < ARRAYSIZE(slots); i++)
     {
         UINT32 sgpr, words[8] = { 0 };
