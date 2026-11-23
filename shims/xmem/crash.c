@@ -18,7 +18,11 @@
  * Hangs: d3d12_xs calls ReboxHeartbeat on every present. When none comes for
  * REBOX_HANG_DUMP seconds (default 60, 0 off), every thread's stack is
  * logged once, with its name, to see what a title is waiting for; after the
- * next present it can happen again (three times at most). */
+ * next present it can happen again (three times at most).
+ *
+ * Slow frames: REBOX_STACK_SAMPLE=N[,COUNT] logs every thread's stack every
+ * N seconds, COUNT times (default 10), to see where a title that presents but
+ * slowly spends its time. */
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -197,13 +201,17 @@ static void log_thread(DWORD tid)
     CloseHandle(thread);
 }
 
-static void dump_threads(DWORD seconds)
+static void dump_threads(DWORD seconds, int sample)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te = { sizeof(te) };
     DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
 
-    rebox_log("xmem: no frame presented for %lu s: every thread's stack follows (REBOX_HANG_DUMP)", seconds);
+    if (sample)
+        rebox_log("xmem: stack sample %d (%lld presents so far): every thread's stack follows (REBOX_STACK_SAMPLE)",
+                     sample, (long long)heartbeats);
+    else
+        rebox_log("xmem: no frame presented for %lu s: every thread's stack follows (REBOX_HANG_DUMP)", seconds);
     if (snap == INVALID_HANDLE_VALUE)
         return;
     for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te))
@@ -239,10 +247,21 @@ static DWORD WINAPI hang_watch(void *param)
         }
         else if (++idle >= seconds && armed)
         {
-            dump_threads(seconds);
+            dump_threads(seconds, 0);
             dumps++;
             armed = FALSE;
         }
+    }
+    return 0;
+}
+
+static DWORD WINAPI stack_sampler(void *param)
+{
+    DWORD every = LOWORD((ULONG_PTR)param), count = HIWORD((ULONG_PTR)param);
+    for (DWORD i = 1; i <= count; i++)
+    {
+        Sleep(every * 1000);
+        dump_threads(0, (int)i);
     }
     return 0;
 }
@@ -262,4 +281,12 @@ void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
         AddVectoredExceptionHandler(0, on_exception);
     if (hang_seconds > 0)
         CloseHandle(CreateThread(NULL, 0, hang_watch, (void *)(ULONG_PTR)hang_seconds, 0, NULL));
+    {
+        char sample[32];
+        DWORD len = GetEnvironmentVariableA("REBOX_STACK_SAMPLE", sample, sizeof(sample));
+        unsigned every = 0, count = 10;
+        if (len && len < sizeof(sample) && sscanf(sample, "%u,%u", &every, &count) >= 1 && every && count)
+            CloseHandle(CreateThread(NULL, 0, stack_sampler,
+                                     (void *)(ULONG_PTR)MAKELONG(min(every, 0xffffu), min(count, 0xffffu)), 0, NULL));
+    }
 }
