@@ -3099,6 +3099,58 @@ static void test_acphal(void)
     XSLOT(hal, 5, void)(hal);
 }
 
+/* xapu.dll: the decoder queue answers each command at once, a Process with silence of the
+ * length asked for (FMOD in a GDK title drives it); acphal's other FMOD imports answer too. */
+static void test_xapu(void)
+{
+#pragma pack(push, 1)
+    struct command { UINT32 type, stream, sequence, options; void *context; };
+    struct process { struct command id; float ramp, pitch; UINT32 first_frame, frames, input_bytes; void *input;
+                     UINT32 output_bytes; void *output; } p;
+    struct result { struct command id; UINT32 state; UINT64 state_data, time; HRESULT error; UINT32 frames,
+                    output_bytes; void *output; float pitch; UINT32 input_bytes; void *input; } r;
+    struct { UINT32 process, streams, commands_per_stream, data_bytes, frames_per_output, options; } in = { 1, 2, 4, 0, 256, 0 };
+    struct { void *data; HANDLE ready; } out;
+#pragma pack(pop)
+    HMODULE m = LoadLibraryA("xapu.dll"), acp = LoadLibraryA("acphal.dll");
+    HRESULT (WINAPI *connect)(void *, void *, HANDLE *) = m ? (void *)GetProcAddress(m, "XApuConnect") : NULL;
+    HRESULT (WINAPI *enqueue)(HANDLE, const void *, UINT32 *) = m ? (void *)GetProcAddress(m, "XApuEnqueueCommand") : NULL;
+    HRESULT (WINAPI *dequeue)(HANDLE, void *) = m ? (void *)GetProcAddress(m, "XApuDequeueResult") : NULL;
+    HRESULT (WINAPI *disconnect)(HANDLE) = m ? (void *)GetProcAddress(m, "XApuDisconnect") : NULL;
+    HRESULT (WINAPI *map)(UINT32 *, void *, UINT32) = acp ? (void *)GetProcAddress(acp, "ApuMapVirtualAddress") : NULL;
+    BOOL (WINAPI *valid)(const void *, UINT32) = acp ? (void *)GetProcAddress(acp, "ApuIsVirtualAddressValid") : NULL;
+    HRESULT (WINAPI *release)(void) = acp ? (void *)GetProcAddress(acp, "AcpHalReleaseShapeContexts") : NULL;
+    BYTE buf[4096];
+    HANDLE h = NULL;
+    UINT32 n = 0, a1 = 0, a2 = 0;
+    BOOL silent = TRUE;
+
+    CHECK(map && valid && release, "acphal.dll exports FMOD's ApuMapVirtualAddress, ApuIsVirtualAddressValid and AcpHalReleaseShapeContexts");
+    if (map && valid && release)
+        CHECK(map(&a1, buf, 0x2000) == S_OK && map(&a2, buf + 0x2000, 16) == S_OK && a1 != a2 && valid(buf, 16)
+                  && release() == S_OK, "ApuMapVirtualAddress gives distinct addresses (%#x, %#x)", a1, a2);
+    CHECK(connect && enqueue && dequeue && disconnect, "xapu.dll exports FMOD's four imports");
+    if (!connect || !enqueue || !dequeue || !disconnect) return;
+    CHECK(connect(&in, &out, &h) == S_OK && h, "XApuConnect");
+    if (!h) return;
+    memset(&p, 0, sizeof(p));
+    memset(buf, 0xaa, sizeof(buf));
+    p.id.type = 3;
+    p.id.stream = 1;
+    p.pitch = 1.0f;
+    p.output_bytes = sizeof(buf);
+    p.output = buf;
+    CHECK(enqueue(h, &p, &n) == S_OK && n == 1, "XApuEnqueueCommand(Process)");
+    memset(&r, 0, sizeof(r));
+    CHECK(dequeue(h, &r) == S_OK && r.frames == 256 && r.output == buf && r.state == 3,
+          "XApuDequeueResult gives the frames asked for (%u)", r.frames);
+    for (int i = 0; i < 256 * 8; i++)
+        silent &= buf[i] == 0;
+    CHECK(silent && buf[256 * 8] == 0xaa, "the output is silence of that length");
+    CHECK(dequeue(h, &r) == (HRESULT)0x8ac81001, "XApuDequeueResult says when there is nothing");
+    CHECK(disconnect(h) == S_OK, "XApuDisconnect");
+}
+
 /* A texture placed at a title address (slot 44) is filled from the tiled memory there: at first
  * use, and again after a reported write (DirectStorage reports its writes the same way). */
 /* A texture placed on memory the title has only reserved: it is filled once the memory is
@@ -4616,6 +4668,7 @@ int main(int argc, char **argv)
     test_xcrdapi();
     test_gameinput();
     test_acphal();
+    test_xapu();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();

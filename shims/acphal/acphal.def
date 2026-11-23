@@ -6,3 +6,6 @@ EXPORTS
     ApuHeapGetState
     AcpHalCreate
     AcpHalAllocateShapeContexts
+    AcpHalReleaseShapeContexts
+    ApuMapVirtualAddress
+    ApuIsVirtualAddressValid

@@ -286,9 +286,41 @@ HRESULT WINAPI AcpHalAllocateShapeContexts(BYTE *contexts)
             return E_OUTOFMEMORY;
         if (array)
             memset(array, 0, counts[i] * each);
-        memcpy(contexts + 0x18 + 8 * i, &array, sizeof(array));
+        /* Only kinds asked for: FMOD's struct has five arrays (xcl), the sixth count reserved. */
+        if (counts[i])
+            memcpy(contexts + 0x18 + 8 * i, &array, sizeof(array));
         if (counts[i])
             rebox_log("acphal: %u %s contexts at %p", counts[i], names[i], array);
     }
     return S_OK;
+}
+
+/* FMOD (a GDK title) also imports these (xcl has the same meanings). */
+HRESULT WINAPI AcpHalReleaseShapeContexts(void)
+{
+    return S_OK; /* the arrays stay in the heap, which never gives memory back */
+}
+
+/* An APU address for the title's own memory: its heap offset if it's in the heap, else a new
+ * address past the heap's (as ApuAlloc gives a block that didn't fit). */
+HRESULT WINAPI ApuMapVirtualAddress(UINT32 *address, void *va, UINT32 size)
+{
+    if (!address)
+        return E_INVALIDARG;
+    AcquireSRWLockExclusive(&lock);
+    if (heap && (BYTE *)va >= heap && (BYTE *)va < heap + heap_size)
+        *address = (UINT32)((BYTE *)va - heap);
+    else
+    {
+        *address = (UINT32)(heap_size + outside);
+        outside += (size + 0xfff) & ~0xfff;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return S_OK;
+}
+
+/* All of the process's memory is the coprocessor's here. */
+BOOL WINAPI ApuIsVirtualAddressValid(const void *va, UINT32 size)
+{
+    return TRUE;
 }
