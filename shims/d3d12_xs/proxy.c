@@ -1188,48 +1188,128 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(struct proxy 
     return hr;
 }
 
+/* A pipeline stream's subobjects: a 32-bit type, then the payload at its alignment, the whole
+ * aligned to 8 (alignas(void *)). The desktop's payload sizes and alignments by type; 0 for a type
+ * the desktop doesn't have. */
+static void stream_payload(UINT type, SIZE_T *size, SIZE_T *align)
+{
+    static const struct { unsigned short size, align; } payloads[] = {
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE] = { 8, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS] = { 16, 8 }, [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS] = { 16, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS] = { 16, 8 }, [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS] = { 16, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] = { 16, 8 }, [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS] = { 16, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT] = { 32, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND] = { 328, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER] = { 44, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL] = { 52, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT] = { 16, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS] = { 36, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC] = { 8, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO] = { 16, 8 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS] = { 4, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1] = { 56, 4 },
+        [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING] = { 24, 8 },
+        [24] = { 16, 8 }, [25] = { 16, 8 },        /* AS, MS */
+        [26] = { 68, 4 },                          /* DEPTH_STENCIL2 */
+        [27] = { 44, 4 }, [28] = { 40, 4 },        /* RASTERIZER1, RASTERIZER2 */
+    };
+    *size = type < ARRAYSIZE(payloads) ? payloads[type].size : 0;
+    *align = type < ARRAYSIZE(payloads) ? payloads[type].align : 0;
+}
+
+/* The stream without what the desktop can't take: type 26 that isn't a desktop DEPTH_STENCIL2 (The
+ * UE5 sample ends streams that already have a DEPTH_STENCIL1 with a 26 of 24 bytes, 8-aligned:
+ * four dwords, 0xffff in the last, then a pointer; the console's own), or a type the desktop lacks.
+ * Returns the stream to use: the title's, or a copy in *copy (freed by the caller). */
+static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        D3D12_PIPELINE_STATE_STREAM_DESC *storage, BYTE **copy)
+{
+    const BYTE *base = desc->pPipelineStateSubobjectStream, *end = base + desc->SizeInBytes;
+    SIZE_T kept = 0;
+
+    *copy = NULL;
+    /* Pass 0 finds whether anything is dropped; pass 1 copies the rest. */
+    for (int pass = 0; pass < 2; pass++)
+    {
+        BOOL depth_stencil = FALSE, dropped = FALSE;
+        for (const BYTE *s = base; s + sizeof(UINT) <= end;)
+        {
+            UINT type = *(const UINT *)s;
+            SIZE_T size, align, next;
+            BOOL drop = FALSE;
+
+            stream_payload(type, &size, &align);
+            if (!size || (type == 26 && (depth_stencil || s + ((sizeof(UINT) + align - 1) & ~(align - 1)) + size > end)))
+            {
+                /* The console's: taken as 24 bytes of 8-aligned payload. */
+                drop = TRUE;
+                size = 24;
+                align = 8;
+            }
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
+                    || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
+                depth_stencil = TRUE;
+            next = (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
+            if (next > (SIZE_T)(end - s))
+                next = end - s;
+            if (drop)
+            {
+                dropped = TRUE;
+                if (pass == 0)
+                {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 4)
+                        rebox_log("d3d12_xs: pipeline stream subobject type %u at +%#zx (%zu bytes) is the console's: "
+                                     "dropped", type, (size_t)(s - base), (size_t)next);
+                }
+            }
+            else if (pass == 1)
+            {
+                memcpy(*copy + kept, s, next);
+                kept += next;
+            }
+            s += next;
+        }
+        if (pass == 0 && (!dropped || !(*copy = malloc(desc->SizeInBytes))))
+            return desc;
+    }
+    storage->SizeInBytes = kept;
+    storage->pPipelineStateSubobjectStream = *copy;
+    return storage;
+}
+
 /* Slot 86: ID3D12Device2::CreatePipelineState (PC 47), a pipeline from a stream of subobjects, as
- * Unreal 5's Xbox RHI makes them (a UE5 sample, XboxCommonD3D12PipelineState.cpp). Forwarded:
- * vkd3d-proton takes the console shaders in it as in the other pipeline paths. A stream it refuses
- * has its subobject types logged (the console may have types of its own). */
+ * Unreal 5's Xbox RHI makes them (a UE5 sample, XboxCommonD3D12PipelineState.cpp). Forwarded
+ * without the console's own subobjects (desktop_stream): vkd3d-proton takes the console shaders in
+ * it as in the other pipeline paths. A stream it still refuses has its first type logged. */
 static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
         REFIID riid, void **out)
 {
+    D3D12_PIPELINE_STATE_STREAM_DESC storage;
     ID3D12Device2 *device2 = NULL;
+    BYTE *copy = NULL;
     HRESULT hr = IUnknown_QueryInterface(p->inner, &IID_ID3D12Device2, (void **)&device2);
 
     if (FAILED(hr))
         return hr;
-    hr = ID3D12Device2_CreatePipelineState(device2, desc, riid, out);
+    hr = ID3D12Device2_CreatePipelineState(device2, desc && desc->pPipelineStateSubobjectStream
+            ? desktop_stream(desc, &storage, &copy) : desc, riid, out);
     ID3D12Device2_Release(device2);
+    free(copy);
     if (SUCCEEDED(hr) && out && *out)
         patch_child(*out);
     else if (FAILED(hr) && desc && desc->pPipelineStateSubobjectStream)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 4)
-        {
-            /* Each subobject is a 32-bit type, aligned to pointer size, then its value; the first
-             * type is enough to see a console one. */
-            char types[16];
-            snprintf(types, sizeof(types), " %u", desc->SizeInBytes >= sizeof(UINT)
-                     ? *(const UINT *)desc->pPipelineStateSubobjectStream : 0u);
-            rebox_log("d3d12_xs: CreatePipelineState (stream of %zu bytes, first subobject type%s) failed: %#lx",
-                         (size_t)desc->SizeInBytes, types, (unsigned long)hr);
-            /* The first refused stream's dwords, to find a subobject type the desktop lacks. */
-            if (logged == 1)
-            {
-                const UINT *d = desc->pPipelineStateSubobjectStream;
-                for (SIZE_T i = 0; i < desc->SizeInBytes / 4; i += 8)
-                {
-                    char line[128];
-                    int at = 0;
-                    for (SIZE_T j = i; j < i + 8 && j < desc->SizeInBytes / 4; j++)
-                        at += snprintf(line + at, sizeof(line) - at, " %08x", d[j]);
-                    rebox_log("d3d12_xs:   stream +%#05zx:%s", i * 4, line);
-                }
-            }
-        }
+            rebox_log("d3d12_xs: CreatePipelineState (stream of %zu bytes, first subobject type %u) failed: %#lx",
+                         (size_t)desc->SizeInBytes, desc->SizeInBytes >= sizeof(UINT)
+                         ? *(const UINT *)desc->pPipelineStateSubobjectStream : 0u, (unsigned long)hr);
     }
     return hr;
 }

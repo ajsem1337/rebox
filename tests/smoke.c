@@ -1704,6 +1704,26 @@ static void test_stream_pso(void *dev)
           (unsigned long)hr);
     if (pso)
         IUnknown_Release((IUnknown *)pso);
+    /* Ending with the console's type 26 (24 bytes: four dwords, 0xffff, a pointer), as The Matrix
+     * Awakens' streams do: dropped, not refused. */
+    {
+        struct
+        {
+            struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; void *rs; } __attribute__((aligned(8))) root;
+            struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_SHADER_BYTECODE cs; } __attribute__((aligned(8))) cs;
+            struct { UINT type; UINT pad; UINT words[4]; void *pointer; } __attribute__((aligned(8))) console;
+        } console_stream = { { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, rs },
+                             { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, { test_empty_cs, sizeof(test_empty_cs) } },
+                             { 26, 0, { 0, 0, 0, 0xffff }, &console_stream } };
+        D3D12_PIPELINE_STATE_STREAM_DESC console_desc = { sizeof(console_stream), &console_stream };
+        pso = NULL;
+        hr = rs ? XSLOT(dev, 86, HRESULT, const D3D12_PIPELINE_STATE_STREAM_DESC *, REFIID, void **)(dev, &console_desc,
+                &IID_ID3D12PipelineState, &pso) : E_FAIL;
+        CHECK(SUCCEEDED(hr) && pso, "a stream ending with the console's subobject type 26 makes its pipeline (%#lx)",
+              (unsigned long)hr);
+        if (pso)
+            IUnknown_Release((IUnknown *)pso);
+    }
     if (rs)
         IUnknown_Release((IUnknown *)rs);
 }
