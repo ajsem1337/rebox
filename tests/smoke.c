@@ -95,6 +95,47 @@ static void test_crash_report(HMODULE xmem)
 
 static void test_probe(HMODULE xmem);
 
+/* Closing a title's window suspends it (its app state routines hear "quiesced") before the
+ * process ends; REBOX_QUIT_EXIT=0 stops short of ending it here. */
+static HANDLE quit_suspended;
+static BOOLEAN quit_quiesced;
+static void CALLBACK quit_app_state(BOOLEAN quiesced, void *context)
+{
+    quit_quiesced = quiesced;
+    SetEvent(context);
+}
+
+static void test_quit(HMODULE xmem)
+{
+    ULONG (WINAPI *reg)(void *, void *, void **) = (void *)GetProcAddress(xmem, "ReboxAppStateRegister");
+    HWND (WINAPI *subclass)(HWND) = (void *)GetProcAddress(xmem, "ReboxQuitSubclass");
+    void *registration = NULL;
+    HWND hwnd;
+
+    CHECK(reg && subclass, "xmem exports ReboxAppStateRegister and ReboxQuitSubclass");
+    if (!reg || !subclass) return;
+    SetEnvironmentVariableA("REBOX_QUIT_EXIT", "0");
+    quit_suspended = CreateEventA(NULL, TRUE, FALSE, NULL);
+    CHECK(reg(quit_app_state, quit_suspended, &registration) == ERROR_SUCCESS && registration,
+          "RegisterAppStateChangeNotification (ours) registers");
+    {
+        WNDCLASSW wc = { .lpfnWndProc = DefWindowProcW, .hInstance = GetModuleHandleW(NULL), .lpszClassName = L"SmokeTitle" };
+        RegisterClassW(&wc);
+    }
+    /* Message-only: there's no display here. */
+    hwnd = subclass(CreateWindowExW(0, L"SmokeTitle", L"title", 0, 0, 0, 64, 64, HWND_MESSAGE, NULL,
+                                    GetModuleHandleW(NULL), NULL));
+    CHECK(hwnd != NULL, "a title window");
+    if (!hwnd) return;
+    CHECK(WaitForSingleObject(quit_suspended, 0) == WAIT_TIMEOUT, "the title isn't suspended before it's closed");
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    CHECK(WaitForSingleObject(quit_suspended, 5000) == WAIT_OBJECT_0 && quit_quiesced,
+          "closing the title's window suspends the title (quiesced)");
+    CHECK(IsWindow(hwnd), "the window stays until the process ends");
+    DestroyWindow(hwnd);
+    SetEnvironmentVariableA("REBOX_QUIT_EXIT", NULL);
+}
+
 static void test_xmem(void)
 {
     HMODULE m = LoadLibraryA("xmem.dll");
@@ -113,6 +154,7 @@ static void test_xmem(void)
     CHECK(xalloc && xfree && set_hooks && alloc_default && free_default, "xmem exports present");
     CHECK(GetProcAddress(m, "ReboxHeartbeat") != NULL, "xmem exports ReboxHeartbeat (the hang watchdog's)");
     test_probe(m);
+    test_quit(m);
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
     test_crash_report(m);
 
@@ -3054,12 +3096,13 @@ static void test_gameinput(void)
         {
             void *next = (void *)1, *again = NULL, *nav = NULL;
             UINT32 buttons = 0xffffffff;
-            /* Nothing changed: no newer reading, and the current one is the same reading. */
+            /* Nothing changed: no newer reading; the next current reading is a new one all the same. */
             CHECK(XSLOT(gi, 5, HRESULT, void *, UINT32, void *, void **)(gi, reading, 0x00040000, NULL, &next)
                       == (HRESULT)0x838a0003 && !next, "GameInput GetNextReading: nothing newer while the state holds");
             CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x00040000, NULL, &again))
-                      && XSLOT(again, 4, UINT64, UINT32)(again, 0x00040000) == XSLOT(reading, 4, UINT64, UINT32)(reading, 0x00040000),
-                  "an unchanged state keeps its reading's sequence number");
+                      && XSLOT(again, 4, UINT64, UINT32)(again, 0x00040000) > XSLOT(reading, 4, UINT64, UINT32)(reading, 0x00040000)
+                      && XSLOT(again, 3, UINT32)(again) == 0x00040000,
+                  "each GetCurrentReading is a new gamepad reading (a GDK title polls it)");
             if (again) XSLOT(again, 2, ULONG)(again);
             CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x01000000 /* UI navigation */, NULL, &nav))
                       && nav && (XSLOT(nav, 3, UINT32)(nav) & 0x01000000) && XSLOT(nav, 24, BOOL, UINT32 *)(nav, &buttons)
