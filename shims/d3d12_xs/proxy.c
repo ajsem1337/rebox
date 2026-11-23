@@ -753,10 +753,14 @@ static HRESULT wrap_result(HRESULT hr, IUnknown *inner, struct proxy_class *cls,
 {
     if (out)
         *out = NULL;
-    if (FAILED(hr))
-        return hr;
-    if (!inner)
-        return E_FAIL;
+    if (FAILED(hr) || !inner)
+    {
+        /* A title asserts on a failed creation without saying which: name it. */
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 16)
+            rebox_log("d3d12_xs: creating a %s failed (%#lx)", cls->name, FAILED(hr) ? hr : E_FAIL);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
     if (!out)
     {
         IUnknown_Release(inner);
