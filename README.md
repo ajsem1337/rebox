@@ -57,7 +57,7 @@ shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA
 shims/acphal/             acphal.dll: the APU heap, and an audio coprocessor channel that acknowledges
                           commands and ticks audio frames (nothing is mixed)
 shims/xapu/               xapu.dll: the audio decoder queue; every command is done at once, output is silence
-shims/chad/               chad.dll: the audio DSP (XDsp); connecting reports it absent, so audio goes on without it
+shims/chad/               chad.dll: the audio DSP (XDsp); it connects and takes commands that do nothing
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
 patches/                  Mesa patch letting RADV place memory at lower-half device addresses;

@@ -3611,9 +3611,13 @@ static void test_chad(void)
           "chad.dll exports the five XDsp functions a title imports");
     if (!connect || !activate || !submit || !disconnect)
         return;
-    CHECK(FAILED(connect(command, 0, 0, 0x80, 1, &h)) && !h, "XDspConnectWithMaximumStreamLimit: no DSP, no connection");
-    CHECK(FAILED(activate(NULL, 0, 0, 0)) && FAILED(submit(NULL, command)) && disconnect(NULL) == S_OK,
-          "XDspActivate and XDspSubmitCommand fail without a DSP; XDspDisconnect succeeds");
+    /* A title stops at a breakpoint when it can't connect: the DSP connects and takes commands. */
+    h = NULL;
+    CHECK(connect(command, 0, 0, 0x80, 1, &h) == S_OK && h && activate(h, 0, 0, 0) == S_OK
+          && submit(h, command) == S_OK && disconnect(h) == S_OK,
+          "the DSP connects, activates, takes a command and disconnects");
+    CHECK(FAILED(submit(NULL, command)) && FAILED(activate(NULL, 0, 0, 0)),
+          "XDsp calls without a connection fail");
 }
 
 static void test_xapu(void)
