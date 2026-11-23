@@ -962,6 +962,18 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                          in->user_sgprs[5], in->user_sgprs[6], in->user_sgprs[7], in->user_sgprs[8], in->user_sgprs[9],
                          in->user_sgprs[10], in->user_sgprs[11], in->user_sgprs[12], in->user_sgprs[13],
                          in->user_sgprs[14], in->user_sgprs[15]);
+            /* What the table s8 points at holds (in a shadow heap), for the zeros some stages read. */
+            {
+                BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+                UINT32 table[16];
+                if (in->user_sgprs[8] && ReboxShadowRead(in->user_sgprs[8], table, sizeof(table)))
+                    rebox_log("d3d12_xs:   at s8 %#x: %08x %08x %08x %08x %08x %08x %08x %08x  %08x %08x %08x %08x %08x "
+                              "%08x %08x %08x", in->user_sgprs[8], table[0], table[1], table[2], table[3], table[4],
+                              table[5], table[6], table[7], table[8], table[9], table[10], table[11], table[12],
+                              table[13], table[14], table[15]);
+                else if (in->user_sgprs[8])
+                    rebox_log("d3d12_xs:   at s8 %#x: not in a shadow heap", in->user_sgprs[8]);
+            }
         }
     }
     set_last(E_FAIL, "no result (out of memory?)", NULL);
