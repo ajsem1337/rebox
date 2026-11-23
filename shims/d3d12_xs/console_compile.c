@@ -683,46 +683,28 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
 }
 
-/* The address of the n-th texture slot (T#) in a graphics stage's descriptor tables that reads as
- * empty now (sa5_analyse; table t is the pointer in user SGPR table_sgprs[t], or s8 + t), or 0. */
+/* The address of the n-th T# a graphics stage loads from its descriptor tables that reads as empty
+ * now, or 0. The code is scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode
+ * 3) from an SGPR pair whose low register is a table pointer (user SGPRs 8-15, the console's
+ * graphics layout, used as {sN, 0}): the address is that SGPR plus the load's offset. */
 static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
 {
     BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
-    static struct sa5_slot slots[64]; /* under compile_lock */
-    struct sa5_layout layout;
-    char ignored[64];
+    const UINT32 *code = (const UINT32 *)((const BYTE *)h + h->code_offset);
     UINT seen = 0;
 
-    memset(&layout, 0, sizeof(layout));
-    if (!sa5.analyse || sa5.analyse((const UINT32 *)((const BYTE *)h + h->code_offset), h->code_dwords,
-                                    user_sgprs(h, TRUE), &layout, slots, ARRAYSIZE(slots), ignored, sizeof(ignored)))
-        return 0;
+    for (UINT32 i = 0; i + 1 < h->code_dwords; i++)
     {
-        static LONG logged;
-        if (InterlockedIncrement(&logged) <= 4)
-        {
-            char line[256];
-            int at = 0;
-            for (UINT32 i = 0; i < layout.slot_count && i < ARRAYSIZE(slots) && at < 200; i++)
-                at += snprintf(line + at, sizeof(line) - at, " t%u+%u:k%u/%u", slots[i].table, slots[i].dword,
-                               slots[i].kind, slots[i].size);
-            line[at] = 0;
-            rebox_log("d3d12_xs: late T# search: %u tables (first in s%u), slots%s", layout.table_count,
-                      layout.table_count ? layout.table_sgprs[0] : 0, at ? line : " none");
-        }
-    }
-    for (UINT32 i = 0; i < layout.slot_count && i < ARRAYSIZE(slots); i++)
-    {
-        UINT32 sgpr, words[8] = { 0 };
+        UINT32 w0 = code[i], w1 = code[i + 1], sbase, op, words[8] = { 0 };
         UINT64 address;
-        if (slots[i].kind != SA5_SLOT_TEXTURE || slots[i].size != 8 || slots[i].table >= layout.table_count)
+        if (w0 >> 26 != 0x3d) /* SMEM */
             continue;
-        sgpr = layout.table_sgprs[slots[i].table];
-        if (sgpr >= 16)
-            sgpr = 8 + slots[i].table;
-        if (!in->user_sgprs[sgpr])
+        op = (w0 >> 18) & 0xff;
+        sbase = (w0 & 0x3f) * 2;
+        i++; /* SMEM is two dwords */
+        if (op != 3 || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
             continue;
-        address = (UINT64)in->user_sgprs[sgpr] + slots[i].dword * 4ull;
+        address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
         if (ReboxShadowRead(address, words, sizeof(words))
                 && !(words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7])
                 && seen++ == n)
