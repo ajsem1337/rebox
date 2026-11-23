@@ -126,6 +126,7 @@ method the title asked for that isn't implemented.
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_WATCH_STAGE=<id>[:<offset>]` | At that console graphics stage's draws (the first 16, then every 100th), the four floats at the offset (hex, default 0x20) of the buffer its s8 table's first V# names |
 | `REBOX_DUMP_STAGES=<id>,...` | With `REBOX_DUMP_SPIRV`, those console graphics stages' code and the first 256 bytes of their s8 table, once each, as `<id>.code.bin` and `<id>.table.bin` |
+| (always) | The title's `OutputDebugString` text, its own boot log, is in the log as `title: ...` lines |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
 | `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |
 | `REBOX_CA_BUNDLE=FILE` | CA certificates placed at `G:\etc\ssl\certs\ca-bundle.crt`, where XCurl under WineGDK looks for them (without them every TLS request fails and some hang). The flake passes Nix's `cacert` |

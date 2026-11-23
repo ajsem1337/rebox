@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -308,6 +309,46 @@ HRESULT WINAPI ReboxRenderAudioStateMonitor(UINT category, void **monitor)
 
 static FARPROC WINAPI get_proc_address(HMODULE module, const char *name);
 
+/* The title's OutputDebugString text (its own boot log; Leonida's runtime traces it too) goes to
+ * the log as "title: ...", one line per line of text, then on to Wine's (a debugger's). */
+static void *real_output_debug_string_a, *real_output_debug_string_w;
+
+static void log_title_text(const char *text)
+{
+    static LONG lines;
+    char line[512];
+    while (text && *text)
+    {
+        size_t n = strcspn(text, "\r\n");
+        if (n && InterlockedIncrement(&lines) <= 20000)
+        {
+            snprintf(line, sizeof(line), "%.*s", (int)(n < sizeof(line) - 1 ? n : sizeof(line) - 1), text);
+            rebox_log("title: %s", line);
+        }
+        text += n;
+        while (*text == '\r' || *text == '\n')
+            text++;
+    }
+}
+
+static void WINAPI output_debug_string_a(const char *text)
+{
+    if (text && !IsBadStringPtrA(text, 4096))
+        log_title_text(text);
+    if (real_output_debug_string_a)
+        ((void (WINAPI *)(const char *))real_output_debug_string_a)(text);
+}
+
+static void WINAPI output_debug_string_w(const WCHAR *text)
+{
+    char narrow[1024];
+    if (text && !IsBadStringPtrW(text, 4096)
+            && WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow, sizeof(narrow), NULL, NULL))
+        log_title_text(narrow);
+    if (real_output_debug_string_w)
+        ((void (WINAPI *)(const WCHAR *))real_output_debug_string_w)(text);
+}
+
 static struct
 {
     const char *dll, *name;
@@ -318,6 +359,10 @@ static struct
     /* The title's reservations below 2^46, the console's address width (xmem.c). */
     { "kernelbase.dll", "VirtualAlloc", xmem_low_virtual_alloc },
     { "kernel32.dll", "VirtualAlloc", xmem_low_virtual_alloc },
+    { "kernelbase.dll", "OutputDebugStringA", output_debug_string_a },
+    { "kernel32.dll", "OutputDebugStringA", output_debug_string_a },
+    { "kernelbase.dll", "OutputDebugStringW", output_debug_string_w },
+    { "kernel32.dll", "OutputDebugStringW", output_debug_string_w },
     { "kernelbase.dll", "GetProcAddress", get_proc_address },
     { "kernel32.dll", "GetProcAddress", get_proc_address },
     { "user32.dll", "CreateWindowExW", create_window_w },
@@ -493,6 +538,10 @@ void import_fixup_run(void)
             real_get_proc_address = replacements[i].wine;
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
+        if (replacements[i].ours == (void *)output_debug_string_a && replacements[i].wine && !real_output_debug_string_a)
+            real_output_debug_string_a = replacements[i].wine;
+        if (replacements[i].ours == (void *)output_debug_string_w && replacements[i].wine && !real_output_debug_string_w)
+            real_output_debug_string_w = replacements[i].wine;
     }
     register_notification = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
     if (!register_notification || register_notification(0, dll_loaded, NULL, &cookie))

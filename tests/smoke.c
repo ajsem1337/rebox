@@ -3598,6 +3598,8 @@ static void test_acphal(void)
  * title's audio engine goes on without it; the rest fail or do nothing. */
 static void test_chad(void)
 {
+    /* The title's debug text reaches the log (run-smoke.sh looks for it). */
+    OutputDebugStringA("rebox smoke boot line\nsecond line\n");
     HMODULE m = LoadLibraryA("chad.dll");
     HRESULT (WINAPI *connect)(void *, UINT32, UINT32, UINT32, UINT32, HANDLE *) =
             m ? (void *)GetProcAddress(m, "XDspConnectWithMaximumStreamLimit") : NULL;
