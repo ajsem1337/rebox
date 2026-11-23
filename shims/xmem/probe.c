@@ -4,7 +4,7 @@
  * puts an int3 at each address. A hit logs the thread, the four argument registers, the return
  * address and the stack pointer, then the original byte is put back for one single-stepped
  * instruction and the int3 rearmed. Each probe logs its first REBOX_PROBE_MAX hits (default 20;
- * later hits are counted, not logged). Up to 16 probes. REBOX_PROBE_DUMP=N also logs the first N
+ * later hits are counted, not logged). Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
  * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA). This is how to see what a title's own code
  * is called with without changing its file: xcl's XCL_PROBE does the same with hardware
  * breakpoints (a GDK title's controller path was found so). A hit on another thread while one byte
@@ -18,7 +18,7 @@
 #include "../common/rebox_log.h"
 #include "probe.h"
 
-#define MAX_PROBES 16
+#define MAX_PROBES 64
 
 static struct probe
 {
