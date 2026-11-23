@@ -407,6 +407,11 @@ static void test_xmem(void)
             range = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
             CHECK(palloc(0x20000000, &count, pages) && count == 16 && pages[0] != pages[15],
                   "XMemAllocatePhysicalPages hands out 16 distinct pages");
+            /* 4 KiB frame numbers: a title packs them as >> 4 and back as (packed << 4) & 0x1fffff0. */
+            CHECK(!(pages[0] & 15) && !(pages[15] & 15) && ((pages[3] >> 4) << 4 & 0x1fffff0) == pages[3]
+                  && pages[1] - pages[0] == 16,
+                  "physical page numbers are 4 KiB frames, 16 a page (%#llx, %#llx)", (unsigned long long)pages[0],
+                  (unsigned long long)pages[1]);
             CHECK(range && pmap(range, 16, pages), "XMemMapPhysicalPages maps them into a reserved range");
             if (range)
             {
@@ -425,6 +430,9 @@ static void test_xmem(void)
                 CHECK(scatter && r2 && scatter(where, 2, pages), "XMemMapPhysicalPagesScatter maps two pages apart");
                 if (scatter && r2)
                 {
+                    /* Page 0 was written at range and unmapped there: what it held comes with it. */
+                    CHECK(r2[3 << 16] == 0x5a, "a physical page's contents follow it to a new address (%#x)",
+                          r2[3 << 16]);
                     MEMORY_BASIC_INFORMATION mbi = { 0 };
                     r2[(3 << 16) + 1] = 1;
                     r2[(9 << 16) + 0xffff] = 2;
