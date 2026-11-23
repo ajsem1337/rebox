@@ -635,11 +635,12 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
  * to VALUE in its low BITS bits run; the rest are skipped (their dispatch dropped). Each program run
  * is logged once. Halving the set run by run finds a program that faults the GPU (The Matrix
  * Awakens: a GPUVM fault at address 0 with console compute on). */
-static BOOL compute_bisect_skips(UINT64 code_address)
+static BOOL compute_bisect_skips(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in)
 {
+    UINT64 code_address = h->code_address;
     static int state = -1; /* -1 unread, 0 off, 1 on */
     static UINT64 value, mask;
-    UINT64 h = hash_bytes(0xcbf29ce484222325ull, &code_address, sizeof(code_address));
+    UINT64 hv = hash_bytes(0xcbf29ce484222325ull, &code_address, sizeof(code_address));
 
     if (state < 0)
     {
@@ -655,7 +656,7 @@ static BOOL compute_bisect_skips(UINT64 code_address)
     }
     if (!state)
         return FALSE;
-    if ((h & mask) != value)
+    if ((hv & mask) != value)
         return TRUE;
     {
         static UINT64 seen[256];
@@ -665,9 +666,36 @@ static BOOL compute_bisect_skips(UINT64 code_address)
             known |= seen[i] == code_address;
         if (!known && count < 256)
         {
+            /* What it's given and what it reads: its user SGPRs, the tables the layout analysis
+             * finds, and its code in %TEMP%\rebox-compute-<address>.bin to disassemble. */
+            char line[400], tables[128], path[MAX_PATH];
+            int at = 0, tat = 0;
+            struct sa5_layout layout;
+            static struct sa5_slot slots[64];
+            char ignored[64];
+            HANDLE f;
             seen[count++] = code_address;
-            rebox_log("d3d12_xs: console compute bisection runs program %#llx (hash %#llx)", (unsigned long long)code_address,
-                         (unsigned long long)h);
+            for (UINT32 i = 0; in->user_sgprs && i < in->user_sgpr_count && i < 32 && at < 380; i++)
+                at += snprintf(line + at, sizeof(line) - at, " %08x", in->user_sgprs[i]);
+            line[at] = 0;
+            tables[0] = 0;
+            InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
+            memset(&layout, 0, sizeof(layout));
+            if (sa5.analyse && !sa5.analyse((const UINT32 *)((const BYTE *)h + h->code_offset), h->code_dwords, user_sgprs(h, FALSE),
+                                            &layout, slots, ARRAYSIZE(slots), ignored, sizeof(ignored)))
+                for (UINT32 t = 0; t < layout.table_count && t < 16 && tat < 110; t++)
+                    tat += snprintf(tables + tat, sizeof(tables) - tat, " s%u", layout.table_sgprs[t]);
+            rebox_log("d3d12_xs: console compute bisection runs program %#llx (hash %#llx, %u dwords); tables through%s; "
+                         "user SGPRs:%s", (unsigned long long)code_address, (unsigned long long)hv, h->code_dwords,
+                         tat ? tables : " (none found)", line);
+            GetTempPathA(sizeof(path) - 64, path);
+            snprintf(path + strlen(path), 64, "rebox-compute-%llx.bin", (unsigned long long)code_address);
+            if ((f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL)) != INVALID_HANDLE_VALUE)
+            {
+                DWORD written;
+                WriteFile(f, (const BYTE *)h + h->code_offset, h->code_dwords * 4u, &written, NULL);
+                CloseHandle(f);
+            }
         }
     }
     return FALSE;
@@ -768,7 +796,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         }
     }
     set_last(E_FAIL, "no result (out of memory?)", NULL);
-    if (!graphics && compute_bisect_skips(h->code_address))
+    if (!graphics && compute_bisect_skips(h, in))
     {
         set_last(E_FAIL, "skipped by REBOX_CONSOLE_COMPUTE_BISECT", NULL);
         return E_FAIL;
