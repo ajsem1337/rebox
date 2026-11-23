@@ -774,7 +774,7 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
 {
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
-        Module m(Freeze(result->spirv, result->result.specialization));
+        Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr);
         HostBuffers(m, buffers, buffer_count, nullptr);
         const auto words = m.Words();
@@ -796,7 +796,7 @@ SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
         if (draw_block_base % 8u) Fail("the draw block's address must be 8-byte aligned in the push block");
-        Module m(Freeze(result->spirv, result->result.specialization));
+        Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
         const DrawBlock draw(m, draw_block_base);
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw);
         HostBuffers(m, buffers, buffer_count, &draw);

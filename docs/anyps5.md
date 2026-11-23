@@ -278,6 +278,10 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      in the module, so a shader keeps one module and one pipeline when the title copies its
      descriptors to new heap slots every draw (a UE5 title does: with the slots baked in, half its
      stage compiles made a new module and vkd3d-proton a new pipeline).
+     Graphics stages compile through AnyPS5's resource capture and result memo (`CaptureResources`,
+     then `Recompile(request, capture)`), as its own driver draws: a draw whose captured resources
+     match an earlier one's reuses that result with its per-draw data patched in. Results are held
+     by pointer and their SPIR-V words made only for a new module (the largest are 330k words).
      The process-wide host buffers (fault buffer, GDS, page table) are baked into the modules
      (`sa5_host_buffer.address`). Baking everything made a module and a pipeline per draw, and
      a UE5 title's render thread stopped presenting while it compiled them. The pipeline is

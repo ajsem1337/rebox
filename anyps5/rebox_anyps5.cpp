@@ -3,6 +3,8 @@
 #include "rebox_anyps5.h"
 
 #include "BdaAbi.hpp"
+#include "Optimization/RequestMemoryView.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
 
 #include <algorithm>
@@ -21,6 +23,21 @@ using namespace ShaderRecompiler;
 #include "sa5_internal.hpp"
 
 namespace {
+
+// Graphics stages: through AnyPS5's resource capture and result memo, as its own driver draws. A
+// draw whose captured resources match an earlier one's reuses that result with only its per-draw
+// data patched in (buffer tables, the flattened SRT, shader data), instead of materializing and
+// emitting the variant again (a UE5 title draws the same shaders with new descriptor tables every
+// draw).
+std::shared_ptr<const RecompileResult> RecompileMemoized(const RecompileRequest& request,
+                                                         const std::vector<MemoryRegion>& regions)
+{
+    if (!request.useCache) return std::make_shared<const RecompileResult>(Recompile(request));
+    RequestMemoryView memory{std::span<const MemoryRegion>(regions)};
+    const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    const auto capture = CaptureResources(request, runtime);
+    return Recompile(request, *capture);
+}
 
 // A conservative Vulkan 1.2-class target. TODO: fill it from vkd3d-proton's
 // VkPhysicalDevice (subgroup size, limits, capabilities, extensions).
@@ -98,10 +115,7 @@ SA5_API int sa5_compile_compute(const sa5_compute_request* request, sa5_result**
         };
         compile.useCache = request->use_cache != 0;
 
-        auto* result = new sa5_result{Recompile(compile), {}};
-        const auto words = result->result.spirv.Words();
-        result->spirv.assign(words.begin(), words.end());
-        *out = result;
+        *out = new sa5_result(std::make_shared<const RecompileResult>(Recompile(compile)));
         return 0;
     } catch (const std::exception& e) {
         SetError(error, error_size, e.what());
@@ -169,10 +183,7 @@ SA5_API int sa5_compile_pixel(const sa5_pixel_request* request, sa5_result** out
         compile.layout = {0, 0, request->push_offset, request->push_size ? request->push_size : 128u};
         compile.useCache = request->use_cache != 0;
 
-        auto* result = new sa5_result{Recompile(compile), {}};
-        const auto words = result->result.spirv.Words();
-        result->spirv.assign(words.begin(), words.end());
-        *out = result;
+        *out = new sa5_result(RecompileMemoized(compile, regions));
         return 0;
     } catch (const std::exception& e) {
         SetError(error, error_size, e.what());
@@ -225,10 +236,7 @@ SA5_API int sa5_compile_vertex(const sa5_vertex_request* request, sa5_result** o
         compile.layout = {0, 0, request->push_offset, request->push_size ? request->push_size : 128u};
         compile.useCache = request->use_cache != 0;
 
-        auto* result = new sa5_result{Recompile(compile), {}};
-        const auto words = result->result.spirv.Words();
-        result->spirv.assign(words.begin(), words.end());
-        *out = result;
+        *out = new sa5_result(RecompileMemoized(compile, regions));
         return 0;
     } catch (const std::exception& e) {
         SetError(error, error_size, e.what());
@@ -259,8 +267,8 @@ SA5_API int sa5_result_vertex_input(const sa5_result* result, std::uint32_t inde
 SA5_API const std::uint32_t* sa5_result_spirv(const sa5_result* result, std::uint32_t* word_count)
 {
     if (word_count)
-        *word_count = result ? static_cast<std::uint32_t>(result->spirv.size()) : 0u;
-    return result ? result->spirv.data() : nullptr;
+        *word_count = result ? static_cast<std::uint32_t>(const_cast<sa5_result*>(result)->Spirv().size()) : 0u;
+    return result ? const_cast<sa5_result*>(result)->Spirv().data() : nullptr;
 }
 
 SA5_API std::uint32_t sa5_result_binding_count(const sa5_result* result)
