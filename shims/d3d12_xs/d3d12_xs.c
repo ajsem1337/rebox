@@ -540,6 +540,18 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         if (subobj_layouts[type].stage)
         {
             D3D12_SHADER_BYTECODE *bc = (D3D12_SHADER_BYTECODE *)(stream + offset + subobj_layouts[type].offset);
+            /* A stream walked out of step (a console subobject of another size) gives a bytecode
+             * that isn't one: pass the stream through rather than read through it. */
+            if (bc->BytecodeLength && (!bc->pShaderBytecode || IsBadReadPtr(bc->pShaderBytecode, bc->BytecodeLength)))
+            {
+                static LONG once;
+                if (!InterlockedExchange(&once, 1))
+                    rebox_log("d3d12_xs: pipeline stream walked out of step at +%#zx (%s bytecode %p, %zu bytes); "
+                                 "passing it through untranslated", (size_t)offset, subobj_layouts[type].stage,
+                                 bc->pShaderBytecode, (size_t)bc->BytecodeLength);
+                free(stream);
+                return orig_create_pipeline(device, desc, riid, pso);
+            }
             if (stage_count < ARRAYSIZE(stages))
             {
                 census_names[stage_count] = subobj_layouts[type].stage;

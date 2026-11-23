@@ -1306,6 +1306,34 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
     SIZE_T kept = 0;
 
     *copy = NULL;
+    /* The first mesh pipeline stream (AS or MS), whole, to check its layout against the desktop's. */
+    {
+        static LONG dumped;
+        BOOL mesh = FALSE;
+        for (const BYTE *s = base; s + sizeof(UINT) <= end && !mesh;)
+        {
+            UINT type = *(const UINT *)s;
+            SIZE_T size, align;
+            mesh = type == 24 || type == 25;
+            stream_payload(type, &size, &align);
+            if (!size)
+                break;
+            s += (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
+        }
+        if (mesh && !InterlockedExchange(&dumped, 1))
+        {
+            const UINT *d = desc->pPipelineStateSubobjectStream;
+            rebox_log("d3d12_xs: first mesh pipeline stream, %zu bytes:", (size_t)desc->SizeInBytes);
+            for (SIZE_T i = 0; i < desc->SizeInBytes / 4; i += 8)
+            {
+                char line[128];
+                int at = 0;
+                for (SIZE_T j = i; j < i + 8 && j < desc->SizeInBytes / 4; j++)
+                    at += snprintf(line + at, sizeof(line) - at, " %08x", d[j]);
+                rebox_log("d3d12_xs:   stream +%#05zx:%s", i * 4, line);
+            }
+        }
+    }
     /* Pass 0 finds whether anything is dropped; pass 1 copies the rest. */
     for (int pass = 0; pass < 2; pass++)
     {
