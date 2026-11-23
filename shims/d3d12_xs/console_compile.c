@@ -690,8 +690,7 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
 }
 
-/* The address of the n-th T# a graphics stage loads from its descriptor tables that reads as empty
- * now, or 0. The code is scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode
+/* The address of the n-th T# a graphics stage loads from its descriptor tables, or 0. The code is scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode
  * 3) from an SGPR pair whose low register is a table pointer (user SGPRs 8-15, the console's
  * graphics layout, used as {sN, 0}): the address is that SGPR plus the load's offset. */
 static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
@@ -712,9 +711,8 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
         if (op != 3 || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
             continue;
         address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
-        if (ReboxShadowRead(address, words, sizeof(words))
-                && !(words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7])
-                && seen++ == n)
+        /* In a shadow heap, whatever it holds now: AnyPS5 may have read it empty a moment before. */
+        if (ReboxShadowRead(address, words, sizeof(words)) && seen++ == n)
             return address;
     }
     return 0;
