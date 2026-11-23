@@ -18,6 +18,7 @@
  * and its dispatches are skipped. REBOX_DUMP_SPIRV=DIR writes each finalized module there. */
 
 #define COBJMACROS
+#define WIDL_C_INLINE_WRAPPERS
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +27,10 @@
 #include "../common/rebox_log.h"
 #include "../../anyps5/rebox_anyps5.h"
 #include "console_compile.h"
+#include "console_desc.h"
 #include "gpu_memory.h"
 #include "shadow.h"
+#include "title_textures.h"
 
 #define TITLE_BASE 0x10000000ull
 #define MAX_REGIONS 64
@@ -937,6 +940,28 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             {
                 const UINT32 *w = b.words + e * per;
                 SIZE_T heap = (SIZE_T)in->heap_cpu[sampler];
+                if (graphics && !sampler)
+                {
+                    /* The first graphics stages' textures: which resource, and whether its texels
+                     * come from title memory (uploaded how often) or through the API. */
+                    static LONG shown;
+                    ID3D12Resource *res = console_texture_of(w);
+                    UINT64 address = 0;
+                    UINT uploads = 0;
+                    if (InterlockedIncrement(&shown) <= 64)
+                    {
+                        D3D12_RESOURCE_DESC rd = { 0 };
+                        BOOL title = res && title_texture_info(res, &address, &uploads);
+                        if (res)
+                            rd = ID3D12Resource_GetDesc(res);
+                        rebox_log("d3d12_xs: console %s shader %016llx texture %u.%u: T# %08x %08x, resource %p "
+                                     "%llux%u format %u flags %#x, %s %#llx, uploaded %u times",
+                                     h->stage == 0x10 ? "pixel" : "vertex", (unsigned long long)stage_id, i, e, w[0],
+                                     w[1], (void *)res, (unsigned long long)rd.Width, rd.Height, rd.Format, rd.Flags,
+                                     title ? "title memory at" : "not from title memory", (unsigned long long)address,
+                                     uploads);
+                    }
+                }
                 UINT *index = &indices[index_count + e];
                 /* Samplers not in the heap (built from literals, or AnyPS5's point-filtered twins)
                  * are made in its reserved tail; matching that ignores rewritten fields is the

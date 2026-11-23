@@ -8,4 +8,6 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
                             const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state);
 void title_textures_upload(ID3D12CommandQueue *queue);
 UINT64 title_texture_size(const D3D12_RESOURCE_DESC *desc);
+/* Whether a texture is filled from title memory: its address and how often it was uploaded. */
+BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads);
 void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size);

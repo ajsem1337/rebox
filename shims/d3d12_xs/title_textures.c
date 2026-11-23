@@ -45,6 +45,7 @@ struct title_texture
     BOOL chunk;                 /* in our GPU memory chunks, which stay mapped */
     UINT check_at, backoff;     /* in submissions */
     UINT64 fingerprint;
+    UINT uploads;
     UINT callback;
     struct title_texture *next;
 };
@@ -280,6 +281,19 @@ static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12
     else
         surface->mode = single_texture_mode(surface, block, bytes);
     return TRUE;
+}
+
+BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads)
+{
+    struct title_texture *t;
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (t = textures; t && !found; t = t->next)
+        if ((found = t->resource == resource))
+            *address = t->address, *uploads = t->uploads;
+    ReleaseSRWLockShared(&lock);
+    return found;
 }
 
 /* The bytes a texture takes in console memory (0 if it isn't uploaded). */
@@ -549,7 +563,10 @@ void title_textures_upload(ID3D12CommandQueue *queue)
             InterlockedDecrement(&dirty_count);
             t->fingerprint = fingerprint(t);
             if ((b->buffers[b->count] = record_upload(device, b->list, t)))
+            {
                 b->count++;
+                t->uploads++;
+            }
         }
     ReleaseSRWLockExclusive(&lock);
     if (FAILED(ID3D12GraphicsCommandList_Close(b->list)) || !b->count)

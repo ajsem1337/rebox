@@ -167,6 +167,21 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
     return va;
 }
 
+ID3D12Resource *console_texture_of(const UINT32 words[2])
+{
+    UINT64 va = ((UINT64)(words[1] & 0xff) << 32 | words[0]) << 8;
+    ID3D12Resource *res = NULL;
+    struct texture_id *t;
+
+    AcquireSRWLockShared(&texture_lock);
+    for (UINT i = 0; i < ARRAYSIZE(texture_ids) && !res; i++)
+        for (t = texture_ids[i]; t && !res; t = t->next)
+            if (t->va == va)
+                res = t->res;
+    ReleaseSRWLockShared(&texture_lock);
+    return res;
+}
+
 void console_encode_srv(ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *d, UINT32 out[8])
 {
     D3D12_RESOURCE_DESC rd;

@@ -12,3 +12,5 @@ void console_encode_sampler(const D3D12_SAMPLER_DESC *desc, UINT32 out[4]);
 /* The D3D12 sampler an S# describes (console_encode_sampler's inverse, for samplers shaders build
  * themselves). */
 void console_decode_sampler(const UINT32 words[4], D3D12_SAMPLER_DESC *desc);
+/* The texture a T# names by its synthetic address (console_encode_srv/uav), or NULL. */
+ID3D12Resource *console_texture_of(const UINT32 words[2]);
