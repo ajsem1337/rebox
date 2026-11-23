@@ -11,6 +11,7 @@
  * is restored is missed. */
 
 #include <windows.h>
+#include <winternl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +149,36 @@ static BOOL add_probe(BYTE *address, const char *name)
     return TRUE;
 }
 
+/* Probes on a module that isn't loaded yet (MODULE!RVA: xgameruntime.dll comes in later, through
+ * the Gaming Runtime's API sets) are armed when it loads, from ntdll's load notification. */
+static struct pending { char module[64]; ULONG_PTR rva; } pendings[MAX_PROBES];
+static UINT pending_count;
+
+typedef struct
+{
+    ULONG Flags;
+    const UNICODE_STRING *FullDllName;
+    const UNICODE_STRING *BaseDllName;
+    void *DllBase;
+    ULONG SizeOfImage;
+} PROBE_DLL_LOADED;
+
+static void CALLBACK probe_dll_loaded(ULONG reason, const PROBE_DLL_LOADED *data, void *context)
+{
+    char name[64];
+    if (reason != 1 || !data->BaseDllName)
+        return;
+    snprintf(name, sizeof(name), "%.*ls", (int)(data->BaseDllName->Length / 2), data->BaseDllName->Buffer);
+    for (UINT i = 0; i < pending_count; i++)
+        if (pendings[i].rva && !_stricmp(pendings[i].module, name))
+        {
+            char probe_name[64];
+            snprintf(probe_name, sizeof(probe_name), "%s+%#llx", pendings[i].module, (unsigned long long)pendings[i].rva);
+            add_probe((BYTE *)data->DllBase + pendings[i].rva, probe_name);
+            pendings[i].rva = 0;
+        }
+}
+
 /* For tests and tools: probe an address at run time, and read a probe's hit count. */
 BOOL WINAPI ReboxProbeAdd(void *address, const char *name)
 {
@@ -187,13 +218,35 @@ void probe_install(void)
         ULONG_PTR rva = strtoull(bang ? bang + 1 : tok, NULL, 16);
         char name[64];
 
-        if (!module || !rva)
+        if (!rva)
         {
-            rebox_log("probe %s: no such module or address", tok);
+            rebox_log("probe %s: no address", tok);
+            continue;
+        }
+        if (!module && bang && pending_count < MAX_PROBES)
+        {
+            snprintf(pendings[pending_count].module, sizeof(pendings[0].module), "%s", tok);
+            pendings[pending_count++].rva = rva;
+            continue;
+        }
+        if (!module)
+        {
+            rebox_log("probe %s: no such module", tok);
             continue;
         }
         snprintf(name, sizeof(name), "%s+%#llx", bang ? tok : "exe", (unsigned long long)rva);
         add_probe((BYTE *)module + rva, name);
     }
     free(spec);
+    if (pending_count)
+    {
+        NTSTATUS (WINAPI *register_notification)(ULONG, void *, void *, void **) =
+                (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
+        static void *cookie;
+        if (register_notification && !register_notification(0, probe_dll_loaded, NULL, &cookie))
+            rebox_log("probes: %u wait for their modules to load", pending_count);
+        else
+            rebox_log("probes: no DLL load notifications; %u probes on modules not loaded yet are dropped",
+                         pending_count);
+    }
 }
