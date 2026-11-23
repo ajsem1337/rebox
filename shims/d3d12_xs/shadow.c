@@ -391,6 +391,20 @@ UINT shadow_buffer_ranges(UINT64 (*out)[2], UINT max)
     return n;
 }
 
+/* The first writes into shader-visible heaps, by title address: do the slots the console tables
+ * point at get written, and before the draws that read them? */
+static void note_visible_write(const struct shadow_heap *h, UINT index, const char *how)
+{
+    static LONG shown;
+    if (h->title_va && InterlockedIncrement(&shown) <= 64)
+        rebox_log("d3d12_xs: shadow write (%s) at %#llx: view %u, words %08x %08x %08x %08x", how,
+                     (unsigned long long)(h->title_va + (UINT64)index * h->stride), h->views[index],
+                     ((const UINT32 *)(h->data + (SIZE_T)index * h->stride))[0],
+                     ((const UINT32 *)(h->data + (SIZE_T)index * h->stride))[1],
+                     ((const UINT32 *)(h->data + (SIZE_T)index * h->stride))[2],
+                     ((const UINT32 *)(h->data + (SIZE_T)index * h->stride))[3]);
+}
+
 static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_view view)
 {
     struct shadow_heap *h;
@@ -404,6 +418,7 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
         memcpy(h->data + (SIZE_T)index * h->stride, words, size < h->stride ? size : h->stride);
         h->views[index] = view;
         index_slot(h, index);
+        note_visible_write(h, index, "view");
     }
     ReleaseSRWLockExclusive(&lock);
 }
@@ -484,6 +499,7 @@ void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
             d->views[di] = SHADOW_VIEW_NONE;
         }
         index_slot(d, di);
+        note_visible_write(d, di, "copy");
     }
     ReleaseSRWLockExclusive(&lock);
 }
