@@ -88,11 +88,57 @@ static ULONG WINAPI app_constrained_register(void *routine, void *context, void 
     return ERROR_SUCCESS;
 }
 
+/* The title's top-level windows are the console's screen: frameless, the client area the whole
+ * window (xcl). a GDK title asks for an overlapped 1920x1080 window and sizes its back
+ * buffers from the client area, which a frame cut to 1912x1046. Top-level windows with a caption or
+ * sizing frame are made popups at the size asked for. REBOX_FRAMELESS=0 leaves them. */
+static DWORD frameless_style(DWORD style, HWND parent)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("REBOX_FRAMELESS", v, sizeof(v));
+        enabled = !(n && n < sizeof(v) && v[0] == '0');
+    }
+    if (!enabled || parent || (style & WS_CHILD) || !(style & (WS_CAPTION | WS_THICKFRAME)))
+        return style;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("frameless window: style %#lx made a popup (the console's screen)", style);
+    }
+    return (style & ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+}
+
+/* The real functions, by the pointers captured at startup: never through an import, which may be
+ * one of these replacements (our own DLLs load from outside the Windows directory in the smoke
+ * test, and would call themselves). */
+static void *real_create_window_w, *real_create_window_a;
+
+static HWND WINAPI create_window_w(DWORD ex, const WCHAR *cls, const WCHAR *name, DWORD style, int x, int y, int w,
+        int h, HWND parent, HMENU menu, HINSTANCE inst, void *param)
+{
+    return ((HWND (WINAPI *)(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
+            void *))real_create_window_w)(ex, cls, name, frameless_style(style, parent), x, y, w, h, parent, menu, inst,
+            param);
+}
+
+static HWND WINAPI create_window_a(DWORD ex, const char *cls, const char *name, DWORD style, int x, int y, int w,
+        int h, HWND parent, HMENU menu, HINSTANCE inst, void *param)
+{
+    return ((HWND (WINAPI *)(DWORD, const char *, const char *, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
+            void *))real_create_window_a)(ex, cls, name, frameless_style(style, parent), x, y, w, h, parent, menu, inst,
+            param);
+}
+
 static struct
 {
     const char *dll, *name;
     void *ours, *wine;
 } replacements[] = {
+    { "user32.dll", "CreateWindowExW", create_window_w },
+    { "user32.dll", "CreateWindowExA", create_window_a },
     { "twinapi.appcore.dll", "RegisterAppStateChangeNotification", app_state_register },
     { "twinapi.appcore.dll", "UnregisterAppStateChangeNotification", app_state_unregister },
     { "twinapi.appcore.dll", "RegisterAppConstrainedChangeNotification", app_constrained_register },
@@ -158,11 +204,19 @@ static UINT fix_module(HMODULE module)
     IMAGE_IMPORT_DESCRIPTOR *desc;
     char path[MAX_PATH], *file;
     UINT fixed = 0;
+    BOOL title;
 
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || !dir->VirtualAddress)
         return 0;
     GetModuleFileNameA(module, path, sizeof(path));
     file = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+    /* Replacements are for the title's modules only: not Wine's DLLs or ours (all under the
+     * Windows directory), which would otherwise call themselves through them. */
+    {
+        char windir[MAX_PATH];
+        UINT n = GetWindowsDirectoryA(windir, sizeof(windir));
+        title = !(n && n < sizeof(windir) && !_strnicmp(path, windir, n));
+    }
     for (desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress); desc->Name; desc++)
     {
         void **iat = (void **)(base + desc->FirstThunk);
@@ -172,7 +226,7 @@ static UINT fix_module(HMODULE module)
             DWORD old;
             void *ours;
 
-            if ((ours = replacement(*iat)))
+            if (title && (ours = replacement(*iat)))
             {
                 if (VirtualProtect(iat, sizeof(*iat), PAGE_READWRITE, &old))
                 {
@@ -232,6 +286,10 @@ void import_fixup_run(void)
     {
         HMODULE dll = LoadLibraryA(replacements[i].dll);
         replacements[i].wine = dll ? (void *)GetProcAddress(dll, replacements[i].name) : NULL;
+        if (replacements[i].ours == (void *)create_window_w)
+            real_create_window_w = replacements[i].wine;
+        if (replacements[i].ours == (void *)create_window_a)
+            real_create_window_a = replacements[i].wine;
     }
     register_notification = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
     if (!register_notification || register_notification(0, dll_loaded, NULL, &cookie))
