@@ -283,11 +283,19 @@ void console_encode_uav(ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_D
     encode_texture(resource_va(res, &rd), &rd, &v, out);
 }
 
+/* A constant buffer as the console's runtime writes one: 16-byte rows (stride 16, the record count
+ * in rows) with an index-only bounds check. A shader may read rows by index (buffer_load idxen: a
+ * UI vertex shader's transform rows); with stride 0 every row was row 0 and each vertex had x = y,
+ * the whole UI on one diagonal (as xcl had: ivall/xcl #175). Scalar loads are bounded by stride
+ * times records, the same bytes. */
 void console_encode_cbv(const D3D12_CONSTANT_BUFFER_VIEW_DESC *d, UINT32 out[8])
 {
     memset(out, 0, 8 * sizeof(*out));
     if (d && d->BufferLocation)
-        encode_buffer(d->BufferLocation, d->SizeInBytes, 0, DXGI_FORMAT_R32G32B32A32_FLOAT, out);
+    {
+        encode_buffer(d->BufferLocation, (d->SizeInBytes + 15) & ~15u, 16, DXGI_FORMAT_R32G32B32A32_FLOAT, out);
+        out[3] = (out[3] & ~(3u << 28)) | 1u << 28; /* OOB_SELECT: index only */
+    }
 }
 
 static UINT clamp_mode(D3D12_TEXTURE_ADDRESS_MODE m)

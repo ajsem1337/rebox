@@ -1427,6 +1427,10 @@ static void test_present(void *dev, void *queue)
             words = pdata ? (const UINT32 *)((BYTE *)pdata + 3 * pstride) : NULL;
             CHECK(SUCCEEDED(hr) && words && (words[0] || words[1]), "a CBV written at a title handle in it reaches the "
                   "shadow heap (%#lx: %08x %08x)", hr, words ? words[0] : 0, words ? words[1] : 0);
+            /* As the console's runtime writes one: 16-byte rows, an index-only bounds check. */
+            CHECK(words && (words[1] >> 16 & 0x3fff) == 16 && words[2] == 256 / 16 && (words[3] >> 28 & 3) == 1,
+                  "the CBV's V# has stride 16 and its size in rows (%08x %08x %08x)", words ? words[1] : 0,
+                  words ? words[2] : 0, words ? words[3] : 0);
             if (cbuf) ID3D12Resource_Release(cbuf);
         }
         if (pheap) XSLOT(pheap, 2, ULONG)(pheap);
