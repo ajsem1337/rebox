@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -198,12 +199,28 @@ struct ConnectivityHint {
 static_assert(sizeof(ConnectivityHint) == 16, "XNetworkingConnectivityHint layout");
 
 constexpr uint32_t kConnectivityLevelNone = 1;
+constexpr uint32_t kConnectivityLevelInternetAccess = 3;
 constexpr uint32_t kConnectivityCostUnknown = 0;
+constexpr uint32_t kConnectivityCostUnrestricted = 1;
 const ConnectivityHint kOfflineHint{kConnectivityLevelNone, kConnectivityCostUnknown, 0, 1, 0, 0, 0};
+// rebox local change: internet access on an unmetered Ethernet link (IANA type 6) by default. A
+// retail title polls XNetworkingGetConnectivityHint without end while it says no connectivity (about
+// 3,000 calls a second, its boot stalled); xcl (ivall/xcl) answers internet access and the title
+// boots on. Connections themselves are the host's business (rebox blocks them unless
+// REBOX_NETWORK=1). XGR_CONNECTIVITY=none answers no connectivity, as before.
+const ConnectivityHint kOnlineHint{kConnectivityLevelInternetAccess, kConnectivityCostUnrestricted, 6, 1, 0, 0, 0};
+
+const ConnectivityHint& connectivity_hint() {
+  static const ConnectivityHint* hint = [] {
+    const char* setting = std::getenv("XGR_CONNECTIVITY");
+    return setting && !_stricmp(setting, "none") ? &kOfflineHint : &kOnlineHint;
+  }();
+  return *hint;
+}
 
 HRESULT XNetworkingGetConnectivityHint_impl(void*, ConnectivityHint* hint) {
   if (!hint) return E_INVALIDARG;
-  *hint = kOfflineHint;
+  *hint = connectivity_hint();
   return S_OK;
 }
 
@@ -232,7 +249,7 @@ void CALLBACK deliver_initial_connectivity_hint(void* holder, bool canceled) {
     r.running = deliver;
   }
   if (deliver) {
-    r.callback(r.context, &kOfflineHint);
+    r.callback(r.context, &connectivity_hint());
     std::lock_guard<std::mutex> lock(g_connectivity_lock);
     r.running = false;
     if (!r.active) g_connectivity.erase(r.token);

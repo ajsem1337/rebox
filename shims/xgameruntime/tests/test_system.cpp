@@ -337,9 +337,9 @@ static void CheckNetworking() {
   ConnectivityHint hint;
   std::memset(&hint, 0xcc, sizeof(hint));
   HRESULT hr = net.At<HRESULT (*)(void*, ConnectivityHint*)>(15, "XNetworkingGetConnectivityHint")(net.self, &hint);
-  Check(hr == S_OK && hint.level == 1 && hint.cost == 0 && hint.networkInitialized == 1 && !hint.approachingDataLimit &&
-            !hint.overDataLimit && !hint.roaming,
-        "XNetworkingGetConnectivityHint reports an initialised stack with no connectivity");
+  Check(hr == S_OK && hint.level == 3 && hint.cost == 1 && hint.ianaInterfaceType == 6 && hint.networkInitialized == 1 &&
+            !hint.approachingDataLimit && !hint.overDataLimit && !hint.roaming,
+        "XNetworkingGetConnectivityHint reports an initialised stack with internet access (rebox: XGR_CONNECTIVITY=none for none)");
   Check(net.At<HRESULT (*)(void*, ConnectivityHint*)>(15, "XNetworkingGetConnectivityHint")(net.self, nullptr) == E_INVALIDARG, "XNetworkingGetConnectivityHint rejects null");
 
   auto reg = net.At<HRESULT (*)(void*, void*, void*, void*, Token*)>(16, "XNetworkingRegisterConnectivityHintChanged");
@@ -348,7 +348,7 @@ static void CheckNetworking() {
   Token token{};
   hr = reg(net.self, nullptr, g_hint_event, reinterpret_cast<void*>(&HintCallback), &token);
   bool delivered = hr == S_OK && WaitForSingleObject(g_hint_event, 5000) == WAIT_OBJECT_0;
-  Check(delivered && g_delivered_hint.level == 1 && g_delivered_hint.networkInitialized == 1,
+  Check(delivered && g_delivered_hint.level == 3 && g_delivered_hint.networkInitialized == 1,
         "XNetworkingRegisterConnectivityHintChanged sends the documented initial notification");
   Sleep(50);
   Check(g_hint_calls == 1, "XNetworkingRegisterConnectivityHintChanged sends nothing after the initial notification");

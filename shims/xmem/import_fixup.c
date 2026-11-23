@@ -14,7 +14,7 @@
  * The title's network is off unless REBOX_NETWORK=1: its HTTP connections (WinHTTP, which
  * libHttpClient uses too) and sockets fail as with no network, so it sends nothing out (a title's
  * crash handler uploads a minidump of the process, with the host's details, to its publisher).
- * Loopback addresses and localhost still work. */
+ * Loopback addresses, localhost and the machine's own name still work. */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -443,9 +443,19 @@ static int WSAAPI net_wsa_sendto(SOCKET s, WSABUF *buffers, DWORD count, DWORD *
     return SOCKET_ERROR;
 }
 
+/* Names that stay on this machine: none (the host itself), localhost, loopback addresses, and the
+ * machine's own name, which a retail title looks up at start (xcl allows the same). */
 static BOOL local_name(const char *name)
 {
-    return !name || !*name || !_stricmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "::1");
+    char own[256];
+    DWORD size = sizeof(own);
+
+    if (!name || !*name || !_stricmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "::1"))
+        return TRUE;
+    if (GetComputerNameExA(ComputerNameDnsHostname, own, &size) && !_stricmp(name, own))
+        return TRUE;
+    size = sizeof(own);
+    return GetComputerNameExA(ComputerNameDnsFullyQualified, own, &size) && !_stricmp(name, own);
 }
 
 static int WSAAPI net_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
