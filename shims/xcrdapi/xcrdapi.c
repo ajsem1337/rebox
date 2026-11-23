@@ -529,6 +529,13 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
 
     if (!request)
         return;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("xcrdapi: request (options %#llx, %s, %u -> %u bytes)", (unsigned long long)request->options,
+                         request->options & OPT_SOURCE_MEMORY ? "from memory" : "from a file", request->source_size,
+                         request->destination_size);
+    }
     e.request = *request;
     if (!(request->options & OPT_SOURCE_MEMORY) && request->source)
     {
@@ -618,6 +625,8 @@ static HRESULT WINAPI factory_CreateQueue(struct object *self, const DSTORAGE_QU
     *out = NULL;
     if (!desc || desc->source_type > 1)
         return E_INVALIDARG;
+    rebox_log("xcrdapi: queue created (%s source, capacity %u, priority %d, %s)",
+                 desc->source_type ? "memory" : "file", desc->capacity, desc->priority, desc->name ? desc->name : "unnamed");
     if (!(q = calloc(1, sizeof(*q))))
         return E_OUTOFMEMORY;
     q->obj = (struct object){ queue_vtbl, 1, queue_destroy };
