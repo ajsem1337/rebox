@@ -9,10 +9,16 @@
  *
  * So for now the object is a placeholder: it answers as a state object and its properties, with
  * zero shader identifiers and stack sizes, and traces nothing. Ray traced passes then draw without
- * their rays instead of the title stopping. Slots past the desktop interfaces (state object 8,
- * properties 7: the console's, called with selectors 0 and 1, per TuxBox) log their arguments and
- * return 0. REBOX_DUMP_STATE_OBJECTS=DIR writes each distinct blob there, for working out the
- * format. */
+ * their rays instead of the title stopping. REBOX_DUMP_STATE_OBJECTS=DIR writes each distinct
+ * blob there, for working out the format.
+ *
+ * Unreal then inspects the native programs (FD3D12Device::GetRayTracingPipelineInfo, read from its
+ * code): properties slot 7 (selector, 16-byte struct out): selector 0 fills two dwords, selector 1
+ * an interface whose slot 3 gives a struct with a count at +8; state object slot 8 (out) gives an
+ * interface whose slot 9 (1, 0, out) gives another, whose slot 3 gives a table (0x18-byte entries,
+ * count at +0x10) of register counts (bits 0-8 and 11-18 of the dword at +0x14). The placeholder's
+ * answers describe no programs: zero structs, and an inspection object whose slot 3 points at
+ * zeros. Other console slots log their arguments and return 0. */
 
 #define COBJMACROS
 #include <stdio.h>
@@ -101,16 +107,75 @@ static UINT64 extra_slot(const char *iface, UINT slot, UINT64 a, UINT64 b, UINT6
     return 0;
 }
 
+/* What the console's inspection slots hand out: an object whose slot 3 points at zeros (no
+ * programs, no counts) and whose slot 9 gives itself. */
+static const BYTE zeros[1024];
+static void *const inspect_vtbl[16];
+static void *const inspection = (void *)inspect_vtbl;
+
+static HRESULT WINAPI inspect_QueryInterface(void *self, REFIID iid, void **out)
+{
+    if (!out)
+        return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+static ULONG WINAPI inspect_ref(void *self) { return 1; }
+static const void *WINAPI inspect_data(void *self) { return zeros; }
+static HRESULT WINAPI inspect_child(void *self, UINT64 a, UINT64 b, void **out)
+{
+    if (out)
+        *out = (void *)&inspection;
+    return S_OK;
+}
+static UINT64 WINAPI inspect_other(void *self, UINT64 a, UINT64 b, UINT64 c)
+{
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: placeholder inspection slot (%#llx, %#llx, %#llx): 0", (unsigned long long)a,
+                     (unsigned long long)b, (unsigned long long)c);
+    return 0;
+}
+static void *const inspect_vtbl[16] = {
+    inspect_QueryInterface, inspect_ref, inspect_ref, inspect_data, inspect_other, inspect_other, inspect_other,
+    inspect_other, inspect_other, inspect_child, inspect_other, inspect_other, inspect_other, inspect_other,
+    inspect_other, inspect_other,
+};
+
+/* State object slot 8 (out): the inspection object. */
+static HRESULT WINAPI so_programs(void *self, void **out)
+{
+    if (out)
+        *out = (void *)&inspection;
+    return S_OK;
+}
+
+/* Properties slot 7 (selector, 16-byte struct out): zeros; selector 1's first qword the
+ * inspection object. */
+static HRESULT WINAPI props_info(void *iface, UINT selector, void *out)
+{
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 4)
+        rebox_log("d3d12_xs: placeholder properties slot 7 (selector %u): no programs", selector);
+    if (out)
+    {
+        memset(out, 0, 16);
+        if (selector == 1)
+            *(void **)out = (void *)&inspection;
+    }
+    return S_OK;
+}
+
 #define SO_EXTRA(n) \
     static UINT64 WINAPI so_extra_##n(void *self, UINT64 a, UINT64 b, UINT64 c) { return extra_slot("state object", n, a, b, c); }
 #define PROPS_EXTRA(n) \
     static UINT64 WINAPI props_extra_##n(void *self, UINT64 a, UINT64 b, UINT64 c) { return extra_slot("properties", n, a, b, c); }
-SO_EXTRA(8) SO_EXTRA(9) SO_EXTRA(10) SO_EXTRA(11) SO_EXTRA(12) SO_EXTRA(13) SO_EXTRA(14) SO_EXTRA(15)
-PROPS_EXTRA(7) PROPS_EXTRA(8) PROPS_EXTRA(9) PROPS_EXTRA(10) PROPS_EXTRA(11) PROPS_EXTRA(12) PROPS_EXTRA(13) PROPS_EXTRA(14)
+SO_EXTRA(9) SO_EXTRA(10) SO_EXTRA(11) SO_EXTRA(12) SO_EXTRA(13) SO_EXTRA(14) SO_EXTRA(15)
+PROPS_EXTRA(8) PROPS_EXTRA(9) PROPS_EXTRA(10) PROPS_EXTRA(11) PROPS_EXTRA(12) PROPS_EXTRA(13) PROPS_EXTRA(14)
 
 static void *const so_vtbl[] = {
     so_QueryInterface, so_AddRef, so_Release, so_GetPrivateData, so_SetPrivateData, so_SetPrivateDataInterface,
-    so_SetName, so_GetDevice, so_extra_8, so_extra_9, so_extra_10, so_extra_11, so_extra_12, so_extra_13, so_extra_14,
+    so_SetName, so_GetDevice, so_programs, so_extra_9, so_extra_10, so_extra_11, so_extra_12, so_extra_13, so_extra_14,
     so_extra_15,
 };
 
@@ -134,7 +199,7 @@ static void WINAPI props_SetPipelineStackSize(void *iface, UINT64 size) { from_p
 
 static void *const props_vtbl[] = {
     props_QueryInterface, props_AddRef, props_Release, props_GetShaderIdentifier, props_GetShaderStackSize,
-    props_GetPipelineStackSize, props_SetPipelineStackSize, props_extra_7, props_extra_8, props_extra_9,
+    props_GetPipelineStackSize, props_SetPipelineStackSize, props_info, props_extra_8, props_extra_9,
     props_extra_10, props_extra_11, props_extra_12, props_extra_13, props_extra_14,
 };
 

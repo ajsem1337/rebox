@@ -1648,7 +1648,23 @@ static void test_state_object_placeholder(void *dev)
             zero &= !id[i];
         CHECK(id && zero && XSLOT(props, 4, UINT64, const WCHAR *)(props, L"RayGen") == 0,
               "its shader identifiers are zero (no shader), stack sizes 0");
-        CHECK(XSLOT(props, 7, UINT64, UINT64)(props, 0) == 0, "the console's properties slot 7 answers 0");
+        {
+            /* Unreal's inspection of the native programs: none here. */
+            void *info0[2] = { (void *)1, (void *)1 }, *info1[2] = { NULL, NULL }, *programs = NULL, *table = NULL;
+            const BYTE *count1 = NULL, *count2 = NULL;
+            XSLOT(props, 7, HRESULT, UINT, void *)(props, 0, info0);
+            XSLOT(props, 7, HRESULT, UINT, void *)(props, 1, info1);
+            if (info1[0])
+                count1 = XSLOT(info1[0], 3, const BYTE *)(info1[0]);
+            XSLOT(so, 8, HRESULT, void **)(so, &programs);
+            if (programs)
+                XSLOT(programs, 9, HRESULT, UINT64, UINT64, void **)(programs, 1, 0, &table);
+            if (table)
+                count2 = XSLOT(table, 3, const BYTE *)(table);
+            CHECK(!info0[0] && !info0[1] && count1 && !*(const UINT *)(count1 + 8) && count2
+                      && !*(const UINT *)(count2 + 0x10),
+                  "the console's inspection slots (properties 7, state object 8) describe no programs");
+        }
         XSLOT(props, 2, ULONG)(props);
     }
     CHECK(SUCCEEDED(XSLOT(so, 7, HRESULT, REFIID, void **)(so, &IID_IUnknown, &device)) && device,
