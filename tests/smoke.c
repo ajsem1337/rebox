@@ -4618,6 +4618,26 @@ static void test_xbox(void)
             CHECK(depth_info.SizeInBytes >= 256 * 144 * 8 && depth_info.SizeInBytes != ~(UINT64)0,
                   "GetResourceAllocationInfo (slot 25) of a depth texture with unordered access (%#llx)",
                   (unsigned long long)depth_info.SizeInBytes);
+            /* The console's own D16_UNORM_S8_UINT (118): a desktop depth format here. */
+            dd.Format = (DXGI_FORMAT)118;
+            dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | (D3D12_RESOURCE_FLAGS)0x800000;
+            depth_info.SizeInBytes = 0;
+            XSLOT(dev, 25, D3D12_RESOURCE_ALLOCATION_INFO *, void *, UINT, UINT,
+                  const D3D12_RESOURCE_DESC *)(&depth_info, dev, 0, 1, &dd);
+            CHECK(depth_info.SizeInBytes && depth_info.SizeInBytes != ~(UINT64)0,
+                  "GetResourceAllocationInfo of a D16_UNORM_S8_UINT (118) depth texture (%#llx)",
+                  (unsigned long long)depth_info.SizeInBytes);
+            {
+                D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT };
+                D3D12_CLEAR_VALUE cv = { (DXGI_FORMAT)118, .DepthStencil = { 1.0f, 0 } };
+                void *tex = NULL;
+                HRESULT thr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS,
+                        const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID,
+                        void **)(dev, &dh, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                        &IID_ID3D12Resource, &tex);
+                CHECK(SUCCEEDED(thr) && tex, "a D16_UNORM_S8_UINT depth texture with its clear value is made (%#lx)", thr);
+                if (tex) IUnknown_Release((IUnknown *)tex);
+            }
         }
     }
 

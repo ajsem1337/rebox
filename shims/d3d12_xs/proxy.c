@@ -103,6 +103,9 @@ static struct proxy_class *const classes[] = { &device_class, &queue_class, &que
  * here (see the rectangle lists' topology), so the pipeline is a triangle one. */
 #define CONSOLE_TOPOLOGY_TYPE_RECTANGLE 0x13
 
+static DXGI_FORMAT pc_format(DXGI_FORMAT format);
+static const D3D12_CLEAR_VALUE *pc_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_VALUE *storage);
+
 /* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
 static UINT32 sdk_version;
 
@@ -1184,6 +1187,13 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, I
         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SIZE_T cpu)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
+    D3D12_SHADER_RESOURCE_VIEW_DESC pc;
+    if (desc && pc_format(desc->Format) != desc->Format)
+    {
+        pc = *desc;
+        pc.Format = pc_format(desc->Format);
+        desc = &pc;
+    }
     ID3D12Device_CreateShaderResourceView(INNER(p, ID3D12Device), resource, desc, h);
     shadow_write_srv(cpu, resource, desc);
 }
@@ -1197,11 +1207,33 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, 
     shadow_write_uav(cpu, resource, desc);
 }
 
+/* Slot 21: CreateDepthStencilView, as on PC, with the console's own formats made desktop ones. */
+static void STDMETHODCALLTYPE device_CreateDepthStencilView(struct proxy *p, ID3D12Resource *resource,
+        const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_DEPTH_STENCIL_VIEW_DESC pc;
+    if (desc && pc_format(desc->Format) != desc->Format)
+    {
+        pc = *desc;
+        pc.Format = pc_format(desc->Format);
+        desc = &pc;
+    }
+    ID3D12Device_CreateDepthStencilView(INNER(p, ID3D12Device), resource, desc, h);
+}
+
 /* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_RENDER_TARGET_VIEW_DESC pc;
+    if (desc && pc_format(desc->Format) != desc->Format)
+    {
+        pc = *desc;
+        pc.Format = pc_format(desc->Format);
+        desc = &pc;
+    }
     note_display_view("render target view", resource, cpu);
     ID3D12Device_CreateRenderTargetView(INNER(p, ID3D12Device), resource, desc, h);
 }
@@ -1500,14 +1532,47 @@ static const D3D12_HEAP_PROPERTIES *buffer_heap(const D3D12_HEAP_PROPERTIES *pro
  * know, so they become UNKNOWN, the driver's choice; titles that address
  * texels themselves go through scratch GPU VAs instead. Each distinct
  * value is logged once. */
+/* The console's own formats (116-120 in its dxgiformat.h), as the nearest desktop ones: the desktop
+ * refuses them (the target title asserts on a D16_UNORM_S8_UINT depth texture's size). */
+static DXGI_FORMAT pc_format(DXGI_FORMAT format)
+{
+    switch ((UINT)format)
+    {
+    case 116: /* R10G10B10_7E3_A2_FLOAT */
+    case 117: /* R10G10B10_6E4_A2_FLOAT */
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;     /* D16_UNORM_S8_UINT */
+    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS; /* R16_UNORM_X8_TYPELESS */
+    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;  /* X16_TYPELESS_G8_UINT */
+    default: return format;
+    }
+}
+
+/* A clear value in a console-only format, in the desktop one its resource gets. */
+static const D3D12_CLEAR_VALUE *pc_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_VALUE *storage)
+{
+    if (!clear || pc_format(clear->Format) == clear->Format)
+        return clear;
+    *storage = *clear;
+    storage->Format = pc_format(clear->Format);
+    return storage;
+}
+
 static const D3D12_RESOURCE_DESC *pc_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC *storage)
 {
-    static LONG seen[8], depth_uav;
+    static LONG seen[8], depth_uav, formats;
     const D3D12_RESOURCE_FLAGS both = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    if (!desc || (desc->Layout < 0x100 && (desc->Flags & both) != both))
+    if (!desc || (desc->Layout < 0x100 && (desc->Flags & both) != both && pc_format(desc->Format) == desc->Format))
         return desc;
     *storage = *desc;
+    if (pc_format(desc->Format) != desc->Format)
+    {
+        if (InterlockedIncrement(&formats) <= 4)
+            rebox_log("d3d12_xs: console format %u (%ux%u) made desktop format %u", desc->Format, (UINT)desc->Width,
+                      desc->Height, pc_format(desc->Format));
+        storage->Format = pc_format(desc->Format);
+    }
     if (desc->Layout >= 0x100)
     {
         if (!InterlockedExchange(&seen[desc->Layout & 7], 1))
@@ -1648,6 +1713,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p,
 {
     D3D12_HEAP_PROPERTIES storage;
     D3D12_RESOURCE_DESC desc_storage, rounded;
+    D3D12_CLEAR_VALUE clear_storage;
     HRESULT hr;
 
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -1662,7 +1728,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(struct proxy *p,
         rounded.Width = (desc->Width + 0xff) & ~(UINT64)0xff;
         desc = &rounded;
     }
-    hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state, clear, riid, out);
+    hr = ID3D12Device_CreateCommittedResource(INNER(p, ID3D12Device), props, flags, desc, state,
+                                              pc_clear(clear, &clear_storage), riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -1685,8 +1752,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(struct proxy *p, ID
         void **out)
 {
     D3D12_RESOURCE_DESC storage;
+    D3D12_CLEAR_VALUE clear_storage;
     HRESULT hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, pc_desc(desc, &storage),
-                                                   state, clear, riid, out);
+                                                   state, pc_clear(clear, &clear_storage), riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -1696,8 +1764,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, 
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
     D3D12_RESOURCE_DESC storage;
-    HRESULT hr = ID3D12Device_CreateReservedResource(INNER(p, ID3D12Device), pc_desc(desc, &storage), state, clear,
-                                                     riid, out);
+    D3D12_CLEAR_VALUE clear_storage;
+    HRESULT hr = ID3D12Device_CreateReservedResource(INNER(p, ID3D12Device), pc_desc(desc, &storage), state,
+                                                     pc_clear(clear, &clear_storage), riid, out);
     if (SUCCEEDED(hr) && out && *out)
         present_track_state(*out, state);
     return hr;
@@ -1796,11 +1865,19 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC triangles;
     HRESULT hr;
+    BOOL formats = FALSE;
 
-    if (desc && desc->PrimitiveTopologyType == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
+    for (UINT i = 0; desc && i < 8; i++)
+        formats |= pc_format(desc->RTVFormats[i]) != desc->RTVFormats[i];
+    if (desc && (desc->PrimitiveTopologyType == CONSOLE_TOPOLOGY_TYPE_RECTANGLE || formats
+                 || pc_format(desc->DSVFormat) != desc->DSVFormat))
     {
         triangles = *desc;
-        triangles.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        if (desc->PrimitiveTopologyType == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
+            triangles.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        for (UINT i = 0; i < 8; i++)
+            triangles.RTVFormats[i] = pc_format(desc->RTVFormats[i]);
+        triangles.DSVFormat = pc_format(desc->DSVFormat);
         desc = &triangles;
     }
     hr = ID3D12Device_CreateGraphicsPipelineState(INNER(p, ID3D12Device), desc, riid, out);
@@ -1949,6 +2026,14 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && s + 2 * sizeof(UINT) <= end
                     && ((const UINT *)s)[1] == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
                 rectangles = TRUE;
+            /* Console-only formats of render targets and depth (pc_format): as rectangles, a copy. */
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT && s + 2 * sizeof(UINT) <= end
+                    && pc_format(((const UINT *)s)[1]) != ((const UINT *)s)[1])
+                rectangles = TRUE;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS && s + 10 * sizeof(UINT) <= end)
+                for (UINT i = 1; i <= 8; i++)
+                    if (pc_format(((const UINT *)s)[i]) != ((const UINT *)s)[i])
+                        rectangles = TRUE;
             next = (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
             if (next > (SIZE_T)(end - s))
                 next = end - s;
@@ -1971,6 +2056,11 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
                 if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && next >= 2 * sizeof(UINT)
                         && ((UINT *)(*copy + kept))[1] == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
                     ((UINT *)(*copy + kept))[1] = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT && next >= 2 * sizeof(UINT))
+                    ((UINT *)(*copy + kept))[1] = pc_format(((UINT *)(*copy + kept))[1]);
+                if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS && next >= 10 * sizeof(UINT))
+                    for (UINT i = 1; i <= 8; i++)
+                        ((UINT *)(*copy + kept))[i] = pc_format(((UINT *)(*copy + kept))[i]);
                 kept += next;
             }
             s += next;
@@ -2201,7 +2291,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
         why = 1;
     else
     {
-        hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, d, state, clear, riid, out);
+        D3D12_CLEAR_VALUE clear_storage;
+        hr = ID3D12Device_CreatePlacedResource(INNER(p, ID3D12Device), heap, offset, d, state,
+                                               pc_clear(clear, &clear_storage), riid, out);
         ID3D12Heap_Release(heap);
         why = 2;
     }
@@ -3412,6 +3504,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(18, device_CreateShaderResourceView),
         FN(19, device_CreateUnorderedAccessView),
         FN(20, device_CreateRenderTargetView),
+        FN(21, device_CreateDepthStencilView),
         FN(22, device_CreateSampler),
         FN(23, device_CopyDescriptors),
         FN(24, device_CopyDescriptorsSimple),
