@@ -319,6 +319,72 @@ static ULONG STDMETHODCALLTYPE proxy_AddRef(struct proxy *p)
     return InterlockedIncrement(&p->refs);
 }
 
+/* Command lists made before the title's layout was known (on the older table) move to the newer one
+ * when it is (lists_to_newer_layout): the target title makes lists before any fence or newer device
+ * method gives it away, and then calls their newer console methods. */
+static struct proxy **older_lists;
+static SIZE_T older_list_count, older_list_capacity;
+static SRWLOCK older_lists_lock = SRWLOCK_INIT;
+
+static void older_list_add(struct proxy *p)
+{
+    AcquireSRWLockExclusive(&older_lists_lock);
+    if (older_list_count == older_list_capacity)
+    {
+        SIZE_T n = older_list_capacity ? older_list_capacity * 2 : 64;
+        struct proxy **grown = realloc(older_lists, n * sizeof(*grown));
+        if (grown)
+        {
+            older_lists = grown;
+            older_list_capacity = n;
+        }
+    }
+    if (older_list_count < older_list_capacity)
+        older_lists[older_list_count++] = p;
+    ReleaseSRWLockExclusive(&older_lists_lock);
+}
+
+static void older_list_remove(struct proxy *p)
+{
+    AcquireSRWLockExclusive(&older_lists_lock);
+    for (SIZE_T i = 0; i < older_list_count; i++)
+        if (older_lists[i] == p)
+        {
+            older_lists[i] = older_lists[--older_list_count];
+            break;
+        }
+    ReleaseSRWLockExclusive(&older_lists_lock);
+}
+
+static void lists_to_newer_layout(void)
+{
+    SIZE_T moved;
+
+    AcquireSRWLockExclusive(&older_lists_lock);
+    for (SIZE_T i = 0; i < older_list_count; i++)
+    {
+        older_lists[i]->cls = &list_v4_class;
+        InterlockedExchangePointer((void **)&older_lists[i]->vtbl, list_v4_class.vtbl);
+    }
+    moved = older_list_count;
+    older_list_count = 0;
+    ReleaseSRWLockExclusive(&older_lists_lock);
+    if (moved)
+        rebox_log("d3d12_xs: %zu command lists made before the layout was known now have the newer one", moved);
+}
+
+/* A device method only the newer layout has: the title's runtime has the newer layouts (xcl's
+ * note_newer_device_method). */
+static void note_newer_device_method(UINT slot)
+{
+    if (sdk_version >= 0x20004 && !InterlockedExchange(&newer_layouts, 1))
+    {
+        rebox_log("d3d12_xs: device slot %u, which only the newer layout has: the title's runtime has the newer "
+                  "layouts", slot);
+        lists_to_newer_layout();
+    }
+}
+
 static ULONG STDMETHODCALLTYPE proxy_Release(struct proxy *p)
 {
     ULONG refs = InterlockedDecrement(&p->refs);
@@ -330,6 +396,8 @@ static ULONG STDMETHODCALLTYPE proxy_Release(struct proxy *p)
         present_queue_destroy(p->present);
         if (p->cls == &heap_class)
             shadow_heap_destroyed((ID3D12DescriptorHeap *)p->inner);
+        if (p->cls == &list_class)
+            older_list_remove(p);
         IUnknown_Release(p->inner);
         free(p);
     }
@@ -835,8 +903,11 @@ static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *a
     HRESULT hr = ID3D12Device_CreateCommandList(INNER(p, ID3D12Device), 0, t, proxy_unwrap(alloc), pso,
                                                 &IID_ID3D12GraphicsCommandList, (void **)&list);
 
-    return wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class
-                       : newer_layouts ? &list_v4_class : &list_class, out);
+    hr = wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class
+                     : newer_layouts ? &list_v4_class : &list_class, out);
+    if (SUCCEEDED(hr) && out && *out && ((struct proxy *)*out)->cls == &list_class)
+        older_list_add(*out);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandList(struct proxy *p, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -1274,6 +1345,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
 {
     UINT64 total = 0, alignment = 0;
 
+    note_newer_device_method(108);
     if (!is_proxy(p) && is_proxy(ret)) /* console order: (result, device, ...) */
     {
         struct proxy *device = (struct proxy *)ret;
@@ -1811,6 +1883,7 @@ static D3D12_RESOURCE_STATES layout_state(UINT32 layout)
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceLayoutX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
         const D3D12_RESOURCE_DESC *desc, UINT32 layout, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
 {
+    note_newer_device_method(133);
     return device_CreatePlacedResourceX(p, address, desc, layout_state(layout), clear, riid, out);
 }
 
@@ -1828,8 +1901,11 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct pr
         const D3D12_CLEAR_VALUE *clear, void *protected_session, UINT32 castable_count, const DXGI_FORMAT *castable,
         REFIID riid, void **out)
 {
-    HRESULT hr = device_CreateCommittedResource(p, props, flags & ~D3D12_HEAP_FLAG_ALLOW_DISPLAY, desc,
-                                                layout_state(layout), clear, riid, out);
+    HRESULT hr;
+
+    note_newer_device_method(127);
+    hr = device_CreateCommittedResource(p, props, flags & ~D3D12_HEAP_FLAG_ALLOW_DISPLAY, desc,
+                                        layout_state(layout), clear, riid, out);
 
     if (SUCCEEDED(hr) && (flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) && desc
             && GetProcAddress(GetModuleHandleA(NULL), "__XMemAllocationHooks__"))
@@ -1889,6 +1965,7 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceViewAtX(struct proxy *p
     D3D12_SHADER_RESOURCE_VIEW_DESC v;
     ID3D12Resource *res;
 
+    note_newer_device_method(70);
     if (!view || IsBadReadPtr(view, 0x30))
         return;
     memcpy(&v, view, sizeof(v));
@@ -1904,6 +1981,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessViewAtX(struct proxy *
     D3D12_UNORDERED_ACCESS_VIEW_DESC v;
     ID3D12Resource *res;
 
+    note_newer_device_method(71);
     if (!view || IsBadReadPtr(view, 0x38))
         return;
     memcpy(&v, view, sizeof(v));
@@ -2107,8 +2185,11 @@ static BOOL is_fence(const void *p)
 static void note_newer_layouts(UINT slot)
 {
     if (!InterlockedExchange(&newer_layouts, 1))
+    {
         rebox_log("d3d12_xs: a fence passed to queue slot %u: the title's runtime has the newer layouts (queue: "
                      "Signal 16, PresentX 32; lists: console methods two slots later)", slot);
+        lists_to_newer_layout();
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags);
