@@ -110,7 +110,7 @@ words (16 dwords), which the dispatch path will have to fill.
    `the shader archive` convert. Whether the exe passes these containers at PSO creation, or PS09 cache
    blobs, is still open question 1. The `FLAT_SCRATCH` setup many console shaders open with
    (`s_setreg_imm32_b32` or `s_setreg_b32` to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size
-   `s_nop`s before each compile. Only the leading run is touched, and the first time is logged.
+   `s_nop`s before each compile. Only the scalar prologue is scanned (up to the first vector or memory instruction: a UE5 title's pixel shaders move M0 first), and the first time is logged.
 2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
    from the root parameters as for SCSV shaders, except that descriptor tables point at the
    shadow heaps' title addresses (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`).

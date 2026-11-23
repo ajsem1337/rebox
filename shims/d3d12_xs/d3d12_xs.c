@@ -185,22 +185,30 @@ static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *c
  * compile fails. REBOX_CONSOLE_GRAPHICS=0 turns it off. */
 static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
 {
-    static LONG attached, refused;
+    static LONG attached, refused_vs, refused_ps, refused_other;
     struct rebox_graphics *g;
     void *vs = NULL, *ps = NULL;
     SIZE_T vs_size = 0, ps_size = 0;
     const char *env = getenv("REBOX_CONSOLE_GRAPHICS");
 
-    if ((env && *env == '0') || !pso || !desc->VS.BytecodeLength || !desc->PS.BytecodeLength
-            || desc->HS.BytecodeLength || desc->DS.BytecodeLength || desc->GS.BytecodeLength
-            || desc->InputLayout.NumElements > ARRAYSIZE(g->elements))
+    if ((env && *env == '0') || !pso)
         return;
+    if (!desc->VS.BytecodeLength || !desc->PS.BytecodeLength || desc->HS.BytecodeLength
+            || desc->DS.BytecodeLength || desc->GS.BytecodeLength || desc->InputLayout.NumElements > ARRAYSIZE(g->elements))
+    {
+        LONG n = InterlockedIncrement(&refused_other);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: graphics PSOs not deferred: %ld without both a vertex and a pixel shader, or with "
+                         "tessellation or geometry stages", n);
+        return;
+    }
     if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0x1, &vs_size))
             || !(ps = console_fssm_graphics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, 0x10, &ps_size))
             || !(g = calloc(1, sizeof(*g) + vs_size + ps_size)))
     {
-        if (InterlockedIncrement(&refused) <= 4)
-            rebox_log("d3d12_xs: graphics PSO: a stage isn't a console vertex/pixel shader we can defer (%s)",
+        LONG n = InterlockedIncrement(vs ? &refused_ps : &refused_vs);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: graphics PSOs not deferred: %ld whose %s shader isn't one we can read", n,
                          vs ? "pixel" : "vertex");
         free(vs);
         free(ps);
@@ -223,7 +231,9 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
     memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
     if (SUCCEEDED(ID3D12PipelineState_SetPrivateData((ID3D12PipelineState *)pso, &REBOX_GRAPHICS_GUID, g->size, g))
-            && InterlockedIncrement(&attached) <= 4)
+            && !(InterlockedIncrement(&attached) & (attached - 1)))
+        rebox_log("d3d12_xs: graphics PSOs deferred to draw time: %ld", attached);
+    if (attached <= 4)
         rebox_log("d3d12_xs: graphics PSO: console vertex shader (%u inputs) and pixel shader (%u interpolants) "
                      "deferred to draw time, %u input elements",
                      ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)vs + 1))->input_count,

@@ -408,9 +408,11 @@ static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT3
 #define S_NOP 0xbf800000u
 static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
 {
-    UINT i = 0, count = 0;
+    UINT i = 0, count = 0, scanned = 0;
 
-    while (i < dwords)
+    /* The setup sits among the prologue's scalar instructions (a UE5 title's pixel shaders move M0
+     * first): scan those, up to the first vector or memory instruction. */
+    while (i < dwords && scanned++ < 32)
     {
         UINT32 w = code[i], op = w >> 23, id = w & 0x3f;
         if ((op == 0x175 || op == 0x173) && (id == 20 || id == 21))
@@ -420,6 +422,12 @@ static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
                 code[i++] = S_NOP;
             count++;
         }
+        else if (op == 0x17d || op == 0x17e)              /* SOP1, SOPC */
+            i += 1 + ((w & 0xff) == 0xff || (op == 0x17e && ((w >> 8) & 0xff) == 0xff));
+        else if (w >> 28 == 0xb)                          /* SOPK */
+            i += 1 + (((w >> 23) & 0x1f) == 0x15);
+        else if (w >> 30 == 2 && op != 0x17f)             /* SOP2 */
+            i += 1 + ((w & 0xff) == 0xff || ((w >> 8) & 0xff) == 0xff);
         else
             break;
     }
@@ -544,6 +552,15 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         return E_INVALIDARG;
     stage_id = graphics ? hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
                                      (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
+    if (graphics)
+    {
+        /* Counts for the log, at powers of two: draws' stages compiled (or cached), failed, skipped. */
+        static LONG calls;
+        LONG n = InterlockedIncrement(&calls);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for (%ld %s stages refused so far)", n,
+                         min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)), "distinct");
+    }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
     set_last(E_FAIL, "no result (out of memory?)", NULL);

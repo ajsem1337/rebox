@@ -153,7 +153,7 @@ void WINAPI ReboxConsoleFree(void *blob)
  * fssm-vs-plan.py do the same over dumps):
  * - vertex: the first instruction calls the fetch shader (s_swappc_b64 s[4:5], s[4:5]), which
  *   leaves input r in v[4+4r..7+4r]; the inputs are the consecutive slots from v4 it reads before
- *   writing. 32 user SGPRs.
+ *   writing. Without that call, no inputs (full-screen passes). 32 user SGPRs.
  * - pixel: the prologue's s_mov_b32 m0, sN takes the primitive mask from the SGPR after the user
  *   SGPRs (24 in every a UE5 title PS); interpolants from v_interp_* (flat: only v_interp_mov);
  *   export formats from exp (packed: FP16, else the 32-bit format of the channels written);
@@ -269,14 +269,11 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
     if (stage == 0x1)
     {
         UINT64 read, written, live = 0, done = 0;
-        if ((code[0] & 0xffffff00u) != 0xbe842100u)       /* s_swappc_b64 s[4:5], ... */
-        {
-            free(h);
-            free(fssm);
-            return NULL;
-        }
+        /* No fetch call (s_swappc_b64 s[4:5], ...): no vertex inputs (full-screen passes build
+         * their vertices from the vertex ID). */
+        BOOL fetch = (code[0] & 0xffffff00u) == 0xbe842100u;
         /* VGPRs read before the code wrote them, after the fetch call. */
-        for (UINT i = 1, n; i < dwords; i += n)
+        for (UINT i = 1, n; fetch && i < dwords; i += n)
         {
             n = gfx10_size(code + i, dwords - i);
             read = written = 0;
