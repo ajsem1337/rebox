@@ -79,7 +79,7 @@ struct proxy
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
 
-static struct proxy_class device_class = { "Device", 128 };
+static struct proxy_class device_class = { "Device", MAX_SLOTS };
 static struct proxy_class queue_class = { "CommandQueue", 64 };
 static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", 64 };
 static struct proxy_class list_class = { "GraphicsCommandList", MAX_SLOTS };
@@ -1662,6 +1662,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
 {
     static const D3D12_HEAP_PROPERTIES own = { D3D12_HEAP_TYPE_DEFAULT };
     static LONG logged[3];
+    /* The target title passes 0xffffffff for a buffer over its physical pages: no desktop state. */
+    if (state == (D3D12_RESOURCE_STATES)0xffffffff)
+        state = D3D12_RESOURCE_STATE_COMMON;
     D3D12_RESOURCE_DESC storage;
     const D3D12_RESOURCE_DESC *d = pc_desc(desc, &storage);
     ID3D12Heap *heap;
@@ -2574,6 +2577,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(115, device_DeserializeStateObjectX),
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),
+        /* Slot 133, SDK 0x20004: the same arguments (the target title places a buffer over its
+         * physical pages right after mapping them, and stops if it fails). The device vtable used to
+         * end at 128, so this call jumped through whatever followed it. */
+        FN(133, device_CreatePlacedResourceX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(13, device_CheckFeatureSupport),
         FN(55, device_CreateDerivedPipelineStateX),

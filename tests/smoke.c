@@ -1288,6 +1288,21 @@ static void test_present(void *dev, void *queue)
         CHECK(configure && configure(0, 0, 0, 0) == S_OK, "D3D12ConfigureVirtualMemoryX succeeds");
     }
 
+    /* Device slot 133 (SDK 0x20004): CreatePlacedResourceX, as the target title places a buffer over
+     * its physical pages, with state 0xffffffff. Past the old end of the device vtable (128). */
+    {
+        D3D12_RESOURCE_DESC bd133 = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 1 << 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                      D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+        void *mem = VirtualAlloc(NULL, 1 << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ID3D12Resource *placed = NULL;
+        hr = XSLOT(dev, 133, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                   const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, (UINT64)(ULONG_PTR)mem, &bd133,
+                   (D3D12_RESOURCE_STATES)0xffffffff, NULL, &IID_ID3D12Resource, (void **)&placed);
+        CHECK(SUCCEEDED(hr) && placed, "device slot 133 places a buffer (CreatePlacedResourceX, state 0xffffffff) %#lx", hr);
+        if (placed) ID3D12Resource_Release(placed);
+        if (mem) VirtualFree(mem, 0, MEM_RELEASE);
+    }
+
     /* A texture's GPU VA is 0 under vkd3d-proton; titles write texels
      * through it, so d3d12_xs hands out scratch GPU memory instead. */
     {
