@@ -424,7 +424,11 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     }
     ID3DDestructionNotifier_RegisterDestructionCallback(notifier, destroyed, t, &t->callback);
     ID3DDestructionNotifier_Release(notifier);
-    t->dirty = !t->unreadable;
+    /* A render target, depth or UAV texture is the GPU's (as xcl's GPU-owned textures): never
+     * filled from title memory, which would overwrite what the GPU drew into it. */
+    t->gpu_written = (console_desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+            | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
+    t->dirty = !t->unreadable && !t->gpu_written;
     AcquireSRWLockExclusive(&lock);
     t->next = textures;
     textures = t;
