@@ -833,18 +833,25 @@ static VkResult map_identity(struct device_data *d, VkDeviceMemory memory, VkDev
         VkMemoryMapPlacedInfoEXT pi = { .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT };
         VkMemoryMapInfoKHR mi = { .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pi,
             .flags = VK_MEMORY_MAP_PLACED_BIT_EXT, .memory = memory, .offset = 0, .size = VK_WHOLE_SIZE };
-        VkMemoryUnmapInfoKHR ui = { .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, .memory = memory };
-        void *temp = mmap(NULL, m->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0), *p = NULL;
+        VkMemoryUnmapInfoKHR ui = { .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, .memory = memory,
+            .flags = d->unmap_reserve ? VK_MEMORY_UNMAP_RESERVE_BIT_EXT : 0 };
+        /* The temporary place is in the window, which Wine knows as reserved: an address Linux
+         * picked could be one Wine thinks free and later trips over. */
+        uint64_t temp = window_alloc(m->size, 64 << 10);
+        void *p = NULL;
 
-        if (temp != MAP_FAILED)
+        if (temp)
         {
-            pi.pPlacedAddress = temp;
+            pi.pPlacedAddress = (void *)(uintptr_t)temp;
             if ((vr = d->map2(d->device, &mi, &p)) == VK_SUCCESS)
             {
-                memcpy(temp, (void *)(uintptr_t)m->address, m->size);
+                memcpy((void *)(uintptr_t)temp, (void *)(uintptr_t)m->address, m->size);
                 d->unmap2(d->device, &ui);
+                if (!d->unmap_reserve)
+                    mmap((void *)(uintptr_t)temp, m->size, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
             }
-            munmap(temp, m->size);
+            window_free(temp, m->size);
         }
         else
             vr = VK_ERROR_MEMORY_MAP_FAILED;
