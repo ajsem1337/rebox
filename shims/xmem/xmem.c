@@ -577,6 +577,69 @@ static void *virtual_alloc2(void *address, SIZE_T size, DWORD type, DWORD protec
     return va2(NULL, address, size, type, protect, NULL, 0);
 }
 
+/* GPU-only views. A title reserves a range twice in a row, the same size, first CPU-readable and
+ * then with no CPU access and GPU access bits (protect 0x801); it maps its physical pages into the
+ * first only and places GPU resources at the same offsets in the second: on the console the second
+ * is a GPU view of the first (found by xcl, ivall/xcl #283, for a retail title's video frames).
+ * Here the second is separate memory, so the pair is recorded and ReboxGpuViewToCpu gives the CPU
+ * address behind a GPU-view address, for d3d12_xs to place resources over. */
+static struct gpu_view { ULONG_PTR gpu, cpu, size; } gpu_views[16];
+static ULONG_PTR last_cpu_reservation, last_cpu_reservation_size;
+static SRWLOCK gpu_view_lock = SRWLOCK_INIT;
+
+static void note_reservation(void *p, SIZE_T size, DWORD type, DWORD protect)
+{
+    BOOL gpu_only = (protect & HOST_PROTECT_BITS) == PAGE_NOACCESS && (protect & ~HOST_PROTECT_BITS & ~0x600);
+
+    if (!p || !(type & MEM_RESERVE))
+        return;
+    AcquireSRWLockExclusive(&gpu_view_lock);
+    if (gpu_only && last_cpu_reservation && last_cpu_reservation_size == size)
+    {
+        for (UINT i = 0; i < ARRAYSIZE(gpu_views); i++)
+            if (!gpu_views[i].size)
+            {
+                gpu_views[i].gpu = (ULONG_PTR)p;
+                gpu_views[i].cpu = last_cpu_reservation;
+                gpu_views[i].size = size;
+                rebox_log("xmem: %#zx bytes at %p are a GPU view of the reservation at %#llx", size, p,
+                          (unsigned long long)last_cpu_reservation);
+                break;
+            }
+        last_cpu_reservation = 0;
+    }
+    else if (!gpu_only && (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
+                                      | PAGE_EXECUTE_READWRITE)))
+    {
+        last_cpu_reservation = (ULONG_PTR)p;
+        last_cpu_reservation_size = size;
+    }
+    ReleaseSRWLockExclusive(&gpu_view_lock);
+}
+
+static void forget_reservation(void *p)
+{
+    AcquireSRWLockExclusive(&gpu_view_lock);
+    for (UINT i = 0; i < ARRAYSIZE(gpu_views); i++)
+        if (gpu_views[i].size && (gpu_views[i].gpu == (ULONG_PTR)p || gpu_views[i].cpu == (ULONG_PTR)p))
+            gpu_views[i].size = 0;
+    if (last_cpu_reservation == (ULONG_PTR)p)
+        last_cpu_reservation = 0;
+    ReleaseSRWLockExclusive(&gpu_view_lock);
+}
+
+/* The CPU address behind a GPU-view address, or the address itself. */
+ULONGLONG WINAPI ReboxGpuViewToCpu(ULONGLONG address)
+{
+    ULONGLONG result = address;
+    AcquireSRWLockShared(&gpu_view_lock);
+    for (UINT i = 0; i < ARRAYSIZE(gpu_views); i++)
+        if (gpu_views[i].size && address - gpu_views[i].gpu < gpu_views[i].size)
+            result = address - gpu_views[i].gpu + gpu_views[i].cpu;
+    ReleaseSRWLockShared(&gpu_view_lock);
+    return result;
+}
+
 void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG xmem_flags, DWORD protect)
 {
     DWORD host_type = type & ~(CONSOLE_PAGE_FLAGS | MEM_PHYSICAL | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER),
@@ -593,6 +656,7 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
                            host_protect);
     else
         p = xmem_low_virtual_alloc(address, size, host_type, host_protect);
+    note_reservation(p, size, type, protect);
 
     if (!p ? InterlockedIncrement(&failures) <= 16 : InterlockedIncrement(&calls) <= 4)
         rebox_log("xmem: XMemVirtualAlloc(%p, %#zx, type %#lx, flags %#llx, protect %#lx) -> %p (error %lu)", address,
@@ -602,6 +666,8 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
 
 BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
 {
+    if (type & MEM_RELEASE)
+        forget_reservation(address);
     return VirtualFree(address, size, type);
 }
 

@@ -19,6 +19,7 @@ EXPORTS
     XMemGetAllocationHysteresis
     ReboxHeartbeat
     ReboxGpuvaMailbox
+    ReboxGpuViewToCpu
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister

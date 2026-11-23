@@ -542,6 +542,27 @@ static struct scratch
 } *scratch_list;
 static SRWLOCK scratch_lock = SRWLOCK_INIT;
 
+/* The CPU address behind an address in a GPU-only view of title memory (xmem's ReboxGpuViewToCpu),
+ * or the address itself. */
+static UINT64 gpu_view_to_cpu(UINT64 address)
+{
+    static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
+    static volatile LONG resolved;
+    static LONG logged;
+    UINT64 cpu;
+
+    if (!resolved) /* a race only looks the export up twice */
+    {
+        to_cpu = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "ReboxGpuViewToCpu");
+        resolved = 1;
+    }
+    cpu = to_cpu ? to_cpu(address) : address;
+    if (cpu != address && InterlockedIncrement(&logged) <= 4)
+        rebox_log("d3d12_xs: %#llx is in a GPU view of title memory: placed over %#llx",
+                  (unsigned long long)address, (unsigned long long)cpu);
+    return cpu;
+}
+
 /* Textures by the address the title knows them at (a T# it writes itself holds it): display
  * targets' console memory (slot 127), textures whose GPU VA it asked (scratch), and textures
  * placed in its memory (title_textures.c). */
@@ -568,6 +589,7 @@ ID3D12Resource *proxy_texture_at(UINT64 address)
 
     if (!address)
         return NULL;
+    address = gpu_view_to_cpu(address); /* title textures there are placed over the CPU view */
     AcquireSRWLockShared(&texture_address_lock);
     for (UINT i = 0; i < ARRAYSIZE(texture_addresses) && !res; i++)
         if (texture_addresses[i].resource && texture_addresses[i].address == address)
@@ -2476,7 +2498,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy
  * address, so the title and the GPU share it; a buffer over other title memory has that memory
  * made GPU memory in place first (gpu_memory_adopt). Anything else gets its own memory and is
  * logged once per kind: textures (the chunk heaps hold buffers only, and console tilings aren't
- * modelled), memory that couldn't be made GPU memory, and placements the heap refuses. */
+ * modelled), memory that couldn't be made GPU memory, and placements the heap refuses. An address in
+ * a GPU-only view of title memory is placed over the CPU memory behind it. */
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
         const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
         void **out)
@@ -2492,6 +2515,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
 
     if (!d || !out)
         return E_INVALIDARG;
+    address = gpu_view_to_cpu(address);
     if (d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         why = 0;
     /* A buffer over the title's own memory: that memory is made GPU memory where it is. */

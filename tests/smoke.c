@@ -377,6 +377,21 @@ static void test_xmem(void)
                 if (c) c[0xffff] = 1;
                 VirtualFree(v, 0, MEM_RELEASE);
             }
+            /* The target title's pair: a reservation, then one of the same size with no CPU access and
+             * GPU bits (0x801), its GPU view: an address in the second maps to the first. */
+            {
+                ULONGLONG (WINAPI *to_cpu)(ULONGLONG) = (void *)GetProcAddress(m, "ReboxGpuViewToCpu");
+                BOOL (WINAPI *xfree)(void *, SIZE_T, DWORD) = (void *)GetProcAddress(m, "XMemVirtualFree");
+                BYTE *cpu = valloc(NULL, 0x4000000, 0x20402000, 0x21, PAGE_READWRITE);
+                BYTE *gpu = valloc(NULL, 0x4000000, 0x20402000, 0x3, 0x801);
+                CHECK(to_cpu && cpu && gpu && to_cpu((ULONG_PTR)gpu + 0x12340) == (ULONG_PTR)cpu + 0x12340
+                      && to_cpu((ULONG_PTR)cpu + 0x10) == (ULONG_PTR)cpu + 0x10,
+                      "a no-access GPU reservation after a reservation of its size is its GPU view (%p, %p)", cpu, gpu);
+                if (gpu && xfree) xfree(gpu, 0, MEM_RELEASE);
+                if (cpu && xfree) xfree(cpu, 0, MEM_RELEASE);
+                CHECK(!to_cpu || !gpu || !xfree || to_cpu((ULONG_PTR)gpu) == (ULONG_PTR)gpu,
+                      "the GPU view is forgotten when released");
+            }
             /* A placeholder reservation (the target title's: 185 MiB, type 0x42000, PAGE_NOACCESS),
              * split with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) as the title does, then one
              * piece replaced by committed memory and another given physical pages. */
