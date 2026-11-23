@@ -1601,6 +1601,29 @@ static void test_console_command_signature(void *dev)
     CHECK(arg.Type == 105, "and leaves the title's description as it was");
     if (signature)
         IUnknown_Release((IUnknown *)signature);
+    /* A root signature with arguments that don't change root arguments (the console takes it). */
+    {
+        PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+                GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12SerializeRootSignature");
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 0 };
+        ID3D10Blob *blob = NULL;
+        void *rs = NULL;
+        if (serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+        {
+            XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0, ID3D10Blob_GetBufferPointer(blob),
+                    ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+            ID3D10Blob_Release(blob);
+        }
+        signature = NULL;
+        hr = rs ? XSLOT(dev, 41, HRESULT, const D3D12_COMMAND_SIGNATURE_DESC *, void *, REFIID, void **)(dev, &desc, rs,
+                &IID_ID3D12CommandSignature, &signature) : E_FAIL;
+        CHECK(SUCCEEDED(hr) && signature, "CreateCommandSignature takes a root signature the arguments don't need (%#lx)",
+              (unsigned long)hr);
+        if (signature)
+            IUnknown_Release((IUnknown *)signature);
+        if (rs)
+            IUnknown_Release((IUnknown *)rs);
+    }
 }
 
 static void test_xbox_root_flags(void *dev)

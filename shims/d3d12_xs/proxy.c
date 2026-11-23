@@ -903,6 +903,18 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
             desc = &host;
         }
     }
+    /* A root signature only for arguments that change root arguments (constants, views): the
+     * console takes one regardless, the desktop refuses it (Unreal 5 passes its global root for
+     * the 104-byte dispatch-rays signature; TuxBox found the same). */
+    if (rs && desc && desc->pArgumentDescs)
+    {
+        BOOL changes_root = FALSE;
+        for (UINT i = 0; i < desc->NumArgumentDescs; i++)
+            changes_root |= desc->pArgumentDescs[i].Type >= D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
+                    && desc->pArgumentDescs[i].Type <= D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+        if (!changes_root)
+            rs = NULL;
+    }
     hr = ID3D12Device_CreateCommandSignature(INNER(p, ID3D12Device), desc, rs, riid, out);
     if (FAILED(hr) && desc)
     {
