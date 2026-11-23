@@ -444,13 +444,14 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
             ReleaseSRWLockExclusive(&lock);
             return TRUE;
         }
-        /* Touching counts: a page apart, as RADV maps a guard page past each allocation. */
+        /* Touching counts: 2 MiB apart, as RADV pads each allocation's VA range (a guard page, and
+         * a range a page past a chunk's end was still refused). */
         if (c->gpu <= limit && base <= c->gpu + c->size)
         {
             if (c->gpu + c->size <= address)
-                base = ((c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1)) + ADOPT_ALIGN;
+                base = ((c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1)) + ADOPT_MIN;
             else if (c->gpu >= end)
-                limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_ALIGN;
+                limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_MIN;
             else
                 limit = base; /* the request straddles a chunk: nothing to do */
         }

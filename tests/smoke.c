@@ -2198,6 +2198,13 @@ static void test_pacing(void *dev, void *queue)
 
     hr = wait(dev, 0, 0, NULL, 0, &late);
     CHECK(hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT), "WaitFrameEventX with timeout 0 between frames times out (%#lx)", hr);
+    /* Flag 2 with no timeout, right after a wait (the target title): the event that happened. */
+    {
+        UINT64 now_token = 0;
+        hr = wait(dev, 0, 0, NULL, 2, &now_token);
+        CHECK(hr == S_OK && now_token == late, "WaitFrameEventX(timeout 0, flag 2) gives the last event's token "
+              "(%#lx, %llu)", hr, (unsigned long long)now_token);
+    }
 
     /* ScheduleFrameEventX(type, offset, list, flags): the list is { count, HANDLE * }, a UE5 title's
      * pointing at its own flip-event field (TomBox), which is read at each occurrence. An event

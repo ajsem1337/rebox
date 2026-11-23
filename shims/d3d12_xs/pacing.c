@@ -264,11 +264,24 @@ HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, const void *list, UINT fl
 static volatile LONG64 last_wait_token, last_query_token, queries, unanswered;
 static volatile LONG last_query_types, last_query_answered;
 
-HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
+HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT flags, UINT64 *token)
 {
     static LONG64 counter;
     LONGLONG start, frame, t;
     UINT64 given;
+
+    /* Flag 2 with no timeout (the target title, right after its blocking wait, asserting on
+     * failure): taken as the event that has already happened, neither waited for nor consumed. */
+    if ((flags & 2) && !timeout_ms)
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: WaitFrameEventX(type %u, no timeout, flags %#x): the last frame event's token", type,
+                      flags);
+        if (token)
+            *token = last_wait_token ? last_wait_token : InterlockedIncrement64(&counter);
+        return S_OK;
+    }
 
     if (!ready())
     {

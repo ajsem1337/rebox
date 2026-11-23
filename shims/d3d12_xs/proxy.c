@@ -2386,7 +2386,7 @@ static HRESULT STDMETHODCALLTYPE device_ScheduleFrameEventX(struct proxy *p, UIN
 static HRESULT STDMETHODCALLTYPE device_WaitFrameEventX(struct proxy *p, UINT type, UINT timeout_ms, void *event,
         UINT flags, UINT64 *token)
 {
-    return pacing_wait(type, timeout_ms, token);
+    return pacing_wait(type, timeout_ms, flags, token);
 }
 
 static HRESULT STDMETHODCALLTYPE device_GetFrameStatisticsX(struct proxy *p, UINT64 token, UINT types, UINT *count,

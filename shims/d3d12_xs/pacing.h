@@ -5,7 +5,7 @@
 /* Frame clock behind device slots 78-80; see pacing.c. */
 HRESULT pacing_set_interval(UINT interval_us, UINT period);
 HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, const void *list, UINT flags);
-HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token);
+HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT flags, UINT64 *token);
 HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *statistics);
 void pacing_report(void);
 void pacing_presented(UINT64 token, LONGLONG call, LONGLONG ret);
