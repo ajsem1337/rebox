@@ -45,8 +45,13 @@ SpirvTarget DefaultTarget(std::uint32_t wave)
 
 void SetError(char* error, std::size_t size, const char* message)
 {
-    if (error && size)
-        std::snprintf(error, size, "%s", message);
+    // Not snprintf: AnyPS5's messages can be huge (the serialized request), past what its int
+    // count holds.
+    if (error && size) {
+        const std::size_t n = std::min(std::strlen(message), size - 1);
+        std::memcpy(error, message, n);
+        error[n] = 0;
+    }
 }
 
 }  // namespace

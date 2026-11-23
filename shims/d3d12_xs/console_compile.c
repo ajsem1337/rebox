@@ -493,6 +493,21 @@ static void log_failure(const struct rebox_deferred_shader *h, const char *what,
                      (unsigned long long)id, what, detail ? ": " : "", detail ? detail : "");
 }
 
+/* Graphics stages AnyPS5 refused (their code and stage): not retried at every draw, which falls back
+ * at once. AnyPS5's refusals there come from the code (an instruction it doesn't handle); the
+ * descriptors don't change them. */
+static UINT64 failed_stages[256];
+static LONG failed_stage_count;
+
+static BOOL stage_failed(UINT64 id)
+{
+    LONG n = min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages));
+    for (LONG i = 0; i < n; i++)
+        if (failed_stages[i] == id)
+            return TRUE;
+    return FALSE;
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
@@ -516,6 +531,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
     const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
     BOOL graphics;
+    UINT64 stage_id;
 
     if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC
             || (h->version != 1 && h->version != 2)
@@ -526,6 +542,10 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     graphics = h->version == 2;
     if (graphics && ((h->stage != 0x1 && h->stage != 0x10) || h->code_offset < sizeof(*h) + sizeof(*g)))
         return E_INVALIDARG;
+    stage_id = graphics ? hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
+                                     (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
+    if (graphics && stage_failed(stage_id))
+        return E_FAIL;
     set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
@@ -639,6 +659,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         if (sa5.compile_vertex(&vreq, &result, error, sizeof(error)))
         {
             log_failure(h, "AnyPS5 failed (vertex)", error);
+            {
+                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
+                if (slot < (LONG)ARRAYSIZE(failed_stages))
+                    failed_stages[slot] = stage_id;
+            }
             goto done;
         }
     }
@@ -667,6 +692,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         if (sa5.compile_pixel(&preq, &result, error, sizeof(error)))
         {
             log_failure(h, "AnyPS5 failed (pixel)", error);
+            {
+                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
+                if (slot < (LONG)ARRAYSIZE(failed_stages))
+                    failed_stages[slot] = stage_id;
+            }
             goto done;
         }
     }

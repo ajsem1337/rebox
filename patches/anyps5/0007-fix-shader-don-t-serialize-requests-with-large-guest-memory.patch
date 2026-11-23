@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Mon, 23 Nov 2026 04:00:00 +0000
+Subject: [PATCH] fix(shader): don't serialize requests with large guest memory
+ into errors
+
+recompileReporting appends the serialized request, guest memory regions
+included, to every error. A host that hands AnyPS5 a title's GPU memory
+(hundreds of MiB) got a multi-gigabyte message per failed compile: a
+shader that failed at every draw made each draw take seconds, and a
+message past 2 GiB overflowed mingw's snprintf in the caller. Requests
+with more than 16 MiB of guest memory now say so instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/shader/recompiler/Recompiler.cpp b/core/shader/recompiler/Recompiler.cpp
+index 10f1f2c..3455521 100644
+--- a/core/shader/recompiler/Recompiler.cpp
++++ b/core/shader/recompiler/Recompiler.cpp
+@@ -2350,7 +2350,13 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
+     } catch (const std::exception& e) {
+         NoteFailureOnce();
+         constexpr auto requestSerializer = RequestSerializer{};
+-        const auto inputInfo = request.context.splitState.empty() ? "\nRecompileRequest:\n" + requestSerializer.Serialize(request) : std::string();
++        // The serialized request carries the guest memory regions; a host that passes large ones
++        // (a title's whole GPU memory) would get an error of gigabytes, built at every failure.
++        std::size_t memoryBytes = 0;
++        for (const auto& region : request.context.memory) memoryBytes += region.bytes.size();
++        const auto inputInfo = request.context.splitState.empty() && memoryBytes <= (16u << 20u)
++            ? "\nRecompileRequest:\n" + requestSerializer.Serialize(request)
++            : std::string(memoryBytes > (16u << 20u) ? "\n(RecompileRequest not serialized: " + std::to_string(memoryBytes >> 20u) + " MiB of guest memory)" : "");
+         throw std::runtime_error(std::string("ShaderRecompiler::Recompile: ") + e.what() + inputInfo);
+     } catch (...) {
+         throw std::runtime_error("ShaderRecompiler::Recompile: unknown exception");
+-- 
+2.47.0
