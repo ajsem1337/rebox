@@ -46,7 +46,7 @@ static struct
     LONGLONG last;   /* frame number the last wait returned, -1 for none */
     /* Signalled at each occurrence: handles read through the title's pointer each time (it
      * points at the title's own HANDLE fields, which it may replace), or one given directly. */
-    HANDLE *const volatile *handles;
+    HANDLE volatile *handles;
     UINT count;
     HANDLE event;
     BOOL enabled;
@@ -164,7 +164,7 @@ static DWORD WINAPI signal_proc(void *arg)
                         SetEvent(types[i].event);
                     for (UINT k = 0; k < types[i].count; k++)
                     {
-                        HANDLE h = (*types[i].handles)[k];
+                        HANDLE h = types[i].handles[k];
                         if (h && !SetEvent(h))
                             ReleaseSemaphore(h, 1, NULL);
                     }
@@ -234,7 +234,9 @@ HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, const void *list, UINT fl
     {
         const struct { UINT32 count; UINT32 pad; HANDLE *handles; } *l = list;
         types[type].count = l->handles ? min(l->count, 8) : 0;
-        types[type].handles = types[type].count ? (HANDLE *const volatile *)&l->handles : NULL;
+        /* The list itself is the title's temporary (a UE5 title's is on its stack): keep the address
+         * it gives, of the handle fields, which live on and may change. */
+        types[type].handles = types[type].count ? (HANDLE volatile *)l->handles : NULL;
         types[type].event = NULL;
         {
             static LONG logged;

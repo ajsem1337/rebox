@@ -1164,11 +1164,15 @@ static void test_pacing(void *dev, void *queue)
      * scheduled 5 ms after the origin is set once per frame. */
     {
         static HANDLE field;
-        static struct { UINT32 count, pad; HANDLE *handles; } list = { 1, 0, &field };
         HANDLE other = CreateEventA(NULL, FALSE, FALSE, NULL);
 
         field = event;
-        hr = XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, const void *, UINT)(dev, 1, 5000, &list, 0);
+        {
+            /* A temporary, as a UE5 title's is: only the field it points at lives on. */
+            struct { UINT32 count, pad; HANDLE *handles; } list = { 1, 0, &field };
+            hr = XSLOT(dev, 79, HRESULT, UINT, UINT_PTR, const void *, UINT)(dev, 1, 5000, &list, 0);
+            memset(&list, 0, sizeof(list));
+        }
         ok = SUCCEEDED(hr);
         QueryPerformanceCounter(&t0);
         for (i = 0; i < 3; i++)
