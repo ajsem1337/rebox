@@ -150,14 +150,45 @@ static void read_keyboard(GameInputGamepadState *s)
     s->rightTrigger = key('C');
 }
 
+/* REBOX_GAMEINPUT_LOG=1: the state read, at most 4 times a second while it changes (200 lines),
+ * with XInput's raw values: for a stick that drifts or an axis that reads off-centre. */
+static void log_state(const GameInputGamepadState *s, const XINPUT_STATE *x)
+{
+    static int enabled = -1;
+    static LONG lines;
+    static DWORD last_tick;
+    static GameInputGamepadState last;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv("REBOX_GAMEINPUT_LOG");
+        enabled = env && *env && *env != '0';
+    }
+    if (!enabled || lines >= 200 || !memcmp(&last, s, sizeof(last)) || GetTickCount() - last_tick < 250)
+        return;
+    last = *s;
+    last_tick = GetTickCount();
+    lines++;
+    if (x)
+        rebox_log("gameinput: buttons %#x LT %.2f RT %.2f L (%.3f, %.3f) R (%.3f, %.3f); XInput raw L (%d, %d) R (%d, %d) "
+                     "triggers %u %u", s->buttons, s->leftTrigger, s->rightTrigger, s->leftThumbstickX, s->leftThumbstickY,
+                     s->rightThumbstickX, s->rightThumbstickY, x->Gamepad.sThumbLX, x->Gamepad.sThumbLY,
+                     x->Gamepad.sThumbRX, x->Gamepad.sThumbRY, x->Gamepad.bLeftTrigger, x->Gamepad.bRightTrigger);
+    else
+        rebox_log("gameinput: buttons %#x LT %.2f RT %.2f L (%.3f, %.3f) R (%.3f, %.3f) (keyboard)", s->buttons,
+                     s->leftTrigger, s->rightTrigger, s->leftThumbstickX, s->leftThumbstickY, s->rightThumbstickX,
+                     s->rightThumbstickY);
+}
+
 static void read_gamepad(GameInputGamepadState *s)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     XINPUT_STATE x;
+    BOOL pad;
 
     InitOnceExecuteOnce(&once, load_xinput, NULL, NULL);
     memset(s, 0, sizeof(*s));
-    if (xinput_get && xinput_get(0, &x) == ERROR_SUCCESS)
+    if ((pad = xinput_get && xinput_get(0, &x) == ERROR_SUCCESS))
     {
         static const struct { WORD x; uint32_t g; } map[] = {
             { XINPUT_GAMEPAD_START, 0x1 }, { XINPUT_GAMEPAD_BACK, 0x2 }, { XINPUT_GAMEPAD_A, 0x4 },
@@ -179,6 +210,7 @@ static void read_gamepad(GameInputGamepadState *s)
     }
     else
         read_keyboard(s);
+    log_state(s, pad ? &x : NULL);
 }
 
 /* ------------------------------------------------------------------------ COM plumbing */
