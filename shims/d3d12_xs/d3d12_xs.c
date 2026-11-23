@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -179,9 +180,10 @@ static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *c
     return TRUE;
 }
 
-/* The vertex shader's input signature (its container's ISG1 part, or ISGN): the semantic name and
- * index of each input register that isn't a system value. Returns how many registers it names. */
-static UINT vs_input_semantics(const BYTE *dxbc, SIZE_T size, const char *names[32], UINT indices[32])
+/* A shader's input signature (its container's ISG1 part, or ISGN) or output signature (OSG1, OSG5
+ * or OSGN): the semantic name and index of each register that isn't a system value. Returns how
+ * many registers it names. */
+static UINT signature_semantics(const BYTE *dxbc, SIZE_T size, BOOL output, const char *names[32], UINT indices[32])
 {
     UINT parts, count = 0;
 
@@ -198,8 +200,8 @@ static UINT vs_input_semantics(const BYTE *dxbc, SIZE_T size, const char *names[
 
         if (off + 8 > size)
             continue;
-        v1 = !memcmp(dxbc + off, "ISG1", 4);
-        if (!v1 && memcmp(dxbc + off, "ISGN", 4))
+        v1 = !memcmp(dxbc + off, output ? "OSG1" : "ISG1", 4) || (output && !memcmp(dxbc + off, "OSG5", 4));
+        if (!v1 && memcmp(dxbc + off, output ? "OSGN" : "ISGN", 4))
             continue;
         chunk = *(const UINT32 *)(dxbc + off + 4);
         body = dxbc + off + 8;
@@ -209,7 +211,7 @@ static UINT vs_input_semantics(const BYTE *dxbc, SIZE_T size, const char *names[
         stride = v1 ? 32 : 24;
         for (UINT k = 0; k < n && 8 + (k + 1) * stride <= chunk; k++)
         {
-            const BYTE *e = body + 8 + k * stride + (v1 ? 4 : 0); /* ISG1 starts with the stream */
+            const BYTE *e = body + 8 + k * stride + (v1 ? 4 : 0); /* ISG1/OSG1 start with the stream */
             UINT32 name = *(const UINT32 *)e, index = *(const UINT32 *)(e + 4), sv = *(const UINT32 *)(e + 8);
             UINT32 reg = *(const UINT32 *)(e + 16);
             if (sv || reg >= 32 || name >= chunk)
@@ -249,6 +251,52 @@ static UINT format_bytes(DXGI_FORMAT f)
     default:
         return 4; /* R32, R16G16, R8G8B8A8, R10G10B10A2, R11G11B10 and their kinds */
     }
+}
+
+/* Which vertex shader param each pixel shader attribute reads (SPI_PS_INPUT_CNTL_n.OFFSET), as the
+ * console driver links them: attribute n reads the PS input register the FSSM's table names, whose
+ * semantic is some VS output register, which the VS's table says param N writes (xcl found
+ * a UE5 title's Slate PS reads COLOR0 as attr0 and TEXCOORD1 as attr1, so taking attr n = param n
+ * sampled every UI texture at the wrong coordinates). Left as attr n = param n where a table or
+ * signature is missing. */
+static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *vs_blob, void *ps_blob)
+{
+    struct rebox_deferred_graphics *vs = (void *)((struct rebox_deferred_shader *)vs_blob + 1);
+    struct rebox_deferred_graphics *ps = (void *)((struct rebox_deferred_shader *)ps_blob + 1);
+    const char *in_names[32], *out_names[32];
+    UINT in_indices[32], out_indices[32], linked = 0;
+    static LONG shown;
+    char line[256];
+    int at = 0;
+
+    if (!ps->register_count || !vs->register_count
+            || !signature_semantics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, FALSE, in_names, in_indices)
+            || !signature_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, TRUE, out_names, out_indices))
+        return;
+    for (UINT n = 0; n < ps->register_count; n++)
+    {
+        UINT reg = ps->registers[n], out = 32, param = 32;
+        if (reg < 32 && in_names[reg])
+            for (out = 0; out < 32; out++)
+                if (out_names[out] && !_stricmp(out_names[out], in_names[reg]) && out_indices[out] == in_indices[reg])
+                    break;
+        for (param = 0; out < 32 && param < vs->register_count && vs->registers[param] != out; param++)
+            ;
+        if (out < 32 && param < vs->register_count)
+        {
+            ps->interpolators[n] = param | (ps->flat[n] ? 1u << 10 : 0);
+            linked++;
+        }
+        if (at < 200)
+            at += snprintf(line + at, sizeof(line) - at, " attr%u=%s%u->param%d", n, reg < 32 && in_names[reg]
+                           ? in_names[reg] : "?", reg < 32 ? in_indices[reg] : 0, out < 32 && param < vs->register_count
+                           ? (int)param : -1);
+    }
+    ps->interpolator_count = max(ps->interpolator_count, ps->register_count);
+    line[min(at, (int)sizeof(line) - 1)] = 0;
+    if (InterlockedIncrement(&shown) <= 8)
+        rebox_log("d3d12_xs: graphics PSO interpolants: %u of %u linked by semantic:%s", linked,
+                     ps->register_count, line);
 }
 
 static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
@@ -296,7 +344,7 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
      * order (patch 0006 resolves them only for elements in order). Without a signature, layout order. */
     {
         const char *names[32];
-        UINT indices[32], regs = vs_input_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, names, indices);
+        UINT indices[32], regs = signature_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, FALSE, names, indices);
         UINT offsets[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = { 0 }, resolved[ARRAYSIZE(g->elements)];
         for (UINT i = 0; i < desc->InputLayout.NumElements; i++)
         {
@@ -326,6 +374,7 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
                 g->elements[r] = (struct rebox_graphics_element){ 0, DXGI_FORMAT_UNKNOWN, 0, 0 };
         }
     }
+    link_interpolants(desc, vs, ps);
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
     memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
     if (SUCCEEDED(ID3D12PipelineState_SetPrivateData((ID3D12PipelineState *)pso, &REBOX_GRAPHICS_GUID, g->size, g))

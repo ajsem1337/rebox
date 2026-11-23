@@ -239,6 +239,64 @@ static void gfx10_vgprs(const UINT32 *ins, UINT size, UINT64 *read, UINT64 *writ
 #undef V
 }
 
+/* The FSSM's interface tables (xcl, crates/xcl/src/gpu/recomp/mod.rs, GPL-2.0-only; checked there
+ * on every cached shader of three titles). Attribute and param numbers name signature registers,
+ * numbered by what the code uses, not elements: a UE5 title's Slate pixel shader reads COLOR0 as attr0
+ * and TEXCOORD1 as attr1. The tables sit after a sub-version at +0x10 (5 in a UE5 title's GDK, 6 adds
+ * 8 bytes). Pixel: 32 records of 8 bytes at +0x130 (kind, register, mask, attribute number, 0, 0,
+ * register again, 1 flat / 2 interpolated), the count at +0x100 after them, SPI_PS_INPUT_ENA at
+ * +0x110. Vertex: 32 records of 6 bytes at +0x1D4 (kind, register, param number, 0, 0, 0), the
+ * count at +0xC0 after them. FALSE if the tables aren't there or don't check out. */
+static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct rebox_deferred_graphics *g,
+                           UINT32 *input_ena)
+{
+    SIZE_T shift, base;
+    UINT n;
+
+    if (size < 0x14)
+        return FALSE;
+    switch (u32(fssm + 0x10))
+    {
+    case 5: shift = 0; break;
+    case 6: shift = 8; break;
+    default: return FALSE;
+    }
+    if (stage == 0x10)
+    {
+        base = 0x130 + shift;
+        if (base + 0x114 > size || (n = u32(fssm + base + 0x100)) > 32)
+            return FALSE;
+        for (UINT k = 0; k < n; k++)
+        {
+            const BYTE *r = fssm + base + 8 * k;
+            if (r[3] != k || r[4] || r[5] || r[6] != r[1])
+                return FALSE;
+        }
+        for (UINT k = 0; k < n; k++)
+        {
+            g->registers[k] = fssm[base + 8 * k + 1];
+            g->flat[k] = fssm[base + 8 * k + 7] == 1;
+        }
+        *input_ena = u32(fssm + base + 0x110);
+    }
+    else
+    {
+        base = 0x1d4 + shift;
+        if (base + 0xc4 > size || (n = u32(fssm + base + 0xc0)) > 32)
+            return FALSE;
+        for (UINT k = 0; k < n; k++)
+        {
+            const BYTE *r = fssm + base + 6 * k;
+            if (r[2] != k || r[3] || r[4] || r[5])
+                return FALSE;
+        }
+        for (UINT k = 0; k < n; k++)
+            g->registers[k] = fssm[base + 6 * k + 1];
+    }
+    g->register_count = n;
+    return TRUE;
+}
+
 void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size)
 {
     struct rebox_deferred_shader *h;
@@ -332,6 +390,11 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
         g->input_ena = 0x2;                               /* perspective centre */
     }
 
+    {
+        UINT32 ena = 0;
+        if (fssm_interface(fssm, fssm_size, stage, g, &ena) && stage == 0x10 && ena)
+            g->input_ena = ena;
+    }
     h->magic = REBOX_DEFERRED_MAGIC;
     h->version = 2;
     h->size = sizeof(*h) + sizeof(*g) + (UINT32)code_bytes;

@@ -753,31 +753,49 @@ static BOOL read_dump_pixel(const char *dir, int frame, BYTE bgra[4])
 /* A console container (DXBC, DXIL part, XBCH, zlib FSSM) around graphics FSSM in a UE5 title's older
  * layout (console_fssm.c): code at 0x160 (the u32 at 0xC0 plus 0x28), its size at 0xC8, RSRC1 at
  * 0x108, float mode at 0xFC. zlib in stored blocks, which puff reads. Free with free(). */
-static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T *size)
+/* With an interface table (FSSM sub-version 5: the pixel table's records at 0x130, the vertex
+ * table's at 0x1D4) and a signature part (sig_tag ISG1 or OSG1, its chunk), when given. */
+static BYTE *console_graphics_container_ex(const UINT32 *code, UINT dwords, const BYTE *table, UINT table_at,
+                                           UINT table_size, const char *sig_tag, const BYTE *sig, UINT sig_size, SIZE_T *size)
 {
-    UINT fssm_size = 0x160 + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part, total;
+    UINT code_at = table ? 0x300 : 0x160;
+    UINT fssm_size = code_at + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part, total, parts = sig ? 2 : 1;
+    UINT dxil_at = 0x20 + 4 * parts;
     BYTE *fssm = calloc(1, fssm_size), *out;
     UINT32 a = 1, b = 0;
 
     memcpy(fssm, "FSSM", 4);
-    *(UINT32 *)(fssm + 0xc0) = 0x160 - 0x28;
+    *(UINT32 *)(fssm + 0xc0) = code_at - 0x28;
     *(UINT32 *)(fssm + 0xc8) = dwords * 4;
     *(UINT32 *)(fssm + 0xfc) = 0xc0;
     *(UINT32 *)(fssm + 0x108) = 0x002c0003;
-    memcpy(fssm + 0x160, code, dwords * 4);
+    if (table)
+    {
+        *(UINT32 *)(fssm + 0x10) = 5;
+        memcpy(fssm + table_at, table, table_size);
+    }
+    memcpy(fssm + code_at, code, dwords * 4);
     part = 4 + 0x60 + 4 + 0x14 + zsize;
     part = (part + 3) & ~3u;
-    total = 0x24 + 8 + part;
+    total = dxil_at + 8 + part + (sig ? 8 + sig_size : 0);
     out = calloc(1, total);
     memcpy(out, "DXBC", 4);
     *(UINT32 *)(out + 20) = 1;
     *(UINT32 *)(out + 24) = total;
-    *(UINT32 *)(out + 28) = 1;
-    *(UINT32 *)(out + 32) = 0x24;
-    memcpy(out + 0x24, "DXIL", 4);
-    *(UINT32 *)(out + 0x28) = part;
+    *(UINT32 *)(out + 28) = parts;
+    *(UINT32 *)(out + 32) = dxil_at;
+    memcpy(out + dxil_at, "DXIL", 4);
+    *(UINT32 *)(out + dxil_at + 4) = part;
+    if (sig)
     {
-        BYTE *p = out + 0x2c;
+        UINT at = dxil_at + 8 + part;
+        *(UINT32 *)(out + 36) = at;
+        memcpy(out + at + 8, sig, sig_size);
+        *(UINT32 *)(out + at + 4) = sig_size;
+        memcpy(out + at, sig_tag, 4);
+    }
+    {
+        BYTE *p = out + dxil_at + 8;
         memcpy(p, "XBCH", 4);
         memcpy(p + 4 + 0x60, "NOBC", 4);
         p += 4 + 0x60 + 4 + 0x14;
@@ -804,6 +822,33 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
     return out;
 }
 
+/* A signature chunk (ISG1/OSG1 layout: count, 8, then 32-byte elements from the stream on) naming
+ * register regs[k] semantic names[k]0, a system value where sv[k]. */
+static UINT signature_chunk(const char *const *names, const UINT *regs, const UINT *sv, UINT n, BYTE out[512])
+{
+    UINT strings = 8 + 32 * n;
+    memset(out, 0, 512);
+    *(UINT32 *)out = n;
+    *(UINT32 *)(out + 4) = 8;
+    for (UINT k = 0; k < n; k++)
+    {
+        UINT32 *e = (UINT32 *)(out + 8 + 32 * k);
+        e[1] = strings;          /* name, from the chunk body */
+        e[3] = sv[k];
+        e[4] = 3;                /* float */
+        e[5] = regs[k];
+        e[6] = 0x0f0f;
+        strcpy((char *)out + strings, names[k]);
+        strings += (UINT)strlen(names[k]) + 1;
+    }
+    return (strings + 3) & ~3u;
+}
+
+static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T *size)
+{
+    return console_graphics_container_ex(code, dwords, NULL, 0, 0, NULL, NULL, 0, size);
+}
+
 /* Deferred console graphics (patch 0006): a PSO whose stages are console vertex and pixel shaders
  * in their containers draws with AnyPS5's compiles of them. The vertex shader calls the fetch
  * shader as a UE5 title's do (s_swappc_b64 s[4:5], s[4:5]) and exports input 0 as the position, its x
@@ -812,8 +857,29 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
  * shader exports red, as 32-bit floats or (packed) as two FP16 pairs, which every a UE5 title pixel
  * shader exports. One full-screen triangle over a blue clear: the centre turns red (blue: fell
  * back, or the constant read 0 and the triangle collapsed). */
-static void test_console_draw(void *dev, void *queue, BOOL packed)
+static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked)
 {
+    /* Linked: the vertex shader writes black to param0 and red to param1, whose registers are
+     * TEXCOORD0 and COLOR0 (the FSSM table and OSG1); the pixel shader reads its one input, COLOR0,
+     * as attr0 (flat). Red only if attr0 is linked to param1 by semantic, as the console driver
+     * does and as a UE5 title's UI needs. */
+    static const UINT32 link_vs[] = {
+        0xbe842104,             /* s_swappc_b64 s[4:5], s[4:5] */
+        0x7e100280,             /* v_mov_b32 v8, 0 */
+        0x7e1202f2,             /* v_mov_b32 v9, 1.0 */
+        0xf80008cf, 0x07060504, /* exp pos0 v4, v5, v6, v7 done */
+        0xf800020f, 0x08080808, /* exp param0 v8, v8, v8, v8 */
+        0xf800021f, 0x09080809, /* exp param1 v9, v8, v8, v9 */
+        0xbf810000,             /* s_endpgm */
+    };
+    static const UINT32 link_ps[] = {
+        0xc8020002,             /* v_interp_mov_f32 v0, p0, attr0.x */
+        0xc8060102,             /* v_interp_mov_f32 v1, p0, attr0.y */
+        0xc80a0202,             /* v_interp_mov_f32 v2, p0, attr0.z */
+        0xc80e0302,             /* v_interp_mov_f32 v3, p0, attr0.w */
+        0xf800180f, 0x03020100, /* exp mrt0 v0, v1, v2, v3 done vm */
+        0xbf810000,             /* s_endpgm */
+    };
     static const UINT32 vs_code[] = {
         0xbe842104,             /* s_swappc_b64 s[4:5], s[4:5]: the fetch, input 0 in v4-v7 */
         0xbe890380,             /* s_mov_b32 s9, 0 */
@@ -876,9 +942,30 @@ static void test_console_draw(void *dev, void *queue, BOOL packed)
 
     if (getenv("REBOX_SHADER_FALLBACK") && *getenv("REBOX_SHADER_FALLBACK") == '0')
         return;
-    vs = console_graphics_container(vs_code, ARRAYSIZE(vs_code), &vs_size);
-    ps = packed ? console_graphics_container(ps_packed_code, ARRAYSIZE(ps_packed_code), &ps_size)
-                : console_graphics_container(ps_code, ARRAYSIZE(ps_code), &ps_size);
+    if (linked)
+    {
+        static const char *const vs_names[] = { "SV_Position", "TEXCOORD", "COLOR" }, *const ps_names[] = {
+            "SV_Position", "COLOR" };
+        static const UINT vs_regs[] = { 0, 1, 2 }, vs_sv[] = { 1, 0, 0 }, ps_regs[] = { 0, 1 }, ps_sv[] = { 1, 0 };
+        BYTE vs_table[0xc4] = { 6, 1, 0, 0, 0, 0, 6, 2, 1, 0, 0, 0 }, ps_table[0x114] = { 6, 1, 0xf, 0, 0, 0, 1, 1 };
+        BYTE sig[512];
+        UINT n;
+        vs_table[0xc0] = 2;
+        ps_table[0x100] = 1;
+        ps_table[0x110] = 2;
+        n = signature_chunk(vs_names, vs_regs, vs_sv, 3, sig);
+        vs = console_graphics_container_ex(link_vs, ARRAYSIZE(link_vs), vs_table, 0x1d4, sizeof(vs_table), "OSG1", sig,
+                                           n, &vs_size);
+        n = signature_chunk(ps_names, ps_regs, ps_sv, 2, sig);
+        ps = console_graphics_container_ex(link_ps, ARRAYSIZE(link_ps), ps_table, 0x130, sizeof(ps_table), "ISG1", sig,
+                                           n, &ps_size);
+    }
+    else
+    {
+        vs = console_graphics_container(vs_code, ARRAYSIZE(vs_code), &vs_size);
+        ps = packed ? console_graphics_container(ps_packed_code, ARRAYSIZE(ps_packed_code), &ps_size)
+                    : console_graphics_container(ps_code, ARRAYSIZE(ps_code), &ps_size);
+    }
     hr = serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)) ? S_OK : E_FAIL;
     if (SUCCEEDED(hr))
     {
@@ -993,8 +1080,9 @@ static void test_console_draw(void *dev, void *queue, BOOL packed)
     {
         px = (BYTE *)mapped + 24 * 256 + 32 * 4;
         CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0,
-              "console vertex and pixel shaders draw through AnyPS5, %s export (centre RGB %u %u %u; blue: fell back)",
-              packed ? "FP16 (compr)" : "32-bit", px[0], px[1], px[2]);
+              "console vertex and pixel shaders draw through AnyPS5, %s (centre RGB %u %u %u; blue: fell back)",
+              linked ? "pixel attr0 linked to vertex param1 by semantic (black: attr n = param n)"
+              : packed ? "FP16 (compr) export" : "32-bit export", px[0], px[1], px[2]);
         ID3D12Resource_Unmap(readback, 0, NULL);
     }
 
@@ -3556,8 +3644,9 @@ static void test_xbox(void)
     test_dxgi_device(dev);
     test_pacing(dev, queue);
     test_texture_va_upload(dev, queue);
-    test_console_draw(dev, queue, FALSE);
-    test_console_draw(dev, queue, TRUE);
+    test_console_draw(dev, queue, FALSE, FALSE);
+    test_console_draw(dev, queue, TRUE, FALSE);
+    test_console_draw(dev, queue, FALSE, TRUE);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);

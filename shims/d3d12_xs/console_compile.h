@@ -31,6 +31,11 @@ struct rebox_deferred_graphics
     UINT32 interpolators[32];    /* SPI_PS_INPUT_CNTL_n */
     UINT32 col_format;           /* SPI_SHADER_COL_FORMAT */
     UINT32 depth_export;
+    /* From the FSSM's interface table (0 if it has none): pixel, the signature register each
+     * `v_interp attrN` reads; vertex, the one each `exp paramN` writes. */
+    UINT32 register_count;
+    BYTE registers[32];
+    BYTE flat[32];               /* pixel: attribute N is flat (not interpolated) */
 };
 
 /* What d3d12_xs attaches to a graphics PSO whose stages are console vertex and pixel shaders,

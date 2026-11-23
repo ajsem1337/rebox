@@ -278,6 +278,13 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      a UE5 title's render thread stopped presenting while it compiled them. The pipeline is
      vkd3d-proton's own variant with those two modules and that vertex input, cached per PSO by
      both compiles' keys and the pipeline key. A failed compile draws with the fallback pipeline.
+   - **Interpolants** are linked as the console driver links them: `v_interp attrN` and `exp paramN`
+     name signature registers, numbered by what each shader uses, not elements. The FSSM's interface
+     tables give them (xcl's layout, GPL-2.0-only: sub-version at +0x10; pixel records at +0x130
+     with SPI_PS_INPUT_ENA, vertex records at +0x1D4), and `d3d12_xs` sets
+     `SPI_PS_INPUT_CNTL_n` to the VS param whose OSG1 register has the semantic of the PS's ISG1
+     register for attribute n. Taking attr n = param n made a UE5 title's Slate pixel shader (COLOR0 as
+     attr0, TEXCOORD1 as attr1) sample its textures at the wrong coordinates: a white panel, no text.
    - `test_console_draw` (smoke): a console vertex shader that calls the fetch and exports input 0
      as the position, scaled by a constant buffer it reads through descriptor table 0 (s8), and a
      pixel shader exporting red, in real containers, draw a full-screen triangle on lavapipe.
