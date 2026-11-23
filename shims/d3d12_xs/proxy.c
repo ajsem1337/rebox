@@ -420,6 +420,7 @@ static release_fn orig_resource_release;
 static struct scratch
 {
     void *resource, *cpu;
+    BOOL mapped_here;   /* Map gave this memory (vkd3d-proton refused the texture) */
     struct scratch *next;
 } *scratch_list;
 static SRWLOCK scratch_lock = SRWLOCK_INIT;
@@ -513,6 +514,97 @@ typedef D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *resource_get_desc_fn)(void *, D
 static resource_get_desc_fn orig_resource_get_desc;
 static void **resource_vtbl;
 
+/* Map/Unmap (slots 8, 9): on the console every resource is in unified memory, so titles map
+ * textures too (a GDK title maps one and clears it at startup; vkd3d-proton refuses a DEFAULT
+ * heap texture, the pointer stayed garbage, and the clear wrote to 0xf). A texture's subresource 0
+ * maps to its console memory, the block GetGPUVirtualAddress gives it (registered as a title
+ * texture), and Unmap marks that memory written so the next submission uploads it. */
+typedef HRESULT (STDMETHODCALLTYPE *map_fn)(void *, UINT, const D3D12_RANGE *, void **);
+typedef void (STDMETHODCALLTYPE *unmap_fn)(void *, UINT, const D3D12_RANGE *);
+static map_fn orig_resource_map;
+static unmap_fn orig_resource_unmap;
+
+static BOOL texture_mapped_here(void *self)
+{
+    struct scratch *sc;
+    BOOL here = FALSE;
+    AcquireSRWLockShared(&scratch_lock);
+    for (sc = scratch_list; sc && sc->resource != self; sc = sc->next)
+        ;
+    if (sc)
+        here = sc->mapped_here;
+    ReleaseSRWLockShared(&scratch_lock);
+    return here;
+}
+
+static BOOL texture_block(void *self, void **cpu, UINT64 *size)
+{
+    struct scratch *sc;
+    D3D12_RESOURCE_DESC desc;
+    D3D12_RESOURCE_ALLOCATION_INFO info;
+
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))orig_resource_get_desc)(self, &desc);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || !device_proxy)
+        return FALSE;
+    *cpu = NULL;
+    AcquireSRWLockShared(&scratch_lock);
+    for (sc = scratch_list; sc && sc->resource != self; sc = sc->next)
+        ;
+    if (sc)
+        *cpu = sc->cpu;
+    ReleaseSRWLockShared(&scratch_lock);
+    if (!*cpu)
+        *cpu = (void *)(ULONG_PTR)resource_GetGPUVirtualAddress(self);
+    ((D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT,
+            const D3D12_RESOURCE_DESC *))PC_SLOT(device_proxy->inner, 25))(device_proxy->inner, &info, 0, 1, &desc);
+    *size = max(info.SizeInBytes, title_texture_size(&desc));
+    return *cpu != NULL;
+}
+
+static HRESULT STDMETHODCALLTYPE resource_Map(void *self, UINT subresource, const D3D12_RANGE *range, void **data)
+{
+    HRESULT hr = orig_resource_map(self, subresource, range, data);
+    void *cpu;
+    UINT64 size;
+
+    if (SUCCEEDED(hr) || subresource || !texture_block(self, &cpu, &size))
+        return hr;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: Map of a texture (%#lx from vkd3d-proton): its console memory, %llu bytes", hr,
+                         (unsigned long long)size);
+    }
+    {
+        struct scratch *sc;
+        AcquireSRWLockExclusive(&scratch_lock);
+        for (sc = scratch_list; sc && sc->resource != self; sc = sc->next)
+            ;
+        if (sc)
+            sc->mapped_here = TRUE;
+        ReleaseSRWLockExclusive(&scratch_lock);
+    }
+    if (data)
+        *data = cpu;
+    return S_OK;
+}
+
+static void STDMETHODCALLTYPE resource_Unmap(void *self, UINT subresource, const D3D12_RANGE *range)
+{
+    D3D12_RESOURCE_DESC desc;
+    void *cpu;
+    UINT64 size;
+
+    ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))orig_resource_get_desc)(self, &desc);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !subresource && texture_mapped_here(self)
+            && texture_block(self, &cpu, &size))
+    {
+        ReboxTitleMemoryWritten((UINT64)(ULONG_PTR)cpu, size);
+        return;
+    }
+    orig_resource_unmap(self, subresource, range);
+}
+
 static D3D12_RESOURCE_DESC *STDMETHODCALLTYPE resource_GetDesc(void *a, void *b)
 {
     if (*(void ***)a != resource_vtbl && b && *(void ***)b == resource_vtbl)
@@ -532,6 +624,10 @@ static void patch_resource_class(void *resource)
     orig_resource_release = vtbl[2];
     orig_resource_get_desc = vtbl[10];
     orig_resource_get_va = vtbl[11];
+    orig_resource_map = vtbl[8];
+    orig_resource_unmap = vtbl[9];
+    vtbl[8] = (void *)resource_Map;
+    vtbl[9] = (void *)resource_Unmap;
     vtbl[2] = (void *)resource_Release;
     vtbl[10] = (void *)resource_GetDesc;
     vtbl[11] = (void *)resource_GetGPUVirtualAddress;

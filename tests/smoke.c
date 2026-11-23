@@ -619,9 +619,11 @@ static void test_gpu_memory(HMODULE m)
 
 /* Texels a title writes through a texture's GPU VA (console textures are their memory) reach the
  * texture: d3d12_xs backs the VA with GPU memory it detiles into the texture before the queue
- * runs. One colour everywhere, so the result doesn't depend on which tiling is assumed. */
-static void test_texture_va_upload(void *dev, void *queue)
+ * runs. One colour everywhere, so the result doesn't depend on which tiling is assumed. by_map:
+ * through Map/Unmap instead (a GDK title maps a DEFAULT heap texture, which vkd3d-proton refuses). */
+static void test_texture_va_upload(void *dev, void *queue, BOOL by_map)
 {
+    const char *how = by_map ? "Map" : "GPU VA";
     D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, rb = { D3D12_HEAP_TYPE_READBACK };
     D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE };
@@ -654,14 +656,24 @@ static void test_texture_va_upload(void *dev, void *queue)
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
                 &IID_ID3D12Fence, (void **)&fence);
-    if (SUCCEEDED(hr) && !(va = ID3D12Resource_GetGPUVirtualAddress(tex)))
+    if (SUCCEEDED(hr) && by_map)
+    {
+        void *p = NULL;
+        hr = ID3D12Resource_Map(tex, 0, NULL, &p);
+        va = (UINT64)(ULONG_PTR)p;
+    }
+    else if (SUCCEEDED(hr))
+        va = ID3D12Resource_GetGPUVirtualAddress(tex);
+    if (SUCCEEDED(hr) && !va)
         hr = E_FAIL;
-    CHECK(SUCCEEDED(hr), "texture, readback and list for texels written through a GPU VA (%#lx)", hr);
+    CHECK(SUCCEEDED(hr), "texture, readback and list for texels written through a %s (%#lx)", how, hr);
     if (FAILED(hr))
         goto done;
     texels = (UINT32 *)(ULONG_PTR)va;
     for (UINT i = 0; i < 256 * 256; i++)
         texels[i] = 0xff20c040;
+    if (by_map)
+        ID3D12Resource_Unmap(tex, 0, NULL);
 
     barrier.Transition.pResource = tex;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
@@ -683,13 +695,21 @@ static void test_texture_va_upload(void *dev, void *queue)
     {
         UINT32 a = ((UINT32 *)mapped)[0], b = ((UINT32 *)mapped)[100 * 256 + 37];
         CHECK(a == 0xff20c040 && b == 0xff20c040,
-              "texels written through a texture's GPU VA reach the texture (%08x %08x, want ff20c040)", a, b);
+              "texels written through a texture's %s reach the texture (%08x %08x, want ff20c040)", how, a, b);
         ID3D12Resource_Unmap(readback, 0, NULL);
     }
 
     /* One texel changed later, between the points a sampled fingerprint reads (Unreal's font
      * atlas gains glyphs so): the next submission uploads it. Wherever the tiling puts it. */
+    if (by_map)
+    {
+        void *p = NULL;
+        ID3D12Resource_Map(tex, 0, NULL, &p);
+        texels = p ? p : texels;
+    }
     texels[1000] = 0xff0000ff;
+    if (by_map)
+        ID3D12Resource_Unmap(tex, 0, NULL);
     ID3D12CommandAllocator_Reset(alloc);
     XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -714,8 +734,8 @@ static void test_texture_va_upload(void *dev, void *queue)
             changed += v == 0xff0000ff;
             other += v != 0xff0000ff && v != 0xff20c040;
         }
-        CHECK(changed == 1 && !other, "a one-texel edit through the GPU VA reaches the texture (%u changed, %u other)",
-              changed, other);
+        CHECK(changed == 1 && !other, "a one-texel edit through the %s reaches the texture (%u changed, %u other)",
+              how, changed, other);
         ID3D12Resource_Unmap(readback, 0, NULL);
     }
 
@@ -3643,7 +3663,8 @@ static void test_xbox(void)
 
     test_dxgi_device(dev);
     test_pacing(dev, queue);
-    test_texture_va_upload(dev, queue);
+    test_texture_va_upload(dev, queue, FALSE);
+    test_texture_va_upload(dev, queue, TRUE);
     test_console_draw(dev, queue, FALSE, FALSE);
     test_console_draw(dev, queue, TRUE, FALSE);
     test_console_draw(dev, queue, FALSE, TRUE);
