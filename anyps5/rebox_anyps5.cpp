@@ -24,7 +24,7 @@ using namespace ShaderRecompiler;
 
 namespace {
 
-// Graphics stages: through AnyPS5's resource capture and result memo, as its own driver draws. A
+// Every stage (graphics and compute): through AnyPS5's resource capture and result memo, as its own driver draws. A
 // draw whose captured resources match an earlier one's reuses that result with only its per-draw
 // data patched in (buffer tables, the flattened SRT, shader data), instead of materializing and
 // emitting the variant again (a UE5 title draws the same shaders with new descriptor tables every
@@ -115,7 +115,7 @@ SA5_API int sa5_compile_compute(const sa5_compute_request* request, sa5_result**
         };
         compile.useCache = request->use_cache != 0;
 
-        *out = new sa5_result(std::make_shared<const RecompileResult>(Recompile(compile)));
+        *out = new sa5_result(RecompileMemoized(compile, regions));
         return 0;
     } catch (const std::exception& e) {
         SetError(error, error_size, e.what());

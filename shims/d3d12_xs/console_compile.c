@@ -588,6 +588,8 @@ static LONG failed_stage_count;
 
 static volatile LONG graphics_calls;
 static volatile LONG64 graphics_ticks, phase_ticks[4]; /* regions, AnyPS5, bindings, module */
+static volatile LONG64 compute_ticks;
+static volatile LONG compute_calls;
 static volatile LONG64 part_ticks[4];                  /* within bindings: identity, lookups, page table, host buffers */
 
 static LONG64 ticks_now(void)
@@ -684,6 +686,15 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         }
         QueryPerformanceCounter(&started);
         mark = started;
+    }
+    if (!graphics)
+    {
+        /* Compute compiles, timed the same way (at dispatch, the list's recording waits for them). */
+        LONG n = InterlockedIncrement(&compute_calls);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: console compute: %ld compiles asked for, %.2f ms each on average", n,
+                         compute_ticks * 1000.0 / qpc_frequency() / max(n - 1, 1));
+        QueryPerformanceCounter(&started);
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
@@ -1294,11 +1305,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
 done:
     ReleaseSRWLockExclusive(&compile_lock);
-    if (graphics && started.QuadPart)
+    if (started.QuadPart)
     {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        InterlockedAdd64(&graphics_ticks, now.QuadPart - started.QuadPart);
+        InterlockedAdd64(graphics ? &graphics_ticks : &compute_ticks, now.QuadPart - started.QuadPart);
     }
     if (words)
     {
