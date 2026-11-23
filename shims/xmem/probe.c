@@ -4,7 +4,8 @@
  * puts an int3 at each address. A hit logs the thread, the four argument registers, the return
  * address and the stack pointer, then the original byte is put back for one single-stepped
  * instruction and the int3 rearmed. Each probe logs its first REBOX_PROBE_MAX hits (default 20;
- * later hits are counted, not logged). Up to 16 probes. This is how to see what a title's own code
+ * later hits are counted, not logged). Up to 16 probes. REBOX_PROBE_DUMP=N also logs the first N
+ * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA). This is how to see what a title's own code
  * is called with without changing its file: xcl's XCL_PROBE does the same with hardware
  * breakpoints (a GDK title's controller path was found so). A hit on another thread while one byte
  * is restored is missed. */
@@ -28,6 +29,7 @@ static struct probe
 } probes[MAX_PROBES];
 static UINT probe_count;
 static LONG probe_max = 20;
+static UINT dump_qwords;
 static DWORD rearm_slot = TLS_OUT_OF_INDEXES; /* the probe a thread is single-stepping past, plus one */
 
 static void write_byte(BYTE *at, BYTE value)
@@ -81,6 +83,25 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                 rebox_log("probe %s hit %ld, thread %#lx: rcx %#llx rdx %#llx r8 %#llx r9 %#llx, rsp %#llx, from %s",
                              p->name, n, GetCurrentThreadId(), (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
                              (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rsp, caller);
+                if (dump_qwords && c->Rcx && !IsBadReadPtr((void *)(ULONG_PTR)c->Rcx, dump_qwords * 8))
+                {
+                    char line[1024], where[MAX_PATH + 32];
+                    int at = 0;
+                    for (UINT q = 0; q < dump_qwords && at < 900; q++)
+                    {
+                        ULONG_PTR v = ((ULONG_PTR *)(ULONG_PTR)c->Rcx)[q];
+                        HMODULE m;
+                        if (v && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)v, &m))
+                        {
+                            describe(v, where, sizeof(where));
+                            at += snprintf(line + at, sizeof(line) - at, " %s", where);
+                        }
+                        else
+                            at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)v);
+                    }
+                    rebox_log("probe %s hit %ld: [rcx]%s", p->name, n, line);
+                }
             }
             /* Run the real instruction once, then rearm (single step). */
             write_byte(p->address, p->original);
@@ -148,6 +169,12 @@ void probe_install(void)
     if (max && atoi(max) > 0)
         probe_max = atoi(max);
     free(max);
+    {
+        char *dump = rebox_getenv("REBOX_PROBE_DUMP");
+        if (dump && atoi(dump) > 0)
+            dump_qwords = min(atoi(dump), 32);
+        free(dump);
+    }
     if (!spec || !*spec)
     {
         free(spec);
