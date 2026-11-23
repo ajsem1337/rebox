@@ -240,7 +240,9 @@ down missing translations.
   `.#radv-rebox`, which together make those heaps identity-mapped. Without them,
   `d3d12_xs` logs that GPU memory is not identity-mapped. Buffers the title creates in DEFAULT
   heaps, and DEFAULT heaps that hold only buffers, are made CPU-visible (custom `WRITE_BACK`/`L0`),
-  so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out). Textures and mixed
+  so they're identity-mapped too (`REBOX_CPU_VISIBLE_BUFFERS=0` opts out); the title still sees
+  DEFAULT from `GetHeapProperties` and a heap's `GetDesc` (Unreal 5 takes a CUSTOM heap's path that is
+  broken on the console). Textures and mixed
   heaps keep ordinary GPU addresses.
 - **Controllers SDL maps wrongly.** Wine reads controllers through SDL, by SDL's database of
   layouts. For an Xbox One S controller on Bluetooth (045e:02e0, version 0408) that entry has

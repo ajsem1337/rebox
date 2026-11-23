@@ -619,6 +619,55 @@ static D3D12_RESOURCE_DESC *STDMETHODCALLTYPE resource_GetDesc(void *a, void *b)
     return orig_resource_get_desc(a, b);
 }
 
+/* Heap properties as the title asked for them: buffer heaps it made DEFAULT are CPU-visible
+ * custom heaps here (buffer_heap), which a console title never sees. Unreal 5 checks a CUSTOM
+ * heap's CPU page property through a pointer that's null on the console (a UE5 sample
+ * crashed reading address 4 after placing a transient resource). */
+static BOOL cpu_visible_buffers(void);
+
+static void title_heap_properties(D3D12_HEAP_PROPERTIES *props)
+{
+    if (props && props->Type == D3D12_HEAP_TYPE_CUSTOM && props->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+            && props->MemoryPoolPreference == D3D12_MEMORY_POOL_L0 && cpu_visible_buffers())
+    {
+        props->Type = D3D12_HEAP_TYPE_DEFAULT;
+        props->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        props->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    }
+}
+
+static HRESULT (STDMETHODCALLTYPE *orig_resource_get_heap_properties)(void *, D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS *);
+static HRESULT STDMETHODCALLTYPE resource_GetHeapProperties(void *resource, D3D12_HEAP_PROPERTIES *props,
+        D3D12_HEAP_FLAGS *flags)
+{
+    HRESULT hr = orig_resource_get_heap_properties(resource, props, flags);
+    if (SUCCEEDED(hr))
+        title_heap_properties(props);
+    return hr;
+}
+
+/* ID3D12Heap::GetDesc (slot 8) returns its struct through a hidden pointer, as on PC. */
+static D3D12_HEAP_DESC *(STDMETHODCALLTYPE *orig_heap_get_desc)(void *, D3D12_HEAP_DESC *);
+static D3D12_HEAP_DESC *STDMETHODCALLTYPE placed_heap_GetDesc(void *heap, D3D12_HEAP_DESC *desc)
+{
+    D3D12_HEAP_DESC *ret = orig_heap_get_desc(heap, desc);
+    title_heap_properties(&ret->Properties);
+    return ret;
+}
+
+static void patch_heap_class(void *heap)
+{
+    void **vtbl = *(void ***)heap;
+    DWORD old;
+
+    if (vtbl[8] == (void *)placed_heap_GetDesc)
+        return;
+    VirtualProtect(&vtbl[8], sizeof(void *), PAGE_READWRITE, &old);
+    orig_heap_get_desc = vtbl[8];
+    vtbl[8] = (void *)placed_heap_GetDesc;
+    VirtualProtect(&vtbl[8], sizeof(void *), old, &old);
+}
+
 static void patch_resource_class(void *resource)
 {
     void **vtbl = *(void ***)resource;
@@ -626,8 +675,10 @@ static void patch_resource_class(void *resource)
 
     if (vtbl[11] == (void *)resource_GetGPUVirtualAddress)
         return;
-    VirtualProtect(vtbl, 12 * sizeof(void *), PAGE_READWRITE, &old);
+    VirtualProtect(vtbl, 15 * sizeof(void *), PAGE_READWRITE, &old);
     resource_vtbl = vtbl;
+    orig_resource_get_heap_properties = vtbl[14];
+    vtbl[14] = (void *)resource_GetHeapProperties;
     orig_resource_release = vtbl[2];
     orig_resource_get_desc = vtbl[10];
     orig_resource_get_va = vtbl[11];
@@ -638,7 +689,7 @@ static void patch_resource_class(void *resource)
     vtbl[2] = (void *)resource_Release;
     vtbl[10] = (void *)resource_GetDesc;
     vtbl[11] = (void *)resource_GetGPUVirtualAddress;
-    VirtualProtect(vtbl, 12 * sizeof(void *), old, &old);
+    VirtualProtect(vtbl, 15 * sizeof(void *), old, &old);
 }
 
 /* One object of each class the title gets unwrapped, created and released
@@ -668,7 +719,13 @@ static void patch_child_classes(ID3D12Device *device)
         patch_resource_class(obj);
         IUnknown_Release(obj);
     }
-    PROBE(ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)&obj));
+    obj = NULL;
+    if (SUCCEEDED(ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)&obj)))
+    {
+        patch_child(obj);
+        patch_heap_class(obj);
+        IUnknown_Release(obj);
+    }
     obj = NULL;
     if (SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&obj)))
     {

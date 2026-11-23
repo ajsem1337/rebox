@@ -1744,6 +1744,36 @@ static void test_prebuild_info(void *dev)
           (unsigned long long)info.ResultDataMaxSizeInBytes, (unsigned long long)info.ScratchDataSizeInBytes);
 }
 
+/* DEFAULT buffer heaps are CPU-visible custom heaps here; the title still sees DEFAULT (Unreal 5
+ * takes a CUSTOM heap's path that's broken on the console). */
+static void test_title_heap_properties(void *dev)
+{
+    D3D12_HEAP_PROPERTIES props = { D3D12_HEAP_TYPE_DEFAULT }, got;
+    D3D12_RESOURCE_DESC buffer = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+    D3D12_HEAP_DESC heap_desc = { 64 << 10, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS }, desc;
+    D3D12_HEAP_FLAGS flags;
+    void *resource = NULL, *heap = NULL;
+
+    XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+          D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &props, D3D12_HEAP_FLAG_NONE, &buffer,
+          D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, &resource);
+    memset(&got, 0xcc, sizeof(got));
+    CHECK(resource && SUCCEEDED(XSLOT(resource, 14, HRESULT, D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS *)(resource, &got, &flags))
+              && got.Type == D3D12_HEAP_TYPE_DEFAULT,
+          "a committed DEFAULT buffer reports a DEFAULT heap (type %u)", got.Type);
+    if (resource)
+        IUnknown_Release((IUnknown *)resource);
+    XSLOT(dev, 28, HRESULT, const D3D12_HEAP_DESC *, REFIID, void **)(dev, &heap_desc, &IID_ID3D12Heap, &heap);
+    memset(&desc, 0xcc, sizeof(desc));
+    if (heap)
+        XSLOT(heap, 8, D3D12_HEAP_DESC *, D3D12_HEAP_DESC *)(heap, &desc);
+    CHECK(heap && desc.Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc.SizeInBytes == (64 << 10),
+          "a DEFAULT buffer heap's GetDesc says DEFAULT (type %u)", desc.Properties.Type);
+    if (heap)
+        IUnknown_Release((IUnknown *)heap);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -4075,6 +4105,7 @@ static void test_xbox(void)
     test_state_object_placeholder(dev);
     test_stream_pso(dev);
     test_prebuild_info(dev);
+    test_title_heap_properties(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
@@ -4232,9 +4263,17 @@ static void test_xbox(void)
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&buf);
         if (SUCCEEDED(hr))
             hr = ID3D12Resource_GetHeapProperties(buf, &got, &flags);
-        CHECK(SUCCEEDED(hr) && got.Type == D3D12_HEAP_TYPE_CUSTOM
-              && got.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-              "DEFAULT-heap buffer is created CPU-visible (heap type %u)", got.Type);
+        /* CPU-visible underneath (it maps, which a DEFAULT heap's can't), DEFAULT to the title. */
+        {
+            void *mapped = NULL;
+            D3D12_RANGE none = { 0, 0 };
+            HRESULT map_hr = buf ? ID3D12Resource_Map(buf, 0, &none, &mapped) : E_FAIL;
+            CHECK(SUCCEEDED(hr) && got.Type == D3D12_HEAP_TYPE_DEFAULT && SUCCEEDED(map_hr) && mapped,
+                  "DEFAULT-heap buffer is created CPU-visible (maps: %#lx), reported as DEFAULT (heap type %u)",
+                  (unsigned long)map_hr, got.Type);
+            if (SUCCEEDED(map_hr))
+                ID3D12Resource_Unmap(buf, 0, &none);
+        }
         if (buf)
         {
             UINT64 va = ID3D12Resource_GetGPUVirtualAddress(buf);
