@@ -184,7 +184,13 @@ static BOOL WINAPI status_IsComplete(struct status_array *a, UINT32 index)
 
     InterlockedIncrement64(&stats.polls);
     if (!complete)
+    {
+        static LONG logged;
         InterlockedIncrement64(&stats.polls_pending);
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("xcrdapi: status array %p entry %u of %u polled before it completed (%s)", (void *)a, index,
+                      a->capacity, index < a->capacity ? "enqueued, not yet written" : "past its capacity");
+    }
     return complete;
 }
 
@@ -800,6 +806,12 @@ static HRESULT WINAPI factory_CreateStatusArray(struct object *self, UINT32 capa
     }
     a->obj = (struct object){ status_vtbl, 1, status_destroy };
     a->capacity = capacity;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("xcrdapi: status array %p of %u entries (%s)", (void *)a, capacity,
+                      name && !IsBadStringPtrA(name, 64) ? name : "no name");
+    }
     for (UINT32 i = 0; i < capacity; i++)
         a->entries[i].complete = TRUE;
     *out = a;
