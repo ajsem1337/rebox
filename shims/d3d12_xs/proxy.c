@@ -1241,6 +1241,46 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
     return ret;
 }
 
+/* Slot 108 (newer layout, after xcl): GetResourceAllocationInfo2(visible mask, count,
+ * D3D12_RESOURCE_DESC1s of 0x48 bytes, D3D12_RESOURCE_ALLOCATION_INFO1 for each or null), returned
+ * as slot 25's (either argument order): their total size and largest alignment. */
+static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAllocationInfo2X(struct proxy *p,
+        D3D12_RESOURCE_ALLOCATION_INFO *ret, UINT visible_mask, UINT count, const BYTE *descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1 *infos)
+{
+    UINT64 total = 0, alignment = 0;
+
+    if (!is_proxy(p) && is_proxy(ret)) /* console order: (result, device, ...) */
+    {
+        struct proxy *device = (struct proxy *)ret;
+        ret = (D3D12_RESOURCE_ALLOCATION_INFO *)p;
+        p = device;
+    }
+    for (UINT k = 0; k < count && descs; k++)
+    {
+        D3D12_RESOURCE_ALLOCATION_INFO one = { 0 };
+        D3D12_RESOURCE_DESC d;
+        UINT64 offset;
+
+        memcpy(&d, descs + (SIZE_T)k * 0x48, sizeof(d));
+        device_GetResourceAllocationInfo(p, &one, visible_mask, 1, &d);
+        if (one.SizeInBytes == ~(UINT64)0 || !one.Alignment)
+        {
+            ret->SizeInBytes = ~(UINT64)0;
+            ret->Alignment = 0;
+            return ret;
+        }
+        offset = (total + one.Alignment - 1) & ~(one.Alignment - 1);
+        if (infos)
+            infos[k] = (D3D12_RESOURCE_ALLOCATION_INFO1){ offset, one.Alignment, one.SizeInBytes };
+        total = offset + one.SizeInBytes;
+        alignment = max(alignment, one.Alignment);
+    }
+    ret->SizeInBytes = total;
+    ret->Alignment = alignment;
+    return ret;
+}
+
 /* Slot 26: GetCustomHeapProperties, either argument order (see resource_GetDesc). */
 static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE device_GetCustomHeapProperties(struct proxy *p,
         D3D12_HEAP_PROPERTIES *ret, UINT node_mask, D3D12_HEAP_TYPE type)
@@ -1683,9 +1723,6 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
 {
     static const D3D12_HEAP_PROPERTIES own = { D3D12_HEAP_TYPE_DEFAULT };
     static LONG logged[3];
-    /* The target title passes 0xffffffff for a buffer over its physical pages: no desktop state. */
-    if (state == (D3D12_RESOURCE_STATES)0xffffffff)
-        state = D3D12_RESOURCE_STATE_COMMON;
     D3D12_RESOURCE_DESC storage;
     const D3D12_RESOURCE_DESC *d = pc_desc(desc, &storage);
     ID3D12Heap *heap;
@@ -1720,6 +1757,134 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     if (SUCCEEDED(hr) && why == 0 && *out)
         title_texture_register(*out, address, desc, d, state);
     return hr;
+}
+
+/* Device methods of the newer layout (SDK 0x20004) a retail title uses, after xcl (ivall/xcl,
+ * GPL-2.0-only, crates/xcl/src/hle/d3d12x: device_x.rs, real.rs, kernelx.rs). */
+
+/* The resource state of a D3D12_BARRIER_LAYOUT (undefined, 0xffffffff: COMMON), as xcl's
+ * layout_state. */
+static D3D12_RESOURCE_STATES layout_state(UINT32 layout)
+{
+    switch (layout)
+    {
+    case 1: return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    case 3: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;
+    case 6: return D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    case 7: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case 8: return D3D12_RESOURCE_STATE_COPY_DEST;
+    case 9: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    default: return D3D12_RESOURCE_STATE_COMMON;
+    }
+}
+
+/* Slot 133: CreatePlacedResourceX with a barrier layout in the initial state's place (the target
+ * title places a buffer over its physical pages with 0xffffffff, undefined). */
+static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceLayoutX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
+        const D3D12_RESOURCE_DESC *desc, UINT32 layout, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
+{
+    return device_CreatePlacedResourceX(p, address, desc, layout_state(layout), clear, riid, out);
+}
+
+/* XALLOC_ATTRIBUTES of a display target's memory (xcl's D3D_DISPLAY_TARGET): 4 MiB pages, the D3D
+ * allocator (128), graphics memory. The target title's hook gives its back buffers one block for
+ * every request with these and asserts that the block gets used up. */
+#define XALLOC_DISPLAY_TARGET (2ull << 14 | 0x80ull << 16 | 16ull << 24 | 1ull << 29)
+
+/* Slot 127: CreateCommittedResource with a barrier layout in the initial state's place: the PC's
+ * CreateCommittedResource3 arguments (heap properties, flags, desc, layout, clear, protected
+ * session, castable format count and list, riid, out). A display target (ALLOW_DISPLAY) also gets
+ * its console memory from the title's allocation hook, as the console runtime's does. */
+static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct proxy *p,
+        const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC *desc, UINT32 layout,
+        const D3D12_CLEAR_VALUE *clear, void *protected_session, UINT32 castable_count, const DXGI_FORMAT *castable,
+        REFIID riid, void **out)
+{
+    HRESULT hr = device_CreateCommittedResource(p, props, flags & ~D3D12_HEAP_FLAG_ALLOW_DISPLAY, desc,
+                                                layout_state(layout), clear, riid, out);
+
+    if (SUCCEEDED(hr) && (flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) && desc
+            && GetProcAddress(GetModuleHandleA(NULL), "__XMemAllocationHooks__"))
+    {
+        void *(WINAPI *xmem_alloc)(SIZE_T, ULONGLONG) = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemAlloc");
+        UINT64 size = title_texture_size(desc);
+        void *memory = size && xmem_alloc ? xmem_alloc((SIZE_T)size, XALLOC_DISPLAY_TARGET) : NULL;
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: display target %llux%u format %u: %#llx bytes of the title's memory at %p",
+                      (unsigned long long)desc->Width, desc->Height, desc->Format, (unsigned long long)size, memory);
+    }
+    return hr;
+}
+
+/* A resource placed at a title address for views of memory (slots 70 and 71), made once per address
+ * and description and kept, as xcl's resource_at. */
+static struct memory_view_resource { UINT64 address; D3D12_RESOURCE_DESC desc; ID3D12Resource *res; } *memory_views;
+static SIZE_T memory_view_count, memory_view_capacity;
+static SRWLOCK memory_view_lock = SRWLOCK_INIT;
+
+static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address)
+{
+    ID3D12Resource *res = NULL;
+
+    if (!desc || !address)
+        return NULL;
+    AcquireSRWLockExclusive(&memory_view_lock);
+    for (SIZE_T i = 0; i < memory_view_count && !res; i++)
+        if (memory_views[i].address == address && !memcmp(&memory_views[i].desc, desc, sizeof(*desc)))
+            res = memory_views[i].res;
+    if (!res && SUCCEEDED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
+            &IID_ID3D12Resource, (void **)&res)) && res)
+    {
+        if (memory_view_count == memory_view_capacity)
+        {
+            SIZE_T n = memory_view_capacity ? memory_view_capacity * 2 : 64;
+            struct memory_view_resource *grown = realloc(memory_views, n * sizeof(*grown));
+            if (grown)
+            {
+                memory_views = grown;
+                memory_view_capacity = n;
+            }
+        }
+        if (memory_view_count < memory_view_capacity)
+            memory_views[memory_view_count++] = (struct memory_view_resource){ address, *desc, res };
+    }
+    ReleaseSRWLockExclusive(&memory_view_lock);
+    return res;
+}
+
+/* Slot 70: a shader resource view of memory, without a resource object: (resource desc, { the PC's
+ * SRV desc; GPU address at +0x28 }, destination). */
+static void STDMETHODCALLTYPE device_CreateShaderResourceViewAtX(struct proxy *p, const D3D12_RESOURCE_DESC *rdesc,
+        const BYTE *view, SIZE_T cpu)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC v;
+    ID3D12Resource *res;
+
+    if (!view || IsBadReadPtr(view, 0x30))
+        return;
+    memcpy(&v, view, sizeof(v));
+    res = resource_at(p, rdesc, *(const UINT64 *)(view + 0x28));
+    device_CreateShaderResourceView(p, res, res ? &v : NULL, cpu);
+}
+
+/* Slot 71: the same for an unordered access view ({ the PC's UAV desc; GPU address at +0x28; the
+ * counter's at +0x30 }). The counter isn't kept. */
+static void STDMETHODCALLTYPE device_CreateUnorderedAccessViewAtX(struct proxy *p, const D3D12_RESOURCE_DESC *rdesc,
+        const BYTE *view, SIZE_T cpu)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC v;
+    ID3D12Resource *res;
+
+    if (!view || IsBadReadPtr(view, 0x38))
+        return;
+    memcpy(&v, view, sizeof(v));
+    res = resource_at(p, rdesc, *(const UINT64 *)(view + 0x28));
+    device_CreateUnorderedAccessView(p, res, NULL, res ? &v : NULL, cpu);
 }
 
 /* Slot 61: CreateSamplerX(desc, handle) (ScarlettX's retail trace; layout from XValkyrie): a
@@ -2608,7 +2773,11 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         /* Slot 133, SDK 0x20004: the same arguments (the target title places a buffer over its
          * physical pages right after mapping them, and stops if it fails). The device vtable used to
          * end at 128, so this call jumped through whatever followed it. */
-        FN(133, device_CreatePlacedResourceX),
+        FN(133, device_CreatePlacedResourceLayoutX),
+        FN(127, device_CreateCommittedResourceLayoutX),
+        FN(70, device_CreateShaderResourceViewAtX),
+        FN(108, device_GetResourceAllocationInfo2X),
+        FN(71, device_CreateUnorderedAccessViewAtX),
         FN(48, device_CreateCommandQueue), /* CreateCommandQueueX */
         FN(13, device_CheckFeatureSupport),
         FN(55, device_CreateDerivedPipelineStateX),

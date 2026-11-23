@@ -1370,6 +1370,60 @@ static void test_present(void *dev, void *queue)
         placement_size = 0;
     }
 
+    /* Newer-layout device methods a retail title uses (after xcl): 127 CreateCommittedResource with a
+     * barrier layout, 108 GetResourceAllocationInfo2, 70 a shader resource view of memory. */
+    {
+        D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC b1 = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 1 << 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+        BYTE descs[2][0x48] = { { 0 } };
+        D3D12_RESOURCE_ALLOCATION_INFO1 infos[2];
+        D3D12_RESOURCE_ALLOCATION_INFO all = { 0 };
+        ID3D12Resource *committed = NULL;
+        HRESULT (WINAPI *gpu_alloc)(SIZE_T, SIZE_T, void **, UINT64 *) =
+                (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGpuAlloc");
+
+        hr = XSLOT(dev, 127, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *, UINT32,
+                   const D3D12_CLEAR_VALUE *, void *, UINT32, const DXGI_FORMAT *, REFIID, void **)(dev, &dh,
+                   D3D12_HEAP_FLAG_NONE, &b1, 0xffffffff, NULL, NULL, 0, NULL, &IID_ID3D12Resource, (void **)&committed);
+        CHECK(SUCCEEDED(hr) && committed, "device slot 127 makes a committed resource from a barrier layout %#lx", hr);
+        if (committed) ID3D12Resource_Release(committed);
+
+        memcpy(descs[0], &b1, sizeof(b1));
+        memcpy(descs[1], &b1, sizeof(b1));
+        XSLOT(dev, 108, D3D12_RESOURCE_ALLOCATION_INFO *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT, const void *,
+              D3D12_RESOURCE_ALLOCATION_INFO1 *)(dev, &all, 0, 2, descs, infos);
+        CHECK(all.SizeInBytes >= 2 << 16 && infos[1].Offset >= infos[0].SizeInBytes,
+              "device slot 108 sums two buffers (%llu bytes, the second at %llu)", (unsigned long long)all.SizeInBytes,
+              (unsigned long long)infos[1].Offset);
+
+        if (gpu_alloc)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC vh = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+            HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+                    (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxShadowHeap");
+            struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R32_TYPELESS,
+                    D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+            void *mem = NULL, *vheap = NULL, *vdata = NULL;
+            UINT64 va = 0, vva;
+            UINT vstride, vcount;
+            SIZE_T vstart;
+            view.v.Buffer.NumElements = 16;
+            view.v.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            if (SUCCEEDED(gpu_alloc(1 << 16, 1 << 16, &mem, &va)) && SUCCEEDED(XSLOT(dev, 14, HRESULT,
+                    const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &vh, &IID_ID3D12DescriptorHeap, &vheap)))
+            {
+                view.address = va;
+                vstart = XSLOT(vheap, 9, SIZE_T)(vheap);
+                XSLOT(dev, 70, void, const D3D12_RESOURCE_DESC *, const void *, SIZE_T)(dev, &b1, &view, vstart);
+                hr = shadow_heap ? shadow_heap(vstart, &vva, &vdata, &vstride, &vcount) : E_FAIL;
+                CHECK(SUCCEEDED(hr) && vdata && (((UINT32 *)vdata)[0] || ((UINT32 *)vdata)[1]),
+                      "device slot 70 writes a view of memory at %#llx into the heap (%#lx)", (unsigned long long)va, hr);
+                XSLOT(vheap, 2, ULONG)(vheap);
+            }
+        }
+    }
+
     /* Device slot 133 (SDK 0x20004): CreatePlacedResourceX, as the target title places a buffer over
      * its physical pages, with state 0xffffffff. Past the old end of the device vtable (128). */
     {

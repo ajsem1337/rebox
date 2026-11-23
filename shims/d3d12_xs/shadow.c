@@ -361,7 +361,9 @@ void shadow_heap_destroyed(ID3D12DescriptorHeap *inner)
  * the heap's CPU start is that address. Here the heap gets title memory the same way and that is
  * its CPU start; the title's CPU handles are translated to vkd3d-proton's at each call
  * (shadow_cpu_to_inner). Only titles with allocation hooks (exe export __XMemAllocationHooks__). */
-#define XALLOC_DESCRIPTOR_HEAP (4ull | 128ull << 16)
+/* xcl's D3D_DESCRIPTOR_HEAP: object type 4, 64 KiB pages and alignment, the D3D allocator (128),
+ * graphics memory. The title's handler compares the object type and the size. */
+#define XALLOC_DESCRIPTOR_HEAP (4ull | 1ull << 14 | 0x80ull << 16 | 16ull << 24 | 1ull << 29)
 
 void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
 {
