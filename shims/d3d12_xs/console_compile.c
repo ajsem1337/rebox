@@ -631,6 +631,48 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
 }
 
+/* REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS: only the compute programs whose code address hashes
+ * to VALUE in its low BITS bits run; the rest are skipped (their dispatch dropped). Each program run
+ * is logged once. Halving the set run by run finds a program that faults the GPU (The Matrix
+ * Awakens: a GPUVM fault at address 0 with console compute on). */
+static BOOL compute_bisect_skips(UINT64 code_address)
+{
+    static int state = -1; /* -1 unread, 0 off, 1 on */
+    static UINT64 value, mask;
+    UINT64 h = hash_bytes(0xcbf29ce484222325ull, &code_address, sizeof(code_address));
+
+    if (state < 0)
+    {
+        char v[64];
+        unsigned long long a = 0, b = 0;
+        DWORD n = GetEnvironmentVariableA("REBOX_CONSOLE_COMPUTE_BISECT", v, sizeof(v));
+        state = n && n < sizeof(v) && sscanf(v, "%llu/%llu", &a, &b) == 2 && b < 64;
+        mask = state ? (1ull << b) - 1 : 0;
+        value = a & mask;
+        if (state)
+            rebox_log("d3d12_xs: console compute bisection: programs with hash & %#llx == %#llx run", (unsigned long long)mask,
+                         (unsigned long long)value);
+    }
+    if (!state)
+        return FALSE;
+    if ((h & mask) != value)
+        return TRUE;
+    {
+        static UINT64 seen[256];
+        static LONG count;
+        BOOL known = FALSE;
+        for (LONG i = 0; i < count && i < 256; i++)
+            known |= seen[i] == code_address;
+        if (!known && count < 256)
+        {
+            seen[count++] = code_address;
+            rebox_log("d3d12_xs: console compute bisection runs program %#llx (hash %#llx)", (unsigned long long)code_address,
+                         (unsigned long long)h);
+        }
+    }
+    return FALSE;
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
@@ -726,6 +768,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         }
     }
     set_last(E_FAIL, "no result (out of memory?)", NULL);
+    if (!graphics && compute_bisect_skips(h->code_address))
+    {
+        set_last(E_FAIL, "skipped by REBOX_CONSOLE_COMPUTE_BISECT", NULL);
+        return E_FAIL;
+    }
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
     if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input || !sa5.finalize_draw)))
