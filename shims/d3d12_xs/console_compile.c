@@ -863,16 +863,22 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 {
                     /* The first graphics stages' buffers and their first values (where guest
                      * memory has them): do vertex shaders get real transforms, or zeros? */
-                    static LONG shown;
+                    static LONG shown[2];
                     const float *f = NULL;
+                    MEMORY_BASIC_INFORMATION mbi;
                     for (UINT r = 0; r < n && !f; r++)
                         if (base >= regions[r].address && base + 32 <= regions[r].address + regions[r].size)
                             f = (const float *)((const BYTE *)regions[r].data + (base - regions[r].address));
-                    if (InterlockedIncrement(&shown) <= 48)
+                    /* xmem's GPU memory is identity-mapped: the title's own buffers read at their GPU VA. */
+                    if (!f && base && VirtualQuery((const void *)(ULONG_PTR)base, &mbi, sizeof(mbi))
+                            && mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+                            && base + 32 <= (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize)
+                        f = (const float *)(ULONG_PTR)base;
+                    if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 48)
                         rebox_log("d3d12_xs: console %s shader %016llx buffer %u.%u: base %#llx, stride %u, "
                                      "%u records%s %g %g %g %g %g %g %g %g", h->stage == 0x10 ? "pixel" : "vertex",
                                      (unsigned long long)stage_id, i, e, (unsigned long long)base, stride, w[2],
-                                     f ? ";" : " (not in guest memory)", f ? f[0] : 0, f ? f[1] : 0, f ? f[2] : 0,
+                                     f ? ";" : " (not readable here)", f ? f[0] : 0, f ? f[1] : 0, f ? f[2] : 0,
                                      f ? f[3] : 0, f ? f[4] : 0, f ? f[5] : 0, f ? f[6] : 0, f ? f[7] : 0);
                 }
             }
