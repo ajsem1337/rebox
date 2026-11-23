@@ -1109,8 +1109,33 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, 
         ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, SIZE_T cpu)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
+    note_display_view("unordered access view", resource, cpu);
     ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), resource, counter, desc, h);
     shadow_write_uav(cpu, resource, desc);
+}
+
+/* Views of a display-sized texture (what PresentX shows), for finding how the title draws into it. */
+static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T cpu)
+{
+    static LONG logged;
+    D3D12_RESOURCE_DESC d;
+
+    if (!resource)
+        return;
+    d = ID3D12Resource_GetDesc(resource);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
+            && InterlockedIncrement(&logged) <= 24)
+        rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#Ix", what, (void *)resource,
+                  (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, cpu);
+}
+
+/* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
+static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
+        const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    note_display_view("render target view", resource, cpu);
+    ID3D12Device_CreateRenderTargetView(INNER(p, ID3D12Device), resource, desc, h);
 }
 
 static void STDMETHODCALLTYPE device_CreateSampler(struct proxy *p, const D3D12_SAMPLER_DESC *desc, SIZE_T cpu)
@@ -3248,6 +3273,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(17, device_CreateConstantBufferView),
         FN(18, device_CreateShaderResourceView),
         FN(19, device_CreateUnorderedAccessView),
+        FN(20, device_CreateRenderTargetView),
         FN(22, device_CreateSampler),
         FN(23, device_CopyDescriptors),
         FN(24, device_CopyDescriptorsSimple),
