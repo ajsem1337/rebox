@@ -1216,6 +1216,19 @@ static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, con
                      ? *(const UINT *)desc->pPipelineStateSubobjectStream : 0u);
             rebox_log("d3d12_xs: CreatePipelineState (stream of %zu bytes, first subobject type%s) failed: %#lx",
                          (size_t)desc->SizeInBytes, types, (unsigned long)hr);
+            /* The first refused stream's dwords, to find a subobject type the desktop lacks. */
+            if (logged == 1)
+            {
+                const UINT *d = desc->pPipelineStateSubobjectStream;
+                for (SIZE_T i = 0; i < desc->SizeInBytes / 4; i += 8)
+                {
+                    char line[128];
+                    int at = 0;
+                    for (SIZE_T j = i; j < i + 8 && j < desc->SizeInBytes / 4; j++)
+                        at += snprintf(line + at, sizeof(line) - at, " %08x", d[j]);
+                    rebox_log("d3d12_xs:   stream +%#05zx:%s", i * 4, line);
+                }
+            }
         }
     }
     return hr;
