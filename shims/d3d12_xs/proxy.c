@@ -1047,6 +1047,29 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
     return hr;
 }
 
+/* ExecuteIndirect (PC 59): rays with no real pipeline set are skipped (see ray_signatures). */
+static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
+        void *count_buffer, UINT64 count_offset)
+{
+    if (!signature || !is_command_signature(signature))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: command-list slot 59 called without a command signature (%p, %u, %p): ignored",
+                         signature, count, args);
+        return;
+    }
+    if (!p->ray_pipeline && is_ray_signature(signature))
+    {
+        static LONG skipped;
+        if (!InterlockedExchange(&skipped, 1))
+            rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
+        return;
+    }
+    ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
+            p->inner, signature, count, args, offset, count_buffer, count_offset);
+}
+
 /* List slot 61. The two measurements disagree: Leonida (the retail FSR DLL) calls it with
  * ExecuteIndirect's arguments (PC 59), ScarlettX has the PIX trio SetMarker, BeginEvent, EndEvent
  * at 60-62 (PC + 4: BeginEvent, PC 57). ExecuteIndirect's first argument is a command signature,
@@ -2512,6 +2535,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * (a UE5 title calls 124 as RSSetShadingRate(1x1, combiners)). 60 and 62 are console methods. */
     static struct slot list_slots[96] = {
         FN(7, child_GetDevice),
+        FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
@@ -2539,6 +2563,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * past the end of the older table. docs/d3d12x.md. */
     static struct slot list_v4_slots[96] = {
         FN(7, child_GetDevice),
+        FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(114, list_SetPipelineState1),              /* PC 67 */
         FN(115, list_DispatchRays),                   /* PC 68 */
         FN(10, list_Reset),

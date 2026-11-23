@@ -4049,8 +4049,13 @@ static void test_xbox(void)
                                   D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
                                   (void **)&args);
                             if (ray_sig && args)
+                            {
                                 XSLOT(list4, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list4, ray_sig, 1, args,
                                         0, NULL, 0);
+                                /* Unreal 5 calls it at the desktop's 59 as well. */
+                                XSLOT(list4, 59, void, void *, UINT, void *, UINT64, void *, UINT64)(list4, ray_sig, 1, args,
+                                        0, NULL, 0);
+                            }
                             else
                                 printf("skip indirect rays (signature %p, arguments %p)\n", ray_sig, (void *)args);
                             if (args) ID3D12Resource_Release(args);
