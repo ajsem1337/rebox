@@ -965,6 +965,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                     static LONG shown[2];
                     const float *f = NULL;
                     MEMORY_BASIC_INFORMATION mbi;
+                    if (shown[h->stage == 0x10] >= 48)
+                        continue;
                     for (UINT r = 0; r < n && !f; r++)
                         if (base >= regions[r].address && base + 32 <= regions[r].address + regions[r].size)
                             f = (const float *)((const BYTE *)regions[r].data + (base - regions[r].address));
@@ -1034,11 +1036,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                     /* The first graphics stages' textures: which resource, and whether its texels
                      * come from title memory (uploaded how often) or through the API. */
                     static LONG shown;
-                    ID3D12Resource *res = console_texture_of(w);
                     UINT64 address = 0;
                     UINT uploads = 0;
-                    if (InterlockedIncrement(&shown) <= 64)
+                    /* Only when logging: console_texture_of walks every texture the title made. */
+                    if (shown < 64 && InterlockedIncrement(&shown) <= 64)
                     {
+                        ID3D12Resource *res = console_texture_of(w);
                         D3D12_RESOURCE_DESC rd = { 0 };
                         BOOL title = res && title_texture_info(res, &address, &uploads);
                         if (res)
