@@ -76,7 +76,7 @@ struct proxy
     ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
     UINT heap_count;
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
-    BOOL display_bound; /* lists: a display render target is bound (counted for the log) */
+    int display_bound; /* lists: 1 + which display-sized target is bound, or 0 (counted for the log) */
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
@@ -1144,14 +1144,15 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
 /* Render target views of display-sized RGBA8 textures (what PresentX shows), and what lists do with
  * them, counted for the log at each of the first presents (proxy_frame_presented). */
 static volatile SIZE_T display_rtvs[8];
-static volatile LONG display_binds, display_clears, display_draws;
+static volatile LONG display_binds[8], display_clears[8], display_draws[8];
 
-static BOOL is_display_rtv(SIZE_T cpu)
+/* Which of display_rtvs this handle is, or -1. */
+static int display_rtv(SIZE_T cpu)
 {
     for (UINT i = 0; i < ARRAYSIZE(display_rtvs); i++)
         if (cpu && display_rtvs[i] == cpu)
-            return TRUE;
-    return FALSE;
+            return i;
+    return -1;
 }
 
 /* Views of a display-sized texture (what PresentX shows), for finding how the title draws into it. */
@@ -2905,20 +2906,21 @@ static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
 static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rts,
         BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *ds)
 {
-    BOOL display = FALSE;
-    for (UINT i = 0; rts && i < (single ? 1 : count); i++)
-        display |= is_display_rtv(rts[i].ptr);
-    p->display_bound = display;
-    if (display)
-        InterlockedIncrement(&display_binds);
+    int display = -1;
+    for (UINT i = 0; rts && i < (single ? 1 : count) && display < 0; i++)
+        display = display_rtv(rts[i].ptr);
+    p->display_bound = display + 1;
+    if (display >= 0)
+        InterlockedIncrement(&display_binds[display]);
     ID3D12GraphicsCommandList_OMSetRenderTargets(INNER(p, ID3D12GraphicsCommandList), count, rts, single, ds);
 }
 
 static void STDMETHODCALLTYPE list_ClearRenderTargetView(struct proxy *p, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
         const FLOAT *color, UINT rect_count, const D3D12_RECT *rects)
 {
-    if (is_display_rtv(rtv.ptr))
-        InterlockedIncrement(&display_clears);
+    int display = display_rtv(rtv.ptr);
+    if (display >= 0)
+        InterlockedIncrement(&display_clears[display]);
     ID3D12GraphicsCommandList_ClearRenderTargetView(INNER(p, ID3D12GraphicsCommandList), rtv, color, rect_count, rects);
 }
 
@@ -2926,7 +2928,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
         UINT first_instance)
 {
     if (p->display_bound)
-        InterlockedIncrement(&display_draws);
+        InterlockedIncrement(&display_draws[p->display_bound - 1]);
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
 }
@@ -2935,7 +2937,7 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
         INT base_vertex, UINT first_instance)
 {
     if (p->display_bound)
-        InterlockedIncrement(&display_draws);
+        InterlockedIncrement(&display_draws[p->display_bound - 1]);
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
 }
@@ -3380,9 +3382,16 @@ void proxy_frame_presented(void)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 12)
-            rebox_log("d3d12_xs: since the last present, the display's render targets were bound %ld times, cleared "
-                      "%ld times, drawn to %ld times", InterlockedExchange(&display_binds, 0),
-                      InterlockedExchange(&display_clears, 0), InterlockedExchange(&display_draws, 0));
+        {
+            char line[400];
+            int at = 0;
+            for (UINT i = 0; i < ARRAYSIZE(display_rtvs) && display_rtvs[i] && at < 360; i++)
+                at += snprintf(line + at, sizeof(line) - at, " %#llx: %ld/%ld/%ld;",
+                               (unsigned long long)display_rtvs[i], InterlockedExchange(&display_binds[i], 0),
+                               InterlockedExchange(&display_clears[i], 0), InterlockedExchange(&display_draws[i], 0));
+            line[at] = 0;
+            rebox_log("d3d12_xs: since the last present, display-sized RGBA8 targets bound/cleared/drawn:%s", line);
+        }
     }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
         proxy_log_slot_stats();
