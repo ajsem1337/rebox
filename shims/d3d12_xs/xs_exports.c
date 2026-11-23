@@ -32,6 +32,18 @@ UINT WINAPI D3D12XboxGetProcessDebugFlags(void)
     return (UINT)debug_flags;
 }
 
+/* The console's GPU virtual memory configuration, set before the device is created. Its arguments
+ * aren't known (xcl stubs it too); title memory is identity-mapped here, so there's nothing to
+ * configure. The first four argument registers are logged. */
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX(UINT64 a, UINT64 b, UINT64 c, UINT64 d)
+{
+    static LONG once;
+    if (!InterlockedExchange(&once, 1))
+        rebox_log("d3d12_xs: D3D12ConfigureVirtualMemoryX(%#llx, %#llx, %#llx, %#llx): nothing to configure",
+                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
+    return S_OK;
+}
+
 /* The console's CPU and GPU caches aren't coherent for some memory types; here they are. */
 void WINAPI D3DFlushEntireCpuCache(void)
 {

@@ -27,6 +27,7 @@ EXPORTS
     ReboxDetileSize
     ReboxTile
     D3D12XboxSetProcessDebugFlags
+    D3D12ConfigureVirtualMemoryX
     D3D12XboxGetProcessDebugFlags
     D3DFlushEntireCpuCache
     D3D10CreateBlob = d3dcompiler_47.D3DCreateBlob

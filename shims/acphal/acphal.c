@@ -303,6 +303,10 @@ HRESULT WINAPI AcpHalReleaseShapeContexts(void)
 
 /* An APU address for the title's own memory: its heap offset if it's in the heap, else a new
  * address past the heap's (as ApuAlloc gives a block that didn't fit). */
+/* Memory outside the heap gets APU addresses past it, kept so ApuMapApuAddress can map them back. */
+static struct { UINT32 apu, size; BYTE *va; } mapped[256];
+static unsigned mapped_count;
+
 HRESULT WINAPI ApuMapVirtualAddress(UINT32 *address, void *va, UINT32 size)
 {
     if (!address)
@@ -314,9 +318,30 @@ HRESULT WINAPI ApuMapVirtualAddress(UINT32 *address, void *va, UINT32 size)
     {
         *address = (UINT32)(heap_size + outside);
         outside += (size + 0xfff) & ~0xfff;
+        if (mapped_count < ARRAYSIZE(mapped))
+        {
+            mapped[mapped_count].apu = *address;
+            mapped[mapped_count].size = size;
+            mapped[mapped_count++].va = va;
+        }
     }
     ReleaseSRWLockExclusive(&lock);
     return S_OK;
+}
+
+/* The memory an APU address stands for, or NULL (xcl: ApuMapApuAddress(apu) -> va). */
+void *WINAPI ApuMapApuAddress(UINT32 apu)
+{
+    void *va = NULL;
+
+    AcquireSRWLockExclusive(&lock);
+    if (heap && apu < heap_size)
+        va = heap + apu;
+    for (unsigned i = 0; i < mapped_count && !va; i++)
+        if (apu >= mapped[i].apu && apu - mapped[i].apu < mapped[i].size)
+            va = mapped[i].va + (apu - mapped[i].apu);
+    ReleaseSRWLockExclusive(&lock);
+    return va;
 }
 
 /* All of the process's memory is the coprocessor's here. */

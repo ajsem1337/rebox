@@ -347,6 +347,23 @@ static void test_xmem(void)
                 CHECK(pmap(range, 16, NULL), "XMemMapPhysicalPages with no pages unmaps");
                 VirtualFree(range, 0, MEM_RELEASE);
             }
+            /* Scattered: page i to addresses[i] (pages 3 and 9 of a fresh range), then unmapped. */
+            {
+                BOOL (WINAPI *scatter)(void **, ULONG_PTR, ULONG_PTR *) =
+                        (void *)GetProcAddress(m, "XMemMapPhysicalPagesScatter");
+                BYTE *r2 = VirtualAlloc(NULL, 16 << 16, MEM_RESERVE, PAGE_NOACCESS);
+                void *where[2] = { r2 + (3 << 16), r2 + (9 << 16) };
+                CHECK(scatter && r2 && scatter(where, 2, pages), "XMemMapPhysicalPagesScatter maps two pages apart");
+                if (scatter && r2)
+                {
+                    MEMORY_BASIC_INFORMATION mbi = { 0 };
+                    r2[(3 << 16) + 1] = 1;
+                    r2[(9 << 16) + 0xffff] = 2;
+                    CHECK(scatter(where, 2, NULL) && VirtualQuery(where[1], &mbi, sizeof(mbi))
+                          && mbi.State != MEM_COMMIT, "XMemMapPhysicalPagesScatter with no pages unmaps them");
+                }
+                if (r2) VirtualFree(r2, 0, MEM_RELEASE);
+            }
             CHECK(pfree(16, pages), "XMemFreePhysicalPages");
         }
     }
@@ -1236,6 +1253,13 @@ static void test_present(void *dev, void *queue)
         if (CreateWindowExW(0, wc.lpszClassName, L"title", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 320, 240,
                             NULL, NULL, wc.hInstance, NULL))
             printf("info a title window exists for PresentX\n");
+    }
+
+    /* Called before the device is made; title memory is identity-mapped, so it only succeeds. */
+    {
+        HRESULT (WINAPI *configure)(UINT64, UINT64, UINT64, UINT64) =
+                (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12ConfigureVirtualMemoryX");
+        CHECK(configure && configure(0, 0, 0, 0) == S_OK, "D3D12ConfigureVirtualMemoryX succeeds");
     }
 
     /* A texture's GPU VA is 0 under vkd3d-proton; titles write texels
@@ -3322,6 +3346,11 @@ static void test_xapu(void)
     if (map && valid && release)
         CHECK(map(&a1, buf, 0x2000) == S_OK && map(&a2, buf + 0x2000, 16) == S_OK && a1 != a2 && valid(buf, 16)
                   && release() == S_OK, "ApuMapVirtualAddress gives distinct addresses (%#x, %#x)", a1, a2);
+    {
+        void *(WINAPI *back)(UINT32) = acp ? (void *)GetProcAddress(acp, "ApuMapApuAddress") : NULL;
+        CHECK(back && back(a1 + 0x10) == buf + 0x10 && back(a2) == buf + 0x2000,
+              "ApuMapApuAddress maps APU addresses back to memory");
+    }
     CHECK(connect && enqueue && dequeue && disconnect, "xapu.dll exports FMOD's four imports");
     if (!connect || !enqueue || !dequeue || !disconnect) return;
     CHECK(connect(&in, &out, &h) == S_OK && h, "XApuConnect");

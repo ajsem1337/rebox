@@ -512,6 +512,36 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
     return FALSE;
 }
 
+/* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
+ * goes to addresses[i] (a null pages array, or a zero page, unmaps). Each mapping is fresh memory:
+ * physical pages are tokens here (XMemAllocatePhysicalPages), so two addresses never alias. */
+BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)
+{
+    BOOL ok = TRUE;
+
+    if (!addresses)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    {
+        static LONG calls;
+        if (InterlockedIncrement(&calls) <= 4)
+            rebox_log("xmem: XMemMapPhysicalPagesScatter(%lu pages, first at %p)", (unsigned long)count,
+                      count ? addresses[0] : NULL);
+    }
+    for (ULONG_PTR i = 0; i < count; i++)
+    {
+        if (!addresses[i])
+            continue;
+        if (!pages || !pages[i])
+            VirtualFree(addresses[i], 64u << 10, MEM_DECOMMIT);
+        else
+            ok &= XMemMapPhysicalPages(addresses[i], 1, &pages[i]);
+    }
+    return ok;
+}
+
 /* Moves memory between the title's and the system's budgets, which aren't kept apart here. */
 BOOL WINAPI XMemTransferMemory(UINT direction, SIZE_T size)
 {

@@ -12,6 +12,7 @@ EXPORTS
     XMemAllocatePhysicalPages
     XMemFreePhysicalPages
     XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
     XMemTransferMemory
     XMemMakeTag
     XMemIsToolsMemAvailable
