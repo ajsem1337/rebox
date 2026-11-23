@@ -82,6 +82,8 @@ static struct proxy_class queue_class = { "CommandQueue", 64 };
 static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", 64 };
 static struct proxy_class list_class = { "GraphicsCommandList", MAX_SLOTS };
 static struct proxy_class list_v4_class = { "GraphicsCommandList (SDK 0x20004)", MAX_SLOTS };
+static void *fence_vtbl;              /* vkd3d-proton's fence class (is_fence) */
+static volatile LONG newer_layouts;  /* the title's runtime has the newer queue/list layouts */
 static struct proxy_class copy_list_class = { "CopyCommandList", 64 };
 static struct proxy_class heap_class = { "DescriptorHeap", 16 };
 
@@ -95,6 +97,9 @@ static UINT32 sdk_version;
 void proxy_set_sdk_version(UINT32 version)
 {
     sdk_version = version;
+    /* Only 0x20004 runtimes come in two layouts; an older version can't have the newer one. */
+    if (version < 0x20004)
+        newer_layouts = 0;
 }
 
 static struct proxy *device_proxy;
@@ -662,7 +667,13 @@ static void patch_child_classes(ID3D12Device *device)
         IUnknown_Release(obj);
     }
     PROBE(ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)&obj));
-    PROBE(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&obj));
+    obj = NULL;
+    if (SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&obj)))
+    {
+        fence_vtbl = *(void **)obj; /* is_fence() */
+        patch_child(obj);
+        IUnknown_Release(obj);
+    }
     PROBE(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
             (void **)&obj));
     PROBE(ID3D12Device_CreateQueryHeap(device, &query_desc, &IID_ID3D12QueryHeap, (void **)&obj));
@@ -724,7 +735,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(struct proxy *p, cons
     d.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     d.NodeMask = 0;
     hr = ID3D12Device_CreateCommandQueue(INNER(p, ID3D12Device), &d, &IID_ID3D12CommandQueue, (void **)&queue);
-    return wrap_result(hr, (IUnknown *)queue, sdk_version >= 0x20004 ? &queue_v4_class : &queue_class, out);
+    /* Every queue starts on the older layout; queue_Slot16/17 tell the newer one apart. */
+    return wrap_result(hr, (IUnknown *)queue, &queue_class, out);
 }
 
 static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
@@ -737,7 +749,7 @@ static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *a
                                                 &IID_ID3D12GraphicsCommandList, (void **)&list);
 
     return wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class
-                       : sdk_version >= 0x20004 ? &list_v4_class : &list_class, out);
+                       : newer_layouts ? &list_v4_class : &list_class, out);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateCommandList(struct proxy *p, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -1432,6 +1444,78 @@ static void note_signal(ID3D12Fence *fence, UINT64 value)
     ReleaseSRWLockExclusive(&signalled_lock);
 }
 
+/* Two queue layouts share SDK version 0x20004 (xcl, GPL-2.0-only, crates/xcl/src/hle/d3d12x/real.rs):
+ * the older (a UE5 title, a GDK title, another title) is the PC's through 18 (Signal 14, Wait 15,
+ * GetTimestampFrequency 16, GetClockCalibration 17) with SignalX 23 and PresentX 30; the newer
+ * (a later title) has two methods ahead of Signal (Signal 16 ... SignalX 25, PresentX 32), and
+ * its lists' console methods sit two slots later too. Nothing at device creation tells them apart,
+ * but Signal and Wait take a fence and the older 16/17 never do: the first fence at 16 or 17 means
+ * the newer layouts from then on. a GDK title (0x20004) called 16 as GetTimestampFrequency, which the
+ * newer table took for Signal (vkd3d-proton asserted on the non-fence). fence_vtbl and
+ * newer_layouts are declared with the classes. */
+
+static BOOL is_fence(const void *p)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || !fence_vtbl || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
+            || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || (const BYTE *)p + 8 > (const BYTE *)mbi.BaseAddress + mbi.RegionSize)
+        return FALSE;
+    return *(void *const *)p == fence_vtbl;
+}
+
+static void note_newer_layouts(UINT slot)
+{
+    if (!InterlockedExchange(&newer_layouts, 1))
+        rebox_log("d3d12_xs: a fence passed to queue slot %u: the title's runtime has the newer layouts (queue: "
+                     "Signal 16, PresentX 32; lists: console methods two slots later)", slot);
+}
+
+static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags);
+static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, const void *plane_params,
+        const void *params);
+
+/* Slot 16: newer Signal(fence, value), or older GetTimestampFrequency(&frequency). */
+static HRESULT STDMETHODCALLTYPE queue_Slot16(struct proxy *p, void *a1, UINT64 a2)
+{
+    if (is_fence(a1))
+    {
+        note_newer_layouts(16);
+        return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), a1, a2);
+    }
+    return ID3D12CommandQueue_GetTimestampFrequency(INNER(p, ID3D12CommandQueue), a1);
+}
+
+/* Slot 17: newer Wait(fence, value), or older GetClockCalibration(&gpu, &cpu). */
+static HRESULT STDMETHODCALLTYPE queue_Slot17(struct proxy *p, void *a1, UINT64 a2)
+{
+    if (is_fence(a1))
+    {
+        note_newer_layouts(17);
+        return ID3D12CommandQueue_Wait(INNER(p, ID3D12CommandQueue), a1, a2);
+    }
+    return ID3D12CommandQueue_GetClockCalibration(INNER(p, ID3D12CommandQueue), a1, (UINT64 *)(ULONG_PTR)a2);
+}
+
+/* Slots 25 and 32: the newer layout's SignalX and PresentX. */
+static HRESULT STDMETHODCALLTYPE queue_Slot25(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
+{
+    if (newer_layouts || is_fence(fence))
+    {
+        note_newer_layouts(25);
+        return queue_SignalX(p, fence, value, flags);
+    }
+    rebox_log("d3d12_xs: queue slot 25 on the older layout: unknown method, E_NOTIMPL");
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE queue_Slot32(struct proxy *p, UINT planes, const void *plane_params, const void *params)
+{
+    if (newer_layouts)
+        return queue_PresentX(p, planes, plane_params, params);
+    rebox_log("d3d12_xs: queue slot 32 on the older layout: unknown method, E_NOTIMPL");
+    return E_NOTIMPL;
+}
+
 static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
 {
     note_signal(proxy_unwrap(fence), value);
@@ -1955,6 +2039,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static const struct slot queue_slots[] = {
         FN(7, child_GetDevice),
         FN(10, queue_ExecuteCommandLists),
+        FN(16, queue_Slot16),
+        FN(17, queue_Slot17),
+        FN(25, queue_Slot25),
+        FN(32, queue_Slot32),
         FN(23, queue_SignalX),
         FN(26, queue_GetDesc),
         FN(30, queue_PresentX),

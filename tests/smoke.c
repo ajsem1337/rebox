@@ -3527,7 +3527,9 @@ static void test_xbox(void)
             printf("skip CreatePlacedResourceX: no GPU memory\n");
     }
 
-    /* Titles built against SDK 0x20004 or later get the later queue layout: Signal at 16. */
+    /* Two queue layouts share SDK 0x20004 (xcl): the older has the PC's GetTimestampFrequency and
+     * GetClockCalibration at 16 and 17 (a GDK title), the newer Signal and Wait there; a fence at 16
+     * or 17 tells them apart. */
     {
         UINT32 params[6] = { 0x20004 }, old[6] = { 0 };
         void *dev4 = NULL, *queue4 = NULL;
@@ -3541,6 +3543,15 @@ static void test_xbox(void)
         if (SUCCEEDED(hr))
             hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
                     &IID_ID3D12Fence, (void **)&fence4);
+        if (SUCCEEDED(hr))
+        {
+            UINT64 frequency = 0, gpu = 0, cpu = 0;
+            HRESULT f = XSLOT(queue4, 16, HRESULT, UINT64 *)(queue4, &frequency);
+            HRESULT c = XSLOT(queue4, 17, HRESULT, UINT64 *, UINT64 *)(queue4, &gpu, &cpu);
+            CHECK(SUCCEEDED(f) && frequency && SUCCEEDED(c),
+                  "SDK 0x20004 queue, older layout: GetTimestampFrequency at 16 (%#lx, %llu Hz), GetClockCalibration "
+                  "at 17 (%#lx)", f, (unsigned long long)frequency, c);
+        }
         if (SUCCEEDED(hr))
             hr = XSLOT(queue4, 16, HRESULT, ID3D12Fence *, UINT64)(queue4, fence4, 7);
         for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 7; i++)
