@@ -5,7 +5,9 @@
  * address and the stack pointer, then the original byte is put back for one single-stepped
  * instruction and the int3 rearmed. Each probe logs its first REBOX_PROBE_MAX hits (default 20;
  * later hits are counted, not logged). Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
- * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA). This is how to see what a title's own code
+ * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA).
+ * REBOX_PROBE_MEMORY=RVA:BYTES[,...] (hex, relative to the exe) also logs those ranges of the exe's
+ * memory (its globals) at each logged hit, as dwords. This is how to see what a title's own code
  * is called with without changing its file: xcl's XCL_PROBE does the same with hardware
  * breakpoints (a GDK title's controller path was found so). A hit on another thread while one byte
  * is restored is missed. */
@@ -31,6 +33,8 @@ static struct probe
 static UINT probe_count;
 static LONG probe_max = 20;
 static UINT dump_qwords;
+static struct { ULONG_PTR rva, bytes; } memory_ranges[8];
+static UINT memory_range_count;
 static DWORD rearm_slot = TLS_OUT_OF_INDEXES; /* the probe a thread is single-stepping past, plus one */
 
 static void write_byte(BYTE *at, BYTE value)
@@ -102,6 +106,20 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                             at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)v);
                     }
                     rebox_log("probe %s hit %ld: [rcx]%s", p->name, n, line);
+                }
+                for (UINT m = 0; m < memory_range_count; m++)
+                {
+                    const UINT32 *at = (const UINT32 *)((BYTE *)GetModuleHandleA(NULL) + memory_ranges[m].rva);
+                    for (ULONG_PTR off = 0; off < memory_ranges[m].bytes && !IsBadReadPtr(at, memory_ranges[m].bytes);
+                         off += 32)
+                    {
+                        char line[160];
+                        int len = 0;
+                        for (ULONG_PTR k = off; k < off + 32 && k < memory_ranges[m].bytes; k += 4)
+                            len += snprintf(line + len, sizeof(line) - len, " %08x", at[k / 4]);
+                        rebox_log("probe %s hit %ld: exe+%#llx:%s", p->name, n,
+                                  (unsigned long long)(memory_ranges[m].rva + off), line);
+                    }
                 }
             }
             /* Run the real instruction once, then rearm (single step). */
@@ -201,10 +219,19 @@ void probe_install(void)
         probe_max = atoi(max);
     free(max);
     {
-        char *dump = rebox_getenv("REBOX_PROBE_DUMP");
+        char *dump = rebox_getenv("REBOX_PROBE_DUMP"), *memory = rebox_getenv("REBOX_PROBE_MEMORY"), *t, *ctx = NULL;
         if (dump && atoi(dump) > 0)
             dump_qwords = min(atoi(dump), 32);
         free(dump);
+        for (t = memory ? strtok_s(memory, ",", &ctx) : NULL; t && memory_range_count < ARRAYSIZE(memory_ranges);
+             t = strtok_s(NULL, ",", &ctx))
+        {
+            char *colon = strchr(t, ':');
+            memory_ranges[memory_range_count].rva = strtoull(t, NULL, 16);
+            memory_ranges[memory_range_count].bytes = colon ? min(strtoull(colon + 1, NULL, 16), 0x400) : 4;
+            memory_range_count++;
+        }
+        free(memory);
     }
     if (!spec || !*spec)
     {
