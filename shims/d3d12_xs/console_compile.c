@@ -550,6 +550,14 @@ static LONG failed_stage_count;
 
 static volatile LONG graphics_calls;
 static volatile LONG64 graphics_ticks, phase_ticks[4]; /* regions, AnyPS5, bindings, module */
+static volatile LONG64 part_ticks[3];                  /* within bindings: identity, descriptor lookups, page table */
+
+static LONG64 ticks_now(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
 
 static void phase_end(LARGE_INTEGER *mark, UINT phase)
 {
@@ -629,8 +637,10 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         {
             double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
             rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average (memory "
-                         "regions %.2f, AnyPS5 %.2f, bindings %.2f, module %.2f); %ld distinct stages refused so far", n,
+                         "regions %.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f], module %.2f); "
+                         "%ld distinct stages refused so far", n,
                          graphics_ticks * ms, phase_ticks[0] * ms, phase_ticks[1] * ms, phase_ticks[2] * ms,
+                         part_ticks[0] * ms, part_ticks[1] * ms, part_ticks[2] * ms,
                          phase_ticks[3] * ms, min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
         }
         QueryPerformanceCounter(&started);
@@ -861,7 +871,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
     if (graphics)
         phase_end(&mark, 1);
-    sa5.identity(result, key);
+    {
+        LONG64 t = ticks_now();
+        sa5.identity(result, key);
+        if (graphics)
+            InterlockedAdd64(&part_ticks[0], ticks_now() - t);
+    }
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
     if (graphics)
     {
@@ -1000,10 +1015,13 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 /* Samplers not in the heap (built from literals, or AnyPS5's point-filtered twins)
                  * are made in its reserved tail; matching that ignores rewritten fields is the
                  * last resort. */
+                LONG64 lookup_start = ticks_now();
                 BOOL found = shadow_find_index(heap, w, per, sampler, !sampler, index)
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
                 BOOL null_view = FALSE;
+                if (graphics)
+                    InterlockedAdd64(&part_ticks[1], ticks_now() - lookup_start);
                 /* A texture descriptor the title wrote outside our heaps, or an empty slot, reads
                  * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
                  * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
@@ -1087,8 +1105,13 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 break;
             }
             case ROLE_BDA_PAGETABLE:
+            {
+                LONG64 t = ticks_now();
                 va = page_table(&bytes);
+                if (graphics)
+                    InterlockedAdd64(&part_ticks[2], ticks_now() - t);
                 break;
+            }
             default:
             {
                 char role[32];
