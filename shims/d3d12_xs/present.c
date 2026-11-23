@@ -347,6 +347,28 @@ static HWND title_window(void)
     return best;
 }
 
+/* Console planes are 4K and titles size their windows from that, which can be larger than the
+ * screen: the compositor then cuts the frame off. The window is fitted to its monitor's work area
+ * (the swapchain stretches the plane into it). REBOX_PRESENT_FIT=0 leaves it as it is. */
+static void fit_to_monitor(HWND hwnd)
+{
+    const char *fit = getenv("REBOX_PRESENT_FIT");
+    MONITORINFO mi = { sizeof(mi) };
+    HMONITOR monitor;
+    RECT r;
+
+    if ((fit && *fit == '0') || !(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
+            || !GetMonitorInfoW(monitor, &mi) || !GetWindowRect(hwnd, &r))
+        return;
+    if (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top)
+        return;
+    rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; resizing it to %ldx%ld",
+                 r.right - r.left, r.bottom - r.top, mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top);
+    /* Asynchronous: the window's thread may be the title's, busy in this present. */
+    SetWindowPos(hwnd, NULL, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right - mi.rcWork.left,
+                 mi.rcWork.bottom - mi.rcWork.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
 static HWND create_window(UINT width, UINT height)
 {
     struct window_args *args = calloc(1, sizeof(*args)); /* the thread outlives this call */
@@ -460,6 +482,7 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
         s->swapchain_failed = TRUE;
         return FALSE;
     }
+    fit_to_monitor(s->hwnd);
     if (!(dxgi = LoadLibraryA("dxgi.dll"))
         || !(create_factory = (void *)GetProcAddress(dxgi, "CreateDXGIFactory2"))
         || FAILED(hr = create_factory(0, &IID_IDXGIFactory2, (void **)&factory)))
