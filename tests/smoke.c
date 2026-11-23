@@ -3084,8 +3084,16 @@ static void test_gameinput(void)
     if (!gi_seen_device) return;
     info = XSLOT(gi_seen_device, 3, const BYTE *)(gi_seen_device);
     CHECK(info && *(const UINT32 *)info == 328 && (*(const UINT32 *)(info + 104) & 0x00040000)
-              && XSLOT(gi_seen_device, 4, UINT32)(gi_seen_device) == 1,
-          "the gamepad's device info and status");
+              && XSLOT(gi_seen_device, 4, UINT32)(gi_seen_device) == 0x47,
+          "the gamepad's device info and status (connected, input and output enabled, synchronized)");
+    {
+        void *found = NULL;
+        BYTE other[32] = { 1 };
+        CHECK(SUCCEEDED(XSLOT(gi, 16, HRESULT, const void *, void **)(gi, info + 32, &found)) && found == gi_seen_device,
+              "GameInput FindDeviceFromId finds the gamepad by its id");
+        CHECK(XSLOT(gi, 16, HRESULT, const void *, void **)(gi, other, &found) == (HRESULT)0x838a0002 && !found,
+              "GameInput FindDeviceFromId finds no other device");
+    }
     CHECK(SUCCEEDED(XSLOT(gi, 4, HRESULT, UINT32, void *, void **)(gi, 0x00040000, gi_seen_device, &reading)) && reading,
           "GameInput GetCurrentReading(gamepad)");
     if (reading)

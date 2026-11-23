@@ -27,11 +27,15 @@
 
 #include "../common/rebox_log.h"
 
+#define GAMEINPUT_E_DEVICE_NOT_FOUND ((HRESULT)0x838a0002)
 #define GAMEINPUT_E_READING_NOT_FOUND ((HRESULT)0x838a0003)
 #define KIND_GAMEPAD 0x00040000u
 #define KIND_UI_NAVIGATION 0x01000000u
 #define KINDS (KIND_GAMEPAD | KIND_UI_NAVIGATION)
 #define STATUS_CONNECTED 0x1u
+/* GameInputDeviceStatus as xcl reports it: connected, input enabled, output enabled,
+ * synchronized. A screen that wants input enabled ignores a device that's only connected. */
+#define STATUS_ALL 0x47u
 
 typedef struct
 {
@@ -68,6 +72,7 @@ typedef struct
 } GameInputDeviceInfo;
 /* Checked against the header WineGDK generates from its gameinput.idl. */
 C_ASSERT(sizeof(GameInputDeviceInfo) == 328);
+C_ASSERT(offsetof(GameInputDeviceInfo, deviceId) == 32);
 C_ASSERT(offsetof(GameInputDeviceInfo, supportedInput) == 104);
 C_ASSERT(offsetof(GameInputDeviceInfo, gamepadInfo) == 256);
 C_ASSERT(offsetof(GameInputDeviceInfo, supportedSystemButtons) == 320);
@@ -203,7 +208,7 @@ static HRESULT WINAPI device_QueryInterface(struct object *o, REFIID iid, void *
 
 static ULONG WINAPI device_Release(struct object *o) { return 1; }
 static const GameInputDeviceInfo *WINAPI device_GetDeviceInfo(void *self) { return &device_info; }
-static uint32_t WINAPI device_GetDeviceStatus(void *self) { return STATUS_CONNECTED; }
+static uint32_t WINAPI device_GetDeviceStatus(void *self) { return STATUS_ALL; }
 /* GameInputBatteryState v0: four floats and a status, all 0 (unknown). */
 static void WINAPI device_GetBatteryState(void *self, void *state) { if (state) memset(state, 0, 20); }
 static HRESULT WINAPI device_CreateForceFeedbackEffect(void *self, uint32_t motor, const void *params, void **effect)
@@ -554,7 +559,7 @@ static HRESULT WINAPI input_RegisterDeviceCallback(void *self, void *device, uin
     log_call("RegisterDeviceCallback", kind, S_OK);
     if (callback && enum_kind && (kind & KINDS) && (filter & STATUS_CONNECTED)
             && (!device || device == &gamepad))
-        callback(t, context, &gamepad, timestamp_us(), STATUS_CONNECTED, 0);
+        callback(t, context, &gamepad, timestamp_us(), STATUS_ALL, 0);
     return S_OK;
 }
 
@@ -593,7 +598,28 @@ static HRESULT WINAPI input_CreateAggregateDevice(void *self, uint32_t kind, voi
 static HRESULT WINAPI input_find(void *self, const void *value, void **out)
 {
     if (out) *out = NULL;
+    log_call("FindDevice (not by id)", 0, E_NOTIMPL);
     return E_NOTIMPL;
+}
+
+/* FindDeviceFromId: the gamepad for its APP_LOCAL_DEVICE_ID, the id XUser's device association
+ * names (xcl, GPL-2.0-only, has it: a GDK title looks the associated device up here). */
+static HRESULT WINAPI input_FindDeviceFromId(void *self, const APP_LOCAL_DEVICE_ID *id, void **out)
+{
+    HRESULT hr;
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
+    if (id && !memcmp(id, &device_info.deviceId, sizeof(*id)))
+    {
+        obj_AddRef(&gamepad);
+        *out = &gamepad;
+        hr = S_OK;
+    }
+    else
+        hr = GAMEINPUT_E_DEVICE_NOT_FOUND;
+    log_call("FindDeviceFromId", 0, hr);
+    return hr;
 }
 static HRESULT WINAPI input_EnableOemDeviceSupport(void *self, uint16_t vid, uint16_t pid, uint8_t iface,
                                                    uint8_t collection)
@@ -607,7 +633,7 @@ static void *const input_vtbl[] = {
     input_GetNextReading, input_GetPreviousReading, input_GetTemporalReading,
     input_RegisterReadingCallback, input_RegisterDeviceCallback, input_register_other /* system buttons */,
     input_RegisterKeyboardLayoutCallback, input_StopCallback, input_UnregisterCallback, input_CreateDispatcher,
-    input_CreateAggregateDevice, input_find /* id */, input_find /* object */, input_find /* platform handle */,
+    input_CreateAggregateDevice, input_FindDeviceFromId, input_find /* object */, input_find /* platform handle */,
     input_find /* platform string */, input_EnableOemDeviceSupport, input_SetFocusPolicy,
 };
 
