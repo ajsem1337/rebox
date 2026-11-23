@@ -31,6 +31,7 @@ is already there:
 | `0006-deferred-console-graphics` | Deferred console vertex and pixel stages, compiled at each draw ([anyps5.md](anyps5.md)) |
 | `0007-console-compute-user-sgprs` | The console's compute user-SGPR layout for deferred compute shaders: root parameters from s4, one SGPR per descriptor table (a 32-bit pointer), two per root descriptor, one per constant; s0-s3 left 0. `REBOX_CONSOLE_COMPUTE_LAYOUT=pairs` packs as `0002` does, from s0 with two per table, which the smoke test's hand-written programs use |
 | `0008-console-breadcrumbs` | With `VKD3D_CONFIG=breadcrumbs`, records each console variant's key before its dispatch or draw, so a lost device's breadcrumb dump names the console shader (`d3d12_xs` logs the key with each compile). The flake builds vkd3d-proton with `enable_trace` for this |
+| `0009-console-heap-sizes` | Shader-visible CBV/SRV/UAV heaps of up to 2^21 descriptors where the device uses descriptor buffers and its limits allow (D3D12 guarantees 1,000,000; the target title makes one of 1,245,440). The bindless set layouts are sized from the same maximum; elsewhere it stays at 1,000,000 |
 
 The smoke test covers `0001`-`0004` with hand-written SPIR-V console shaders (GLSL in
 `tools/gen_fallback_shaders.sh`): a compute shader writes s0-s31 to the root UAV in s0:s1, an

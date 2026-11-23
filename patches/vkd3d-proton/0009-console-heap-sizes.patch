@@ -1,0 +1,43 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 63a82c3..92b2a74 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9294,6 +9294,28 @@ static D3D12_SAMPLER_FEEDBACK_TIER d3d12_device_determine_sampler_feedback_tier(
+     return D3D12_SAMPLER_FEEDBACK_TIER_0_9;
+ }
+ 
++/* rebox: console titles make shader-visible CBV/SRV/UAV heaps past D3D12's 1,000,000 (the target
++ * title: 1,245,440). With descriptor buffers the heap is only buffer memory, so where the device's
++ * per-stage limits allow, heaps (and so the bindless set layouts sized from this) take 2^21. */
++#define VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT (1u << 21)
++
++static bool d3d12_device_allows_console_heaps(struct d3d12_device *device)
++{
++    const VkPhysicalDeviceVulkan12Properties *limits = &device->device_info.vulkan_1_2_properties;
++
++    return d3d12_device_uses_descriptor_buffers(device) &&
++            limits->maxPerStageDescriptorUpdateAfterBindSampledImages >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            limits->maxPerStageDescriptorUpdateAfterBindStorageImages >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            limits->maxPerStageDescriptorUpdateAfterBindStorageBuffers >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            limits->maxDescriptorSetUpdateAfterBindSampledImages >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            limits->maxDescriptorSetUpdateAfterBindStorageImages >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            limits->maxDescriptorSetUpdateAfterBindStorageBuffers >= VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT &&
++            /* Room for them side by side with texel buffers, as vkd3d_global_descriptor_buffer_init asks. */
++            device->device_info.descriptor_buffer_properties.maxResourceDescriptorBufferRange >=
++                    2 * (VkDeviceSize)(VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT + 1) *
++                    vkd3d_bindless_get_mutable_descriptor_type_size(device);
++}
++
+ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
+ {
+     /* For now, hard-code descriptor counts to the minimum numbers required by D3D12.
+@@ -9302,7 +9324,8 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device,
+     switch (heap_type)
+     {
+         case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+-            return VKD3D_MIN_VIEW_DESCRIPTOR_COUNT;
++            return d3d12_device_allows_console_heaps(device) ? VKD3D_REBOX_VIEW_DESCRIPTOR_COUNT
++                    : VKD3D_MIN_VIEW_DESCRIPTOR_COUNT;
+ 
+         case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+             return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
