@@ -3,7 +3,9 @@
  *   sa5_check CODE.bin SKIP RSRC1 RSRC2 X,Y,Z  a dumped shader (e.g. a PS09
  *                                              entry, SKIP = 36), compile only,
  *                                              with no guest memory
- *   sa5_check vs PLAN [FIRST [COUNT]]          the vertex shaders in PLAN (tools/fssm-vs-plan.py)
+ *   sa5_check vs PLAN [FIRST [COUNT]]          the vertex shaders in PLAN (tools/fssm-vs-plan.py);
+ *                                              SA5_USER, SA5_MEMORY: a draw's user SGPRs and guest
+ *                                              memory (see vertex_sweep)
  *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (tools/ps-plan.py) with
  *                                              their PSO register state, compile only, no guest
  *                                              memory; one "ps NAME ok|FAIL ..." line each */
@@ -163,6 +165,10 @@ static int pixel_sweep(const char *plan, int first, int count)
 
 /* Vertex shaders: plan lines NAME CODE SKIP RSRC1 USER_SGPRS INPUTS (tools/fssm-vs-plan.py). Each
  * input r gets a synthetic RGBA32F vertex buffer (stride 16) and v[4+4r..7+4r]. */
+static uint32_t memory[64], memory_words;
+static uint64_t memory_address;
+static struct sa5_region region;
+
 static int vertex_sweep(const char *plan, int first, int count)
 {
     FILE *f = fopen(plan, "r");
@@ -219,6 +225,39 @@ static int vertex_sweep(const char *plan, int first, int count)
             req.inputs[r].register_count = 4;
         }
         req.push_size = getenv("SA5_PUSH_SIZE") ? (uint32_t)atoi(getenv("SA5_PUSH_SIZE")) : 0;
+        /* SA5_USER=v0,v1,... (hex, from s0; s[4:5] stays the fetch address) and
+         * SA5_MEMORY=ADDRESS:w0,w1,... (hex): a draw's user SGPRs and guest memory, as d3d12_xs logs
+         * them, to follow the descriptors a shader resolves. */
+        if (getenv("SA5_USER"))
+        {
+            const char *p = getenv("SA5_USER");
+            for (unsigned i = 0; i < 32 && *p; i++)
+            {
+                char *end;
+                uint32_t v = (uint32_t)strtoul(p, &end, 16);
+                if (i != 4 && i != 5)
+                    user_data[i] = v;
+                p = *end == ',' ? end + 1 : end;
+                if (end == p && *end != ',')
+                    break;
+            }
+        }
+        if (getenv("SA5_MEMORY"))
+        {
+            const char *p = getenv("SA5_MEMORY");
+            char *end;
+            memory_address = strtoull(p, &end, 16);
+            memory_words = 0;
+            for (p = *end == ':' ? end + 1 : end; *p && memory_words < 64; p = *end == ',' ? end + 1 : end)
+            {
+                memory[memory_words++] = (uint32_t)strtoul(p, &end, 16);
+                if (end == p)
+                    break;
+            }
+            region = (struct sa5_region){ memory_address, memory, memory_words * 4u };
+            req.regions = &region;
+            req.region_count = 1;
+        }
         if (sa5_compile_vertex(&req, &result, error, sizeof(error)))
         {
             for (char *p = error; *p; p++)
@@ -235,6 +274,15 @@ static int vertex_sweep(const char *plan, int first, int count)
             printf("vs %s ok %u words, %u vertex inputs, %u bindings, %s%.300s\n", name, words,
                    sa5_result_vertex_input_count(result), sa5_result_binding_count(result),
                    valid ? "valid" : "INVALID: ", valid ? "" : error);
+            for (uint32_t i = 0; i < sa5_result_binding_count(result) && getenv("SA5_MEMORY"); i++)
+            {
+                struct sa5_binding b;
+                sa5_result_binding(result, i, &b);
+                printf("     binding role %u kind %u count %u words", b.role, b.kind, b.count);
+                for (uint32_t w = 0; w < b.word_count && w < 8; w++)
+                    printf(" %08x", b.words[w]);
+                printf("\n");
+            }
             /* SA5_PUSH_SIZE set: finalize as a graphics stage does, host buffers' addresses pushed
              * after the stage's push data (the guest buffer table) or baked (the rest). */
             if (getenv("SA5_PUSH_SIZE"))

@@ -338,7 +338,7 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
     h->stage = stage;
     h->wave_size = 0;                                     /* inferred from the code (console_compile.c) */
     h->rsrc1 = (u32(fssm + FSSM_GFX_RSRC1) & ~(0xffu << 12)) | (u32(fssm + FSSM_SHORT_FLOAT_MODE) & 0xff) << 12;
-    h->rsrc2 = user << 1;
+    h->rsrc2 = (user & 0x1f) << 1 | (user >> 5 & 1) << 27; /* USER_SGPR, USER_SGPR_MSB (32 for vertex shaders) */
     h->code_offset = sizeof(*h) + sizeof(*g);
     h->code_dwords = dwords;
     h->code_address = 0x10000000000ull;

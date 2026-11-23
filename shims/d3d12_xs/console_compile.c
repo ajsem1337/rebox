@@ -539,6 +539,13 @@ static BOOL stage_failed(UINT64 id)
     return FALSE;
 }
 
+/* The user SGPR count from RSRC2: graphics stages' USER_SGPR_MSB (bit 27) makes 32 possible
+ * (compute's bit 27 is an exception enable). */
+static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
+{
+    return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
@@ -681,11 +688,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         struct sa5_layout layout;
         static struct sa5_slot slots[1];
         char ignored[64];
-        req.wave = sa5.analyse && !sa5.analyse(code, h->code_dwords, (h->rsrc2 >> 1) & 0x1f, &layout, slots, 0,
+        req.wave = sa5.analyse && !sa5.analyse(code, h->code_dwords, user_sgprs(h, graphics), &layout, slots, 0,
                                                  ignored, sizeof(ignored)) ? layout.wave : 32;
     }
     req.user_data = in->user_sgprs;
-    req.user_data_count = min(in->user_sgpr_count, (h->rsrc2 >> 1) & 0x1f);
+    req.user_data_count = min(in->user_sgpr_count, user_sgprs(h, graphics));
     memcpy(req.threads, h->workgroup_size, sizeof(req.threads));
     req.rsrc1 = h->rsrc1;
     req.rsrc2 = h->rsrc2;

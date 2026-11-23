@@ -266,7 +266,9 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      are compiled through `ReboxConsoleCompile` with user SGPRs as TomBox reads the console's
      graphics layout (root parameters from s8, one SGPR per descriptor table, two per root
      descriptor: a UE5 title's vertex shaders load their constant buffer's V# through s[12:13] with
-     s13 = 0; the fetch shader's address at s[4:5]); the vertex
+     s13 = 0; the fetch shader's address at s[4:5]). Vertex shaders get 32 user SGPRs, which
+     RSRC2 holds with `USER_SGPR_MSB` (bit 27): the 5-bit field alone read 0, so AnyPS5 saw only
+     s0-s5 and every constant buffer resolved to a null V# (a UE5 title's runs drew nothing). The vertex
      stage via `sa5_compile_vertex`, whose attributes (location r = input layout element r) make
      the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's: AnyPS5's 112
      bytes, then the addresses of up to two host buffers whose contents change per draw (the guest
@@ -277,8 +279,8 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      vkd3d-proton's own variant with those two modules and that vertex input, cached per PSO by
      both compiles' keys and the pipeline key. A failed compile draws with the fallback pipeline.
    - `test_console_draw` (smoke): a console vertex shader that calls the fetch and exports input 0
-     as the position, and a pixel shader exporting red, in real containers, draw a full-screen
-     triangle on lavapipe.
+     as the position, scaled by a constant buffer it reads through descriptor table 0 (s8), and a
+     pixel shader exporting red, in real containers, draw a full-screen triangle on lavapipe.
 
 ## Open questions
 
@@ -361,6 +363,8 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   mode, so each becomes a Vulkan vertex attribute (`sa5_result_vertex_input`), and s[4:5] a fetch
   address outside the program. AnyPS5 patch 0006 accepts a fetch call that links into its own
   pointer pair and lets the code reuse it. `tools/fssm-vs-plan.py` reads the input count from the
-  code; `sa5_check vs PLAN` compiles each with synthetic RGBA32F buffers. 2026-11-23: all 11
+  code; `sa5_check vs PLAN` compiles each with synthetic RGBA32F buffers (`SA5_USER` and
+  `SA5_MEMORY` give a draw's user SGPRs and descriptors, as `d3d12_xs` logs them, and list the
+  bindings AnyPS5 resolves). 2026-11-23: all 11
   dumped from a run compile and pass `spirv-val` (1-5 inputs each).
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.

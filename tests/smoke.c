@@ -696,15 +696,26 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
 
 /* Deferred console graphics (patch 0006): a PSO whose stages are console vertex and pixel shaders
  * in their containers draws with AnyPS5's compiles of them. The vertex shader calls the fetch
- * shader as a UE5 title's do (s_swappc_b64 s[4:5], s[4:5]) and exports input 0 as the position; the
- * pixel shader exports red. One full-screen triangle over a blue clear: the centre turns red. */
+ * shader as a UE5 title's do (s_swappc_b64 s[4:5], s[4:5]) and exports input 0 as the position, its x
+ * and y scaled by a constant buffer's first value (1.0), whose V# it loads through descriptor table
+ * 0 in s8 as a UE5 title's load theirs through s12: past the 5-bit RSRC2 user SGPR count. The pixel
+ * shader exports red. One full-screen triangle over a blue clear: the centre turns red (blue: fell
+ * back, or the constant read 0 and the triangle collapsed). */
 static void test_console_draw(void *dev, void *queue)
 {
     static const UINT32 vs_code[] = {
         0xbe842104,             /* s_swappc_b64 s[4:5], s[4:5]: the fetch, input 0 in v4-v7 */
+        0xbe890380,             /* s_mov_b32 s9, 0 */
+        0xf4080304, 0xfa000000, /* s_load_dwordx4 s[12:15], s[8:9], 0x0: table 0's V# */
+        0xbf8cc07f,             /* s_waitcnt lgkmcnt(0) */
+        0xf4200406, 0xfa000000, /* s_buffer_load_dword s16, s[12:15], 0x0 */
+        0xbf8cc07f,             /* s_waitcnt lgkmcnt(0) */
+        0x10080810,             /* v_mul_f32 v4, s16, v4 */
+        0x100a0a10,             /* v_mul_f32 v5, s16, v5 */
         0xf80008cf, 0x07060504, /* exp pos0 v4, v5, v6, v7 done */
         0xbf810000,             /* s_endpgm */
     };
+    static const float scale[64] = { 1.0f };
     static const UINT32 ps_code[] = {
         0x7e0002f2,             /* v_mov_b32 v0, 1.0 */
         0x7e020280,             /* v_mov_b32 v1, 0 */
@@ -724,17 +735,23 @@ static void test_console_draw(void *dev, void *queue)
                                          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
             GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12SerializeRootSignature");
-    D3D12_ROOT_SIGNATURE_DESC rsd = { 0, NULL, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0 };
+    D3D12_ROOT_PARAMETER param = { D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = { 1, &range },
+                                   .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL };
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    D3D12_DESCRIPTOR_HEAP_DESC cbv_hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
     D3D12_VIEWPORT vp = { 0, 0, 64, 48, 0, 1 };
     D3D12_RECT sc = { 0, 0, 64, 48 };
     D3D12_RESOURCE_BARRIER barrier = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
     D3D12_TEXTURE_COPY_LOCATION dst = { 0 }, src = { 0 };
     D3D12_VERTEX_BUFFER_VIEW vbv;
-    ID3D12Resource *tex = NULL, *vb = NULL, *readback = NULL;
+    ID3D12Resource *tex = NULL, *vb = NULL, *cb = NULL, *readback = NULL;
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12Fence *fence = NULL;
-    void *rtv_heap = NULL, *list = NULL, *rs = NULL, *pso = NULL, *mapped;
+    void *rtv_heap = NULL, *cbv_heap = NULL, *list = NULL, *rs = NULL, *pso = NULL, *mapped;
     BYTE *vs = NULL, *ps = NULL, *px;
     SIZE_T vs_size, ps_size, rtv;
     ID3D10Blob *blob = NULL;
@@ -782,6 +799,14 @@ static void test_console_draw(void *dev, void *queue)
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                 D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
                 &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&vb);
+    bd.Width = sizeof(scale);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&cb);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cbv_hd,
+                &IID_ID3D12DescriptorHeap, &cbv_heap);
     bd.Width = 256 * 48;
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
@@ -805,6 +830,14 @@ static void test_console_draw(void *dev, void *queue)
         memcpy(mapped, tri, sizeof(tri));
         ID3D12Resource_Unmap(vb, 0, NULL);
     }
+    if (SUCCEEDED(ID3D12Resource_Map(cb, 0, NULL, &mapped)))
+    {
+        memcpy(mapped, scale, sizeof(scale));
+        ID3D12Resource_Unmap(cb, 0, NULL);
+    }
+    cbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(cb);
+    cbv.SizeInBytes = sizeof(scale);
+    XSLOT(dev, 17, void, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, SIZE_T)(dev, &cbv, XSLOT(cbv_heap, 9, SIZE_T)(cbv_heap));
 
     rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
     XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, tex, NULL, rtv);
@@ -813,7 +846,9 @@ static void test_console_draw(void *dev, void *queue)
     XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
     XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
     XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    XSLOT(list, 32, void, UINT, void *const *)(list, 1, &cbv_heap);
     XSLOT(list, 34, void, void *)(list, rs);
+    XSLOT(list, 36, void, UINT, UINT64)(list, 0, XSLOT(cbv_heap, 10, UINT64)(cbv_heap));
     XSLOT(list, 25, void, void *)(list, pso);
     vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vb);
     vbv.SizeInBytes = sizeof(tri);
@@ -851,8 +886,10 @@ done:
     if (alloc) ID3D12CommandAllocator_Release(alloc);
     if (readback) ID3D12Resource_Release(readback);
     if (vb) ID3D12Resource_Release(vb);
+    if (cb) ID3D12Resource_Release(cb);
     if (tex) ID3D12Resource_Release(tex);
     if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
+    if (cbv_heap) XSLOT(cbv_heap, 2, ULONG)(cbv_heap);
     if (pso) XSLOT(pso, 2, ULONG)(pso);
     if (rs) XSLOT(rs, 2, ULONG)(rs);
     free(vs);
