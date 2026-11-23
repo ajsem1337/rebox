@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index be9f25c..bf3f621 100644
+index be9f25c..ef230ad 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -7555,6 +7555,9 @@ static void d3d12_command_list_check_vbo_alignment(struct d3d12_command_list *li
@@ -39,7 +39,39 @@ index be9f25c..bf3f621 100644
              &list->dynamic_state, list->dsv.format, &new_active_flags)))
      {
          if (!(vk_pipeline = d3d12_pipeline_state_get_or_create_pipeline(list->state,
-@@ -8223,9 +8234,10 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+@@ -8185,8 +8196,8 @@ static uint64_t d3d12_command_list_rebox_table_va(struct d3d12_command_list *
+ }
+ 
+ /* Fills data[0..31] with the user SGPRs; returns how many are set. */
+-static unsigned int d3d12_command_list_rebox_sgprs(struct d3d12_command_list *list,
+-        const struct vkd3d_pipeline_bindings *bindings, uint32_t *data)
++static unsigned int d3d12_command_list_rebox_sgprs_layout(struct d3d12_command_list *list,
++        const struct vkd3d_pipeline_bindings *bindings, uint32_t *data, bool table_dword)
+ {
+     const struct d3d12_root_signature *rs = bindings->root_signature;
+     unsigned int i, k, n = 0;
+@@ -8211,21 +8222,30 @@ static unsigned int d3d12_command_list_rebox_sgprs(struct d3d12_command_list
+                 break;
+         }
+         data[n++] = (uint32_t)va;
+-        if (n < 32)
++        /* The console's own layout gives a descriptor table one SGPR (shaders build the pointer with
++         * s_mov_b32 hi, 0); root descriptors take two. */
++        if (n < 32 && !(table_dword && p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE))
+             data[n++] = (uint32_t)(va >> 32);
+     }
+     return n;
+ }
+ 
++static unsigned int d3d12_command_list_rebox_sgprs(struct d3d12_command_list *list,
++        const struct vkd3d_pipeline_bindings *bindings, uint32_t *data)
++{
++    return d3d12_command_list_rebox_sgprs_layout(list, bindings, data, false);
++}
++
+ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings, const struct d3d12_bind_point_layout *layout)
+ {
      const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
      uint32_t data[VKD3D_REBOX_CONSOLE_PUSH_SIZE / sizeof(uint32_t)];
  
@@ -52,7 +84,7 @@ index be9f25c..bf3f621 100644
          memcpy(data, list->rebox.push, sizeof(data));
      }
      else
-@@ -8289,10 +8301,60 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
+@@ -8289,10 +8309,61 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
          WARN("rebox: console shader compile failed, hr %#x; skipping the dispatch.\n", hr);
          return VK_NULL_HANDLE;
      }
@@ -64,7 +96,8 @@ index be9f25c..bf3f621 100644
  
 +/* Compiles the bound PSO's deferred console vertex and pixel stages for this draw (d3d12_xs caches)
 + * and returns their pipeline, or VK_NULL_HANDLE to draw with the fallback. User SGPRs follow
-+ * TomBox's reading of the console's graphics layout: root parameters from s8, the fetch shader's
++ * TomBox's reading of the console's graphics layout: root parameters from s8, one SGPR per
++ * descriptor table (a UE5 title's vertex shaders load from s[12:13] with s13 = 0), the fetch shader's
 + * address at s[4:5] (d3d12_xs puts one there). */
 +static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_command_list *list,
 +        uint32_t *dynamic_state_flags)
@@ -84,7 +117,7 @@ index be9f25c..bf3f621 100644
 +    memset(&in, 0, sizeof(in));
 +    memset(sgprs, 0, sizeof(sgprs));
 +    memset(root, 0, sizeof(root));
-+    n = d3d12_command_list_rebox_sgprs(list, &list->graphics_bindings, root);
++    n = d3d12_command_list_rebox_sgprs_layout(list, &list->graphics_bindings, root, true);
 +    memcpy(&sgprs[8], root, min(n, 24u) * sizeof(uint32_t));
 +    in.user_sgprs = sgprs;
 +    in.user_sgpr_count = 32;

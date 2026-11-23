@@ -264,7 +264,9 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    - **Draw** (vkd3d-proton patch 0006): at the first draw the PSO's private data is read; its
      vertex buffers join the PSO's mask and it pushes the console block. At each draw both stages
      are compiled through `ReboxConsoleCompile` with user SGPRs as TomBox reads the console's
-     graphics layout (root parameters from s8, the fetch shader's address at s[4:5]); the vertex
+     graphics layout (root parameters from s8, one SGPR per descriptor table, two per root
+     descriptor: a UE5 title's vertex shaders load their constant buffer's V# through s[12:13] with
+     s13 = 0; the fetch shader's address at s[4:5]); the vertex
      stage via `sa5_compile_vertex`, whose attributes (location r = input layout element r) make
      the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's: AnyPS5's 112
      bytes, then the addresses of up to two host buffers whose contents change per draw (the guest
