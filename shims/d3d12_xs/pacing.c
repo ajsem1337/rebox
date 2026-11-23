@@ -185,6 +185,10 @@ HRESULT pacing_schedule(UINT type, UINT_PTR offset_us, HANDLE event)
     return S_OK;
 }
 
+/* For pacing_report: what the title last asked the clock. */
+static volatile LONG64 last_wait_token, last_query_token, queries, unanswered;
+static volatile LONG last_query_types, last_query_answered;
+
 HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
 {
     static LONG64 counter;
@@ -216,6 +220,7 @@ HRESULT pacing_wait(UINT type, UINT timeout_ms, UINT64 *token)
     sleep_until(t);
     if (token)
         *token = (UINT64)frame + 1;
+    InterlockedExchange64(&last_wait_token, frame + 1);
     return S_OK;
 }
 
@@ -294,5 +299,27 @@ HRESULT pacing_frame_statistics(UINT64 token, UINT types, UINT *count, void *sta
         (*count)++;
     }
     ReleaseSRWLockShared(&lock);
+    InterlockedIncrement64(&queries);
+    InterlockedExchange64(&last_query_token, (LONG64)token);
+    InterlockedExchange(&last_query_types, (LONG)types);
+    InterlockedExchange(&last_query_answered, (LONG)*count);
+    if (!*count)
+        InterlockedIncrement64(&unanswered);
     return S_OK;
+}
+
+void pacing_report(void)
+{
+    LONGLONG frame = -1;
+
+    if (ready())
+    {
+        AcquireSRWLockShared(&lock);
+        frame = frame_at(0, now());
+        ReleaseSRWLockShared(&lock);
+    }
+    rebox_log("d3d12_xs: frame clock at frame %lld; last WaitFrameEventX token %lld; %lld GetFrameStatisticsX "
+                 "calls, %lld with nothing to report, the last for token %lld types %#lx: %ld entries",
+                 (long long)frame, (long long)last_wait_token, (long long)queries, (long long)unanswered,
+                 (long long)last_query_token, last_query_types, last_query_answered);
 }

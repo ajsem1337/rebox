@@ -1335,6 +1335,7 @@ void WINAPI ReboxHangReport(void)
                      done < signalled[i].value ? " (behind)" : "");
     }
     ReleaseSRWLockShared(&signalled_lock);
+    pacing_report();
     proxy_log_slot_stats();
 }
 
