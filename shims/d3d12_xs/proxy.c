@@ -239,7 +239,19 @@ static BOOL console_iid(const struct proxy_class *cls, REFIID riid)
     if (cls == &device_class)
         return IsEqualGUID(riid, &console_device8_iid);
     if (cls == &list_class || cls == &list_v4_class)
-        return IsEqualGUID(riid, &console_list6_iid);
+    {
+        /* The console's command list IIDs keep PC's first fields and end in 98cf-645b51dc4874
+         * (list 6 above; a UE5 title asks for list 5 as 55050859-4024-474c-98cf-...). */
+        static const DWORD pc_lists[] = { 0x5b160d0f, 0x553103fb, 0x38c3e585, 0x6fda83a7, 0x8754318e, 0x55050859,
+                                          0xc3827890, 0xdd171223, 0xee936ef9, 0x7013c015 };
+        if (IsEqualGUID(riid, &console_list6_iid))
+            return TRUE;
+        if (riid->Data4[0] == 0x98 && riid->Data4[1] == 0xcf)
+            for (size_t i = 0; i < ARRAYSIZE(pc_lists); i++)
+                if (riid->Data1 == pc_lists[i])
+                    return TRUE;
+        return FALSE;
+    }
     if (cls == &copy_list_class)
         return IsEqualGUID(riid, &console_dma_list_iid);
     return FALSE;
@@ -272,8 +284,10 @@ static HRESULT STDMETHODCALLTYPE proxy_QueryInterface(struct proxy *p, REFIID ri
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 8)
-            rebox_log("d3d12_xs: Xbox %s has no interface {%08lx-%04x-%04x-%02x%02x-...}", p->cls->name,
-                         riid->Data1, riid->Data2, riid->Data3, riid->Data4[0], riid->Data4[1]);
+            rebox_log("d3d12_xs: Xbox %s has no interface {%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+                         p->cls->name, riid->Data1, riid->Data2, riid->Data3, riid->Data4[0], riid->Data4[1],
+                         riid->Data4[2], riid->Data4[3], riid->Data4[4], riid->Data4[5], riid->Data4[6],
+                         riid->Data4[7]);
         return hr;
     }
     if (result == p->inner)

@@ -2606,6 +2606,16 @@ static void test_list_queries(void *dev, void *queue)
                    REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
     if (SUCCEEDED(hr))
     {
+        /* The console's list 5 IID (PC's first fields, Xbox ending; a UE5 title asks for it). */
+        static const GUID list5 = { 0x55050859, 0x4024, 0x474c, { 0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74 } };
+        void *l5 = NULL;
+        HRESULT qhr = XSLOT(list, 0, HRESULT, REFIID, void **)(list, &list5, &l5);
+        CHECK(SUCCEEDED(qhr) && l5 == list, "command list QueryInterface(console list 5) %#lx", qhr);
+        if (l5)
+            XSLOT(l5, 2, ULONG)(l5);
+    }
+    if (SUCCEEDED(hr))
+    {
         XSLOT(list, 29, void, void *, D3D12_QUERY_TYPE, UINT)(list, qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
         XSLOT(list, 30, void, void *, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource *, UINT64)(list, qheap,
               D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, buf, 0);
