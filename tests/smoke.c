@@ -1587,6 +1587,22 @@ static double ms_since(LARGE_INTEGER a)
 
 /* Xbox-only root signature flags (0x01000000, 0x02000000, 0x80000000; Leonida found the PC
  * deserializer rejects them): serializing, creating and deserializing must all work. */
+/* Console indirect argument types: Unreal 5 (a UE5 sample) makes its dispatch-indirect
+ * signature with type 105, a dispatch of three group counts on the console. */
+static void test_console_command_signature(void *dev)
+{
+    D3D12_INDIRECT_ARGUMENT_DESC arg = { (D3D12_INDIRECT_ARGUMENT_TYPE)105 };
+    D3D12_COMMAND_SIGNATURE_DESC desc = { sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &arg, 0 };
+    void *signature = NULL;
+    HRESULT hr = XSLOT(dev, 41, HRESULT, const D3D12_COMMAND_SIGNATURE_DESC *, void *, REFIID, void **)(dev, &desc, NULL,
+            &IID_ID3D12CommandSignature, &signature);
+    CHECK(SUCCEEDED(hr) && signature, "CreateCommandSignature takes the console's dispatch argument type 105 (%#lx)",
+          (unsigned long)hr);
+    CHECK(arg.Type == 105, "and leaves the title's description as it was");
+    if (signature)
+        IUnknown_Release((IUnknown *)signature);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -3897,6 +3913,7 @@ static void test_xbox(void)
     test_console_draw(dev, queue, TRUE, FALSE);
     test_console_draw(dev, queue, FALSE, TRUE);
     test_xbox_root_flags(dev);
+    test_console_command_signature(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);

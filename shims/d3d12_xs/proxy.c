@@ -863,10 +863,63 @@ static BOOL is_command_signature(void *object)
     return found;
 }
 
+/* The console's own indirect argument types: 104 and 105 (DISPATCHX, DISPATCH_L2) are dispatches
+ * with the desktop's three group counts, 107 a mesh dispatch (16-byte records). Facts from
+ * xvalkyrie and TuxBox; Unreal 5's D3D12 RHI on the console (a UE5 sample) makes its
+ * dispatch-indirect signature with 105, which vkd3d-proton rejects. Returns the desktop type. */
+static D3D12_INDIRECT_ARGUMENT_TYPE desktop_argument_type(D3D12_INDIRECT_ARGUMENT_TYPE type)
+{
+    static LONG seen[8];
+    D3D12_INDIRECT_ARGUMENT_TYPE desktop;
+    switch ((UINT)type)
+    {
+    case 104: case 105: desktop = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH; break;
+    case 107: desktop = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH; break;
+    default: return type;
+    }
+    if (!InterlockedExchange(&seen[(UINT)type - 100], 1))
+        rebox_log("d3d12_xs: command signature argument type %u (the console's) taken as desktop type %u",
+                     (UINT)type, (UINT)desktop);
+    return desktop;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, const D3D12_COMMAND_SIGNATURE_DESC *desc,
         ID3D12RootSignature *rs, REFIID riid, void **out)
 {
-    HRESULT hr = ID3D12Device_CreateCommandSignature(INNER(p, ID3D12Device), desc, rs, riid, out);
+    D3D12_INDIRECT_ARGUMENT_DESC local[16], *args = NULL;
+    D3D12_COMMAND_SIGNATURE_DESC host;
+    HRESULT hr;
+
+    if (desc && desc->pArgumentDescs && desc->NumArgumentDescs)
+    {
+        args = desc->NumArgumentDescs <= ARRAYSIZE(local) ? local : malloc(desc->NumArgumentDescs * sizeof(*args));
+        if (args)
+        {
+            memcpy(args, desc->pArgumentDescs, desc->NumArgumentDescs * sizeof(*args));
+            for (UINT i = 0; i < desc->NumArgumentDescs; i++)
+                args[i].Type = desktop_argument_type(args[i].Type);
+            host = *desc;
+            host.pArgumentDescs = args;
+            desc = &host;
+        }
+    }
+    hr = ID3D12Device_CreateCommandSignature(INNER(p, ID3D12Device), desc, rs, riid, out);
+    if (FAILED(hr) && desc)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+        {
+            char types[128];
+            int at = 0;
+            types[0] = 0;
+            for (UINT i = 0; i < desc->NumArgumentDescs && desc->pArgumentDescs && at < 100; i++)
+                at += snprintf(types + at, sizeof(types) - at, " %u", (UINT)desc->pArgumentDescs[i].Type);
+            rebox_log("d3d12_xs: CreateCommandSignature (stride %u, argument types%s, root signature %p) failed: %#lx",
+                         desc->ByteStride, types, (void *)rs, (unsigned long)hr);
+        }
+    }
+    if (args && args != local)
+        free(args);
 
     if (SUCCEEDED(hr) && out && *out)
     {
