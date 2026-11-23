@@ -138,6 +138,9 @@ struct sa5_remap
     uint32_t new_set, new_binding;
     uint32_t count;
     const uint32_t *heap_indices;
+    /* sa5_finalize_draw: element i's heap index is the draw block's index word draw_index_base + i
+     * (heap_indices is unused). */
+    uint32_t draw_index_base;
 };
 
 struct sa5_host_buffer
@@ -161,6 +164,15 @@ SA5_API int sa5_finalize(const struct sa5_result *result, const struct sa5_remap
                          const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t **out,
                          uint32_t *out_count, char *error, size_t error_size);
 SA5_API void sa5_free_words(uint32_t *words);
+/* As sa5_finalize, but nothing that changes from draw to draw is baked in, so one module serves
+ * every draw of the same shader: the push block holds, at byte draw_block_base, the address of a
+ * draw block {uint64 addresses[SA5_DRAW_ADDRESSES]; uint32 indices[]} the caller fills per draw.
+ * Each host buffer without a baked address is addresses[push_slot]; each remap's element i is
+ * heap index indices[draw_index_base + i]. */
+#define SA5_DRAW_ADDRESSES 8
+SA5_API int sa5_finalize_draw(const struct sa5_result *result, const struct sa5_remap *remaps, uint32_t remap_count,
+                              const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t draw_block_base,
+                              uint32_t **out, uint32_t *out_count, char *error, size_t error_size);
 /* spirv-val for Vulkan 1.2 (scalar block layout): 0, or -1 and the validator's messages. */
 SA5_API int sa5_validate(const uint32_t *words, uint32_t word_count, char *error, size_t error_size);
 

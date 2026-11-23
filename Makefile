@@ -90,7 +90,7 @@ $(BUILD)/texcheck.exe: tools/texcheck.c $(BUILD)/detile.o $(ADDRLIB_OBJ)
 	$(MINGW_CC) $(CFLAGS) -o $@ $< $(BUILD)/detile.o $(ADDRLIB_OBJ) -static -lstdc++
 
 .SECONDEXPANSION:
-$(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
+$(BUILD)/%.dll: $$(wildcard shims/$$*/*.c) $$(wildcard shims/$$*/*.h) anyps5/rebox_anyps5.h $(COMMON) shims/common/rebox_log.h shims/$$*/$$*.def $$(wildcard $(GEN)/$$*_stubs.*)
 	@mkdir -p $(BUILD)
 	cat shims/$*/$*.def $(wildcard $(GEN)/$*_stubs.def) > $(BUILD)/$*.def
 	$(MINGW_CC) $(CFLAGS) $(CFLAGS_$*) -o $@ $(wildcard shims/$*/*.c) $(wildcard $(GEN)/$*_stubs.c) $(COMMON) $(BUILD)/$*.def $(LDFLAGS) $(LIBS_$*)
@@ -100,7 +100,7 @@ $(BUILD)/stub/%.dll: $(GEN)/dlls/$$*/stubs.c $(GEN)/dlls/$$*/$$*.def $(COMMON) s
 	$(MINGW_CC) $(CFLAGS) -Ishims/common -o $@ $(GEN)/dlls/$*/stubs.c $(COMMON) $(GEN)/dlls/$*/$*.def $(LDFLAGS)
 
 # Smoke test executable, run under Wine by tests/run-smoke.sh.
-$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h $(GEN)/repro_shaders.h
+$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h $(GEN)/repro_shaders.h anyps5/rebox_anyps5.h
 	@mkdir -p $(BUILD)
 	$(MINGW_CC) $(CFLAGS) -o $@ $<
 

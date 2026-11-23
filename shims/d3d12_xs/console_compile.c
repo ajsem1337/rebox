@@ -40,7 +40,7 @@
  * up to two host buffers whose contents change per draw (baked addresses made a module and a
  * pipeline per draw: a UE5 title's render thread spent its frames compiling). */
 #define GRAPHICS_PUSH_DATA 112u
-#define GRAPHICS_PUSHED_MAX 2u
+#define GRAPHICS_PUSHED_MAX SA5_DRAW_ADDRESSES /* per-draw host buffers: in the draw block */
 
 enum role { ROLE_GDS = 3, ROLE_BDA_PAGETABLE = 4, ROLE_FAULT_BUFFER = 5, ROLE_FLATTENED_SRT = 6, ROLE_SHADER_DATA = 7,
             ROLE_IMAGE_TABLE = 8, ROLE_SAMPLER_TABLE = 9, ROLE_IMAGE_TABLE_MAP = 10, ROLE_IMAGE_STORAGE_TABLE = 11 };
@@ -70,6 +70,8 @@ static struct
     void (*result_free)(struct sa5_result *);
     int (*finalize)(const struct sa5_result *, const struct sa5_remap *, UINT32, const struct sa5_host_buffer *,
             UINT32, UINT32 **, UINT32 *, char *, size_t);
+    int (*finalize_draw)(const struct sa5_result *, const struct sa5_remap *, UINT32, const struct sa5_host_buffer *,
+            UINT32, UINT32, UINT32 **, UINT32 *, char *, size_t);
     UINT32 (*fault_buffer_bytes)(void);
     UINT32 (*gds_bytes)(void);
 } sa5;
@@ -146,6 +148,7 @@ static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
     GET(analyse, "sa5_analyse");
     GET(result_free, "sa5_result_free");
     GET(finalize, "sa5_finalize");
+    GET(finalize_draw, "sa5_finalize_draw");
     GET(fault_buffer_bytes, "sa5_fault_buffer_bytes");
     GET(gds_bytes, "sa5_gds_bytes");
 #undef GET
@@ -714,7 +717,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
-    if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input)))
+    if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input || !sa5.finalize_draw)))
     {
         set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable (or too old for graphics stages)", NULL);
         return E_NOTIMPL;
@@ -1110,9 +1113,14 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 }
             }
             remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, in->bindless[b.kind][0],
-                                                        in->bindless[b.kind][1], b.count, &indices[index_count] };
+                                                        in->bindless[b.kind][1], b.count, &indices[index_count],
+                                                        index_count };
             key[0] = hash_bytes(key[0], &b.binding, sizeof(b.binding));
-            key[0] = hash_bytes(key[0], &indices[index_count], b.count * sizeof(UINT32));
+            key[0] = hash_bytes(key[0], &b.count, sizeof(b.count));
+            /* Graphics: the heap slots are in the draw block, not the module (a UE5 title copies its
+             * descriptors to new slots every draw: one module per draw, and a pipeline each). */
+            if (!graphics)
+                key[0] = hash_bytes(key[0], &indices[index_count], b.count * sizeof(UINT32));
             index_count += b.count;
         }
         else
@@ -1203,7 +1211,10 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         phase_end(&mark, 2);
     if (!(module = find_module(key)))
     {
-        if (sa5.finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error, sizeof(error)))
+        if (graphics ? sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
+                                         in->push_offset + GRAPHICS_PUSH_DATA, &words, &word_count, error, sizeof(error))
+                     : sa5.finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error,
+                                    sizeof(error)))
         {
             log_failure(h, "fitting it to vkd3d-proton's bindings failed", error);
             goto done;
@@ -1239,8 +1250,22 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     memcpy(out->push, push, min(push_size, graphics ? GRAPHICS_PUSH_DATA : 128u));
     for (UINT32 i = 0; i < host_count && !graphics; i++)
         memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
-    for (UINT32 i = 0; i < pushed_count && graphics; i++)
-        memcpy(&out->push[GRAPHICS_PUSH_DATA / 4 + 2 * i], &pushed_va[i], sizeof(UINT64));
+    if (graphics)
+    {
+        /* The draw block: the per-draw host buffers' addresses, then every remapped binding's heap
+         * slots (sa5_finalize_draw); its address follows the stage's push data. */
+        static UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS]; /* under compile_lock */
+        UINT64 va;
+        memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
+        memcpy(block, pushed_va, pushed_count * sizeof(UINT64));
+        memcpy(block + 2 * SA5_DRAW_ADDRESSES, indices, index_count * sizeof(UINT32));
+        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32))))
+        {
+            log_failure(h, "no GPU memory for the draw block", NULL);
+            goto done;
+        }
+        memcpy(&out->push[GRAPHICS_PUSH_DATA / 4], &va, sizeof(UINT64));
+    }
     if (graphics && h->stage == 0x1)
     {
         out->vertex_input_count = min(sa5.vertex_input_count(result), 32u);

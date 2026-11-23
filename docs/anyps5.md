@@ -271,8 +271,13 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      s0-s5 and every constant buffer resolved to a null V# (a UE5 title's runs drew nothing). The vertex
      stage via `sa5_compile_vertex`, whose attributes (location r = input layout element r) make
      the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's: AnyPS5's 112
-     bytes, then the addresses of up to two host buffers whose contents change per draw (the guest
-     buffer table, the flattened SRT, shader data, image table maps; `sa5_host_buffer.push_base`).
+     bytes, then the address of the stage's **draw block** (`sa5_finalize_draw`): the addresses of
+     the host buffers whose contents change per draw (the guest buffer table, the flattened SRT,
+     shader data, image table maps; up to 8), then the heap slot of every element of every remapped
+     descriptor array. Draw blocks come from a 128 MiB GPU ring. Nothing that changes per draw is
+     in the module, so a shader keeps one module and one pipeline when the title copies its
+     descriptors to new heap slots every draw (a UE5 title does: with the slots baked in, half its
+     stage compiles made a new module and vkd3d-proton a new pipeline).
      The process-wide host buffers (fault buffer, GDS, page table) are baked into the modules
      (`sa5_host_buffer.address`). Baking everything made a module and a pipeline per draw, and
      a UE5 title's render thread stopped presenting while it compiled them. The pipeline is

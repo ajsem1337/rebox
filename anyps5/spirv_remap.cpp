@@ -14,6 +14,10 @@
 //    PhysicalStorageBuffer pointer read from the push block: AnyPS5's 128 bytes of push data, then
 //    one 64-bit address per host buffer from byte 128; or, given its address, a constant (graphics:
 //    each stage's push data takes 128 bytes of the block).
+// With a draw block (sa5_finalize_draw), the heap indices of 2. and the pushed addresses of 3. are
+// read from a per-draw buffer whose address is in the push block instead: the module has nothing
+// that changes from draw to draw, so a title that copies its descriptors to new heap slots every
+// draw (a UE5 title) gets one module and one pipeline per shader, not one per draw.
 #define REBOX_ANYPS5_BUILD
 #include "rebox_anyps5.h"
 
@@ -240,6 +244,56 @@ struct Module {
     }
 };
 
+std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base, std::uint32_t slots);
+
+// The per-draw block (sa5_finalize_draw): {uint64 addresses[SA5_DRAW_ADDRESSES]; uint32 indices[]},
+// read as a uint array through a PhysicalStorageBuffer pointer that is the push block's one address.
+struct DrawBlock {
+    std::uint32_t pushVar = 0, memberConstant = 0, pushUvec2 = 0, uvec2 = 0, uintType = 0, psbBlock = 0, psbUint = 0,
+                  c0 = 0;
+
+    DrawBlock(Module& m, std::uint32_t base)
+    {
+        const auto [var, member] = PushBlock(m, base, 1);
+        pushVar = var;
+        memberConstant = m.Constant(member);
+        uintType = m.UintType();
+        uvec2 = m.Type(OpTypeVector, {uintType, 2});
+        pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
+        const std::uint32_t runtime = m.NewId(), block = m.NewId();
+        m.AddGlobal(Make(OpTypeRuntimeArray, {runtime, uintType}));
+        m.AddDecoration(Make(OpDecorate, {runtime, DecorationArrayStride, 4}));
+        m.AddGlobal(Make(OpTypeStruct, {block, runtime}));
+        m.AddDecoration(Make(OpDecorate, {block, DecorationBlock}));
+        m.AddDecoration(Make(OpMemberDecorate, {block, 0, DecorationOffset, 0}));
+        psbBlock = m.Pointer(StorageClassPhysicalStorageBuffer, block);
+        psbUint = m.Pointer(StorageClassPhysicalStorageBuffer, uintType);
+        c0 = m.Constant(0);
+        m.AddCapability(CapPhysicalStorageBufferAddresses);
+        for (auto& inst : m.insts)
+            if (Op(inst) == OpMemoryModel) inst[1] = AddressingPhysicalStorageBuffer64;
+    }
+
+    // Instructions loading the block's pointer; returns its id.
+    std::uint32_t Pointer(Module& m, std::vector<Inst>& out) const
+    {
+        const std::uint32_t chain = m.NewId(), value = m.NewId(), pointer = m.NewId();
+        out.push_back(Make(OpAccessChain, {pushUvec2, chain, pushVar, memberConstant, c0}));
+        out.push_back(Make(OpLoad, {uvec2, value, chain}));
+        out.push_back(Make(OpBitcast, {psbBlock, pointer, value}));
+        return pointer;
+    }
+
+    // Instructions loading word `index` (an id) of the block; returns the loaded id.
+    std::uint32_t Word(Module& m, std::vector<Inst>& out, std::uint32_t pointer, std::uint32_t index) const
+    {
+        const std::uint32_t chain = m.NewId(), loaded = m.NewId();
+        out.push_back(Make(OpAccessChain, {psbUint, chain, pointer, c0, index}));
+        out.push_back(Make(OpLoad, {uintType, loaded, chain, MemoryAccessAligned, 4}));
+        return loaded;
+    }
+};
+
 // ---------------------------------------------------------------- 1. specialization constants
 
 std::vector<std::uint32_t> Freeze(const std::vector<std::uint32_t>& words,
@@ -278,7 +332,7 @@ std::uint32_t DynamicIndexingCapability(std::uint32_t kind)
     }
 }
 
-void Rebind(Module& m, const sa5_remap& remap)
+void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
 {
     const std::uint32_t var = m.VariableAt(remap.set, remap.binding);
     const Inst varDef = m.Def(var);
@@ -289,7 +343,7 @@ void Rebind(Module& m, const sa5_remap& remap)
     const std::uint32_t uintType = m.UintType();
     const auto heapIndex = [&](std::uint32_t i) {
         if (i >= remap.count) Fail("descriptor index " + std::to_string(i) + " out of range for binding " + std::to_string(remap.binding));
-        return remap.heap_indices[i];
+        return remap.heap_indices ? remap.heap_indices[i] : 0u;  // none with a draw block
     };
 
     // T[] and a pointer to it.
@@ -335,15 +389,38 @@ void Rebind(Module& m, const sa5_remap& remap)
         }
     }
     std::map<std::uint32_t, std::uint32_t> constantIds;
+    if (draw) {
+        // Every index comes from the draw block: element i is word 2 * SA5_DRAW_ADDRESSES +
+        // draw_index_base + i. The constants for constant elements are made first.
+        constantIndex.clear();
+        dynamic = true;
+        for (const auto& inst : m.insts)
+            if ((Op(inst) == OpAccessChain || Op(inst) == OpInBoundsAccessChain) && inst.size() >= 5 && inst[3] == var &&
+                constantValues.count(inst[4])) {
+                if (constantValues[inst[4]] >= remap.count) heapIndex(constantValues[inst[4]]);  // fails
+                constantIds[inst[2]] = m.Constant(2u * SA5_DRAW_ADDRESSES + remap.draw_index_base + constantValues[inst[4]]);
+            }
+    }
+    const std::uint32_t drawBase = draw ? m.Constant(2u * SA5_DRAW_ADDRESSES + remap.draw_index_base) : 0u;
     for (const auto& [result, value] : constantIndex) constantIds[result] = m.Constant(value);
-    if (dynamic) makeTable();
+    if (dynamic && !draw) makeTable();
 
     std::vector<Inst> out, decorations;
     out.reserve(m.insts.size() + 8);
     for (auto& inst : m.insts) {
         const auto op = Op(inst);
         if ((op == OpAccessChain || op == OpInBoundsAccessChain) && inst.size() >= 5 && inst[3] == var) {
-            if (constantIds.count(inst[2])) {
+            if (draw) {
+                std::uint32_t word = constantIds.count(inst[2]) ? constantIds[inst[2]] : 0u;
+                if (!word) {
+                    word = m.NewId();
+                    out.push_back(Make(OpIAdd, {uintType, word, inst[4], drawBase}));
+                }
+                const std::uint32_t pointer = draw->Pointer(m, out);
+                const std::uint32_t loaded = draw->Word(m, out, pointer, word);
+                if (nonUniform.count(inst[4])) decorations.push_back(Make(OpDecorate, {loaded, DecorationNonUniform}));
+                inst[4] = loaded;
+            } else if (constantIds.count(inst[2])) {
                 inst[4] = constantIds[inst[2]];
             } else {
                 const std::uint32_t slot = m.NewId(), loaded = m.NewId();
@@ -468,7 +545,7 @@ std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base,
     return {var, 1};
 }
 
-void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
+void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count, const DrawBlock* draw)
 {
     if (!count) return;
     if (count > MaxHostBuffers) Fail("too many host buffers");
@@ -481,11 +558,13 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
         pushed = true;
         if (buffers[i].push_base) base = buffers[i].push_base;
         slots = std::max(slots, buffers[i].push_slot + 1u);
+        if (draw && buffers[i].push_slot >= SA5_DRAW_ADDRESSES) Fail("more host buffers than the draw block has addresses for");
     }
     if (base % 8u) Fail("host buffer addresses must be 8-byte aligned in the push block");
-    // Only buffers without a baked address need the push block's address array.
-    const auto [pushVar, member] = pushed ? PushBlock(m, base, base == HostPushOffset ? MaxHostBuffers : slots)
-                                          : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
+    // Only buffers without a baked address need the push block's address array (with a draw block,
+    // its address array holds them).
+    const auto [pushVar, member] = pushed && !draw ? PushBlock(m, base, base == HostPushOffset ? MaxHostBuffers : slots)
+                                                   : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
     const std::uint32_t pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
 
     struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; std::uint32_t address; };
@@ -532,7 +611,10 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     for (const auto& b : list) lengthConstants[b.var] = m.Constant(b.length);
     std::map<std::uint32_t, std::uint32_t> slotConstants;
     for (const auto& b : list) slotConstants[b.slot] = m.Constant(b.slot);
-    const std::uint32_t memberConstant = pushed ? m.Constant(member) : 0u;
+    const std::uint32_t memberConstant = pushed && !draw ? m.Constant(member) : 0u;
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> wordConstants;  // slot -> its two words
+    if (draw)
+        for (const auto& b : list) wordConstants[b.slot] = {m.Constant(2u * b.slot), m.Constant(2u * b.slot + 1u)};
 
     std::vector<Inst> out;
     std::map<std::uint32_t, std::uint32_t> current;  // host buffer variable -> this function's pointer
@@ -569,10 +651,16 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
         if (inFunction && needPrologue && op != OpFunction && op != OpLabel && op != 55 /* OpFunctionParameter */ &&
             !(op == OpVariable && inst[3] == StorageClassFunction)) {
             // First instruction after the entry block's variables: load each host buffer's address.
+            const std::uint32_t block = draw ? draw->Pointer(m, out) : 0u;
             for (const auto& b : list) {
                 const std::uint32_t pointer = m.NewId();
                 std::uint32_t value = b.address;
-                if (!value) {
+                if (!value && draw) {
+                    const std::uint32_t lo = draw->Word(m, out, block, wordConstants[b.slot].first);
+                    const std::uint32_t hi = draw->Word(m, out, block, wordConstants[b.slot].second);
+                    value = m.NewId();
+                    out.push_back(Make(OpCompositeConstruct, {uvec2, value, lo, hi}));
+                } else if (!value) {
                     const std::uint32_t chain = m.NewId();
                     value = m.NewId();
                     out.push_back(Make(OpAccessChain, {pushUvec2, chain, pushVar, memberConstant, slotConstants[b.slot]}));
@@ -687,8 +775,31 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
         Module m(Freeze(result->spirv, result->result.specialization));
-        for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i]);
-        HostBuffers(m, buffers, buffer_count);
+        for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr);
+        HostBuffers(m, buffers, buffer_count, nullptr);
+        const auto words = m.Words();
+        Validate(words);
+        *out = new uint32_t[words.size()];
+        std::memcpy(*out, words.data(), words.size() * sizeof(uint32_t));
+        *out_count = static_cast<uint32_t>(words.size());
+        return 0;
+    } catch (const std::exception& e) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
+        return -1;
+    }
+}
+
+SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_remap* remaps, uint32_t remap_count,
+                              const struct sa5_host_buffer* buffers, uint32_t buffer_count, uint32_t draw_block_base,
+                              uint32_t** out, uint32_t* out_count, char* error, size_t error_size)
+{
+    try {
+        if (!result || !out || !out_count) Fail("bad arguments");
+        if (draw_block_base % 8u) Fail("the draw block's address must be 8-byte aligned in the push block");
+        Module m(Freeze(result->spirv, result->result.specialization));
+        const DrawBlock draw(m, draw_block_base);
+        for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw);
+        HostBuffers(m, buffers, buffer_count, &draw);
         const auto words = m.Words();
         Validate(words);
         *out = new uint32_t[words.size()];
