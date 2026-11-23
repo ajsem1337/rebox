@@ -3751,6 +3751,35 @@ static void test_list_queries(void *dev, void *queue)
     }
     CHECK(out && out[0], "a timestamp through list slots 29/30 (EndQuery, ResolveQueryData) -> %llu (%#lx)",
           out ? (unsigned long long)out[0] : 0ull, hr);
+    if (SUCCEEDED(hr) && gpu_identity)
+    {
+        /* Console memory writes (list slots 69/70 bottom of pipe, 88 top, 71 a wait): to GPU memory
+         * they run with the list; anywhere else they are made when recorded. */
+        gpu_alloc_fn galloc = (gpu_alloc_fn)(void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGpuAlloc");
+        static UINT32 cpu_only;
+        UINT32 *mem = NULL;
+        UINT64 va = 0;
+        if (galloc && SUCCEEDED(galloc(64 << 10, 64 << 10, (void **)&mem, &va)))
+        {
+            memset(mem, 0, 16);
+            ID3D12CommandAllocator_Reset(alloc);
+            XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+            XSLOT(list, 69, void, UINT64, UINT32)(list, va, 0x1234);
+            XSLOT(list, 70, void, UINT64, UINT64)(list, va + 8, 0x1122334455667788ull);
+            XSLOT(list, 88, void, UINT64, UINT32)(list, va + 4, 0xabcd);
+            XSLOT(list, 71, void, UINT64, UINT32, UINT64, UINT64, UINT)(list, va, 3, 0x1234, ~0ull, 0);
+            XSLOT(list, 69, void, UINT64, UINT32)(list, (UINT64)(ULONG_PTR)&cpu_only, 77);
+            CHECK(cpu_only == 77, "Write32BitValueBottomOfPipeX outside GPU memory is made when recorded");
+            XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
+            for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
+                Sleep(10);
+            CHECK(mem[0] == 0x1234 && mem[1] == 0xabcd && *(UINT64 *)(mem + 2) == 0x1122334455667788ull,
+                  "console memory writes (list slots 69/70/88) -> %#x %#x %#llx", mem[0], mem[1],
+                  (unsigned long long)*(UINT64 *)(mem + 2));
+        }
+    }
     if (out) ID3D12Resource_Unmap(buf, 0, NULL);
     if (fence)
     {

@@ -2488,6 +2488,66 @@ static void STDMETHODCALLTYPE list_Ignore(struct proxy *p)
 {
 }
 
+/* Console memory writes and waits (xcl, list_x.rs; older layout 69-72 and 88-90, newer two later):
+ * a value written to a GPU address at the bottom or top of the pipe, or a wait on one. A write to
+ * our GPU memory (identity-mapped) is WriteBufferImmediate; anywhere else it is made on the CPU at
+ * once, ahead of the GPU work before it. Waits are not kept yet (logged). */
+static void list_write_values(struct proxy *p, UINT64 address, const UINT32 *values, UINT count,
+        D3D12_WRITEBUFFERIMMEDIATE_MODE mode, const char *what)
+{
+    static LONG logged_cpu;
+    ID3D12Heap *heap;
+    UINT64 offset;
+
+    if (!address)
+        return;
+    if (gpu_memory_heap_at(address, &heap, &offset))
+    {
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2];
+        D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = { mode, mode };
+        ID3D12Heap_Release(heap);
+        for (UINT i = 0; i < count; i++)
+            params[i] = (D3D12_WRITEBUFFERIMMEDIATE_PARAMETER){ address + 4 * i, values[i] };
+        ID3D12GraphicsCommandList2_WriteBufferImmediate(INNER(p, ID3D12GraphicsCommandList2), count, params, modes);
+        return;
+    }
+    if (!IsBadWritePtr((void *)(ULONG_PTR)address, 4 * count))
+        memcpy((void *)(ULONG_PTR)address, values, 4 * count);
+    if (!InterlockedExchange(&logged_cpu, 1))
+        rebox_log("d3d12_xs: %s to %#llx, outside GPU memory: written on the CPU when recorded",
+                  what, (unsigned long long)address);
+}
+
+static void STDMETHODCALLTYPE list_Write32BitValueBottomOfPipeX(struct proxy *p, UINT64 address, UINT32 value)
+{
+    list_write_values(p, address, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
+}
+
+static void STDMETHODCALLTYPE list_Write64BitValueBottomOfPipeX(struct proxy *p, UINT64 address, UINT64 value)
+{
+    UINT32 v[2] = { (UINT32)value, (UINT32)(value >> 32) };
+    list_write_values(p, address, v, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write64BitValueBottomOfPipeX");
+}
+
+static void STDMETHODCALLTYPE list_Write32BitValueTopOfPipeX(struct proxy *p, UINT64 address, UINT32 value)
+{
+    list_write_values(p, address, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write32BitValueTopOfPipeX");
+}
+
+static void STDMETHODCALLTYPE list_Write64BitValueTopOfPipeX(struct proxy *p, UINT64 address, UINT64 value)
+{
+    UINT32 v[2] = { (UINT32)value, (UINT32)(value >> 32) };
+    list_write_values(p, address, v, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write64BitValueTopOfPipeX");
+}
+
+static void STDMETHODCALLTYPE list_WaitBitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: Wait*BitValueX(%#llx, comparison %u, %#llx): GPU memory waits aren't kept yet",
+                  (unsigned long long)address, comparison, (unsigned long long)value);
+}
+
 /* Acceleration structure builds, postbuild info and copies (PC 72-74). Ray tracing isn't translated
  * (state_object.c), so no ray reads them, and building them faulted the GPU: a UE5 sample fills its
  * bottom levels by copies in a mode vkd3d-proton doesn't support (4), and the top-level build then
@@ -2959,6 +3019,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
         FN(67, list_Ignore),                          /* FlushPipelineX */
         FN(68, list_Ignore),                          /* OMSetDepthBoundsX */
+        FN(69, list_Write32BitValueBottomOfPipeX),    /* xcl */
+        FN(70, list_Write64BitValueBottomOfPipeX),
+        FN(71, list_WaitBitValueX),                   /* Wait32BitValueX */
+        FN(72, list_WaitBitValueX),                   /* Wait64BitValueX */
+        FN(88, list_Write32BitValueTopOfPipeX),
+        FN(89, list_Write64BitValueTopOfPipeX),
+        FN(90, list_Write32BitValueBottomOfPipeX),    /* Write32BitValueBottomOfShaderX */
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
         FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
@@ -2987,6 +3054,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(120, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
         FN(121, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
         FN(122, list_SetPipelineState1),              /* PC 75 */
+        FN(71, list_Write32BitValueBottomOfPipeX),    /* the older 69-72 and 88-90, two later (xcl) */
+        FN(72, list_Write64BitValueBottomOfPipeX),
+        FN(73, list_WaitBitValueX),
+        FN(74, list_WaitBitValueX),
+        FN(90, list_Write32BitValueTopOfPipeX),
+        FN(91, list_Write64BitValueTopOfPipeX),
+        FN(92, list_Write32BitValueBottomOfPipeX),
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
