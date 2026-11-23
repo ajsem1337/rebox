@@ -806,11 +806,23 @@ static HRESULT WINAPI factory_CreateStatusArray(struct object *self, UINT32 capa
     return S_OK;
 }
 
-UNNAMED(factory, 6) UNNAMED(factory, 7) UNNAMED(factory, 8) UNNAMED(factory, 9) UNNAMED(factory, 10)
+/* Slot 10 of a newer SDK's factory (IID {62959d11-d45f-4884-a0a3-f7862ea243ae}, xcl): CreateQueue
+ * with a 0x20-byte desc, CreateQueue's 0x18 then a u64 (the target title: 1), for the newer queue
+ * interface ({3c02cb0c-c050-4195-99a1-a1ce94ba33c5}). Without it the title used the null queue. */
+static HRESULT WINAPI factory_CreateQueue1(struct object *self, const DSTORAGE_QUEUE_DESC *desc, REFIID riid, void **out)
+{
+    static LONG logged;
+    if (desc && !InterlockedExchange(&logged, 1))
+        rebox_log("xcrdapi: CreateQueue with the newer 0x20-byte desc (u64 at 0x18: %#llx)",
+                  (unsigned long long)*(const UINT64 *)((const BYTE *)desc + 0x18));
+    return factory_CreateQueue(self, desc, riid, out);
+}
+
+UNNAMED(factory, 6) UNNAMED(factory, 7) UNNAMED(factory, 8) UNNAMED(factory, 9)
 UNNAMED(factory, 11)
 static void *const factory_vtbl[] = {
     object_QueryInterface, object_AddRef, object_Release, factory_CreateQueue, factory_OpenFile,
-    factory_CreateStatusArray, factory_slot6, factory_slot7, factory_slot8, factory_slot9, factory_slot10,
+    factory_CreateStatusArray, factory_slot6, factory_slot7, factory_slot8, factory_slot9, factory_CreateQueue1,
     factory_slot11,
 };
 

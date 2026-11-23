@@ -3310,6 +3310,14 @@ static void test_xcrdapi(void)
          && SUCCEEDED(XSLOT(factory, 5, HRESULT, UINT32, const char *, REFIID, void **)(factory, 4, "test",
                                                                                          &IID_IUnknown, &status));
     CHECK(ok, "DirectStorage factory creates queues, a file and a status array");
+    /* Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc (a u64 after the 0x18). */
+    {
+        struct { UINT64 source_type; UINT16 capacity; INT8 priority; const char *name; UINT64 extra; } d1 = { 1, 128, 0, NULL, 1 };
+        void *q1 = NULL;
+        CHECK(SUCCEEDED(XSLOT(factory, 10, HRESULT, const void *, REFIID, void **)(factory, &d1, &IID_IUnknown, &q1)) && q1,
+              "DirectStorage factory slot 10 creates a queue from the newer 0x20-byte desc");
+        if (q1) XSLOT(q1, 2, ULONG)(q1);
+    }
     if (ok)
     {
         struct req r1 = { 0, plain, 0, sizeof(plain), 0, file, 0, 64 };
