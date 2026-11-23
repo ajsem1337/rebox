@@ -3890,6 +3890,14 @@ static void test_xbox(void)
                     {
                         XSLOT(list4, 114, void, void *)(list4, pipeline);
                         XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                        /* A state object that isn't ours (Unreal 5 passed some): skipped too, not
+                         * handed to vkd3d-proton, which would take it for one of its own. */
+                        {
+                            static void *const no_methods[16];
+                            static struct { void *const *vtbl; BYTE junk[256]; } stranger = { no_methods };
+                            XSLOT(list4, 114, void, void *)(list4, &stranger);
+                            XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                        }
                         /* ... and indirectly (list slot 61 with a rays signature, as Unreal 5 does). */
                         {
                             D3D12_INDIRECT_ARGUMENT_DESC ray_arg = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS };
@@ -3938,7 +3946,7 @@ static void test_xbox(void)
             for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 8; i++)
                 Sleep(10);
             CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence4) == 8,
-                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder pipeline's rays, barriers with nothing to "
+                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder's and a stranger state object's rays, barriers with nothing to "
                   "transition, executed (%#lx)", hr);
             if (list4) XSLOT(list4, 2, ULONG)(list4);
             if (alloc4) ID3D12CommandAllocator_Release(alloc4);

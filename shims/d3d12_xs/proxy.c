@@ -2141,12 +2141,30 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
 
 /* Console methods with nothing to do on the host (cache flushes, depth bounds). */
 /* Ray tracing on a list (0x20004 slots 114 and 115, PC 67 and 68): a placeholder pipeline
- * (state_object.c) never reaches vkd3d-proton, and rays dispatched with one are skipped. */
+ * (state_object.c) never reaches vkd3d-proton, and rays dispatched with one are skipped. Every
+ * state object we hand out is a placeholder, so anything else isn't vkd3d-proton's either: Unreal 5
+ * passed such objects here, which vkd3d-proton's breadcrumbs read as one of its own and crashed on
+ * (a UE5 sample). They're skipped too, and where the object's methods live is logged once. */
 static void STDMETHODCALLTYPE list_SetPipelineState1(struct proxy *p, ID3D12StateObject *state_object)
 {
-    if (!(p->ray_pipeline = state_object && !state_object_is_placeholder(state_object)))
-        return;
-    ID3D12GraphicsCommandList4_SetPipelineState1(INNER(p, ID3D12GraphicsCommandList4), state_object);
+    p->ray_pipeline = FALSE;
+    if (state_object && !state_object_is_placeholder(state_object))
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+        {
+            const void *vtbl = IsBadReadPtr(state_object, sizeof(void *)) ? NULL : *(const void *const *)state_object;
+            HMODULE module = NULL;
+            char name[MAX_PATH] = "?";
+
+            if (vtbl && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, vtbl, &module))
+                GetModuleFileNameA(module, name, sizeof(name));
+            rebox_log("d3d12_xs: SetPipelineState1 with a state object that isn't ours (%p, methods at %p in %s+%#llx); "
+                         "its rays are skipped", (void *)state_object, vtbl, name,
+                         (unsigned long long)((const BYTE *)vtbl - (const BYTE *)module));
+        }
+    }
 }
 
 static void STDMETHODCALLTYPE list_DispatchRays(struct proxy *p, const D3D12_DISPATCH_RAYS_DESC *desc)
