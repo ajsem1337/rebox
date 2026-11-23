@@ -210,6 +210,13 @@ void console_resolve_late(void)
                 done = TRUE;
             }
         }
+        if (!done)
+        {
+            static LONG unresolved;
+            if (t->tries == 0 && InterlockedIncrement(&unresolved) <= 4)
+                rebox_log("d3d12_xs: late T# at %#llx: %08x %08x %08x %08x %08x %08x %08x %08x, no view for it yet",
+                          (unsigned long long)t->source, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
         if (!done && ++t->tries < 8)
             late[kept++] = *t;
     }
@@ -1450,10 +1457,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     null_view = shadow_reserve_null(heap, b.kind == 5, index);
                 /* An empty T# of a graphics stage: maybe one the title writes before it submits. Its
                  * address is the n-th texture slot of the code's tables that is empty now. */
-                if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])
+                if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3])
                         && pending_count < ARRAYSIZE(pending))
                 {
                     UINT64 source = late_source(h, in, zero_textures++);
+                    static LONG noted;
+                    if (InterlockedIncrement(&noted) <= 4)
+                        rebox_log("d3d12_xs: console shader %016llx: empty T# (%08x %08x %08x %08x), noted at %#llx",
+                                  (unsigned long long)stage_id, w[4], w[5], w[6], w[7], (unsigned long long)source);
                     if (source)
                     {
                         pending[pending_count].position = index_count + e;
