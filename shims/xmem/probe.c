@@ -98,8 +98,8 @@ static DWORD WINAPI arm_watches(void *param)
             DWORD old;
             if (w->armed)
                 continue;
+            /* Committed (it may span several regions): VirtualProtect succeeds on the whole range. */
             if (VirtualQuery((void *)w->page_start, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT
-                    && (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize >= w->page_end
                     && VirtualProtect((void *)w->page_start, w->page_end - w->page_start, PAGE_READONLY, &old))
             {
                 w->armed = TRUE;
