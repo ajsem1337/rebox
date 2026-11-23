@@ -22,6 +22,7 @@
 #   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
+#   REBOX_PRESENT_WAIT=1  let vkd3d-proton use VK_KHR_present_wait(2); off by default (see below)
 #   REBOX_DUMP_SHADERS, REBOX_STUB_FATAL, REBOX_LOG: see README
 set -euo pipefail
 
@@ -238,6 +239,14 @@ if [[ ${REBOX_DUMP_FRAMES:-} == /* ]]; then
 fi
 
 export WINEDLLOVERRIDES="$overrides${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+
+# vkd3d-proton waits for every present to reach the screen (vkWaitForPresentKHR, no timeout), and
+# before it rebuilds a swapchain it waits for those waits on the D3D12 queue's own thread. On a
+# Wayland window the compositor isn't showing they never end, and the queue stops for good: a UE5 title's
+# render thread then spun on a fence forever. We pace frames ourselves (d3d12_xs pacing.c).
+if [[ ${REBOX_PRESENT_WAIT:-0} != 1 ]]; then
+    export VKD3D_DISABLE_EXTENSIONS="VK_KHR_present_wait,VK_KHR_present_wait2${VKD3D_DISABLE_EXTENSIONS:+,$VKD3D_DISABLE_EXTENSIONS}"
+fi
 
 # Unified memory (docs/d3d12x.md): GPU VA == CPU address needs the identity
 # layer and, on AMD, a RADV that accepts lower-half device addresses. The

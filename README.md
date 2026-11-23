@@ -128,6 +128,7 @@ method the title asked for that isn't implemented.
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
 | `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
 | `REBOX_VSYNC=N` | `PresentX` sync interval, default 1. Frames the display isn't taking (a hidden Wayland window) are dropped, never waited for |
+| `REBOX_PRESENT_WAIT=1` | Let vkd3d-proton wait for presents to reach the screen (`VK_KHR_present_wait`/`present_wait2`). Off by default: with a window the compositor isn't showing (Wayland) those waits never end and vkd3d-proton stops the D3D12 queue behind them at the next swapchain rebuild |
 | `REBOX_FRAME_PACING=0` | Make `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX` no-ops, so the title runs as fast as `PresentX` allows |
 | `REBOX_DUMP_FRAMES=DIR` | Write presented frames to `DIR/frame_<n>.bmp` (8-bit RGBA/BGRA planes) or `.bin` |
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
