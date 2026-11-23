@@ -348,13 +348,16 @@ static HWND title_window(void)
 }
 
 /* Console planes are 4K and titles size their windows from that, which can be larger than the
- * screen: the compositor then cuts the frame off. The window is fitted to its monitor's work area
- * (the swapchain stretches the plane into it). REBOX_PRESENT_FIT=0 leaves it as it is. */
+ * screen: the compositor then cuts the frame off (and a frame fitted to the work area still
+ * overflowed it with decorations). A window larger than its monitor's work area becomes borderless
+ * and covers the monitor, which Wine's display drivers show fullscreen; the swapchain stretches the
+ * plane into it. REBOX_PRESENT_FIT=0 leaves it as it is. */
 static void fit_to_monitor(HWND hwnd)
 {
     const char *fit = getenv("REBOX_PRESENT_FIT");
     MONITORINFO mi = { sizeof(mi) };
     HMONITOR monitor;
+    LONG_PTR style;
     RECT r;
 
     if ((fit && *fit == '0') || !(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
@@ -362,11 +365,15 @@ static void fit_to_monitor(HWND hwnd)
         return;
     if (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top)
         return;
-    rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; resizing it to %ldx%ld",
-                 r.right - r.left, r.bottom - r.top, mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top);
+    rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; making it borderless "
+                 "over the monitor, %ldx%ld", r.right - r.left, r.bottom - r.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
+    style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
     /* Asynchronous: the window's thread may be the title's, busy in this present. */
-    SetWindowPos(hwnd, NULL, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right - mi.rcWork.left,
-                 mi.rcWork.bottom - mi.rcWork.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 }
 
 static HWND create_window(UINT width, UINT height)
