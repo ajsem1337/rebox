@@ -171,6 +171,41 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
 static SRWLOCK buffers_lock = SRWLOCK_INIT;
 static struct host_buffer { UINT64 hash, gpu; SIZE_T size; const void *cpu; struct host_buffer *next; } *buffers[256];
 
+/* GPU memory for contents that change with every draw or dispatch (guest buffer tables, the
+ * flattened SRT, shader data, image table maps: they hold the title's per-draw constant buffer
+ * addresses and table pointers): a ring, bump-allocated and wrapped. Sharing by content never hit
+ * for those, so each draw allocated GPU memory it never freed, about 10 ms each. The ring is large
+ * enough that a slot is reused long after the GPU read it (frames are far fewer draws than its
+ * DRAW_RING / 256 slots). */
+#define DRAW_RING (128u << 20)
+
+static UINT64 draw_buffer(const void *data, SIZE_T size)
+{
+    static SRWLOCK ring_lock = SRWLOCK_INIT;
+    static BYTE *ring_cpu;
+    static UINT64 ring_gpu, ring_head;
+    SIZE_T aligned = (size + 255) & ~(SIZE_T)255;
+    UINT64 at;
+
+    if (!size || aligned > DRAW_RING)
+        return 0;
+    AcquireSRWLockExclusive(&ring_lock);
+    if (!ring_cpu && FAILED(ReboxGpuAlloc(DRAW_RING, 256, (void **)&ring_cpu, &ring_gpu)))
+        ring_cpu = NULL;
+    if (!ring_cpu)
+    {
+        ReleaseSRWLockExclusive(&ring_lock);
+        return 0;
+    }
+    if (ring_head + aligned > DRAW_RING)
+        ring_head = 0;
+    at = ring_head;
+    ring_head += aligned;
+    memcpy(ring_cpu + at, data, size);
+    ReleaseSRWLockExclusive(&ring_lock);
+    return ring_gpu + at;
+}
+
 /* GPU memory holding these bytes; equal contents share it. */
 static UINT64 host_buffer(const void *data, SIZE_T size)
 {
@@ -550,7 +585,7 @@ static LONG failed_stage_count;
 
 static volatile LONG graphics_calls;
 static volatile LONG64 graphics_ticks, phase_ticks[4]; /* regions, AnyPS5, bindings, module */
-static volatile LONG64 part_ticks[3];                  /* within bindings: identity, descriptor lookups, page table */
+static volatile LONG64 part_ticks[4];                  /* within bindings: identity, lookups, page table, host buffers */
 
 static LONG64 ticks_now(void)
 {
@@ -637,10 +672,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         {
             double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
             rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average (memory "
-                         "regions %.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f], module %.2f); "
+                         "regions %.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers %.2f], "
+                         "module %.2f); "
                          "%ld distinct stages refused so far", n,
                          graphics_ticks * ms, phase_ticks[0] * ms, phase_ticks[1] * ms, phase_ticks[2] * ms,
-                         part_ticks[0] * ms, part_ticks[1] * ms, part_ticks[2] * ms,
+                         part_ticks[0] * ms, part_ticks[1] * ms, part_ticks[2] * ms, part_ticks[3] * ms,
                          phase_ticks[3] * ms, min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
         }
         QueryPerformanceCounter(&started);
@@ -945,7 +981,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                                      f ? f[3] : 0, f ? f[4] : 0, f ? f[5] : 0, f ? f[6] : 0, f ? f[7] : 0);
                 }
             }
-            va = host_buffer(table, (b.count ? b.count : 1) * 16);
+            {
+                LONG64 t = ticks_now();
+                va = draw_buffer(table, (b.count ? b.count : 1) * 16);
+                InterlockedAdd64(&part_ticks[3], ticks_now() - t);
+            }
             free(table);
             if (!va)
             {
@@ -1086,8 +1126,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             case ROLE_IMAGE_TABLE_MAP: /* the image tables' map (ImageTableAbi.hpp), host data like the SRT */
             case ROLE_FLATTENED_SRT:
             case ROLE_SHADER_DATA:
-                va = b.word_count ? host_buffer(b.words, bytes) : zero_buffer(bytes = 16);
+            {
+                LONG64 t = ticks_now();
+                va = b.word_count ? draw_buffer(b.words, bytes) : zero_buffer(bytes = 16);
+                InterlockedAdd64(&part_ticks[3], ticks_now() - t);
                 break;
+            }
             case ROLE_FAULT_BUFFER:
             {
                 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
