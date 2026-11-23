@@ -77,6 +77,8 @@ struct present_queue
 
     ID3D12Resource *convert; /* RGBA8 copy of planes a swapchain can't take */
     UINT convert_w, convert_h;
+    ID3D12Resource *scaled;  /* RGBA8, the window's size, when the plane isn't */
+    UINT scaled_w, scaled_h;
 
     HWND hwnd;
     BOOL own_window;  /* ours, not the title's: ours to close */
@@ -696,6 +698,30 @@ static void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UIN
 }
 
 /* The RGBA8 target planes in other formats are converted into. */
+static BOOL ensure_texture(struct present_queue *s, ID3D12Resource **texture, UINT *tw, UINT *th, UINT width,
+                           UINT height)
+{
+    D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+                                 DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+
+    if (*texture && *tw == width && *th == height)
+        return TRUE;
+    if (*texture)
+    {
+        wait_idle(s);
+        ID3D12Resource_Release(*texture);
+        *texture = NULL;
+    }
+    if (FAILED(ID3D12Device_CreateCommittedResource(s->device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)texture)))
+        return FALSE;
+    *tw = width;
+    *th = height;
+    return TRUE;
+}
+
 static BOOL ensure_convert(struct present_queue *s, UINT width, UINT height)
 {
     D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
@@ -740,7 +766,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     D3D12_RESOURCE_DESC desc;
     DXGI_FORMAT format;
     UINT kind = TRACK_LEGACY, from = D3D12_RESOURCE_STATE_COMMON;
-    BOOL show, dump, convert;
+    BOOL show, dump, convert, scale = FALSE;
+    UINT out_w, out_h;
     UINT64 frame, total = 0;
     unsigned r;
     static LONG logged;
@@ -808,7 +835,28 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
     lookup(plane, &kind, &from);
 
-    show = ensure_swapchain(s, (UINT)desc.Width, desc.Height, format) && frame_slot_free(s);
+    /* The window's client size, when it differs from the plane's: vkd3d-proton's swapchain shows a
+     * 4K plane unscaled in a smaller window (a quarter of it in a 1920x1080 tile), so the plane is
+     * blitted to the window's size and the swapchain made that size. Dumps stay plane-sized. */
+    out_w = (UINT)desc.Width;
+    out_h = desc.Height;
+    {
+        RECT rc;
+        if (s->hwnd && env_int("REBOX_PRESENT_SCALE", 1) && GetClientRect(s->hwnd, &rc)
+                && rc.right - rc.left >= 64 && rc.bottom - rc.top >= 64
+                && ((UINT)(rc.right - rc.left) != out_w || (UINT)(rc.bottom - rc.top) != out_h))
+        {
+            out_w = rc.right - rc.left;
+            out_h = rc.bottom - rc.top;
+            scale = ensure_texture(s, &s->scaled, &s->scaled_w, &s->scaled_h, out_w, out_h);
+            /* The scaling blit reads our RGBA8 copy, which the convert path makes and transitions. */
+            if (scale && !convert && !(convert = ensure_convert(s, (UINT)desc.Width, desc.Height)))
+                scale = FALSE;
+            if (!scale)
+                out_w = (UINT)desc.Width, out_h = desc.Height;
+        }
+    }
+    show = ensure_swapchain(s, out_w, out_h, scale ? DXGI_FORMAT_R8G8B8A8_UNORM : format) && frame_slot_free(s);
     dump = dump_wanted(frame);
     if (!show && !dump)
         return S_OK;
@@ -836,7 +884,21 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
                                                     &IID_ID3D12Resource, (void **)&back)))
     {
         barrier(s->ring[r].list, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-        ID3D12GraphicsCommandList_CopyResource(s->ring[r].list, back, src);
+        if (scale)
+        {
+            if (src == s->convert)
+                barrier(s->ring[r].list, src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ReboxBlit(s->ring[r].list, src, (UINT)desc.Width, desc.Height, s->scaled, out_w, out_h);
+            if (src == s->convert)
+                barrier(s->ring[r].list, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(s->ring[r].list, s->scaled, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            ID3D12GraphicsCommandList_CopyResource(s->ring[r].list, back, s->scaled);
+            barrier(s->ring[r].list, s->scaled, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else
+            ID3D12GraphicsCommandList_CopyResource(s->ring[r].list, back, src);
         barrier(s->ring[r].list, back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     }
     if (dump)
@@ -902,6 +964,8 @@ void present_queue_destroy(struct present_queue *s)
         CloseHandle(s->latency);
     if (s->convert)
         ID3D12Resource_Release(s->convert);
+    if (s->scaled)
+        ID3D12Resource_Release(s->scaled);
     if (s->hwnd && s->own_window)
         PostMessageW(s->hwnd, WM_QUIT, 0, 0);
     for (int i = 0; i < RING; i++)

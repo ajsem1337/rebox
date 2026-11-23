@@ -137,6 +137,7 @@ method the title asked for that isn't implemented.
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
 | `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
 | `REBOX_VSYNC=N` | `PresentX` sync interval, default 1. Frames the display isn't taking (a hidden Wayland window) are dropped, never waited for |
+| `REBOX_PRESENT_SCALE=0` | Present the plane at its own size. By default a plane that isn't the window's size (4K in a 1920x1080 tile) is scaled to it with a blit, since vkd3d-proton's swapchain showed it unscaled (a quarter of it); the swapchain is the window's size, frame dumps stay the plane's |
 | `REBOX_PRESENT_FIT=1` | Make a presentation window larger than its monitor's work area (titles size theirs from the 4K plane) borderless over the monitor, which Wine shows fullscreen. `REBOX_PRESENT_FIT=WxH` gives it that size instead. Off by default: the window stays as the title made it, a tiling compositor sizes it anyway, and the plane is stretched into it. The log gives the window and monitor sizes and the DPIs Wine reports |
 | `REBOX_PRESENT_WAIT=1` | Let vkd3d-proton wait for presents to reach the screen (`VK_KHR_present_wait`/`present_wait2`). Off by default: with a window the compositor isn't showing (Wayland) those waits never end and vkd3d-proton stops the D3D12 queue behind them at the next swapchain rebuild |
 | `REBOX_CONSOLE_GRAPHICS=0` | Don't defer console vertex and pixel shaders to draw time (AnyPS5, vkd3d-proton patch 0006); their PSOs keep the fallback shaders, which draw nothing |
