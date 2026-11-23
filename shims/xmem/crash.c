@@ -46,7 +46,15 @@ static const char *code_name(DWORD code)
     case EXCEPTION_PRIV_INSTRUCTION: return "privileged instruction";
     case EXCEPTION_INT_DIVIDE_BY_ZERO: return "integer divide by zero";
     case EXCEPTION_STACK_OVERFLOW: return "stack overflow";
-    default: return NULL;
+    case EXCEPTION_BREAKPOINT: return "breakpoint (an assertion?)";
+    case 0xc0000409: return "fail-fast (__fastfail or a stack buffer overrun)";
+    case 0xc0000420: return "assertion failure";
+    case 0xc0000374: return "heap corruption";
+    case 0xe06d7363: return "C++ exception";
+    default:
+        /* Any other error-severity code: a title that writes a minidump and exits on its own says
+         * nothing else about why (the target title, after its first placeholder reservation). */
+        return (code & 0xf0000000) == 0xc0000000 ? "exception" : NULL;
     }
 }
 
@@ -134,6 +142,11 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
     describe(c->Rip, where, sizeof(where));
     rebox_log("xmem: first-chance %s (%#lx) at %s, thread %#lx", name, rec->ExceptionCode, where,
                  GetCurrentThreadId());
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters)
+        rebox_log("  parameters: %#llx %#llx %#llx %#llx", (unsigned long long)rec->ExceptionInformation[0],
+                  (unsigned long long)(rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0),
+                  (unsigned long long)(rec->NumberParameters > 2 ? rec->ExceptionInformation[2] : 0),
+                  (unsigned long long)(rec->NumberParameters > 3 ? rec->ExceptionInformation[3] : 0));
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
     {
         ULONG_PTR target = rec->ExceptionInformation[1];
