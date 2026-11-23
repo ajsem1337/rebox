@@ -1610,6 +1610,92 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, 
     return hr;
 }
 
+/* Deferred PSO destruction. On the console a PSO's shaders are the title's memory, so a title
+ * releases PSOs that work in flight still uses; on the desktop that frees the Vulkan pipeline
+ * under the GPU (the target title lost the device fetching a freed pipeline's code). Each PSO
+ * made here keeps a reference of ours, marked by private data; when the title's last reference
+ * goes (Release, patched in vkd3d-proton's PSO class, returns our 1), the PSO is queued and
+ * released PSO_KEEP_FRAMES presents later. */
+#define PSO_KEEP_FRAMES 8
+
+static const GUID pso_kept_guid = { 0x53435247, 0x0002, 0x4000, { 0x80, 0x00, 0x6b, 0x65, 0x65, 0x70, 0x70, 0x73 } };
+static ULONG (STDMETHODCALLTYPE *pso_orig_release)(ID3D12PipelineState *);
+static SRWLOCK pso_lock = SRWLOCK_INIT;
+static struct { ID3D12PipelineState *pso; LONG64 frame; } *pso_queue;
+static size_t pso_queue_count, pso_queue_cap;
+static volatile LONG64 frames_presented;
+
+static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *pso)
+{
+    ULONG refs = pso_orig_release(pso);
+    UINT size = 0;
+
+    if (refs != 1 || FAILED(ID3D12PipelineState_GetPrivateData(pso, &pso_kept_guid, &size, NULL)))
+        return refs;
+    ID3D12PipelineState_SetPrivateData(pso, &pso_kept_guid, 0, NULL);
+    AcquireSRWLockExclusive(&pso_lock);
+    if (pso_queue_count == pso_queue_cap)
+    {
+        size_t cap = pso_queue_cap ? pso_queue_cap * 2 : 256;
+        void *grown = realloc(pso_queue, cap * sizeof(*pso_queue));
+        if (grown)
+            pso_queue = grown, pso_queue_cap = cap;
+    }
+    if (pso_queue_count < pso_queue_cap)
+    {
+        pso_queue[pso_queue_count].pso = pso;
+        pso_queue[pso_queue_count++].frame = frames_presented;
+        pso = NULL;
+    }
+    ReleaseSRWLockExclusive(&pso_lock);
+    if (pso) /* no room: released now */
+        pso_orig_release(pso);
+    return 0;
+}
+
+/* A PSO for the title: our reference, and Release patched (once; vkd3d-proton's PSOs share a vtable). */
+static void pso_keep(void *object)
+{
+    static const BYTE mark = 1;
+    ID3D12PipelineState *pso = object;
+    void **vtbl;
+    DWORD old;
+
+    if (!pso)
+        return;
+    vtbl = *(void ***)pso;
+    AcquireSRWLockExclusive(&pso_lock);
+    if (vtbl[2] != (void *)pso_Release)
+    {
+        pso_orig_release = vtbl[2];
+        VirtualProtect(&vtbl[2], sizeof(void *), PAGE_READWRITE, &old);
+        vtbl[2] = (void *)pso_Release;
+        VirtualProtect(&vtbl[2], sizeof(void *), old, &old);
+    }
+    ReleaseSRWLockExclusive(&pso_lock);
+    if (SUCCEEDED(ID3D12PipelineState_SetPrivateData(pso, &pso_kept_guid, sizeof(mark), &mark)))
+        ID3D12PipelineState_AddRef(pso);
+}
+
+/* At each present: the PSOs whose time is up. */
+static void pso_release_due(void)
+{
+    LONG64 now = InterlockedIncrement64(&frames_presented);
+    ID3D12PipelineState *due[64];
+    size_t n = 0, kept = 0;
+
+    AcquireSRWLockExclusive(&pso_lock);
+    for (size_t i = 0; i < pso_queue_count; i++)
+        if (n < ARRAYSIZE(due) && pso_queue[i].frame + PSO_KEEP_FRAMES <= now)
+            due[n++] = pso_queue[i].pso;
+        else
+            pso_queue[kept++] = pso_queue[i];
+    pso_queue_count = kept;
+    ReleaseSRWLockExclusive(&pso_lock);
+    for (size_t i = 0; i < n; i++)
+        pso_orig_release(due[i]);
+}
+
 /* PSO creation (slots 10, 11): forwarded; the first PSO patches the PSO
  * class's GetDevice. */
 static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy *p,
@@ -1628,6 +1714,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy
     if (SUCCEEDED(hr) && out)
     {
         patch_child(*out);
+        pso_keep(*out);
         derived_pso_record(*out, desc);
     }
     return hr;
@@ -1638,7 +1725,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(struct proxy 
 {
     HRESULT hr = ID3D12Device_CreateComputePipelineState(INNER(p, ID3D12Device), desc, riid, out);
     if (SUCCEEDED(hr) && out)
+    {
         patch_child(*out);
+        pso_keep(*out);
+    }
     return hr;
 }
 
@@ -1857,7 +1947,10 @@ static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, con
     ID3D12Device2_Release(device2);
     free(copy);
     if (SUCCEEDED(hr) && out && *out)
+    {
         patch_child(*out);
+        pso_keep(*out);
+    }
     else if (FAILED(hr) && desc && desc->pPipelineStateSubobjectStream)
     {
         static LONG logged;
@@ -3131,6 +3224,7 @@ void proxy_frame_presented(void)
     static LONG64 frames;
     int interval = slot_stats_interval();
 
+    pso_release_due();
     if (interval && !(InterlockedIncrement64(&frames) % interval))
         proxy_log_slot_stats();
 }

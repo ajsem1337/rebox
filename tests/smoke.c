@@ -2435,7 +2435,17 @@ done:
     if (list) XSLOT(list, 2, ULONG)(list);
     if (alloc) ID3D12CommandAllocator_Release(alloc);
     if (buf) ID3D12Resource_Release(buf);
-    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (pso)
+    {
+        /* The title's last Release says 0, but the PSO lives on for a few presents (work in
+         * flight may still use it, as on the console). */
+        ULONG refs = XSLOT(pso, 2, ULONG)(pso);
+        static const GUID probe = { 0x1234, 0x5678, 0x9abc, { 1, 2, 3, 4, 5, 6, 7, 8 } };
+        UINT size = 0;
+        HRESULT alive = refs ? E_FAIL : XSLOT(pso, 3, HRESULT, REFGUID, UINT *, void *)(pso, &probe, &size, NULL);
+        CHECK(!refs && alive == DXGI_ERROR_NOT_FOUND,
+              "a PSO's last Release returns 0 and it is kept for later presents (%lu, %#lx)", refs, alive);
+    }
     if (rs) XSLOT(rs, 2, ULONG)(rs);
     if (blob) ID3D10Blob_Release(blob);
     if (heap) XSLOT(heap, 2, ULONG)(heap);
