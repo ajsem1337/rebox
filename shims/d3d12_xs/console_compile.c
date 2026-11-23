@@ -836,6 +836,17 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     {
         struct sa5_binding b;
         sa5.binding(result, i, &b);
+        if (graphics)
+        {
+            /* The first graphics stages' bindings: which roles and kinds their resources come as. */
+            static LONG shown[2];
+            if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 32)
+                rebox_log("d3d12_xs: console %s shader %016llx binding %u: role %u kind %u set %u binding %u, "
+                             "%u elements, %u words%s %08x %08x %08x %08x", h->stage == 0x10 ? "pixel" : "vertex",
+                             (unsigned long long)stage_id, i, b.role, b.kind, b.set, b.binding, b.count, b.word_count,
+                             b.word_count ? ":" : "", b.word_count > 0 ? b.words[0] : 0, b.word_count > 1 ? b.words[1] : 0,
+                             b.word_count > 2 ? b.words[2] : 0, b.word_count > 3 ? b.words[3] : 0);
+        }
         if (b.role == 0 && b.kind == 1)
         {
             /* Guest storage buffers (every V#, constant buffers included) are reached through their
