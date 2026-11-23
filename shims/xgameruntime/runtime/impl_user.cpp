@@ -218,6 +218,7 @@ struct AssociationRegistration {
 struct AssociationDelivery {
   task::Queue* queue;
   uint64_t token;
+  bool reconnect;  // the gamepad leaves the user first, then comes back
 };
 std::map<uint64_t, AssociationRegistration> g_associations;
 SRWLOCK g_associations_lock = SRWLOCK_INIT;
@@ -238,6 +239,13 @@ void CALLBACK deliver_device_association(void* p, bool canceled) {
     DeviceAssociationChange change{};
     static const uint8_t id[] = {'s', 'c', 'a', 'r', 'l', 'e', 't', 't', 1};
     std::memcpy(change.deviceId.value, id, sizeof(id));
+    if (d->reconnect) {
+      change.oldUser.value = the_user()->localId;
+      change.newUser.value = 0;
+      gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XUserRegisterForDeviceAssociationChanged", nullptr,
+                      "the gamepad leaves the local user (callback %llu)", static_cast<unsigned long long>(d->token));
+      r.callback(r.context, &change);
+    }
     change.oldUser.value = 0;
     change.newUser.value = the_user()->localId;
     gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XUserRegisterForDeviceAssociationChanged", nullptr,
@@ -250,10 +258,10 @@ void CALLBACK deliver_device_association(void* p, bool canceled) {
 }
 
 // Queue the association for one registration (the caller holds no lock).
-void queue_association(uint64_t token, task::Queue* queue) {
+void queue_association(uint64_t token, task::Queue* queue, bool reconnect = false) {
   task::Queue* target = nullptr;
   if (FAILED(task::Duplicate(queue, &target))) return;
-  auto* d = new AssociationDelivery{target, token};
+  auto* d = new AssociationDelivery{target, token, reconnect};
   if (FAILED(task::Submit(target, task::PortId::Completion, d, deliver_device_association))) {
     task::Close(target);
     delete d;
@@ -261,21 +269,23 @@ void queue_association(uint64_t token, task::Queue* queue) {
 }
 
 // The title has the user: every registered callback hears of the gamepad, once.
-void associate_all() {
+// reconnect: the gamepad leaves the user first, then comes back (each callback gets both, in order, in one call).
+void associate_all(bool reconnect = false) {
   std::vector<std::pair<uint64_t, task::Queue*>> due;
   AcquireSRWLockShared(&g_associations_lock);
   for (auto& [token, r] : g_associations) due.emplace_back(token, r.queue);
   ReleaseSRWLockShared(&g_associations_lock);
-  for (auto& [token, queue] : due) queue_association(token, queue);
+  for (auto& [token, queue] : due) queue_association(token, queue, reconnect);
 }
 
-// XGR_REASSOCIATE_SECONDS=N (diagnostic): the association again every N seconds, for a screen
-// that only counts controllers that connect while it is open.
+// XGR_REASSOCIATE_SECONDS=N (diagnostic): the gamepad reconnects every N seconds (it leaves the
+// user, then comes back), for a screen that only counts controllers that connect while it is
+// open; the same association again changes nothing, so a title may ignore it.
 DWORD WINAPI reassociate(void* param) {
   DWORD ms = static_cast<DWORD>(reinterpret_cast<uintptr_t>(param)) * 1000;
   for (;;) {
     Sleep(ms);
-    associate_all();
+    associate_all(true);
   }
 }
 

@@ -33,7 +33,7 @@ Local changes for mingw, each marked "rebox local change" in the file:
 | Family | Answer |
 |---|---|
 | XTaskQueue, XAsync, XThread | Complete (GrandTheftXbox's layer) |
-| XUser | One offline local user, always signed in (`XGR_GAMERTAG`, `XGR_USER_ID`), every privilege granted. The gamepad is associated with it once the title has it (`XGR_REASSOCIATE_SECONDS=N` repeats that every N seconds, a diagnostic). Tokens fail with `E_GAMEUSER_FAILED_TO_GET_TOKEN`, so nothing reaches Xbox Live |
+| XUser | One offline local user, always signed in (`XGR_GAMERTAG`, `XGR_USER_ID`), every privilege granted. The gamepad is associated with it once the title has it (`XGR_REASSOCIATE_SECONDS=N` reconnects it every N seconds, leaving the user and coming back: a diagnostic). Tokens fail with `E_GAMEUSER_FAILED_TO_GET_TOKEN`, so nothing reaches Xbox Live |
 | XGameSave, XGameSaveFiles | Local storage under `%LOCALAPPDATA%\xgr\saves` in the prefix (`XGR_SAVE_ROOT`); each container is replaced atomically, nothing syncs |
 | XPersistentLocalStorage | A directory with the quota from `MicrosoftGame.Config` (2048 MB for the target title). `rebox-run` puts it in the prefix (`XGR_PLS_DIR`) |
 | XPackage | The title is one fully installed package: identity from `MicrosoftGame.Config`, every chunk Ready, install monitors complete |
