@@ -507,6 +507,16 @@ static void log_failure(const struct rebox_deferred_shader *h, const char *what,
 static UINT64 failed_stages[256];
 static LONG failed_stage_count;
 
+static volatile LONG graphics_calls;
+static volatile LONG64 graphics_ticks;
+
+static double qpc_frequency(void)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (double)f.QuadPart;
+}
+
 static BOOL stage_failed(UINT64 id)
 {
     LONG n = min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages));
@@ -540,6 +550,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
     BOOL graphics;
     UINT64 stage_id;
+    LARGE_INTEGER started = { 0 };
 
     if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC
             || (h->version != 1 && h->version != 2)
@@ -554,12 +565,14 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                                      (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
     if (graphics)
     {
-        /* Counts for the log, at powers of two: draws' stages compiled (or cached), failed, skipped. */
-        static LONG calls;
-        LONG n = InterlockedIncrement(&calls);
+        /* Counts for the log, at powers of two: stage compiles asked for, the time they took (the
+         * draw waits for them), and stages AnyPS5 refused. */
+        LONG n = InterlockedIncrement(&graphics_calls);
         if (!(n & (n - 1)))
-            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for (%ld %s stages refused so far)", n,
-                         min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)), "distinct");
+            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average; %ld "
+                         "distinct stages refused so far", n, graphics_ticks * 1000.0 / qpc_frequency() / max(n - 1, 1),
+                         min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
+        QueryPerformanceCounter(&started);
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
@@ -990,6 +1003,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
 done:
     ReleaseSRWLockExclusive(&compile_lock);
+    if (graphics && started.QuadPart)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        InterlockedAdd64(&graphics_ticks, now.QuadPart - started.QuadPart);
+    }
     if (words)
     {
         void (*free_words)(UINT32 *) = (void *)GetProcAddress(GetModuleHandleA("rebox_anyps5.dll"), "sa5_free_words");
