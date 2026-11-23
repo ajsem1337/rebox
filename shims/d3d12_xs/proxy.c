@@ -1292,9 +1292,50 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
 
 /* SignalX(fence, value, flush flags): Signal; the flags (cache flushes before the signal, e.g.
  * 0x8000000 from Unreal) have nothing to do here, the queue is already ordered. */
+/* The last value each fence was told to reach, for ReboxHangReport: a fence whose GPU value
+ * lags it is work the GPU never finished; one that matches it, with the title still waiting, is a
+ * signal the title expected from something we don't do. */
+static struct
+{
+    ID3D12Fence *fence;
+    UINT64 value;
+    LONG64 signals;
+} signalled[64];
+static SRWLOCK signalled_lock = SRWLOCK_INIT;
+
+static void note_signal(ID3D12Fence *fence, UINT64 value)
+{
+    AcquireSRWLockExclusive(&signalled_lock);
+    for (unsigned i = 0; i < ARRAYSIZE(signalled); i++)
+        if (signalled[i].fence == fence || !signalled[i].fence)
+        {
+            signalled[i].fence = fence;
+            signalled[i].value = value;
+            signalled[i].signals++;
+            break;
+        }
+    ReleaseSRWLockExclusive(&signalled_lock);
+}
+
 static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
 {
+    note_signal(proxy_unwrap(fence), value);
     return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
+}
+
+/* xmem's hang watchdog calls this after the thread stacks (crash.c). */
+void WINAPI ReboxHangReport(void)
+{
+    AcquireSRWLockShared(&signalled_lock);
+    for (unsigned i = 0; i < ARRAYSIZE(signalled) && signalled[i].fence; i++)
+    {
+        UINT64 done = ID3D12Fence_GetCompletedValue(signalled[i].fence);
+        rebox_log("d3d12_xs: fence %p: signalled to %llu (%lld signals), GPU at %llu%s", (void *)signalled[i].fence,
+                     (unsigned long long)signalled[i].value, (long long)signalled[i].signals, (unsigned long long)done,
+                     done < signalled[i].value ? " (behind)" : "");
+    }
+    ReleaseSRWLockShared(&signalled_lock);
+    proxy_log_slot_stats();
 }
 
 /* GetDesc, in either argument order (see resource_GetDesc). */

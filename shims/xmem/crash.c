@@ -202,6 +202,13 @@ static void dump_threads(DWORD seconds)
         if (te.th32OwnerProcessID == pid && te.th32ThreadID != self)
             log_thread(te.th32ThreadID);
     CloseHandle(snap);
+    {
+        /* d3d12_xs's fences and slot counts (proxy.c), when it is loaded. */
+        HMODULE d3d12 = GetModuleHandleA("d3d12_xs.dll");
+        void (WINAPI *report)(void) = d3d12 ? (void *)GetProcAddress(d3d12, "ReboxHangReport") : NULL;
+        if (report)
+            report();
+    }
     rebox_log("xmem: end of thread stacks");
 }
 

@@ -2629,6 +2629,18 @@ static void test_list_queries(void *dev, void *queue)
     CHECK(out && out[0], "a timestamp through list slots 29/30 (EndQuery, ResolveQueryData) -> %llu (%#lx)",
           out ? (unsigned long long)out[0] : 0ull, hr);
     if (out) ID3D12Resource_Unmap(buf, 0, NULL);
+    if (fence)
+    {
+        /* SignalX (queue slot 23) is recorded for the hang report. */
+        void (WINAPI *report)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxHangReport");
+        hr = XSLOT(queue, 23, HRESULT, ID3D12Fence *, UINT64, UINT)(queue, fence, 7, 0);
+        for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 7; i++)
+            Sleep(10);
+        CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence) == 7 && report,
+              "SignalX (queue slot 23) signals, and ReboxHangReport is exported %#lx", hr);
+        if (report)
+            report();
+    }
     if (list) XSLOT(list, 2, ULONG)(list);
     if (fence) ID3D12Fence_Release(fence);
     if (alloc) ID3D12CommandAllocator_Release(alloc);
