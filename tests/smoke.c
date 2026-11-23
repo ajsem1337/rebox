@@ -4033,6 +4033,29 @@ static void test_xbox(void)
                     {
                         XSLOT(list4, 114, void, void *)(list4, pipeline);
                         XSLOT(list4, 115, void, const D3D12_DISPATCH_RAYS_DESC *)(list4, &rays);
+                        /* ... and indirectly (list slot 61 with a rays signature, as Unreal 5 does). */
+                        {
+                            D3D12_INDIRECT_ARGUMENT_DESC ray_arg = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS };
+                            D3D12_COMMAND_SIGNATURE_DESC ray_sig_desc = { sizeof(D3D12_DISPATCH_RAYS_DESC), 1, &ray_arg, 0 };
+                            void *ray_sig = NULL;
+                            ID3D12Resource *args = NULL;
+                            D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD };
+                            D3D12_RESOURCE_DESC ad = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                                                       { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+                            XSLOT(dev, 41, HRESULT, const D3D12_COMMAND_SIGNATURE_DESC *, void *, REFIID, void **)(dev,
+                                    &ray_sig_desc, NULL, &IID_ID3D12CommandSignature, &ray_sig);
+                            XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                                  D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up,
+                                  D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+                                  (void **)&args);
+                            if (ray_sig && args)
+                                XSLOT(list4, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list4, ray_sig, 1, args,
+                                        0, NULL, 0);
+                            else
+                                printf("skip indirect rays (signature %p, arguments %p)\n", ray_sig, (void *)args);
+                            if (args) ID3D12Resource_Release(args);
+                            if (ray_sig) IUnknown_Release((IUnknown *)ray_sig);
+                        }
                         XSLOT(pipeline, 2, ULONG)(pipeline);
                     }
                 }

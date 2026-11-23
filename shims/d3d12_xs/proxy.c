@@ -74,7 +74,7 @@ struct proxy
     struct present_queue *present; /* queues that have presented */
     ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
     UINT heap_count;
-    BOOL placeholder_pipeline; /* lists: the ray tracing pipeline set is a placeholder (state_object.c) */
+    BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -912,6 +912,19 @@ static SRWLOCK signatures_lock = SRWLOCK_INIT;
 static void **signatures;
 static UINT signature_count, signature_capacity;
 
+/* Signatures that dispatch rays: ExecuteIndirect skips them while a placeholder ray tracing
+ * pipeline is set (vkd3d-proton would read a pipeline it was never given). */
+static void *ray_signatures[64];
+static LONG ray_signature_count;
+
+static BOOL is_ray_signature(void *object)
+{
+    for (LONG i = 0; i < ray_signature_count && i < (LONG)ARRAYSIZE(ray_signatures); i++)
+        if (ray_signatures[i] == object)
+            return TRUE;
+    return FALSE;
+}
+
 static BOOL is_command_signature(void *object)
 {
     BOOL found = FALSE;
@@ -1022,6 +1035,13 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
         }
         if (signature_count < signature_capacity)
             signatures[signature_count++] = *out;
+        for (UINT i = 0; desc && desc->pArgumentDescs && i < desc->NumArgumentDescs; i++)
+            if (desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS
+                    && ray_signature_count < (LONG)ARRAYSIZE(ray_signatures))
+            {
+                ray_signatures[ray_signature_count++] = *out;
+                break;
+            }
         ReleaseSRWLockExclusive(&signatures_lock);
     }
     return hr;
@@ -1037,6 +1057,13 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
 
     if (a && is_command_signature(a))
     {
+        if (!p->ray_pipeline && is_ray_signature(a))
+        {
+            static LONG skipped;
+            if (!InterlockedExchange(&skipped, 1))
+                rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
+            return;
+        }
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
@@ -2076,18 +2103,18 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
  * (state_object.c) never reaches vkd3d-proton, and rays dispatched with one are skipped. */
 static void STDMETHODCALLTYPE list_SetPipelineState1(struct proxy *p, ID3D12StateObject *state_object)
 {
-    if ((p->placeholder_pipeline = state_object_is_placeholder(state_object)))
+    if (!(p->ray_pipeline = state_object && !state_object_is_placeholder(state_object)))
         return;
     ID3D12GraphicsCommandList4_SetPipelineState1(INNER(p, ID3D12GraphicsCommandList4), state_object);
 }
 
 static void STDMETHODCALLTYPE list_DispatchRays(struct proxy *p, const D3D12_DISPATCH_RAYS_DESC *desc)
 {
-    if (p->placeholder_pipeline)
+    if (!p->ray_pipeline)
     {
         static LONG logged;
         if (!InterlockedExchange(&logged, 1))
-            rebox_log("d3d12_xs: DispatchRays with a placeholder pipeline: skipped (console ray tracing isn't translated)");
+            rebox_log("d3d12_xs: DispatchRays without a real ray tracing pipeline: skipped (console ray tracing isn't translated)");
         return;
     }
     ID3D12GraphicsCommandList4_DispatchRays(INNER(p, ID3D12GraphicsCommandList4), desc);
@@ -2102,6 +2129,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     struct embedded **e, *keep = NULL, *drop = NULL;
 
     p->resets++;
+    p->ray_pipeline = FALSE;
     while (p->active)
     {
         struct embedded *a = p->active;
