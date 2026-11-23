@@ -1,0 +1,26 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index e4c3be2..2b61834 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8329,6 +8329,11 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
+         WARN("rebox: console shader compile failed, hr %#x; skipping the dispatch.\n", hr);
+         return VK_NULL_HANDLE;
+     }
++    /* Breadcrumbs (VKD3D_CONFIG=breadcrumbs) name the console shader a lost device was running:
++     * d3d12_xs logs each variant's key with its code hash. */
++    VKD3D_BREADCRUMB_TAG("rebox console compute [key0, key1]");
++    VKD3D_BREADCRUMB_AUX64(out.key[0]);
++    VKD3D_BREADCRUMB_AUX64(out.key[1]);
+     memset(list->rebox.push, 0, sizeof(list->rebox.push));
+     memcpy(list->rebox.push, out.push, sizeof(out.push));
+     return d3d12_pipeline_state_rebox_variant(state, &out);
+@@ -8401,6 +8406,9 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_com
+     memset(&ps, 0, sizeof(ps));
+     if (FAILED(hr = compile(&in, &ps)))
+         return VK_NULL_HANDLE;
++    VKD3D_BREADCRUMB_TAG("rebox console graphics [vs key0, ps key0]");
++    VKD3D_BREADCRUMB_AUX64(vs.key[0]);
++    VKD3D_BREADCRUMB_AUX64(ps.key[0]);
+     memcpy(&list->rebox.push[0], vs.push, 128);
+     memcpy(&list->rebox.push[32], ps.push, 128);
+     return d3d12_pipeline_state_rebox_graphics_variant(state, &list->dynamic_state, list->dsv.format, &vs, &ps,

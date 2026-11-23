@@ -1497,9 +1497,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 fclose(f);
             }
         }
+        /* The key is what vkd3d-proton's breadcrumbs record before the dispatch or draw (patch 0008). */
         rebox_log("d3d12_xs: console shader %016llx: compiled a variant (%u SPIR-V words, %u guest bindings, "
-                     "%u host buffers)", (unsigned long long)hash_bytes(0xcbf29ce484222325ull, req.code,
-                     req.code_dwords * 4u), module->count, remap_count, host_count);
+                     "%u host buffers; key %016llx)", (unsigned long long)hash_bytes(0xcbf29ce484222325ull, req.code,
+                     req.code_dwords * 4u), module->count, remap_count, host_count, (unsigned long long)key[0]);
     }
 
     if (graphics)

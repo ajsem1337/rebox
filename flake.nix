@@ -160,7 +160,9 @@
             # -static links winpthreads (vkd3d-proton uses pthreads on Windows
             # too); cross gcc ignores LIBRARY_PATH, so pass it to meson.
             pthreads=${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib
-            meson setup build --cross-file build-win64.txt --buildtype release --prefix $out \
+            # enable_trace: breadcrumbs (VKD3D_CONFIG=breadcrumbs) name the commands a lost device was
+            # running; trace messages stay off unless WINEDEBUG asks for them.
+            meson setup build --cross-file build-win64.txt --buildtype release --prefix $out -Denable_trace=true \
               -Dc_link_args=-L$pthreads -Dcpp_link_args=-L$pthreads
           '';
           buildPhase = "ninja -C build -j$NIX_BUILD_CORES";
