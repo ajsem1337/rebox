@@ -521,6 +521,8 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
      * graphics PSO from a stream (a UE5 sample), so without this none drew. */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC console = { 0 };
     BOOL other_stages = FALSE;
+    const D3D12_BLEND_DESC *blend = NULL;
+    const D3D12_RT_FORMAT_ARRAY *rt_formats = NULL;
     BYTE *stream;
     HRESULT hr;
 
@@ -577,6 +579,10 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
             stream_output = offset + subobj_layouts[type].offset;
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO)
             cached_pso = offset + subobj_layouts[type].offset;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND)
+            blend = (const D3D12_BLEND_DESC *)(stream + offset + subobj_layouts[type].offset);
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS)
+            rt_formats = (const D3D12_RT_FORMAT_ARRAY *)(stream + offset + subobj_layouts[type].offset);
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
             console.InputLayout = *(const D3D12_INPUT_LAYOUT_DESC *)(stream + offset + subobj_layouts[type].offset);
         offset += subobj_layouts[type].size;
@@ -599,7 +605,21 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         hr = orig_create_pipeline(device, &copy, riid, pso);
     }
     if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages)
+    {
+        /* The first console graphics streams' blending and targets, to check that state reaches the
+         * pipelines console draws get. */
+        static LONG shown;
+        if (InterlockedIncrement(&shown) <= 24)
+            rebox_log("d3d12_xs: console graphics stream PSO %p: RT0 blend %s (src %u dst %u op %u, alpha %u/%u/%u, "
+                      "mask %#x), %u targets (first format %u)", *pso, !blend ? "absent"
+                      : blend->RenderTarget[0].BlendEnable ? "on" : "off",
+                      blend ? blend->RenderTarget[0].SrcBlend : 0, blend ? blend->RenderTarget[0].DestBlend : 0,
+                      blend ? blend->RenderTarget[0].BlendOp : 0, blend ? blend->RenderTarget[0].SrcBlendAlpha : 0,
+                      blend ? blend->RenderTarget[0].DestBlendAlpha : 0, blend ? blend->RenderTarget[0].BlendOpAlpha : 0,
+                      blend ? blend->RenderTarget[0].RenderTargetWriteMask : 0, rt_formats ? rt_formats->NumRenderTargets : 0,
+                      rt_formats ? rt_formats->RTFormats[0] : 0);
         attach_console_graphics(&console, *pso);
+    }
     /* As for graphics and compute PSOs: bytecode that passed as PC's can still fail to compile. */
     if (FAILED(hr) && !miss && stage_count && fallback_enabled() && hr != E_OUTOFMEMORY)
     {
