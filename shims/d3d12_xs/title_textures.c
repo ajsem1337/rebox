@@ -325,6 +325,19 @@ void title_texture_gpu_written(ID3D12Resource *resource)
     ReleaseSRWLockExclusive(&lock);
 }
 
+ID3D12Resource *title_texture_at(UINT64 address)
+{
+    struct title_texture *t;
+    ID3D12Resource *res = NULL;
+
+    AcquireSRWLockShared(&lock);
+    for (t = textures; t && !res; t = t->next)
+        if (t->address == address)
+            res = t->resource;
+    ReleaseSRWLockShared(&lock);
+    return res;
+}
+
 BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads)
 {
     struct title_texture *t;

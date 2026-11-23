@@ -991,6 +991,102 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
     return found;
 }
 
+/* A typed format for a texture's default view (typeless resources need one). */
+static DXGI_FORMAT view_format(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_BC1_TYPELESS: return DXGI_FORMAT_BC1_UNORM;
+    case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM;
+    case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM;
+    case DXGI_FORMAT_BC4_TYPELESS: return DXGI_FORMAT_BC4_UNORM;
+    case DXGI_FORMAT_BC5_TYPELESS: return DXGI_FORMAT_BC5_UNORM;
+    case DXGI_FORMAT_BC7_TYPELESS: return DXGI_FORMAT_BC7_UNORM;
+    default: return f;
+    }
+}
+
+/* A shader resource view of res in the heap's reserved tail, made once per resource: for a T# the
+ * title wrote itself (not through the API), found by the texture's address (console_texture_of). */
+BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
+{
+    ID3D12Device *device = rebox_shared_device();
+    struct shadow_heap *heap = NULL;
+    BOOL found = FALSE;
+    UINT32 key[4];
+    UINT64 r = (UINT64)(ULONG_PTR)res;
+
+    if (!res)
+        return FALSE;
+    key[0] = (UINT32)r;
+    key[1] = (UINT32)(r >> 32);
+    key[2] = 0x53525621; /* "!VRS": not the srv_for_uav keys, whose word 2 is a format */
+    key[3] = 0;
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
+        if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && h->reserved)
+            heap = h;
+    for (UINT i = 0; heap && i < heap->reserved_used && !found; i++)
+        if (!memcmp(heap->reserved_words[i], key, 16))
+        {
+            *index = heap->count + i;
+            found = TRUE;
+        }
+    if (heap && !found && device && heap->reserved_used < heap->reserved
+            && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
+    {
+        D3D12_RESOURCE_DESC rd;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = { 0 };
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        UINT i;
+
+        ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)res)[10])(res, &rd);
+        srv.Format = view_format(rd.Format);
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.DepthOrArraySize > 1)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srv.Texture2DArray.MipLevels = rd.MipLevels;
+            srv.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+        }
+        else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            srv.Texture3D.MipLevels = rd.MipLevels;
+        }
+        else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = rd.MipLevels;
+        }
+        if (srv.ViewDimension)
+        {
+            i = heap->reserved_used++;
+            memcpy(heap->reserved_words[i], key, 16);
+            *index = heap->count + i;
+            cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
+            ID3D12Device_CreateShaderResourceView(device, res, &srv, cpu);
+            found = TRUE;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return found;
+}
+
 /* A view of a 1x1 zeroed dummy texture (SRV, or UAV for a storage image) in the heap's reserved
  * tail, made once: what a console shader gets for a descriptor the title left empty or wrote
  * outside our heaps (a UE5 title's T# with base 0x9200, a dummy), which reads zero there as a null

@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "console_desc.h"
+#include "proxy.h"
 
 /* DST_SEL values */
 #define SEL_0 0
@@ -167,6 +168,12 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
     return va;
 }
 
+/* For tests: console_texture_of. */
+ID3D12Resource *WINAPI ReboxConsoleTextureOf(const UINT32 words[2])
+{
+    return console_texture_of(words);
+}
+
 ID3D12Resource *console_texture_of(const UINT32 words[2])
 {
     UINT64 va = ((UINT64)(words[1] & 0xff) << 32 | words[0]) << 8;
@@ -179,7 +186,8 @@ ID3D12Resource *console_texture_of(const UINT32 words[2])
             if (t->va == va)
                 res = t->res;
     ReleaseSRWLockShared(&texture_lock);
-    return res;
+    /* A T# the title wrote itself holds the texture's address as the title knows it. */
+    return res ? res : proxy_texture_at(va);
 }
 
 void console_encode_srv(ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *d, UINT32 out[8])

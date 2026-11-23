@@ -509,6 +509,48 @@ static struct scratch
 } *scratch_list;
 static SRWLOCK scratch_lock = SRWLOCK_INIT;
 
+/* Textures by the address the title knows them at (a T# it writes itself holds it): display
+ * targets' console memory (slot 127), textures whose GPU VA it asked (scratch), and textures
+ * placed in its memory (title_textures.c). */
+static struct { void *resource; UINT64 address; } texture_addresses[64];
+static SRWLOCK texture_address_lock = SRWLOCK_INIT;
+
+static void note_texture_address(void *resource, UINT64 address)
+{
+    AcquireSRWLockExclusive(&texture_address_lock);
+    for (UINT i = 0; i < ARRAYSIZE(texture_addresses); i++)
+        if (!texture_addresses[i].resource || texture_addresses[i].resource == resource)
+        {
+            texture_addresses[i].resource = resource;
+            texture_addresses[i].address = address;
+            break;
+        }
+    ReleaseSRWLockExclusive(&texture_address_lock);
+}
+
+ID3D12Resource *proxy_texture_at(UINT64 address)
+{
+    ID3D12Resource *res = NULL;
+    struct scratch *sc;
+
+    if (!address)
+        return NULL;
+    AcquireSRWLockShared(&texture_address_lock);
+    for (UINT i = 0; i < ARRAYSIZE(texture_addresses) && !res; i++)
+        if (texture_addresses[i].resource && texture_addresses[i].address == address)
+            res = texture_addresses[i].resource;
+    ReleaseSRWLockShared(&texture_address_lock);
+    if (!res)
+    {
+        AcquireSRWLockShared(&scratch_lock);
+        for (sc = scratch_list; sc && !res; sc = sc->next)
+            if ((UINT64)(ULONG_PTR)sc->cpu == address)
+                res = sc->resource;
+        ReleaseSRWLockShared(&scratch_lock);
+    }
+    return res ? res : title_texture_at(address);
+}
+
 static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
 {
     UINT64 va = orig_resource_get_va(self);
@@ -2237,6 +2279,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct pr
         UINT64 size = title_texture_size(desc);
         void *memory = size && xmem_alloc ? xmem_alloc((SIZE_T)size, XALLOC_DISPLAY_TARGET) : NULL;
         static LONG logged;
+        if (memory && out && *out)
+            note_texture_address(*out, (UINT64)(ULONG_PTR)memory);
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: display target %llux%u format %u: %#llx bytes of the title's memory at %p",
                       (unsigned long long)desc->Width, desc->Height, desc->Format, (unsigned long long)size, memory);

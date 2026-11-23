@@ -4055,6 +4055,14 @@ static void test_placed_texture(void *dev, void *queue)
     hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *,
                REFIID, void **)(dev, gpu, &td, D3D12_RESOURCE_STATE_COPY_SOURCE, NULL, &IID_ID3D12Resource,
                (void **)&tex);
+    /* A T# the title writes itself holds the texture's address (base in 256-byte units): it finds
+     * the texture placed there. */
+    {
+        void *(WINAPI *texture_of)(const UINT32 *) = (void *)GetProcAddress(m, "ReboxConsoleTextureOf");
+        UINT32 t[2] = { (UINT32)(gpu >> 8), (UINT32)(gpu >> 40) & 0xff };
+        CHECK(texture_of && tex && texture_of(t) == tex, "a T# with a placed texture's address finds it (%p, %p)",
+              texture_of ? texture_of(t) : NULL, (void *)tex);
+    }
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                    D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,

@@ -24,3 +24,6 @@ void proxy_log_slot_stats(void);
 
 /* Proxy -> vkd3d-proton object; anything else is returned unchanged. */
 void *proxy_unwrap(void *object);
+
+/* The texture the title knows at this address (a T# it wrote itself holds it), or NULL. */
+ID3D12Resource *proxy_texture_at(UINT64 address);

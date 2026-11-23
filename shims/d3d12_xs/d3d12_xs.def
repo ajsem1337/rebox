@@ -66,3 +66,4 @@ EXPORTS
     WKPDID_D3DDebugObjectNameW DATA
     ReboxDesktopStreamTypes
     ReboxDesktopStream
+    ReboxConsoleTextureOf

@@ -13,4 +13,6 @@ UINT64 title_texture_size(const D3D12_RESOURCE_DESC *desc);
  * is no longer uploaded over them. */
 void title_texture_gpu_written(ID3D12Resource *resource);
 BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads);
+/* The texture registered at this title address, or NULL. */
+ID3D12Resource *title_texture_at(UINT64 address);
 void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size);

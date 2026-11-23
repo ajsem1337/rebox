@@ -1347,6 +1347,20 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                  * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
                  * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
                  * crashed lavapipe. */
+                /* A T# the title wrote itself: the texture at its address, viewed in the reserved tail. */
+                if (b.kind == 4 && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
+                {
+                    ID3D12Resource *res = (w[0] || (w[1] & 0xff)) ? console_texture_of(w) : NULL;
+                    if (res && shadow_reserve_srv(heap, res, index))
+                    {
+                        static LONG logged;
+                        found = TRUE;
+                        if (InterlockedIncrement(&logged) <= 16)
+                            rebox_log("d3d12_xs: console shader %016llx: binding %u: a T# the title wrote itself "
+                                      "(%08x %08x) is texture %p", (unsigned long long)stage_id, b.binding, w[0], w[1],
+                                      (void *)res);
+                    }
+                }
                 if ((b.kind == 4 || b.kind == 5) && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
                     null_view = shadow_reserve_null(heap, b.kind == 5, index);
                 if (null_view)
