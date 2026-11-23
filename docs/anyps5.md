@@ -331,4 +331,13 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   written), depth from an MRTZ export. 2026-11-23: 32 of the 33 dumped from a run compile with
   `sa5_check ps` and pass `spirv-val`; the other writes a hardware register field with
   `s_setreg_imm32_b32` that AnyPS5 doesn't handle (only MODE's round and denormal fields).
+- **a UE5 title's vertex shaders.** Each opens with `s_swappc_b64 s[4:5], s[4:5]` into the fetch
+  shader the console driver builds from the PSO's input layout (not in the container), which leaves
+  input r in `v[4+4r..7+4r]`; the code reuses `s4` as scratch right after. `sa5_compile_vertex`
+  (`rebox_anyps5.dll`) gives AnyPS5 the inputs (a V# and those VGPRs each) in its embedded-fetch
+  mode, so each becomes a Vulkan vertex attribute (`sa5_result_vertex_input`), and s[4:5] a fetch
+  address outside the program. AnyPS5 patch 0006 accepts a fetch call that links into its own
+  pointer pair and lets the code reuse it. `tools/fssm-vs-plan.py` reads the input count from the
+  code; `sa5_check vs PLAN` compiles each with synthetic RGBA32F buffers. 2026-11-23: all 11
+  dumped from a run compile and pass `spirv-val` (1-5 inputs each).
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.

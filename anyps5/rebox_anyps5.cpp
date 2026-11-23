@@ -178,6 +178,79 @@ SA5_API int sa5_compile_pixel(const sa5_pixel_request* request, sa5_result** out
     }
 }
 
+SA5_API int sa5_compile_vertex(const sa5_vertex_request* request, sa5_result** out, char* error, std::size_t error_size)
+{
+    if (!request || !out || !request->code || !request->code_dwords || request->input_count > 32) {
+        SetError(error, error_size, "bad request");
+        return -1;
+    }
+    *out = nullptr;
+    try {
+        std::vector<MemoryRegion> regions;
+        for (std::uint32_t i = 0; i < request->region_count; i++)
+            regions.push_back({request->regions[i].address,
+                               std::span<const std::byte>(static_cast<const std::byte*>(request->regions[i].data),
+                                                          request->regions[i].size)});
+        ShaderVertexStageInfo vs{};
+        vs.resourcesNum = request->input_count;
+        for (std::uint32_t i = 0; i < request->input_count; i++) {
+            const auto& in = request->inputs[i];
+            vs.resources[i].fields = {in.vsharp[0], in.vsharp[1], in.vsharp[2], in.vsharp[3]};
+            vs.resourcesDst[i].registerStart = static_cast<std::int32_t>(in.register_start);
+            vs.resourcesDst[i].registersNum = static_cast<std::int32_t>(in.register_count);
+            vs.resourcesDst[i].attrId = static_cast<std::int32_t>(i);
+            vs.resourcesDst[i].fetchIndex = 0;  // per-vertex
+        }
+        vs.fetchEmbedded = true;  // inputs become Vulkan vertex attributes; the real fetch shader isn't in guest memory
+        ShaderFloatMode floatMode;
+        floatMode.floatMode = (request->rsrc1 >> 12u) & 0xffu;
+        floatMode.dx10Clamp = ((request->rsrc1 >> 21u) & 1u) != 0u;
+        floatMode.ieeeMode = ((request->rsrc1 >> 23u) & 1u) != 0u;
+
+        RecompileRequest compile{};
+        compile.shader = {ShaderStage::Vertex, request->code_address,
+                          std::span<const std::uint32_t>(request->code, request->code_dwords), 0, {}};
+        compile.context.waveSize = request->wave ? request->wave : 64u;
+        compile.context.userDataBaseRegister = 0;
+        compile.context.userData = std::span<const std::uint32_t>(request->user_data, request->user_data_count);
+        compile.context.vertex = vs;
+        compile.context.memory = MemoryRegionView(std::span<const MemoryRegion>(regions));
+        compile.context.floatMode = floatMode;
+        compile.target = DefaultTarget(compile.context.waveSize);
+        compile.layout = {0, 0, request->push_offset, 128};
+        compile.useCache = request->use_cache != 0;
+
+        auto* result = new sa5_result{Recompile(compile), {}};
+        const auto words = result->result.spirv.Words();
+        result->spirv.assign(words.begin(), words.end());
+        *out = result;
+        return 0;
+    } catch (const std::exception& e) {
+        SetError(error, error_size, e.what());
+        return -1;
+    } catch (...) {
+        SetError(error, error_size, "unknown exception");
+        return -1;
+    }
+}
+
+SA5_API std::uint32_t sa5_result_vertex_input_count(const sa5_result* result)
+{
+    return result ? static_cast<std::uint32_t>(result->result.vertexInputs.size()) : 0u;
+}
+
+SA5_API int sa5_result_vertex_input(const sa5_result* result, std::uint32_t index, std::uint32_t* location,
+                                    std::uint32_t* components, std::uint32_t* fetch_index)
+{
+    if (!result || index >= result->result.vertexInputs.size())
+        return -1;
+    const auto& in = result->result.vertexInputs[index];
+    if (location) *location = in.location;
+    if (components) *components = in.components;
+    if (fetch_index) *fetch_index = in.fetchIndex;
+    return 0;
+}
+
 SA5_API const std::uint32_t* sa5_result_spirv(const sa5_result* result, std::uint32_t* word_count)
 {
     if (word_count)

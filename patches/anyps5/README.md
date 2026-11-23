@@ -10,6 +10,7 @@ Each is one commit on a branch of the user's AnyPS5 clone (`../AnyPS5`, remote `
 | `0003-...-fold-XOR-register-swaps` | `feat/shader-fold-xor-swaps`, boykopovar/AnyPS5#24794 |
 | `0004-...-speculate-descriptor-table-pointers` | `feat/shader-speculate-descriptor-pointers`, not yet submitted |
 | `0005-...-fuse-v_mad_legacy_f32-and-v_mac_legacy_f` | `feat/shader-fused-legacy-mad`, from americas-recomp 6c4f4ba70d (GPL-2.0, author kept): RDNA2 fuses the legacy multiply-add, gfx1010 (PS5) doesn't; `XBOX_NO_FUSED_LEGACY_MAD=1` restores the PS5 rounding. Upstream wants a request field for the guest GPU, not an environment variable |
+| `0006-...-accept-fetch-calls-that-link-into-their-pointer` | not yet a branch: RDNA fetch calls were refused when anything wrote the pointer pair, even the call's own link; Xbox Series vertex shaders open with `s_swappc_b64 s[4:5], s[4:5]` and reuse `s4` after it. Only writes before the call count, as for GCN |
 
 The flake applies only the hunks under `core/shader/` (the recompiler); hunks for AnyPS5's driver,
 tests and docs are skipped. Drop a patch here once its pull request is merged and the pin moves past it.

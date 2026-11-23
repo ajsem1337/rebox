@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Mon, 23 Nov 2026 03:00:00 +0000
+Subject: [PATCH] fix(shader): accept fetch calls that link into their pointer
+ pair
+
+isFetchCall required that nothing in an RDNA program writes the fetch
+pointer's SGPR pair, anywhere. Xbox Series vertex shaders open with
+s_swappc_b64 s[4:5], s[4:5]: the call itself writes the pair (its link) and
+the code reuses s4 as scratch right after. Only writes before the call can
+change the pointer it reads, as the GCN path already checks. Likewise the
+link: after the fetch returns, the code may reuse the pair, so the link is
+tracked by the dataflow escape check (a write kills it, a read escapes)
+instead of refusing any instruction that touches it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/shader/recompiler/ControlFlow/src/GraphBuilder.cpp b/core/shader/recompiler/ControlFlow/src/GraphBuilder.cpp
+index 57b0c36..562b9b6 100644
+--- a/core/shader/recompiler/ControlFlow/src/GraphBuilder.cpp
++++ b/core/shader/recompiler/ControlFlow/src/GraphBuilder.cpp
+@@ -485,7 +485,10 @@ bool isFetchCall(const RdnaProgram& program, std::uint32_t index, const SwappcIn
+     const std::uint32_t targetRegister = scalarIndex(instruction.source0);
+     const bool userDataPair = swappc != nullptr && targetRegister != NoScalarRegister &&
+         targetRegister >= swappc->userDataBaseRegister && targetRegister + 1u < swappc->userDataBaseRegister + swappc->userDataCount &&
+-        std::none_of(program.instructions.begin(), GcnGuestShaders() ? program.instructions.begin() + index : program.instructions.end(), [&](const RdnaInstruction& other) {
++        // The pointer is consumed by the call: only writes before it matter. A fetch call commonly
++        // links into its own pointer pair (s_swappc_b64 s[4:5], s[4:5], as Xbox Series vertex
++        // shaders do) and reuses the pair as scratch afterwards.
++        std::none_of(program.instructions.begin(), program.instructions.begin() + index, [&](const RdnaInstruction& other) {
+             return writesScalar(other, targetRegister) || writesScalar(other, targetRegister + 1u);
+         });
+     return swappc != nullptr && swappc->fetchCallAllowed && positional && (userDataPair || outsideProgram);
+@@ -721,9 +724,9 @@ template <typename TError>
+ LinkEscape requireReturnAddressesStayInCalls(const RdnaProgram& program, const std::vector<SwappcCall>& calls, const std::vector<std::uint32_t>& unlinked, std::uint32_t knownWaveSize, const TError& escapeError) {
+     const bool gcn = GcnGuestShaders();
+     std::set<std::uint32_t> links;
+-    for (const auto& call : calls) {
+-        if (!call.fetch || gcn) links.insert(call.linkRegister);
+-    }
++    // A fetch call's link (the return address) is tracked like any other: a later write kills it,
++    // only reading it escapes.
++    for (const auto& call : calls) links.insert(call.linkRegister);
+     const auto size = static_cast<std::uint32_t>(program.instructions.size());
+     const auto successors = [&](std::uint32_t index) {
+         std::vector<std::uint32_t> next;
+@@ -781,7 +784,7 @@ LinkEscape requireReturnAddressesStayInCalls(const RdnaProgram& program, const s
+                 if (holds[index] == 0u || writesLink(index) || instruction.family == RdnaInstructionFamily::SOPC || findReturnAt(calls, index) != nullptr) continue;
+                 const bool inside = std::ranges::any_of(calls, [&](const SwappcCall& call) { return !call.fetch && call.linkRegister == link && index >= call.targetIndex && index <= call.returnIndex; });
+                 if (inside || !(((holds[index] & 1u) != 0u && readsScalarDword(instruction, link, waveSize)) || ((holds[index] & 2u) != 0u && readsScalarDword(instruction, link + 1u, waveSize)))) continue;
+-                const auto owner = std::ranges::find_if(calls, [&](const SwappcCall& call) { return (!call.fetch || gcn) && call.linkRegister == link; });
++                const auto owner = std::ranges::find_if(calls, [&](const SwappcCall& call) { return call.linkRegister == link; });
+                 return escapeError(*owner, instruction);
+             }
+         }
+@@ -902,7 +905,7 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
+                 continue;
+             }
+             const bool outsideRegion = regionEnd != InvalidControlFlowId && (index < call.targetIndex || index > regionEnd);
+-            if (outsideRegion || (call.fetch && GcnGuestShaders())) continue;
++            if (outsideRegion || call.fetch) continue;
+             if (touchesLinkRegister(instruction, call.linkRegister)) {
+                 throw escapeError(call, instruction);
+             }
+-- 
+2.47.0

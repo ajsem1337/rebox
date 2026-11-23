@@ -3,6 +3,7 @@
  *   sa5_check CODE.bin SKIP RSRC1 RSRC2 X,Y,Z  a dumped shader (e.g. a PS09
  *                                              entry, SKIP = 36), compile only,
  *                                              with no guest memory
+ *   sa5_check vs PLAN [FIRST [COUNT]]          the vertex shaders in PLAN (tools/fssm-vs-plan.py)
  *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (tools/ps-plan.py) with
  *                                              their PSO register state, compile only, no guest
  *                                              memory; one "ps NAME ok|FAIL ..." line each */
@@ -160,10 +161,98 @@ static int pixel_sweep(const char *plan, int first, int count)
     return 0;
 }
 
+/* Vertex shaders: plan lines NAME CODE SKIP RSRC1 USER_SGPRS INPUTS (tools/fssm-vs-plan.py). Each
+ * input r gets a synthetic RGBA32F vertex buffer (stride 16) and v[4+4r..7+4r]. */
+static int vertex_sweep(const char *plan, int first, int count)
+{
+    FILE *f = fopen(plan, "r");
+    char line[4096];
+    int index = 0, ok = 0, failed = 0, valid_count = 0;
+
+    if (!f)
+    {
+        printf("FAIL open %s\n", plan);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), f) && (count <= 0 || ok + failed < count))
+    {
+        char name[64], path[1024], winpath[1100], error[600];
+        unsigned skip, rsrc1, user, inputs;
+        struct sa5_vertex_request req = { 0 };
+        struct sa5_result *result = NULL;
+        uint32_t user_data[32] = { 0 }, words = 0;
+        uint8_t *data;
+        long size;
+
+        if (line[0] == '#' || sscanf(line, "%63s %1023s %u %x %u %u", name, path, &skip, &rsrc1, &user, &inputs) != 6)
+            continue;
+        if (index++ < first)
+            continue;
+        snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+        for (char *p = winpath; *p; p++)
+            if (*p == '/') *p = '\\';
+        if (!(data = read_all(winpath, &size)) || size <= (long)skip)
+        {
+            printf("vs %s FAIL unreadable\n", name);
+            failed++;
+            free(data);
+            continue;
+        }
+        req.code = (const uint32_t *)(data + skip);
+        req.code_dwords = (uint32_t)((size - skip) / 4);
+        req.code_address = 0x10000000;
+        req.wave = 64;
+        req.user_data = user_data;
+        req.user_data_count = user > 32 ? 32 : user;
+        /* s[4:5]: the fetch shader's address, outside the program (AnyPS5 then takes the call for
+         * the fetch it stands in for). */
+        user_data[4] = 0x30000000u;
+        req.rsrc1 = rsrc1;
+        req.input_count = inputs > 32 ? 32 : inputs;
+        for (unsigned r = 0; r < req.input_count; r++)
+        {
+            req.inputs[r].vsharp[0] = 0x20000000u + r * 0x100000u;
+            req.inputs[r].vsharp[1] = 16u << 16;
+            req.inputs[r].vsharp[2] = 1024;
+            req.inputs[r].vsharp[3] = (77u << 12) | 0xfacu;
+            req.inputs[r].register_start = 4 + 4 * r;
+            req.inputs[r].register_count = 4;
+        }
+        if (sa5_compile_vertex(&req, &result, error, sizeof(error)))
+        {
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("vs %s FAIL %.400s\n", name, error);
+            failed++;
+        }
+        else
+        {
+            const uint32_t *spirv = sa5_result_spirv(result, &words);
+            int valid = !sa5_validate(spirv, words, error, sizeof(error));
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("vs %s ok %u words, %u vertex inputs, %u bindings, %s%.300s\n", name, words,
+                   sa5_result_vertex_input_count(result), sa5_result_binding_count(result),
+                   valid ? "valid" : "INVALID: ", valid ? "" : error);
+            valid_count += valid;
+            sa5_result_free(result);
+            ok++;
+        }
+        fflush(stdout);
+        free(data);
+    }
+    fclose(f);
+    printf("%s vs-check: %d of %d vertex shaders compile, %d of those pass spirv-val\n",
+           failed ? "info" : "ok  ", ok, ok + failed, valid_count);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && !strcmp(argv[1], "ps"))
         return pixel_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
+    if (argc > 2 && !strcmp(argv[1], "vs"))
+        return vertex_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
 
     static const uint32_t endpgm[] = { 0xbf810000u };
     uint32_t threads[3] = { 1, 1, 1 };

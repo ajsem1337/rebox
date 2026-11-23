@@ -71,12 +71,45 @@ struct sa5_pixel_request
     uint32_t use_cache;
 };
 
+/* A vertex shader whose first instruction calls the console's fetch shader (s_swappc_b64 into a pair
+ * of user SGPRs). AnyPS5 stands in for the fetch: each input names its vertex buffer V# and the
+ * VGPRs the fetch fills (v[4+4r] in a UE5 title's), and becomes a Vulkan vertex attribute
+ * (sa5_result_vertex_input). */
+struct sa5_vertex_input
+{
+    uint32_t vsharp[4];               /* the buffer: address, stride, records, format */
+    uint32_t register_start, register_count;
+};
+
+struct sa5_vertex_request
+{
+    const uint32_t *code;
+    uint32_t code_dwords;
+    uint64_t code_address;
+    uint32_t wave;                    /* 32 or 64 */
+    const uint32_t *user_data;
+    uint32_t user_data_count;
+    uint32_t rsrc1;                   /* SPI_SHADER_PGM_RSRC1_VS: float mode, clamp, IEEE */
+    uint32_t input_count;
+    struct sa5_vertex_input inputs[32];
+    uint32_t push_offset;             /* where this stage's push data goes (graphics: one block per stage) */
+    const struct sa5_region *regions;
+    uint32_t region_count;
+    uint32_t use_cache;
+};
+
 struct sa5_result;
 
 SA5_API int sa5_compile_pixel(const struct sa5_pixel_request *request, struct sa5_result **result,
                               char *error, size_t error_size);
 
 /* Returns 0 on success; on failure, the recompiler's message in error. */
+SA5_API int sa5_compile_vertex(const struct sa5_vertex_request *request, struct sa5_result **result,
+                               char *error, size_t error_size);
+/* Vertex results: the Vulkan vertex attributes the compiled shader reads. */
+SA5_API uint32_t sa5_result_vertex_input_count(const struct sa5_result *result);
+SA5_API int sa5_result_vertex_input(const struct sa5_result *result, uint32_t index, uint32_t *location,
+                                    uint32_t *components, uint32_t *fetch_index);
 SA5_API int sa5_compile_compute(const struct sa5_compute_request *request, struct sa5_result **result,
                                 char *error, size_t error_size);
 SA5_API const uint32_t *sa5_result_spirv(const struct sa5_result *result, uint32_t *word_count);
