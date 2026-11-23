@@ -1253,6 +1253,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         };
         const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
         BOOL solid = debug && (!strcmp(debug, "magenta") || !strcmp(debug, "fullscreen"));
+        /* magenta:<stage id>,...: only those pixel stages (ids as the log names them). */
+        if (debug && !strncmp(debug, "magenta:", 8))
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            solid = strstr(debug + 8, id) != NULL;
+        }
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
         preq.code = solid ? magenta : req.code;
