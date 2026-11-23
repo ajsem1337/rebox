@@ -517,6 +517,10 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     D3D12_SHADER_BYTECODE census_bc[16] = { 0 };
     UINT stage_count = 0;
     BOOL miss = FALSE;
+    /* The title's stages and input layout, for attach_console_graphics: Unreal 5 makes every
+     * graphics PSO from a stream (a UE5 sample), so without this none drew. */
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC console = { 0 };
+    BOOL other_stages = FALSE;
     BYTE *stream;
     HRESULT hr;
 
@@ -552,6 +556,12 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
                 free(stream);
                 return orig_create_pipeline(device, desc, riid, pso);
             }
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS)
+                console.VS = *bc;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS)
+                console.PS = *bc;
+            else if (bc->BytecodeLength)
+                other_stages = TRUE;
             if (stage_count < ARRAYSIZE(stages))
             {
                 census_names[stage_count] = subobj_layouts[type].stage;
@@ -567,6 +577,8 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
             stream_output = offset + subobj_layouts[type].offset;
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO)
             cached_pso = offset + subobj_layouts[type].offset;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
+            console.InputLayout = *(const D3D12_INPUT_LAYOUT_DESC *)(stream + offset + subobj_layouts[type].offset);
         offset += subobj_layouts[type].size;
     }
     shader_cache_census("stream", census_names, census_bc, stage_count,
@@ -586,6 +598,8 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
         hr = orig_create_pipeline(device, &copy, riid, pso);
     }
+    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages)
+        attach_console_graphics(&console, *pso);
     /* As for graphics and compute PSOs: bytecode that passed as PC's can still fail to compile. */
     if (FAILED(hr) && !miss && stage_count && fallback_enabled() && hr != E_OUTOFMEMORY)
     {

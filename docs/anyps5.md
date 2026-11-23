@@ -272,7 +272,9 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
      gets the fallback shaders, and `d3d12_xs` attaches both stages as `SCRD` version 2 blobs
      (`console_fssm_graphics`: code, RSRC1 and what the code says, as `tools/fssm-*-plan.py` do)
      plus the input layout, as private data (`REBOX_GRAPHICS_GUID`, `struct rebox_graphics`).
-     `REBOX_CONSOLE_GRAPHICS=0` turns it off.
+     `REBOX_CONSOLE_GRAPHICS=0` turns it off. PSOs made from pipeline streams
+     (`CreatePipelineState`, which Unreal 5 uses for all of them) get the same when the stream's only
+     stages are a vertex and a pixel shader; mesh and tessellation pipelines stay fallbacks.
    - **Draw** (vkd3d-proton patch 0006): at the first draw the PSO's private data is read; its
      vertex buffers join the PSO's mask and it pushes the console block. At each draw both stages
      are compiled through `ReboxConsoleCompile` with user SGPRs as TomBox reads the console's
