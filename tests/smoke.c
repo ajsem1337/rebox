@@ -1564,6 +1564,23 @@ static void test_present(void *dev, void *queue)
             XSLOT(list, 34, void, void *)(list, rs);
             XSLOT(list, 25, void, void *)(list, pso);
             XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
+            /* IASetIndexBuffer 47, IASetVertexBuffers 48 (PC 43, 44) over the title's own memory:
+             * made GPU memory in place when bound, so vkd3d-proton knows the address. */
+            {
+                static BYTE *ia_memory;
+                D3D12_VERTEX_BUFFER_VIEW vbv;
+                D3D12_INDEX_BUFFER_VIEW ibv;
+                if (!ia_memory)
+                    ia_memory = VirtualAlloc(NULL, 1 << 21, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                vbv.BufferLocation = (UINT64)(ULONG_PTR)ia_memory;
+                vbv.SizeInBytes = 1 << 16;
+                vbv.StrideInBytes = 16;
+                ibv.BufferLocation = (UINT64)(ULONG_PTR)ia_memory + (1 << 16);
+                ibv.SizeInBytes = 1 << 12;
+                ibv.Format = DXGI_FORMAT_R16_UINT;
+                XSLOT(list, 48, void, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW *)(list, 0, 1, &vbv);
+                XSLOT(list, 47, void, const D3D12_INDEX_BUFFER_VIEW *)(list, &ibv);
+            }
             XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
         }
     }

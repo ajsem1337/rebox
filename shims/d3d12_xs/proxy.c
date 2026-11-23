@@ -1432,6 +1432,44 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
     return hr;
 }
 
+/* Vertex and index buffers are bound by GPU address. The title's addresses are its own memory
+ * (identity mapping), but vkd3d-proton only knows memory a heap or resource covers, and binds
+ * nothing for an address it doesn't know (its "VBO VA that does not exist"): so a buffer's range
+ * that isn't GPU memory yet is made GPU memory in place (gpu_memory_adopt) when it's bound, as
+ * CreatePlacedResourceX does. Only addresses that can be the title's are: between 4 GiB and 2^46
+ * (where xmem keeps its memory) and outside the GPU window, whose addresses are vkd3d-proton's own
+ * resources. Ranges that can't be are logged, the first few. */
+static void ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+{
+    static LONG logged;
+    UINT64 end;
+
+    if (!size || address < 0x100000000ull || address + size > 0x400000000000ull
+            || (address + size > 0x200000000000ull && address < 0x210000000000ull)
+            || (gpu_memory_identity_extent(address, &end) && end >= address + size))
+        return;
+    if (!gpu_memory_adopt(address, size) && InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: %s at %#llx+%#x is not GPU memory and could not be made so: the GPU reads nothing there",
+                  what, (unsigned long long)address, size);
+}
+
+/* Slot 47: IASetIndexBuffer (PC 43). */
+static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12_INDEX_BUFFER_VIEW *view)
+{
+    if (view)
+        ia_adopt("an index buffer", view->BufferLocation, view->SizeInBytes);
+    ID3D12GraphicsCommandList_IASetIndexBuffer(INNER(p, ID3D12GraphicsCommandList), view);
+}
+
+/* Slot 48: IASetVertexBuffers (PC 44). */
+static void STDMETHODCALLTYPE list_IASetVertexBuffers(struct proxy *p, UINT start, UINT count,
+        const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+    for (UINT i = 0; views && i < count; i++)
+        ia_adopt("a vertex buffer", views[i].BufferLocation, views[i].SizeInBytes);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(INNER(p, ID3D12GraphicsCommandList), start, count, views);
+}
+
 /* Slot 20: IASetPrimitiveTopology. The console's topology 17 is a rectangle list: three corners of a
  * screen-aligned rectangle per primitive, the fourth made by the hardware. Unreal 5 draws its
  * full-screen passes so (xcl; a UE5 sample), and vkd3d-proton drops a draw with a topology it
@@ -3826,6 +3864,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(47, list_IASetIndexBuffer), FN(48, list_IASetVertexBuffers), /* PC 43, 44 */
         FN(117, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
         FN(118, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
         FN(119, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
@@ -3869,6 +3908,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(47, list_IASetIndexBuffer), FN(48, list_IASetVertexBuffers), /* PC 43, 44 */
         FN(119, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
         FN(120, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
         FN(121, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
