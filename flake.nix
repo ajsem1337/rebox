@@ -268,6 +268,7 @@
           export REBOX_MAKE_FLAGS="${lib.concatStringsSep " " shimsMakeFlags}"
           export REBOX_BUILD_ENV=${mingwBuildEnv}
           export REBOX_BCPACK_SCRIPT=${./helpers/bcpack/bcpack-helper.py}
+          export REBOX_CA_BUNDLE=''${REBOX_CA_BUNDLE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}
           export REBOX_BCPACK_PYTHON=''${REBOX_BCPACK_PYTHON:-${pkgs.pypy3}/bin/pypy3}
           export LEONIDA_SRC=${leonida-src}
           export REBOX_BCPACK_SERVE=''${REBOX_BCPACK_SERVE-${bcpack-serve}/bin/bcpack-serve}

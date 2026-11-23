@@ -23,6 +23,8 @@
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
 #   REBOX_PRESENT_WAIT=1  let vkd3d-proton use VK_KHR_present_wait(2); off by default (see below)
+#   REBOX_CA_BUNDLE    CA certificates for the title's XCurl (G:\etc\ssl\certs\ca-bundle.crt;
+#                         the flake passes Nix's cacert)
 #   REBOX_NATIVE_VCRT=0  use Wine's builtin Visual C++ runtime, not the one the package ships
 #   REBOX_EXE          a file in the game directory to run under MicrosoftGame.Config's
 #                         executable name (e.g. title.exe.original, the unpatched
@@ -182,6 +184,13 @@ mirror() {
     done
 }
 mirror "$game_dir" "$shadow" "$exe_dir"
+# XCurl under WineGDK wants a CA bundle at \etc\ssl\certs\ca-bundle.crt on the game's drive, or
+# every TLS request fails and some hang (a Linux launcher project, MIT: "the server join hangs forever"). The
+# title runs from G:, the shadow package, so it goes there.
+if [[ -f ${REBOX_CA_BUNDLE:-} ]]; then
+    mkdir -p "$shadow/etc/ssl/certs"
+    install -m 644 "$REBOX_CA_BUNDLE" "$shadow/etc/ssl/certs/ca-bundle.crt"
+fi
 if [[ -n ${REBOX_EXE:-} ]]; then
     [[ -f $game_dir/$REBOX_EXE ]] || die "REBOX_EXE: no $REBOX_EXE in $game_dir"
     rm -f "$shadow/$exe"

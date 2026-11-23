@@ -114,6 +114,7 @@ method the title asked for that isn't implemented.
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
 | `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |
+| `REBOX_CA_BUNDLE=FILE` | CA certificates placed at `G:\etc\ssl\certs\ca-bundle.crt`, where XCurl under WineGDK looks for them (a Linux launcher project: without them every TLS request fails and some hang). The flake passes Nix's `cacert` |
 | `REBOX_NATIVE_VCRT=0` | Use Wine's builtin Visual C++ runtime. By default the `msvcp140*`, `vcruntime140*`, `concrt140`, `vccorlib140` and `vcomp140` the package ships next to the exe are loaded (a GDK title crashed at startup in Wine's `msvcp140`) |
 | `REBOX_FRAMELESS=0` | Leave the title's top-level windows as it makes them. By default a top-level window with a caption or sizing frame becomes a borderless popup of the size asked for, as the console's screen is (xcl): a GDK title sizes its back buffers from the client area, which a frame cuts to 1912x1046 |
 | `REBOX_EXE=FILE` | Run FILE from the game directory under `MicrosoftGame.Config`'s executable name, e.g. `title.exe.original`, the unpatched exe some dumps keep next to a patched one |
