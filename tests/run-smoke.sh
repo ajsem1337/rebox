@@ -96,6 +96,8 @@ echo "ok   slot stats count forwarded, custom and trapped slots"
 grep -q "title: rebox smoke boot line" <<<"$out" && grep -q "title: second line" <<<"$out" \
     || { echo "FAIL the title's OutputDebugString text isn't in the log"; exit 1; }
 echo "ok   the title's OutputDebugString text is in the log, a line each"
+grep -q "network: looking up example.com blocked" <<<"$out" || { echo "FAIL a blocked lookup is not logged"; exit 1; }
+echo "ok   a blocked network attempt is logged"
 grep -q "ok   an assertion (int3) in the exe was stepped over" <<<"$out" && grep -q "assertion 1 skipped at smoke.exe+" <<<"$out" \
     || { echo "FAIL REBOX_SKIP_ASSERTS did not step over the exe's int3"; exit 1; }
 echo "ok   REBOX_SKIP_ASSERTS steps over the exe's assertions and logs them"

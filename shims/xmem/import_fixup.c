@@ -9,8 +9,15 @@
  * FidelityFX DLLs) are fixed up from a loader notification, before their DllMain runs.
  *
  * Some functions Wine has but only as failing stubs, where a console title stops if they fail, are
- * replaced the same way, by the address Wine's export resolves to (replacements[]). */
+ * replaced the same way, by the address Wine's export resolves to (replacements[]).
+ *
+ * The title's network is off unless REBOX_NETWORK=1: its HTTP connections (WinHTTP, which
+ * libHttpClient uses too) and sockets fail as with no network, so it sends nothing out (a title's
+ * crash handler uploads a minidump of the process, with the host's details, to its publisher).
+ * Loopback addresses and localhost still work. */
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
@@ -349,11 +356,160 @@ static void WINAPI output_debug_string_w(const WCHAR *text)
         ((void (WINAPI *)(const WCHAR *))real_output_debug_string_w)(text);
 }
 
+/* The network, off (see the top of the file). Each kind of attempt is logged, the first few. */
+static void *real_connect, *real_wsa_connect, *real_sendto, *real_wsa_sendto, *real_getaddrinfo, *real_getaddrinfo_w;
+
+static void network_blocked(const char *what, const char *where)
+{
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 16)
+        rebox_log("network: %s %s blocked (REBOX_NETWORK=1 allows the title's network)", what, where ? where : "");
+}
+
+static BOOL loopback(const struct sockaddr *address, int length)
+{
+    static const BYTE v6_loopback[16] = { [15] = 1 };
+    if (!address)
+        return FALSE;
+    if (address->sa_family == AF_INET && length >= (int)sizeof(struct sockaddr_in))
+        return ((const struct sockaddr_in *)address)->sin_addr.S_un.S_un_b.s_b1 == 127;
+    if (address->sa_family == AF_INET6 && length >= (int)sizeof(struct sockaddr_in6))
+        return !memcmp(&((const struct sockaddr_in6 *)address)->sin6_addr, v6_loopback, 16);
+    return FALSE;
+}
+
+static void describe_address(const struct sockaddr *address, int length, char *out, size_t size)
+{
+    const BYTE *b;
+    *out = 0;
+    if (address && address->sa_family == AF_INET && length >= (int)sizeof(struct sockaddr_in))
+    {
+        b = (const BYTE *)&((const struct sockaddr_in *)address)->sin_addr;
+        snprintf(out, size, "%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3],
+                 (unsigned)((BYTE *)&((const struct sockaddr_in *)address)->sin_port)[0] << 8 | ((BYTE *)&((const struct sockaddr_in *)address)->sin_port)[1]);
+    }
+    else if (address)
+        snprintf(out, size, "(family %u)", address->sa_family);
+}
+
+static int WSAAPI net_connect(SOCKET s, const struct sockaddr *address, int length)
+{
+    char where[64];
+    if (loopback(address, length))
+        return ((int (WSAAPI *)(SOCKET, const struct sockaddr *, int))real_connect)(s, address, length);
+    describe_address(address, length, where, sizeof(where));
+    network_blocked("connect to", where);
+    SetLastError(WSAENETUNREACH);
+    return SOCKET_ERROR;
+}
+
+static int WSAAPI net_wsa_connect(SOCKET s, const struct sockaddr *address, int length, WSABUF *caller, WSABUF *callee,
+        QOS *sqos, QOS *gqos)
+{
+    char where[64];
+    if (loopback(address, length))
+        return ((int (WSAAPI *)(SOCKET, const struct sockaddr *, int, WSABUF *, WSABUF *, QOS *, QOS *))real_wsa_connect)(
+                s, address, length, caller, callee, sqos, gqos);
+    describe_address(address, length, where, sizeof(where));
+    network_blocked("WSAConnect to", where);
+    SetLastError(WSAENETUNREACH);
+    return SOCKET_ERROR;
+}
+
+static int WSAAPI net_sendto(SOCKET s, const char *buffer, int length, int flags, const struct sockaddr *to, int to_length)
+{
+    char where[64];
+    /* No address: a connected socket, which only loopback ones are. */
+    if (!to || loopback(to, to_length))
+        return ((int (WSAAPI *)(SOCKET, const char *, int, int, const struct sockaddr *, int))real_sendto)(
+                s, buffer, length, flags, to, to_length);
+    describe_address(to, to_length, where, sizeof(where));
+    network_blocked("sendto", where);
+    SetLastError(WSAENETUNREACH);
+    return SOCKET_ERROR;
+}
+
+static int WSAAPI net_wsa_sendto(SOCKET s, WSABUF *buffers, DWORD count, DWORD *sent, DWORD flags,
+        const struct sockaddr *to, int to_length, WSAOVERLAPPED *overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE done)
+{
+    char where[64];
+    if (!to || loopback(to, to_length))
+        return ((int (WSAAPI *)(SOCKET, WSABUF *, DWORD, DWORD *, DWORD, const struct sockaddr *, int, WSAOVERLAPPED *,
+                                LPWSAOVERLAPPED_COMPLETION_ROUTINE))real_wsa_sendto)(
+                s, buffers, count, sent, flags, to, to_length, overlapped, done);
+    describe_address(to, to_length, where, sizeof(where));
+    network_blocked("WSASendTo", where);
+    SetLastError(WSAENETUNREACH);
+    return SOCKET_ERROR;
+}
+
+static BOOL local_name(const char *name)
+{
+    return !name || !*name || !_stricmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "::1");
+}
+
+static int WSAAPI net_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
+        struct addrinfo **result)
+{
+    if (local_name(node))
+        return ((int (WSAAPI *)(const char *, const char *, const struct addrinfo *, struct addrinfo **))real_getaddrinfo)(
+                node, service, hints, result);
+    network_blocked("looking up", node);
+    if (result)
+        *result = NULL;
+    SetLastError(WSAHOST_NOT_FOUND);
+    return WSAHOST_NOT_FOUND;
+}
+
+static int WSAAPI net_getaddrinfo_w(const WCHAR *node, const WCHAR *service, const ADDRINFOW *hints, ADDRINFOW **result)
+{
+    char name[256] = "";
+    if (node)
+        WideCharToMultiByte(CP_UTF8, 0, node, -1, name, sizeof(name), NULL, NULL);
+    if (!node || local_name(name))
+        return ((int (WSAAPI *)(const WCHAR *, const WCHAR *, const ADDRINFOW *, ADDRINFOW **))real_getaddrinfo_w)(
+                node, service, hints, result);
+    network_blocked("looking up", name);
+    if (result)
+        *result = NULL;
+    SetLastError(WSAHOST_NOT_FOUND);
+    return WSAHOST_NOT_FOUND;
+}
+
+/* WinHTTP: a session opens, its connections don't (ERROR_WINHTTP_CANNOT_CONNECT). */
+static void *WINAPI net_winhttp_connect(void *session, const WCHAR *server, WORD port, DWORD reserved)
+{
+    char name[256] = "";
+    if (server)
+        WideCharToMultiByte(CP_UTF8, 0, server, -1, name, sizeof(name), NULL, NULL);
+    network_blocked("HTTP connection to", name);
+    SetLastError(12029);
+    return NULL;
+}
+
+static BOOL WINAPI net_winhttp_send_request(void *request, const WCHAR *headers, DWORD headers_length, void *optional,
+        DWORD optional_length, DWORD total_length, DWORD_PTR context)
+{
+    network_blocked("HTTP request", NULL);
+    SetLastError(12029);
+    return FALSE;
+}
+
 static struct
 {
     const char *dll, *name;
     void *ours, *wine;
 } replacements[] = {
+    /* The network (off unless REBOX_NETWORK=1). WS2_32's are imported by ordinal too, which the
+     * address match covers. */
+    { "ws2_32.dll", "connect", net_connect },
+    { "ws2_32.dll", "WSAConnect", net_wsa_connect },
+    { "ws2_32.dll", "sendto", net_sendto },
+    { "ws2_32.dll", "WSASendTo", net_wsa_sendto },
+    { "ws2_32.dll", "getaddrinfo", net_getaddrinfo },
+    { "ws2_32.dll", "GetAddrInfoW", net_getaddrinfo_w },
+    { "winhttp.dll", "WinHttpConnect", net_winhttp_connect },
+    { "winhttp.dll", "WinHttpSendRequest", net_winhttp_send_request },
     /* A replaced function the title looks up by name (GameChat2.dll loads its audio state monitor
      * so) is replaced as well. */
     /* The title's reservations below 2^46, the console's address width (xmem.c). */
@@ -527,10 +683,17 @@ void import_fixup_run(void)
     HMODULE modules[512];
     DWORD bytes;
 
+    char *network = rebox_getenv("REBOX_NETWORK");
+    BOOL network_on = network && atoi(network);
+
+    free(network);
+    if (network_on)
+        rebox_log("network: on (REBOX_NETWORK=1)");
     InitializeCriticalSection(&stub_lock);
     for (UINT i = 0; i < ARRAYSIZE(replacements); i++)
     {
-        HMODULE dll = LoadLibraryA(replacements[i].dll);
+        BOOL net = !_stricmp(replacements[i].dll, "ws2_32.dll") || !_stricmp(replacements[i].dll, "winhttp.dll");
+        HMODULE dll = net && network_on ? NULL : LoadLibraryA(replacements[i].dll);
         replacements[i].wine = dll ? (void *)GetProcAddress(dll, replacements[i].name) : NULL;
         if (replacements[i].ours == (void *)create_window_w)
             real_create_window_w = replacements[i].wine;
@@ -538,6 +701,12 @@ void import_fixup_run(void)
             real_get_proc_address = replacements[i].wine;
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_connect) real_connect = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_wsa_connect) real_wsa_connect = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_sendto) real_sendto = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_wsa_sendto) real_wsa_sendto = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_getaddrinfo) real_getaddrinfo = replacements[i].wine;
+        if (replacements[i].ours == (void *)net_getaddrinfo_w) real_getaddrinfo_w = replacements[i].wine;
         if (replacements[i].ours == (void *)output_debug_string_a && replacements[i].wine && !real_output_debug_string_a)
             real_output_debug_string_a = replacements[i].wine;
         if (replacements[i].ours == (void *)output_debug_string_w && replacements[i].wine && !real_output_debug_string_w)

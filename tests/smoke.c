@@ -3617,6 +3617,26 @@ static void test_chad(void)
 {
     /* The title's debug text reaches the log (run-smoke.sh looks for it). */
     OutputDebugStringA("rebox smoke boot line\nsecond line\n");
+    /* The title's network is off by default: names other than localhost don't resolve. */
+    {
+        HMODULE ws = LoadLibraryA("ws2_32.dll");
+        int (WINAPI *gai)(const char *, const char *, const void *, void **) =
+            ws ? (void *)GetProcAddress(ws, "getaddrinfo") : NULL;
+        void (WINAPI *fai)(void *) = ws ? (void *)GetProcAddress(ws, "freeaddrinfo") : NULL;
+        int (WINAPI *startup)(WORD, void *) = ws ? (void *)GetProcAddress(ws, "WSAStartup") : NULL;
+        BYTE wsa[512];
+        void *res = NULL;
+        int remote, local;
+        if (startup)
+            startup(0x202, wsa);
+        remote = gai ? gai("example.com", "80", NULL, &res) : -1;
+        if (!remote && res && fai) fai(res);
+        res = NULL;
+        local = gai ? gai("localhost", "80", NULL, &res) : -1;
+        if (!local && res && fai) fai(res);
+        CHECK(remote == 11001 && local == 0, "the title's network is off: example.com doesn't resolve (%d), localhost does (%d)",
+              remote, local);
+    }
     HMODULE m = LoadLibraryA("chad.dll");
     HRESULT (WINAPI *connect)(void *, UINT32, UINT32, UINT32, UINT32, HANDLE *) =
             m ? (void *)GetProcAddress(m, "XDspConnectWithMaximumStreamLimit") : NULL;
