@@ -1068,6 +1068,21 @@ static void test_dxgi_device(void *dev)
     void *back = NULL;
     HRESULT hr;
 
+    {
+        /* The console's own ID3D12Device8 IID (not PC's) and IGraphicsUnknown. */
+        static const GUID device8 = { 0x728f1fa2, 0xea11, 0x4a9f, { 0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9 } };
+        static const GUID graphics_unknown = { 0xaceeea63, 0xe0a9, 0x4a1c, { 0xbb, 0xec, 0x71, 0xb2, 0xf4, 0x85, 0xf7, 0x58 } };
+        void *d8 = NULL, *gu = NULL;
+
+        hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &device8, &d8);
+        CHECK(SUCCEEDED(hr) && d8 == dev, "device QueryInterface(console ID3D12Device8) %#lx", hr);
+        hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &graphics_unknown, &gu);
+        CHECK(SUCCEEDED(hr) && gu == dev, "device QueryInterface(IGraphicsUnknown) %#lx", hr);
+        if (d8)
+            XSLOT(d8, 2, ULONG)(d8);
+        if (gu)
+            XSLOT(gu, 2, ULONG)(gu);
+    }
     hr = XSLOT(dev, 0, HRESULT, REFIID, void **)(dev, &IID_IDXGIDevice, (void **)&dxgi);
     CHECK(SUCCEEDED(hr) && dxgi, "device QueryInterface(IDXGIDevice) %#lx", hr);
     if (!dxgi)

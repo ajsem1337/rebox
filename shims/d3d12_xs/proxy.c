@@ -224,6 +224,27 @@ static void embedded_free_list(struct embedded *e)
     }
 }
 
+/* Console-only interface IDs (XValkyrie's June 2020 kit tables; Device8 also xbox-emulator
+ * 5a25b00), which titles compiled with the console headers ask for by value: the proxy answers for
+ * them as it does for the PC versions. IGraphicsUnknown is the base of every console object. */
+static const GUID console_device8_iid = { 0x728f1fa2, 0xea11, 0x4a9f, { 0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9 } };
+static const GUID console_list6_iid = { 0xc3827890, 0x4024, 0x474c, { 0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74 } };
+static const GUID console_dma_list_iid = { 0x30bc77b9, 0x8379, 0x4b25, { 0x95, 0xde, 0xb8, 0x58, 0x8c, 0x42, 0x27, 0x5d } };
+static const GUID graphics_unknown_iid = { 0xaceeea63, 0xe0a9, 0x4a1c, { 0xbb, 0xec, 0x71, 0xb2, 0xf4, 0x85, 0xf7, 0x58 } };
+
+static BOOL console_iid(const struct proxy_class *cls, REFIID riid)
+{
+    if (IsEqualGUID(riid, &graphics_unknown_iid))
+        return TRUE;
+    if (cls == &device_class)
+        return IsEqualGUID(riid, &console_device8_iid);
+    if (cls == &list_class || cls == &list_v4_class)
+        return IsEqualGUID(riid, &console_list6_iid);
+    if (cls == &copy_list_class)
+        return IsEqualGUID(riid, &console_dma_list_iid);
+    return FALSE;
+}
+
 static HRESULT STDMETHODCALLTYPE proxy_QueryInterface(struct proxy *p, REFIID riid, void **out)
 {
     IUnknown *result;
@@ -241,8 +262,20 @@ static HRESULT STDMETHODCALLTYPE proxy_QueryInterface(struct proxy *p, REFIID ri
     /* vkd3d-proton returns the same pointer for every version of an
      * interface (and for IUnknown/ID3D12Object/ID3D12DeviceChild), so "same
      * object back" means the proxy can answer for it. */
+    if (console_iid(p->cls, riid))
+    {
+        InterlockedIncrement(&p->refs);
+        *out = p;
+        return S_OK;
+    }
     if (FAILED(hr = IUnknown_QueryInterface(p->inner, riid, (void **)&result)))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: Xbox %s has no interface {%08lx-%04x-%04x-%02x%02x-...}", p->cls->name,
+                         riid->Data1, riid->Data2, riid->Data3, riid->Data4[0], riid->Data4[1]);
         return hr;
+    }
     if (result == p->inner)
     {
         IUnknown_Release(result);
