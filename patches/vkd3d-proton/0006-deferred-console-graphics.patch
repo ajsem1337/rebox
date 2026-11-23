@@ -171,7 +171,7 @@ index be9f25c..ef6a130 100644
  {
      d3d12_command_list_end_current_render_pass(list, false);
 diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
-index 06eab1b..d82ecfa 100644
+index 06eab1b..8296f70 100644
 --- a/libs/vkd3d/state.c
 +++ b/libs/vkd3d/state.c
 @@ -2462,6 +2462,7 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
@@ -182,7 +182,7 @@ index 06eab1b..d82ecfa 100644
  
          VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
  
-@@ -3475,6 +3476,205 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *st
+@@ -3475,6 +3476,218 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *st
      return vk_pipeline;
  }
  
@@ -353,8 +353,21 @@ index 06eab1b..d82ecfa 100644
 +    }
 +
 +    rebox_override = &override;
-+    vk_pipeline = d3d12_pipeline_state_create_pipeline_variant(state, &pipeline_key, dsv_format, VK_NULL_HANDLE, 0,
-+            dynamic_state_flags);
++    {
++        /* Pipeline creation for console stages: the driver compiles AnyPS5's (sometimes very large)
++         * modules here, outside every timer in d3d12_xs. */
++        static uint64_t total_ns;
++        static uint32_t count;
++        uint64_t start = vkd3d_get_current_time_ns(), took;
++        vk_pipeline = d3d12_pipeline_state_create_pipeline_variant(state, &pipeline_key, dsv_format, VK_NULL_HANDLE,
++                0, dynamic_state_flags);
++        took = vkd3d_get_current_time_ns() - start;
++        total_ns += took;
++        count++;
++        if (took > 50000000ull || !(count & (count - 1)))
++            ERR("rebox: console pipeline %u took %.1f ms (VS %u, PS %u SPIR-V words); %.1f s in %u so far.\n", count,
++                    took / 1e6, vs->spirv_words, ps->spirv_words, total_ns / 1e9, count);
++    }
 +    rebox_override = NULL;
 +    VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
 +    VK_CALL(vkDestroyShaderModule(device->vk_device, override.ps, NULL));
@@ -388,7 +401,7 @@ index 06eab1b..d82ecfa 100644
  static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
          struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
          const struct d3d12_cached_pipeline_state *cached_pso)
-@@ -4561,7 +4761,7 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
+@@ -4561,7 +4774,7 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
      /* Enable dynamic states as necessary */
      dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VIEWPORT | VKD3D_DYNAMIC_STATE_SCISSOR;
  
@@ -397,7 +410,7 @@ index 06eab1b..d82ecfa 100644
          dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
  
      if (is_tess_pipeline && state->device->device_info.extended_dynamic_state2_features.extendedDynamicState2PatchControlPoints)
-@@ -6599,7 +6799,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+@@ -6599,7 +6812,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
      *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
              dynamic_state_buffer, key);
  
@@ -406,7 +419,7 @@ index 06eab1b..d82ecfa 100644
      {
          if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
                  vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
-@@ -6614,6 +6814,16 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+@@ -6614,6 +6827,16 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
      if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
      {
          vkd3d_vertex_input_pipeline_desc_init(&vertex_input_desc, state, key, *dynamic_state_flags);
@@ -423,7 +436,7 @@ index 06eab1b..d82ecfa 100644
          vkd3d_vertex_input_pipeline_desc_prepare(&vertex_input_desc);
  
          tessellation_info.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-@@ -6728,6 +6938,31 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+@@ -6728,6 +6951,31 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
          rwlock_unlock_read(&state->lock);
      }
  
