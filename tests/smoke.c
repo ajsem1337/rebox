@@ -1674,6 +1674,40 @@ static void test_state_object_placeholder(void *dev)
     CHECK(XSLOT(so, 2, ULONG)(so) == 0, "the state object is freed on its last release");
 }
 
+/* Device slot 86: ID3D12Device2::CreatePipelineState from a stream (Unreal 5's Xbox RHI). */
+static void test_stream_pso(void *dev)
+{
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12SerializeRootSignature");
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 0 };
+    ID3D10Blob *blob = NULL;
+    void *rs = NULL, *pso = NULL;
+    struct
+    {
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; void *rs; } __attribute__((aligned(8))) root;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_SHADER_BYTECODE cs; } __attribute__((aligned(8))) cs;
+    } stream = { { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, NULL },
+                 { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, { test_empty_cs, sizeof(test_empty_cs) } } };
+    D3D12_PIPELINE_STATE_STREAM_DESC desc = { sizeof(stream), &stream };
+    HRESULT hr;
+
+    if (serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)))
+    {
+        XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0, ID3D10Blob_GetBufferPointer(blob),
+                ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+        ID3D10Blob_Release(blob);
+    }
+    stream.root.rs = rs;
+    hr = rs ? XSLOT(dev, 86, HRESULT, const D3D12_PIPELINE_STATE_STREAM_DESC *, REFIID, void **)(dev, &desc,
+            &IID_ID3D12PipelineState, &pso) : E_FAIL;
+    CHECK(SUCCEEDED(hr) && pso, "CreatePipelineState from a stream (device slot 86) makes a compute pipeline (%#lx)",
+          (unsigned long)hr);
+    if (pso)
+        IUnknown_Release((IUnknown *)pso);
+    if (rs)
+        IUnknown_Release((IUnknown *)rs);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -4003,6 +4037,7 @@ static void test_xbox(void)
     test_xbox_root_flags(dev);
     test_console_command_signature(dev);
     test_state_object_placeholder(dev);
+    test_stream_pso(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);

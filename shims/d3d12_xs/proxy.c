@@ -1188,6 +1188,39 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(struct proxy 
     return hr;
 }
 
+/* Slot 86: ID3D12Device2::CreatePipelineState (PC 47), a pipeline from a stream of subobjects, as
+ * Unreal 5's Xbox RHI makes them (a UE5 sample, XboxCommonD3D12PipelineState.cpp). Forwarded:
+ * vkd3d-proton takes the console shaders in it as in the other pipeline paths. A stream it refuses
+ * has its subobject types logged (the console may have types of its own). */
+static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        REFIID riid, void **out)
+{
+    ID3D12Device2 *device2 = NULL;
+    HRESULT hr = IUnknown_QueryInterface(p->inner, &IID_ID3D12Device2, (void **)&device2);
+
+    if (FAILED(hr))
+        return hr;
+    hr = ID3D12Device2_CreatePipelineState(device2, desc, riid, out);
+    ID3D12Device2_Release(device2);
+    if (SUCCEEDED(hr) && out && *out)
+        patch_child(*out);
+    else if (FAILED(hr) && desc && desc->pPipelineStateSubobjectStream)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+        {
+            /* Each subobject is a 32-bit type, aligned to pointer size, then its value; the first
+             * type is enough to see a console one. */
+            char types[16];
+            snprintf(types, sizeof(types), " %u", desc->SizeInBytes >= sizeof(UINT)
+                     ? *(const UINT *)desc->pPipelineStateSubobjectStream : 0u);
+            rebox_log("d3d12_xs: CreatePipelineState (stream of %zu bytes, first subobject type%s) failed: %#lx",
+                         (size_t)desc->SizeInBytes, types, (unsigned long)hr);
+        }
+    }
+    return hr;
+}
+
 /* Slot 62 (XboxBvhBuilder.dll 0x18000c4e1): CreateComputePipelineState with
  * two extra arguments, zero at the only call seen. */
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineStateX(struct proxy *p,
@@ -2118,6 +2151,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(30, device_CreateReservedResource),
         FN(38, device_GetCopyableFootprints),
         FN(41, device_CreateCommandSignature),
+        FWD(85, 46),                                  /* SetResidencyPriority */
+        FN(86, device_CreatePipelineState),
         FN(101, device_CreateStateObject),
         FN(115, device_DeserializeStateObjectX),
         FN(43, device_GetAdapterLuid),
