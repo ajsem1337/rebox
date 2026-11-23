@@ -855,8 +855,11 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
                                                (void **)&heap);
     }
     if (SUCCEEDED(hr))
-        shadow_heap_created(heap, desc, ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device),
-                            desc->Type), reserved);
+    {
+        UINT increment = ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), desc->Type);
+        shadow_heap_created(heap, desc, increment, reserved);
+        shadow_place_heap(heap, desc->NumDescriptors, increment);
+    }
     return wrap_result(hr, (IUnknown *)heap, &heap_class, out);
 }
 
@@ -865,7 +868,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
 static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
         const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, SIZE_T cpu)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     ID3D12Device_CreateConstantBufferView(INNER(p, ID3D12Device), desc, h);
     shadow_write_cbv(cpu, desc);
 }
@@ -873,7 +876,7 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
 static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SIZE_T cpu)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     ID3D12Device_CreateShaderResourceView(INNER(p, ID3D12Device), resource, desc, h);
     shadow_write_srv(cpu, resource, desc);
 }
@@ -881,14 +884,14 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, I
 static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, ID3D12Resource *resource,
         ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, SIZE_T cpu)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     ID3D12Device_CreateUnorderedAccessView(INNER(p, ID3D12Device), resource, counter, desc, h);
     shadow_write_uav(cpu, resource, desc);
 }
 
 static void STDMETHODCALLTYPE device_CreateSampler(struct proxy *p, const D3D12_SAMPLER_DESC *desc, SIZE_T cpu)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
     ID3D12Device_CreateSampler(INNER(p, ID3D12Device), desc, h);
     shadow_write_sampler(cpu, desc);
 }
@@ -897,15 +900,33 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(struct proxy *p, UINT dst_c
         const D3D12_CPU_DESCRIPTOR_HANDLE *dst_starts, const UINT *dst_sizes, UINT src_count,
         const D3D12_CPU_DESCRIPTOR_HANDLE *src_starts, const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
+    /* Handles in heaps placed in title memory become vkd3d-proton's (shadow_place_heap). */
+    D3D12_CPU_DESCRIPTOR_HANDLE dst_local[64], src_local[64], *dst = NULL, *src = NULL;
+    if (shadow_title_heaps_placed() && dst_starts && src_starts)
+    {
+        dst = dst_count <= ARRAYSIZE(dst_local) ? dst_local : malloc(dst_count * sizeof(*dst));
+        src = src_count <= ARRAYSIZE(src_local) ? src_local : malloc(src_count * sizeof(*src));
+        if (dst && src)
+        {
+            for (UINT i = 0; i < dst_count; i++)
+                dst[i].ptr = shadow_cpu_to_inner(dst_starts[i].ptr);
+            for (UINT i = 0; i < src_count; i++)
+                src[i].ptr = shadow_cpu_to_inner(src_starts[i].ptr);
+            dst_starts = dst;
+            src_starts = src;
+        }
+    }
     ID3D12Device_CopyDescriptors(INNER(p, ID3D12Device), dst_count, dst_starts, dst_sizes, src_count, src_starts,
                                  src_sizes, type);
     shadow_copy_ranges(dst_count, dst_starts, dst_sizes, src_count, src_starts, src_sizes);
+    if (dst != dst_local) free(dst);
+    if (src != src_local) free(src);
 }
 
 static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT count, SIZE_T dst, SIZE_T src,
         D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE d = { dst }, s = { src };
+    D3D12_CPU_DESCRIPTOR_HANDLE d = { dst = shadow_cpu_to_inner(dst) }, s = { src = shadow_cpu_to_inner(src) };
     ID3D12Device_CopyDescriptorsSimple(INNER(p, ID3D12Device), count, d, s, type);
     shadow_copy(dst, src, count);
 }
@@ -2031,7 +2052,7 @@ static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(struct proxy *p,
         ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE g = { heap_handle_to_vkd3d(gpu) };
-    D3D12_CPU_DESCRIPTOR_HANDLE c = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE c = { shadow_cpu_to_inner(cpu) };
     ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(INNER(p, ID3D12GraphicsCommandList), g, c, resource,
             values, rect_count, rects);
 }
@@ -2040,7 +2061,7 @@ static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(struct proxy *p
         ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE g = { heap_handle_to_vkd3d(gpu) };
-    D3D12_CPU_DESCRIPTOR_HANDLE c = { cpu };
+    D3D12_CPU_DESCRIPTOR_HANDLE c = { shadow_cpu_to_inner(cpu) };
     ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(INNER(p, ID3D12GraphicsCommandList), g, c, resource,
             values, rect_count, rects);
 }
@@ -2399,12 +2420,19 @@ static D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE heap_GetDesc(struct proxy *
 
 /* Slots 9 and 10 return the handle in RAX on Xbox (ScarlettX, verified in a
  * retail title); vkd3d-proton uses the MSVC hidden return pointer. */
-static SIZE_T STDMETHODCALLTYPE heap_GetCPUDescriptorHandleForHeapStart(struct proxy *p)
+static SIZE_T heap_cpu_start(struct proxy *p)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { 0 };
     ((D3D12_CPU_DESCRIPTOR_HANDLE *(STDMETHODCALLTYPE *)(void *, D3D12_CPU_DESCRIPTOR_HANDLE *))
         PC_SLOT(p->inner, 9))(p->inner, &h);
     return h.ptr;
+}
+
+/* The title's own memory for a heap placed there (shadow_place_heap), else vkd3d-proton's start. */
+static SIZE_T STDMETHODCALLTYPE heap_GetCPUDescriptorHandleForHeapStart(struct proxy *p)
+{
+    SIZE_T inner = heap_cpu_start(p), title = shadow_title_cpu_start(inner);
+    return title ? title : inner;
 }
 
 static UINT64 STDMETHODCALLTYPE heap_GetGPUDescriptorHandleForHeapStart(struct proxy *p)
@@ -2421,7 +2449,7 @@ static UINT64 STDMETHODCALLTYPE heap_GetGPUDescriptorHandleForHeapStart(struct p
         UINT64 title, size;
         static LONG logged;
 
-        if (!h.ptr || !shadow_title(heap_GetCPUDescriptorHandleForHeapStart(p), &title, &size))
+        if (!h.ptr || !shadow_title(heap_cpu_start(p), &title, &size))
             return h.ptr;
         heap_range_add(title, h.ptr, size);
         if (!InterlockedExchange(&logged, 1))

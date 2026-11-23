@@ -28,6 +28,14 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index);
 /* A null texture SRV (or UAV, storage) in the reserved tail, made once per heap. */
 BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index);
 void shadow_heap_destroyed(ID3D12DescriptorHeap *inner);
+/* The heap's CPU memory from the title's allocation hooks (XMemAlloc, object type 4, allocator 128),
+ * for titles that have them; then its CPU handles are the title's (shadow.c). */
+void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment);
+/* The title's CPU start for the heap at vkd3d-proton's cpu_start, or 0. */
+SIZE_T shadow_title_cpu_start(SIZE_T cpu_start);
+/* A title CPU handle in a placed heap as vkd3d-proton's; any other handle unchanged. */
+SIZE_T shadow_cpu_to_inner(SIZE_T cpu);
+BOOL shadow_title_heaps_placed(void);
 void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc);
 void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc);

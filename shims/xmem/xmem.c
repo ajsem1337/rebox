@@ -262,23 +262,57 @@ void WINAPI XMemFreeDefault(void *address, ULONGLONG attributes)
         _aligned_free(address);
 }
 
+/* A title that exports __XMemAllocationHooks__ ({alloc, free, ...}) has them used for every XMemAlloc
+ * and XMemFree, as the console's xmem.dll does without an XMemSetAllocationHooks call: the
+ * runtime's own allocations then reach them too (the target title places descriptor heaps through
+ * its hook for the D3D allocator, 128). A hook calling back into XMemAlloc gets the default. */
+static INIT_ONCE title_hooks_once = INIT_ONCE_STATIC_INIT;
+static DWORD in_hook = TLS_OUT_OF_INDEXES; /* a TLS slot: set while this thread is in a hook */
+
+static BOOL CALLBACK find_title_hooks(INIT_ONCE *once, void *param, void **context)
+{
+    void *const *hooks = (void *const *)GetProcAddress(GetModuleHandleA(NULL), "__XMemAllocationHooks__");
+
+    in_hook = TlsAlloc();
+
+    if (hooks && hooks[0] && hooks[1] && !alloc_hook)
+    {
+        alloc_hook = (XMEMALLOC_ROUTINE)hooks[0];
+        free_hook = (XMEMFREE_ROUTINE)hooks[1];
+        rebox_log("xmem: the title's exported allocation hooks are used (alloc %p, free %p)", hooks[0], hooks[1]);
+    }
+    return TRUE;
+}
+
 void *WINAPI XMemAlloc(SIZE_T size, ULONGLONG attributes)
 {
-    if (alloc_hook)
-        return alloc_hook(size, attributes);
-    return XMemAllocDefault(size, attributes);
+    void *p;
+
+    InitOnceExecuteOnce(&title_hooks_once, find_title_hooks, NULL, NULL);
+    if (!alloc_hook || in_hook == TLS_OUT_OF_INDEXES || TlsGetValue(in_hook))
+        return XMemAllocDefault(size, attributes);
+    TlsSetValue(in_hook, (void *)1);
+    p = alloc_hook(size, attributes);
+    TlsSetValue(in_hook, NULL);
+    return p;
 }
 
 void WINAPI XMemFree(void *address, ULONGLONG attributes)
 {
-    if (free_hook)
-        free_hook(address, attributes);
-    else
+    InitOnceExecuteOnce(&title_hooks_once, find_title_hooks, NULL, NULL);
+    if (!free_hook || in_hook == TLS_OUT_OF_INDEXES || TlsGetValue(in_hook))
+    {
         XMemFreeDefault(address, attributes);
+        return;
+    }
+    TlsSetValue(in_hook, (void *)1);
+    free_hook(address, attributes);
+    TlsSetValue(in_hook, NULL);
 }
 
 void WINAPI XMemSetAllocationHooks(XMEMALLOC_ROUTINE alloc, XMEMFREE_ROUTINE free)
 {
+    InitOnceExecuteOnce(&title_hooks_once, find_title_hooks, NULL, NULL);
     rebox_log("xmem: allocation hooks %s", alloc ? "installed" : "cleared");
     alloc_hook = alloc;
     free_hook = free;

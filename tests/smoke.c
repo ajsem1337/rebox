@@ -20,6 +20,37 @@
 #include "../generated/test_shaders.h"
 #include "../anyps5/rebox_anyps5.h"
 
+/* The title's allocation hooks, exported as a title does (__XMemAllocationHooks__: alloc, free):
+ * xmem uses them for every XMemAlloc. Everything goes to the defaults except a descriptor heap
+ * (object type 4, the D3D allocator 128) of a registered size, which gets placement_memory, as the
+ * target title places its heap. */
+static BYTE placement_memory[64 * 64] __attribute__((aligned(64)));
+static SIZE_T placement_size, placement_asked;
+static UINT xhook_calls, xhook_heap_calls;
+static ULONGLONG hook_last_attributes;
+static void *WINAPI hook_alloc(SIZE_T size, ULONGLONG attributes)
+{
+    xhook_calls++;
+    hook_last_attributes = attributes;
+    if ((attributes & 0x3fff) == 4)
+        xhook_heap_calls++;
+    if ((attributes & 0x3fff) == 4 && (attributes >> 16 & 0xff) == 128 && placement_size && size <= sizeof(placement_memory))
+    {
+        placement_asked = size;
+        placement_size = 0;
+        return placement_memory;
+    }
+    return ((void *(WINAPI *)(SIZE_T, ULONGLONG))GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemAllocDefault"))(
+            size, attributes);
+}
+static void WINAPI hook_free(void *address, ULONGLONG attributes)
+{
+    if (address != placement_memory)
+        ((void (WINAPI *)(void *, ULONGLONG))GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemFreeDefault"))(
+                address, attributes);
+}
+__declspec(dllexport) void *__XMemAllocationHooks__[4] = { (void *)hook_alloc, (void *)hook_free, NULL, NULL };
+
 static int failures;
 
 /* Heap slot 10 reports shadow-heap title addresses unless REBOX_HEAP_VA says real or virtual;
@@ -1286,6 +1317,57 @@ static void test_present(void *dev, void *queue)
         HRESULT (WINAPI *configure)(UINT64, UINT64, UINT64, UINT64) =
                 (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12ConfigureVirtualMemoryX");
         CHECK(configure && configure(0, 0, 0, 0) == S_OK, "D3D12ConfigureVirtualMemoryX succeeds");
+    }
+
+    /* A descriptor heap in the title's memory: the title's hook places it (as the target title's
+     * does), its CPU start is that memory, and a view written at a handle there reaches the
+     * console-format shadow heap. */
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC phd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+        HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+                (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxShadowHeap");
+        UINT inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        void *pheap = NULL, *pdata = NULL;
+        UINT pstride = 0, pcount = 0;
+        SIZE_T start = 0;
+        UINT64 pva = 0;
+
+        /* test_xmem cleared the hooks after trying XMemSetAllocationHooks: the exported ones again. */
+        void (WINAPI *set_hooks)(void *, void *) = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemSetAllocationHooks");
+        if (set_hooks)
+            set_hooks((void *)hook_alloc, (void *)hook_free);
+        placement_size = (SIZE_T)64 * inc;
+        if (placement_size <= sizeof(placement_memory)
+                && SUCCEEDED(hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &phd,
+                &IID_ID3D12DescriptorHeap, &pheap)))
+            start = XSLOT(pheap, 9, SIZE_T)(pheap);
+        CHECK(start == (SIZE_T)placement_memory && placement_asked == 64 * inc, "a descriptor heap placed by the title's "
+              "allocation hook starts in its memory (%#Ix, the hook's %p; %Iu bytes asked, 64 x %u; hook calls %u, heaps %u, "
+              "last attributes %#llx)", start, (void *)placement_memory, placement_asked, inc, xhook_calls, xhook_heap_calls,
+              hook_last_attributes);
+        if (start == (SIZE_T)placement_memory)
+        {
+            D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD };
+            D3D12_RESOURCE_DESC cb = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                       D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+            ID3D12Resource *cbuf = NULL;
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = { 0, 256 };
+            const UINT32 *words;
+            if (SUCCEEDED(XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                    D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE, &cb,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&cbuf)))
+            {
+                cbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(cbuf);
+                XSLOT(dev, 17, void, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, SIZE_T)(dev, &cbv, start + 3 * inc);
+            }
+            hr = shadow_heap ? shadow_heap(start, &pva, &pdata, &pstride, &pcount) : E_FAIL;
+            words = pdata ? (const UINT32 *)((BYTE *)pdata + 3 * pstride) : NULL;
+            CHECK(SUCCEEDED(hr) && words && (words[0] || words[1]), "a CBV written at a title handle in it reaches the "
+                  "shadow heap (%#lx: %08x %08x)", hr, words ? words[0] : 0, words ? words[1] : 0);
+            if (cbuf) ID3D12Resource_Release(cbuf);
+        }
+        if (pheap) XSLOT(pheap, 2, ULONG)(pheap);
+        placement_size = 0;
     }
 
     /* Device slot 133 (SDK 0x20004): CreatePlacedResourceX, as the target title places a buffer over

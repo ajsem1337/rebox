@@ -38,12 +38,17 @@
 #define BUCKETS (1u << 18)
 #define INDEXES 3 /* exact; loose (T#/S# with rewritable fields masked); loose V# (its first 3 words) */
 
+static volatile LONG placed_heaps; /* heaps with title_cpu: no translation while 0 */
+
 struct shadow_heap
 {
     ID3D12DescriptorHeap *inner;   /* not referenced: only compared */
     D3D12_DESCRIPTOR_HEAP_TYPE type;
     BOOL shader_visible, gpu_memory;
     SIZE_T cpu_start;              /* vkd3d-proton's CPU handle for descriptor 0 */
+    SIZE_T title_cpu;              /* the title's CPU handle for it, when its memory is the title's
+                                    * (shadow_place_heap), else 0 */
+    ULONGLONG title_attributes;    /* what title_cpu was allocated with */
     UINT stride, count;
     BYTE *data;                    /* count * stride bytes, console format */
     BYTE *views;                   /* count bytes: enum shadow_view of each slot */
@@ -324,16 +329,113 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
 
 void shadow_heap_destroyed(ID3D12DescriptorHeap *inner)
 {
+    SIZE_T title_cpu = 0;
+    ULONGLONG attributes = 0;
+
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap **p = &heaps; *p; p = &(*p)->next)
         if ((*p)->inner == inner)
         {
             struct shadow_heap *h = *p;
             *p = h->next;
+            title_cpu = h->title_cpu;
+            attributes = h->title_attributes;
+            if (title_cpu)
+                InterlockedDecrement(&placed_heaps);
             heap_free(h);
             break;
         }
     ReleaseSRWLockExclusive(&lock);
+    if (title_cpu)
+    {
+        void (WINAPI *xmem_free)(void *, ULONGLONG) =
+                (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemFree");
+        if (xmem_free)
+            xmem_free((void *)title_cpu, attributes);
+    }
+}
+
+/* Descriptor heaps in the title's memory. On the console the runtime allocates a heap's memory
+ * with XMemAlloc (object type 4, the D3D allocator, 128), so the title's allocation hooks can hand
+ * it memory of its own: the target title registers an address for its main heap and asserts that
+ * the heap's CPU start is that address. Here the heap gets title memory the same way and that is
+ * its CPU start; the title's CPU handles are translated to vkd3d-proton's at each call
+ * (shadow_cpu_to_inner). Only titles with allocation hooks (exe export __XMemAllocationHooks__). */
+#define XALLOC_DESCRIPTOR_HEAP (4ull | 128ull << 16)
+
+void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
+{
+    static int hooks = -1;
+    void *(WINAPI *xmem_alloc)(SIZE_T, ULONGLONG);
+    SIZE_T size = (SIZE_T)count * increment;
+    void *memory;
+
+    if (hooks < 0)
+        hooks = GetProcAddress(GetModuleHandleA(NULL), "__XMemAllocationHooks__") != NULL;
+    if (!hooks || !size || !(xmem_alloc = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemAlloc"))
+            || !(memory = xmem_alloc(size, XALLOC_DESCRIPTOR_HEAP)))
+        return;
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 32)
+            rebox_log("d3d12_xs: a descriptor heap of %u descriptors (%Iu bytes) is in the title's memory at %p",
+                      count, size, memory);
+    }
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->inner == inner)
+        {
+            h->title_cpu = (SIZE_T)memory;
+            h->title_attributes = XALLOC_DESCRIPTOR_HEAP;
+            InterlockedIncrement(&placed_heaps);
+            memory = NULL;
+            break;
+        }
+    ReleaseSRWLockExclusive(&lock);
+    if (memory)
+    {
+        void (WINAPI *xmem_free)(void *, ULONGLONG) =
+                (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "XMemFree");
+        if (xmem_free)
+            xmem_free(memory, XALLOC_DESCRIPTOR_HEAP);
+        return;
+    }
+}
+
+BOOL shadow_title_heaps_placed(void)
+{
+    return placed_heaps > 0;
+}
+
+SIZE_T shadow_title_cpu_start(SIZE_T cpu_start)
+{
+    SIZE_T title = 0;
+
+    if (!placed_heaps)
+        return 0;
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h && !title; h = h->next)
+        if (h->cpu_start == cpu_start)
+            title = h->title_cpu;
+    ReleaseSRWLockShared(&lock);
+    return title;
+}
+
+SIZE_T shadow_cpu_to_inner(SIZE_T cpu)
+{
+    SIZE_T inner = cpu;
+
+    if (!placed_heaps)
+        return cpu;
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->title_cpu && cpu - h->title_cpu < (SIZE_T)h->count * h->stride)
+        {
+            inner = h->cpu_start + (cpu - h->title_cpu);
+            break;
+        }
+    ReleaseSRWLockShared(&lock);
+    return inner;
 }
 
 /* What kind of view a write made: is_buffer -1 means "from the resource" (no view desc). */
@@ -872,6 +974,7 @@ HRESULT WINAPI ReboxShadowHeap(SIZE_T cpu_start, UINT64 *title_va, void **data, 
 {
     HRESULT hr = E_INVALIDARG;
 
+    cpu_start = shadow_cpu_to_inner(cpu_start); /* a heap placed in title memory: its title start */
     AcquireSRWLockShared(&lock);
     for (struct shadow_heap *h = heaps; h; h = h->next)
         if (h->cpu_start == cpu_start)
@@ -925,8 +1028,9 @@ BOOL WINAPI ReboxShadowFind(const UINT32 *words, UINT word_count, BOOL sampler, 
         if (!memcmp(e->key, key, sizeof(key)) && (sampler == (e->heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
                 && (!best || (e->heap->shader_visible && !best->heap->shader_visible)))
             best = e;
-    if (best && cpu)
-        *cpu = best->heap->cpu_start + (SIZE_T)best->index * best->heap->stride;
+    if (best && cpu) /* the title's handle for a heap in its memory, as the API gives it */
+        *cpu = (best->heap->title_cpu ? best->heap->title_cpu : best->heap->cpu_start)
+                + (SIZE_T)best->index * best->heap->stride;
     ReleaseSRWLockShared(&lock);
     return best != NULL;
 }
