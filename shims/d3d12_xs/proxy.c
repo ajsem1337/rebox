@@ -2585,6 +2585,7 @@ static HRESULT STDMETHODCALLTYPE device_GetFrameStatisticsX(struct proxy *p, UIN
 /* ------------------------------------------------------------------ queue */
 
 volatile UINT64 rebox_table_watch; /* console_compile.c: a table to show at the next submission */
+volatile UINT64 rebox_value_watch; /* console_compile.c (REBOX_WATCH_STAGE): 4 floats to show at the next submission */
 BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
@@ -2599,6 +2600,13 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     shadow_sync_mirrors();
     /* Textures the title wrote after recording their draws (console_compile.c). */
     console_resolve_late();
+    {
+        UINT64 value_at = InterlockedExchange64((volatile LONG64 *)&rebox_value_watch, 0);
+        const float *f = (const float *)(ULONG_PTR)value_at;
+        if (value_at && !IsBadReadPtr(f, 16))
+            rebox_log("d3d12_xs: at submission, %#llx holds %g %g %g %g", (unsigned long long)value_at, f[0], f[1], f[2],
+                      f[3]);
+    }
     {
         UINT64 at = InterlockedExchange64((volatile LONG64 *)&rebox_table_watch, 0);
         UINT32 t[16];

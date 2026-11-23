@@ -1065,6 +1065,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 if (base && !IsBadReadPtr(f, 16))
                     rebox_log("d3d12_xs: stage %s draw %ld: buffer %#llx + %#llx holds %g %g %g %g", id, n,
                               (unsigned long long)base, (unsigned long long)offset, f[0], f[1], f[2], f[3]);
+                {
+                    extern volatile UINT64 rebox_value_watch;
+                    if (base)
+                        rebox_value_watch = base + offset;
+                }
             }
         }
     }
