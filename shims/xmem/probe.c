@@ -4,7 +4,8 @@
  * puts an int3 at each address. A hit logs the thread, the four argument registers, the return
  * address and the stack pointer, then the original byte is put back for one single-stepped
  * instruction and the int3 rearmed. Each probe logs its first REBOX_PROBE_MAX hits (default 20;
- * later hits are counted, not logged). Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
+ * later hits are counted, not logged); REBOX_PROBE_FROM=N skips each probe's first N-1 hits, for
+ * looking at a loop late in a run. Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
  * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA);
  * REBOX_PROBE_DUMP=N:rdx (or r8, r9) dumps at that register instead.
  * REBOX_PROBE_MEMORY=RVA:BYTES[,...] (hex, relative to the exe) also logs those ranges of the exe's
@@ -32,7 +33,7 @@ static struct probe
     volatile LONG hits;
 } probes[MAX_PROBES];
 static UINT probe_count;
-static LONG probe_max = 20;
+static LONG probe_max = 20, probe_from = 1;
 static UINT dump_qwords, dump_register; /* 0 rcx, 1 rdx, 2 r8, 3 r9 */
 static struct { ULONG_PTR rva, bytes; } memory_ranges[8];
 static UINT memory_range_count;
@@ -182,7 +183,7 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
             if ((BYTE *)rec->ExceptionAddress != p->address)
                 continue;
             n = InterlockedIncrement(&p->hits);
-            if (n <= probe_max)
+            if (n >= probe_from && n < probe_from + probe_max)
             {
                 char caller[MAX_PATH + 32];
                 ULONG_PTR ret = 0;
@@ -281,7 +282,8 @@ static BOOL add_probe(BYTE *address, const char *name)
     snprintf(p->name, sizeof(p->name), "%s", name);
     probe_count++;
     write_byte(address, 0xcc);
-    rebox_log("probe %s armed (byte %02x), first %ld hits logged", p->name, p->original, probe_max);
+    rebox_log("probe %s armed (byte %02x), hits %ld-%ld logged", p->name, p->original, probe_from,
+              probe_from + probe_max - 1);
     return TRUE;
 }
 
@@ -361,6 +363,12 @@ void probe_install(void)
     if (max && atoi(max) > 0)
         probe_max = atoi(max);
     free(max);
+    {
+        char *from = rebox_getenv("REBOX_PROBE_FROM");
+        if (from && atol(from) > 0)
+            probe_from = atol(from);
+        free(from);
+    }
     {
         char *dump = rebox_getenv("REBOX_PROBE_DUMP"), *memory = rebox_getenv("REBOX_PROBE_MEMORY"), *t, *ctx = NULL;
         if (dump && atoi(dump) > 0)
