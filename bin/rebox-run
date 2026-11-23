@@ -23,6 +23,9 @@
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
 #   REBOX_PRESENT_WAIT=1  let vkd3d-proton use VK_KHR_present_wait(2); off by default (see below)
+#   REBOX_EXE          a file in the game directory to run under MicrosoftGame.Config's
+#                         executable name (e.g. title.exe.original, the unpatched
+#                         exe next to a patched one)
 #   REBOX_DUMP_SHADERS, REBOX_STUB_FATAL, REBOX_LOG: see README
 set -euo pipefail
 
@@ -178,6 +181,12 @@ mirror() {
     done
 }
 mirror "$game_dir" "$shadow" "$exe_dir"
+if [[ -n ${REBOX_EXE:-} ]]; then
+    [[ -f $game_dir/$REBOX_EXE ]] || die "REBOX_EXE: no $REBOX_EXE in $game_dir"
+    rm -f "$shadow/$exe"
+    ln -s "$game_dir/$REBOX_EXE" "$shadow/$exe"
+    echo "rebox-run: running $REBOX_EXE as $exe" >&2
+fi
 # The Gaming Runtime stand-in reads MicrosoftGame.config next to the exe (title ID, package
 # identity, storage quota); a title whose exe is deeper in the package (a UE5 title) gets a link to it
 # there. Without it a UE5 title logs "Failed to get TitleID HR=0x80070490".
