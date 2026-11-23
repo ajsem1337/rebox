@@ -91,6 +91,8 @@ static Api Get(const GUID& iid, const char* iface) {
 constexpr HRESULT kNotFound = static_cast<HRESULT>(0x80070490);
 constexpr HRESULT kUserNotFound = static_cast<HRESULT>(0x89245104);
 constexpr HRESULT kFailedToGetToken = static_cast<HRESULT>(0x89245111);
+// rebox local change: token-and-signature requests fail as without the Xbox network (xcl's answer).
+constexpr HRESULT kCannotConnect = static_cast<HRESULT>(0x80072EFD);
 
 static const GUID kUser = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
 static const GUID kUser2 = {0xeb9bf948, 0x18dc, 0x4d82, {0xbb, 0xcc, 0x40, 0xe0, 0xa8, 0x09, 0xc4, 0xc0}};
@@ -191,11 +193,11 @@ static void CheckTokenFamily(int asyncSlot, const char* asyncName, int sizeSlot,
   HRESULT hr = begin(g_user.self, g_handle, 0, method, url, 1, headers, 0, nullptr, &b);
   bool called = WaitForSingleObject(g_completed, 5000) == WAIT_OBJECT_0;
   HRESULT status = WaitAsync(&b);
-  Label(label, sizeof(label), asyncName, "completes (callback fired) with E_GAMEUSER_FAILED_TO_GET_TOKEN: no token is invented");
-  Check(hr == S_OK && called && status == kFailedToGetToken, label);
+  Label(label, sizeof(label), asyncName, "completes (callback fired) with HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT): no token is invented");
+  Check(hr == S_OK && called && status == kCannotConnect, label);
   size_t size = 77;
-  Label(label, sizeof(label), sizeName, "propagates E_GAMEUSER_FAILED_TO_GET_TOKEN");
-  Check(resultSize(g_user.self, &b, &size) == kFailedToGetToken && size == 77, label);
+  Label(label, sizeof(label), sizeName, "propagates HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT)");
+  Check(resultSize(g_user.self, &b, &size) == kCannotConnect && size == 77, label);
   Label(label, sizeof(label), sizeName, "rejects a null size pointer");
   Check(resultSize(g_user.self, &b, nullptr) == E_INVALIDARG, label);
   unsigned char buffer[256];
@@ -206,16 +208,16 @@ static void CheckTokenFamily(int asyncSlot, const char* asyncName, int sizeSlot,
   Label(label, sizeof(label), resultName, "rejects a null buffer with a non-zero size");
   Check(result(g_user.self, &b, sizeof(buffer), nullptr, &data, &used) == E_INVALIDARG, label);
   Label(label, sizeof(label), resultName, "with a zero buffer reports the call's failure");
-  Check(result(g_user.self, &b, 0, nullptr, &data, &used) == kFailedToGetToken && data == nullptr, label);
+  Check(result(g_user.self, &b, 0, nullptr, &data, &used) == kCannotConnect && data == nullptr, label);
   data = reinterpret_cast<Data*>(buffer);
-  Label(label, sizeof(label), resultName, "propagates E_GAMEUSER_FAILED_TO_GET_TOKEN, clears the data pointer and leaves the used count alone");
-  Check(result(g_user.self, &b, sizeof(buffer), buffer, &data, &used) == kFailedToGetToken && data == nullptr && used == 99, label);
+  Label(label, sizeof(label), resultName, "propagates HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT), clears the data pointer and leaves the used count alone");
+  Check(result(g_user.self, &b, sizeof(buffer), buffer, &data, &used) == kCannotConnect && data == nullptr && used == 99, label);
 
   AsyncBlock withBody{};
   const char body[4] = {'b', 'o', 'd', 'y'};
   hr = begin(g_user.self, g_handle, 3, method, url, 0, nullptr, sizeof(body), body, &withBody);
   Label(label, sizeof(label), asyncName, "accepts ForceRefresh|AllUsers with a body and still fails to get a token");
-  Check(hr == S_OK && WaitAsync(&withBody) == kFailedToGetToken, label);
+  Check(hr == S_OK && WaitAsync(&withBody) == kCannotConnect, label);
 
   AsyncBlock unused{};
   Label(label, sizeof(label), asyncName, "rejects a null user");
@@ -403,8 +405,8 @@ static void CALLBACK NeverFiredChange(void*, LocalId, uint32_t) {}
 static void CheckProfileAnswers(const Api& user4) {
   auto closeHandle = g_user.At<void (*)(void*, void*)>(4, "XUserCloseHandle");
   uint32_t maxUsers = 0;
-  Check(g_user.At<HRESULT (*)(void*, uint32_t*)>(6, "XUserGetMaxUsers")(g_user.self, &maxUsers) == S_OK && maxUsers == 4,
-        "XUserGetMaxUsers reports 4 (a choice; no GDK page gives a number)");
+  Check(g_user.At<HRESULT (*)(void*, uint32_t*)>(6, "XUserGetMaxUsers")(g_user.self, &maxUsers) == S_OK && maxUsers == 1,
+        "XUserGetMaxUsers reports 1, the one offline user (rebox local change, xcl's answer)");
   Check(user4.At<BOOLEAN (*)(void*, void*)>(42, "XUserIsStoreUser")(user4.self, g_handle) == 1,
         "XUserIsStoreUser is true, the documented console answer");
   uint32_t ageGroup = 9;

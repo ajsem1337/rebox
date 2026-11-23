@@ -541,6 +541,25 @@ void cleanup() {
   check(remove_own_config(), "cleanup", "test MicrosoftGame.config removed");
 }
 
+// rebox local change: without XGR_STRICT_PACKAGE, questions about any package or selector are
+// answered as for the installed package, and any monitor handle reports it installed (xcl's answers).
+void phase_lenient() {
+  const char* P = "lenient";
+  clear_package_env();
+  set_env(L"XGR_STRICT_PACKAGE", nullptr);
+  Runtime r;
+  if (!r.load()) { check(false, P, "load runtime"); return; }
+  uint32_t avail = 99;
+  check(r.pkg<HRESULT>(FindChunkAvailability, "SomeDlc", 0u, static_cast<Selector*>(nullptr), &avail) == S_OK && avail == 0, P,
+        "FindChunkAvailability(a package it doesn't know) = Ready");
+  Progress pr{};
+  int bogus = 0;
+  r.pkg<void>(GetInstallationProgress, static_cast<void*>(&bogus), &pr);
+  check(pr.completed && pr.launchable && pr.installedBytes == pr.totalBytes, P,
+        "XPackageGetInstallationProgress(a handle it doesn't know): installed, launchable");
+  set_env(L"XGR_STRICT_PACKAGE", L"1");
+}
+
 int main() {
   wchar_t exe[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -551,12 +570,14 @@ int main() {
     std::printf("FAIL a MicrosoftGame.config not written by this test is next to the executable; refusing to touch it\n");
     return 1;
   }
+  set_env(L"XGR_STRICT_PACKAGE", L"1"); /* the documented answers; phase_lenient checks rebox's default */
   phase_defaults();
   phase_environment();
   phase_bogus_language();
   if (!remove_own_config()) check(false, "setup", "remove config between phases");
   phase_uninstall_and_pls();
   phase_config();
+  phase_lenient();
   cleanup();
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
   return g_failures ? 1 : 0;

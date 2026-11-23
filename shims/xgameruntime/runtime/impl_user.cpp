@@ -53,7 +53,8 @@ void hand_out(User* u) {
 
 HRESULT XUserGetMaxUsers_impl(void*, uint32_t* n) {
   if (!n) return E_INVALIDARG;
-  *n = 4;
+  // rebox local change: one, the one offline user (xcl's answer, with which a retail title boots).
+  *n = 1;
   return S_OK;
 }
 
@@ -422,7 +423,10 @@ HRESULT begin_token_request(void* h, uint32_t options, const Char* method, const
   if (!is_local_user(h) || (options & ~kTokenAndSignatureOptionsMask) || !method || !url || (headerCount && !headers) ||
       (bodySize && !body) || !a)
     return E_INVALIDARG;
-  return begin_completing_with(a, identity, name, kFailedToGetToken);
+  // rebox local change: the request fails as on a console that can't reach the Xbox network,
+  // HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT) (xcl's answer, with which a retail title boots),
+  // not as one whose user has no token.
+  return begin_completing_with(a, identity, name, static_cast<HRESULT>(0x80072EFD));
 }
 
 template <typename Data>

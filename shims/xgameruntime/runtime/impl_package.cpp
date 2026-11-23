@@ -4,6 +4,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+
+#include "gtx/log.h"
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -482,10 +485,40 @@ HRESULT check_selectors(uint32_t count, const Selector* selectors) {
   return S_OK;
 }
 
-HRESULT check_package_and_selectors(const char* packageIdentifier, uint32_t count, const Selector* selectors) {
+HRESULT check_package_and_selectors_strict(const char* packageIdentifier, uint32_t count, const Selector* selectors) {
   HRESULT hr = resolve_package(packageIdentifier);
   if (FAILED(hr)) return hr;
   return check_selectors(count, selectors);
+}
+
+// rebox local change: chunk, installation and download questions about the title's package are
+// answered "ready / installed" whatever the identifier and selectors, as xcl (ivall/xcl) answers
+// them, which a retail title boots with: one this runtime can't match against MicrosoftGame.config
+// would otherwise get an error, and a title can wait without end for content it is told is
+// missing. What the strict checks would have refused is logged (the first few).
+// XGR_STRICT_PACKAGE=1 keeps them.
+bool strict_package() {
+  char v[4];
+  DWORD n = GetEnvironmentVariableA("XGR_STRICT_PACKAGE", v, sizeof(v));
+  return n && n < sizeof(v) && v[0] == '1';
+}
+
+HRESULT check_package_and_selectors(const char* packageIdentifier, uint32_t count, const Selector* selectors) {
+  HRESULT hr = check_package_and_selectors_strict(packageIdentifier, count, selectors);
+  if (SUCCEEDED(hr) || strict_package()) return hr;
+  static std::atomic<int> logged{0};
+  if (logged++ < 16) {
+    char first[96] = "";
+    if (count && selectors && selectors[0].type == SelectorType::Chunk)
+      std::snprintf(first, sizeof(first), ", first selector chunk %u", selectors[0].chunkId);
+    else if (count && selectors && selectors[0].text && !IsBadStringPtrA(selectors[0].text, 64))
+      std::snprintf(first, sizeof(first), ", first selector type %u \"%.60s\"", static_cast<unsigned>(selectors[0].type),
+                    selectors[0].text);
+    gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XPackage", nullptr,
+                    "package \"%.80s\", %u selector(s)%s: would be %#lx; answered as the installed package",
+                    packageIdentifier ? packageIdentifier : "(null)", count, first, static_cast<unsigned long>(hr));
+  }
+  return S_OK;
 }
 
 HRESULT copy_string(const std::string& value, size_t size, char* buffer) {
@@ -547,7 +580,8 @@ bool is_live_monitor(void* handle) {
 void XPackageGetInstallationProgress_impl(void*, void* handle, Progress* progress) {
   if (!progress) return;
   *progress = {};
-  if (!is_live_monitor(handle)) return;
+  // rebox local change: any handle reports the installed package (xcl), unless XGR_STRICT_PACKAGE=1.
+  if (!is_live_monitor(handle) && strict_package()) return;
   uint64_t bytes = package_bytes();
   progress->totalBytes = bytes;
   progress->installedBytes = bytes;
@@ -617,7 +651,7 @@ HRESULT XPackageFindChunkAvailability_impl(void*, const char* packageIdentifier,
 HRESULT XPackageEnumerateChunkAvailability_impl(void*, const char* packageIdentifier, SelectorType type, void* context,
                                                 ChunkAvailabilityCallback callback) {
   if (!callback || static_cast<uint32_t>(type) > static_cast<uint32_t>(SelectorType::Feature)) return E_INVALIDARG;
-  HRESULT hr = resolve_package(packageIdentifier);
+  HRESULT hr = check_package_and_selectors(packageIdentifier, 0, nullptr);
   if (FAILED(hr)) return hr;
   if (type != SelectorType::Language) return S_OK;
   for (const std::string& lang : identity().languages) {

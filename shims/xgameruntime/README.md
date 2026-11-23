@@ -67,3 +67,14 @@ outright:
   earlier phase's settings stay. A title sets nothing mid-run: `rebox-run` sets `XGR_PLS_DIR`
   before it starts, and the title's `MicrosoftGame.Config` gives the quota.
 - `test_accessibility` isn't built: it needs the WinRT headers too.
+
+Local changes that follow xcl's (ivall/xcl) answers, with which a retail title boots:
+
+- `runtime/impl_package.cpp`: chunk, installation and download questions about any package
+  identifier or selector are answered as for the installed package (ready, installed, nothing to
+  download), and any installation monitor handle reports it installed; what the documented checks
+  would have refused goes to `GTX_LOG` (the first 16). `XGR_STRICT_PACKAGE=1` keeps the checks.
+- `runtime/impl_user.cpp`: `XUserGetMaxUsers` is 1, and token-and-signature requests complete with
+  `HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT)` (no Xbox network) rather than
+  `E_GAMEUSER_FAILED_TO_GET_TOKEN`.
+- `runtime/impl_system.cpp`: the connectivity hint is internet access (`XGR_CONNECTIVITY=none`: none).
