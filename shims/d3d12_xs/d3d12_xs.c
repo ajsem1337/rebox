@@ -179,10 +179,78 @@ static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *c
     return TRUE;
 }
 
+/* The vertex shader's input signature (its container's ISG1 part, or ISGN): the semantic name and
+ * index of each input register that isn't a system value. Returns how many registers it names. */
+static UINT vs_input_semantics(const BYTE *dxbc, SIZE_T size, const char *names[32], UINT indices[32])
+{
+    UINT parts, count = 0;
+
+    memset(names, 0, 32 * sizeof(*names));
+    if (size < 32 || memcmp(dxbc, "DXBC", 4))
+        return 0;
+    parts = *(const UINT32 *)(dxbc + 28);
+    for (UINT i = 0; i < parts && 32 + 4 * i + 4 <= size; i++)
+    {
+        UINT32 off = *(const UINT32 *)(dxbc + 32 + 4 * i), chunk;
+        const BYTE *body;
+        BOOL v1;
+        UINT n, stride;
+
+        if (off + 8 > size)
+            continue;
+        v1 = !memcmp(dxbc + off, "ISG1", 4);
+        if (!v1 && memcmp(dxbc + off, "ISGN", 4))
+            continue;
+        chunk = *(const UINT32 *)(dxbc + off + 4);
+        body = dxbc + off + 8;
+        if (off + 8 + chunk > size || chunk < 8)
+            return 0;
+        n = *(const UINT32 *)body;
+        stride = v1 ? 32 : 24;
+        for (UINT k = 0; k < n && 8 + (k + 1) * stride <= chunk; k++)
+        {
+            const BYTE *e = body + 8 + k * stride + (v1 ? 4 : 0); /* ISG1 starts with the stream */
+            UINT32 name = *(const UINT32 *)e, index = *(const UINT32 *)(e + 4), sv = *(const UINT32 *)(e + 8);
+            UINT32 reg = *(const UINT32 *)(e + 16);
+            if (sv || reg >= 32 || name >= chunk)
+                continue;
+            names[reg] = (const char *)body + name;
+            indices[reg] = index;
+            count = max(count, reg + 1);
+        }
+        break;
+    }
+    return count;
+}
+
 /* A PSO with fallback shaders whose real stages are a console vertex and pixel shader gets them
  * attached (REBOX_GRAPHICS_GUID): vkd3d-proton (patch 0006) then compiles both with AnyPS5 at
  * each draw, as compute shaders are at dispatch, and keeps the fallback pipeline for draws whose
  * compile fails. REBOX_CONSOLE_GRAPHICS=0 turns it off. */
+/* Bytes per element of the vertex formats input layouts use. */
+static UINT format_bytes(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+        return 16;
+    case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+        return 12;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+        return 8;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SINT:
+        return 2;
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        return 1;
+    default:
+        return 4; /* R32, R16G16, R8G8B8A8, R10G10B10A2, R11G11B10 and their kinds */
+    }
+}
+
 static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
 {
     static LONG attached, refused_vs, refused_ps, refused_other;
@@ -221,12 +289,42 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
     g->vs_size = (UINT32)vs_size;
     g->ps_offset = (UINT32)(sizeof(*g) + vs_size);
     g->ps_size = (UINT32)ps_size;
-    g->element_count = desc->InputLayout.NumElements;
-    for (UINT i = 0; i < g->element_count; i++)
+    /* Element r of the attached layout is the one the fetch puts in input r: the input layout
+     * element whose semantic is the vertex shader's input register r (the console driver builds
+     * the fetch by matching them; a UE5 title's inputs aren't in the layout's order, e.g. ATTRIBUTE0
+     * then ATTRIBUTE13). Offsets are resolved here, D3D12_APPEND_ALIGNED_ELEMENT by the layout's own
+     * order (patch 0006 resolves them only for elements in order). Without a signature, layout order. */
     {
-        const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
-        g->elements[i] = (struct rebox_graphics_element){ e->InputSlot, e->Format, e->AlignedByteOffset,
-                e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA };
+        const char *names[32];
+        UINT indices[32], regs = vs_input_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, names, indices);
+        UINT offsets[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = { 0 }, resolved[ARRAYSIZE(g->elements)];
+        for (UINT i = 0; i < desc->InputLayout.NumElements; i++)
+        {
+            const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
+            UINT slot = min(e->InputSlot, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT - 1);
+            resolved[i] = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? offsets[slot] : e->AlignedByteOffset;
+            offsets[slot] = resolved[i] + format_bytes(e->Format);
+        }
+        g->element_count = regs ? regs : desc->InputLayout.NumElements;
+        for (UINT r = 0; r < g->element_count; r++)
+        {
+            UINT i = r;
+            if (regs)
+            {
+                for (i = 0; i < desc->InputLayout.NumElements; i++)
+                    if (names[r] && !_stricmp(desc->InputLayout.pInputElementDescs[i].SemanticName, names[r])
+                            && desc->InputLayout.pInputElementDescs[i].SemanticIndex == indices[r])
+                        break;
+            }
+            if (i < desc->InputLayout.NumElements)
+            {
+                const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
+                g->elements[r] = (struct rebox_graphics_element){ e->InputSlot, e->Format, resolved[i],
+                        e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA };
+            }
+            else /* no element: no attribute (patch 0006 skips DXGI_FORMAT_UNKNOWN) */
+                g->elements[r] = (struct rebox_graphics_element){ 0, DXGI_FORMAT_UNKNOWN, 0, 0 };
+        }
     }
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
     memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
