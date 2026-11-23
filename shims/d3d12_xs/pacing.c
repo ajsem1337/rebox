@@ -2,11 +2,12 @@
  * WaitFrameEventX).
  *
  * On the console the display hardware raises an origin event once per frame
- * period (interval x period-in-intervals) and titles start each frame by
- * waiting for it. A retail title was traced calling SetFrameIntervalX with
- * 16667 us and period 2 (30 fps), then WaitFrameEventX(ORIGIN, INFINITE) per
- * frame (ScarlettX). Without a clock such a title runs as fast as PresentX
- * lets it.
+ * interval and titles start each frame by waiting for it. A retail title was
+ * traced calling SetFrameIntervalX with 16667 us and periodicity 2, then
+ * WaitFrameEventX(ORIGIN, INFINITE) per frame (ScarlettX); the target title
+ * sets 33 333 us with periodicity 3 and runs at 30 fps with the origin every
+ * interval (xcl), so the periodicity isn't a multiplier of the frame length.
+ * Without a clock such a title runs as fast as PresentX lets it.
  *
  * Here a QPC clock stands in for the hardware. Frame k's event of a given
  * type is due at epoch + k * period + that type's scheduled offset. Each type
@@ -196,12 +197,15 @@ HRESULT pacing_set_interval(UINT interval_us, UINT period)
         interval_us = DEFAULT_INTERVAL_US;
     if (!period)
         period = 1;
-    rebox_log("d3d12_xs: SetFrameIntervalX(%u us, period %u): origin every %.2f ms", interval_us, period,
-                 interval_us * period / 1000.0);
+    /* The origin comes every interval; the periodicity isn't a multiplier (xcl, ivall/xcl,
+     * GPL-2.0-only, frame.rs: the target title sets 33 333 us with periodicity 3 and runs at
+     * 30 fps; taken as 100 ms here it ran at 10). */
+    rebox_log("d3d12_xs: SetFrameIntervalX(%u us, periodicity %u): origin every %.2f ms", interval_us, period,
+                 interval_us / 1000.0);
     AcquireSRWLockExclusive(&lock);
-    interval_us_set = interval_us * period; /* the frame length, with 1 at +4, as XValkyrie reports it */
+    interval_us_set = interval_us; /* the frame length, with 1 at +4, as XValkyrie reports it */
     /* Restart the clock so frame numbers stay monotonic from here. */
-    period_ticks = us_to_ticks((LONGLONG)interval_us * period);
+    period_ticks = us_to_ticks((LONGLONG)interval_us);
     epoch = now();
     for (UINT i = 0; i < MAX_TYPES; i++)
     {

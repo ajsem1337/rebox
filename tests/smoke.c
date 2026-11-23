@@ -2190,8 +2190,8 @@ static void test_pacing(void *dev, void *queue)
     BOOL ok = TRUE;
     int i;
 
-    /* 10 ms x period 2: an origin every 20 ms. */
-    hr = XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 10000, 2);
+    /* 20 ms, periodicity 3 (not a multiplier): an origin every 20 ms. */
+    hr = XSLOT(dev, 78, HRESULT, void *, UINT, UINT)(dev, NULL, 20000, 3);
     CHECK(SUCCEEDED(hr), "SetFrameIntervalX (slot 78) %#lx", hr);
     wait(dev, 0, INFINITE, NULL, 0, &tok[0]);
     QueryPerformanceCounter(&t0);
