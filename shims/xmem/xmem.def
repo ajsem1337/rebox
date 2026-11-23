@@ -21,3 +21,4 @@ EXPORTS
     ReboxProbeHits
     ReboxAppStateRegister
     ReboxQuitSubclass
+    ReboxRenderAudioStateMonitor

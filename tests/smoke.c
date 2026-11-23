@@ -136,6 +136,8 @@ static void test_quit(HMODULE xmem)
     SetEnvironmentVariableA("REBOX_QUIT_EXIT", NULL);
 }
 
+static void test_audio_state_monitor(void);
+
 static void test_xmem(void)
 {
     HMODULE m = LoadLibraryA("xmem.dll");
@@ -155,6 +157,7 @@ static void test_xmem(void)
     CHECK(GetProcAddress(m, "ReboxHeartbeat") != NULL, "xmem exports ReboxHeartbeat (the hang watchdog's)");
     test_probe(m);
     test_quit(m);
+    test_audio_state_monitor();
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
     test_crash_report(m);
 
@@ -3054,6 +3057,30 @@ static void test_xcrdapi(void)
     if (fq) XSLOT(fq, 2, ULONG)(fq);
     if (mq) XSLOT(mq, 2, ULONG)(mq);
     DeleteFileW(path);
+}
+
+/* An audio state monitor looked up by name, as GameChat2.dll does: Wine's aborts the process; ours
+ * (through the GetProcAddress replacement) says full volume. */
+static void test_audio_state_monitor(void)
+{
+    HMODULE m = LoadLibraryA("windows.media.mediacontrol.dll");
+    HRESULT (WINAPI *create)(UINT, void **) = m ? (void *)GetProcAddress(m, "CreateRenderAudioStateMonitorForCategory") : NULL;
+    void *monitor = NULL;
+    INT64 handle = 0;
+
+    if (!m)
+    {
+        printf("skip audio state monitor: no windows.media.mediacontrol.dll in this Wine\n");
+        return;
+    }
+    CHECK(create && SUCCEEDED(create(3 /* GameChat */, &monitor)) && monitor,
+          "CreateRenderAudioStateMonitorForCategory by GetProcAddress gives a monitor (not Wine's abort)");
+    if (!monitor) return;
+    CHECK(XSLOT(monitor, 3, HRESULT, void *, void *, INT64 *)(monitor, NULL, NULL, &handle) == S_OK && handle
+              && XSLOT(monitor, 5, UINT)(monitor) == 2,
+          "the monitor registers a callback and reports full volume");
+    XSLOT(monitor, 4, void, INT64)(monitor, handle);
+    XSLOT(monitor, 2, ULONG)(monitor);
 }
 
 /* gameinput.dll (v0): the gamepad is enumerated as connected, readings carry its state, and

@@ -261,18 +261,87 @@ static HWND WINAPI create_window_a(DWORD ex, const char *cls, const char *name, 
             parent, menu, inst, param), parent, style);
 }
 
+/* Audio state monitors (windows.media.mediacontrol): Wine's are stubs that abort the process, and
+ * a UE5 sample's GameChat2.dll asks for one at startup. A console title's audio is never
+ * ducked or muted by the system here, so the monitor says full volume and never calls back.
+ * IAudioStateMonitor: IUnknown, RegisterCallback, UnregisterCallback, GetSoundLevel. */
+static HRESULT WINAPI monitor_query(void *self, REFIID iid, void **out)
+{
+    if (!out)
+        return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+static ULONG WINAPI monitor_ref(void *self) { return 1; }
+static HRESULT WINAPI monitor_register(void *self, void *callback, void *context, INT64 *handle)
+{
+    if (handle)
+        *handle = 1;
+    return S_OK;
+}
+static void WINAPI monitor_unregister(void *self, INT64 handle) {}
+static UINT WINAPI monitor_level(void *self) { return 2; /* AudioStateMonitorSoundLevel: full volume */ }
+static void *const monitor_vtbl[] = { monitor_query, monitor_ref, monitor_ref, monitor_register, monitor_unregister,
+                                      monitor_level };
+static void *const audio_state_monitor = (void *)monitor_vtbl;
+
+static HRESULT give_monitor(void **monitor)
+{
+    static LONG logged;
+    if (!monitor)
+        return E_POINTER;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("CreateRenderAudioStateMonitor*: a monitor at full volume that never calls back");
+    *monitor = (void *)&audio_state_monitor;
+    return S_OK;
+}
+static HRESULT WINAPI render_monitor(void **monitor) { return give_monitor(monitor); }
+static HRESULT WINAPI render_monitor_category(UINT category, void **monitor) { return give_monitor(monitor); }
+static HRESULT WINAPI render_monitor_category_role(UINT category, UINT role, void **monitor) { return give_monitor(monitor); }
+static HRESULT WINAPI render_monitor_category_id(UINT category, const WCHAR *id, void **monitor) { return give_monitor(monitor); }
+
+/* For tests: what a title gets for CreateRenderAudioStateMonitorForCategory. */
+HRESULT WINAPI ReboxRenderAudioStateMonitor(UINT category, void **monitor)
+{
+    return render_monitor_category(category, monitor);
+}
+
+static FARPROC WINAPI get_proc_address(HMODULE module, const char *name);
+
 static struct
 {
     const char *dll, *name;
     void *ours, *wine;
 } replacements[] = {
+    /* A replaced function the title looks up by name (GameChat2.dll loads its audio state monitor
+     * so) is replaced as well. */
+    { "kernelbase.dll", "GetProcAddress", get_proc_address },
+    { "kernel32.dll", "GetProcAddress", get_proc_address },
     { "user32.dll", "CreateWindowExW", create_window_w },
     { "user32.dll", "CreateWindowExA", create_window_a },
     { "twinapi.appcore.dll", "RegisterAppStateChangeNotification", app_state_register },
     { "twinapi.appcore.dll", "UnregisterAppStateChangeNotification", app_state_unregister },
     { "twinapi.appcore.dll", "RegisterAppConstrainedChangeNotification", app_constrained_register },
     { "twinapi.appcore.dll", "UnregisterAppConstrainedChangeNotification", app_state_unregister },
+    { "windows.media.mediacontrol.dll", "CreateRenderAudioStateMonitor", render_monitor },
+    { "windows.media.mediacontrol.dll", "CreateRenderAudioStateMonitorForCategory", render_monitor_category },
+    { "windows.media.mediacontrol.dll", "CreateRenderAudioStateMonitorForCategoryAndDeviceRole",
+      render_monitor_category_role },
+    { "windows.media.mediacontrol.dll", "CreateRenderAudioStateMonitorForCategoryAndDeviceId",
+      render_monitor_category_id },
 };
+
+static void *replacement(void *target);
+static void *real_get_proc_address;
+
+static FARPROC WINAPI get_proc_address(HMODULE module, const char *name)
+{
+    FARPROC p = ((FARPROC (WINAPI *)(HMODULE, const char *))real_get_proc_address)(module, name);
+    void *ours;
+    if (p && (ours = replacement((void *)p)) && ours != (void *)get_proc_address)
+        return (FARPROC)ours;
+    return p;
+}
 
 static void *replacement(void *target)
 {
@@ -417,6 +486,8 @@ void import_fixup_run(void)
         replacements[i].wine = dll ? (void *)GetProcAddress(dll, replacements[i].name) : NULL;
         if (replacements[i].ours == (void *)create_window_w)
             real_create_window_w = replacements[i].wine;
+        if (replacements[i].ours == (void *)get_proc_address && replacements[i].wine && !real_get_proc_address)
+            real_get_proc_address = replacements[i].wine;
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
     }
