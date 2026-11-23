@@ -203,6 +203,37 @@ if [[ -f ${REBOX_CA_BUNDLE:-} ]]; then
     mkdir -p "$shadow/etc/ssl/certs"
     install -m 644 "$REBOX_CA_BUNDLE" "$shadow/etc/ssl/certs/ca-bundle.crt"
 fi
+# REBOX_OVERLAY=DIR: files laid over the package at the same relative paths, in the shadow
+# package only (the dump is untouched): a symlinked directory on the way becomes a real one whose
+# other entries stay links. For instance Title/Config/UserEngine.ini for an Unreal title's
+# settings (a UE5 sample with r.RayTracing=0: its ray tracing pipelines are console code).
+overlay_file() {
+    local rel=$1 src=$2 dir=$shadow part entry target
+    local -a parts
+    IFS=/ read -ra parts <<<"$(dirname "$rel")"
+    for part in "${parts[@]}"; do
+        [[ -z $part || $part == . ]] && continue
+        if [[ -L $dir/$part ]]; then
+            target=$(readlink -f "$dir/$part")
+            rm "$dir/$part"
+            mkdir "$dir/$part"
+            for entry in "$target"/* "$target"/.[!.]*; do
+                [[ -e $entry ]] && ln -s "$entry" "$dir/$part/"
+            done
+        fi
+        mkdir -p "$dir/$part"
+        dir=$dir/$part
+    done
+    rm -f "$dir/$(basename "$rel")"
+    install -m 644 "$src" "$dir/"
+}
+if [[ -n ${REBOX_OVERLAY:-} ]]; then
+    [[ -d $REBOX_OVERLAY ]] || die "REBOX_OVERLAY: no directory $REBOX_OVERLAY"
+    while IFS= read -r -d '' file; do
+        overlay_file "${file#"$REBOX_OVERLAY"/}" "$file"
+        echo "rebox-run: overlay ${file#"$REBOX_OVERLAY"/}" >&2
+    done < <(find "$REBOX_OVERLAY" -type f -print0)
+fi
 if [[ -n ${REBOX_EXE:-} ]]; then
     [[ -f $game_dir/$REBOX_EXE ]] || die "REBOX_EXE: no $REBOX_EXE in $game_dir"
     rm -f "$shadow/$exe"
