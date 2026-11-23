@@ -699,9 +699,10 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
  * shader as a UE5 title's do (s_swappc_b64 s[4:5], s[4:5]) and exports input 0 as the position, its x
  * and y scaled by a constant buffer's first value (1.0), whose V# it loads through descriptor table
  * 0 in s8 as a UE5 title's load theirs through s12: past the 5-bit RSRC2 user SGPR count. The pixel
- * shader exports red. One full-screen triangle over a blue clear: the centre turns red (blue: fell
+ * shader exports red, as 32-bit floats or (packed) as two FP16 pairs, which every a UE5 title pixel
+ * shader exports. One full-screen triangle over a blue clear: the centre turns red (blue: fell
  * back, or the constant read 0 and the triangle collapsed). */
-static void test_console_draw(void *dev, void *queue)
+static void test_console_draw(void *dev, void *queue, BOOL packed)
 {
     static const UINT32 vs_code[] = {
         0xbe842104,             /* s_swappc_b64 s[4:5], s[4:5]: the fetch, input 0 in v4-v7 */
@@ -720,6 +721,12 @@ static void test_console_draw(void *dev, void *queue)
         0x7e0002f2,             /* v_mov_b32 v0, 1.0 */
         0x7e020280,             /* v_mov_b32 v1, 0 */
         0xf800180f, 0x00010100, /* exp mrt0 v0, v1, v1, v0 done vm */
+        0xbf810000,             /* s_endpgm */
+    };
+    static const UINT32 ps_packed_code[] = {
+        0xd52f0000, 0x000100f2, /* v_cvt_pkrtz_f16_f32 v0, 1.0, 0: red, green */
+        0xd52f0001, 0x0001e480, /* v_cvt_pkrtz_f16_f32 v1, 0, 1.0: blue, alpha */
+        0xf8001c0f, 0x00000100, /* exp mrt0 v0, v0, v1, v1 done compr vm */
         0xbf810000,             /* s_endpgm */
     };
     static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
@@ -760,7 +767,8 @@ static void test_console_draw(void *dev, void *queue)
     if (getenv("REBOX_SHADER_FALLBACK") && *getenv("REBOX_SHADER_FALLBACK") == '0')
         return;
     vs = console_graphics_container(vs_code, ARRAYSIZE(vs_code), &vs_size);
-    ps = console_graphics_container(ps_code, ARRAYSIZE(ps_code), &ps_size);
+    ps = packed ? console_graphics_container(ps_packed_code, ARRAYSIZE(ps_packed_code), &ps_size)
+                : console_graphics_container(ps_code, ARRAYSIZE(ps_code), &ps_size);
     hr = serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)) ? S_OK : E_FAIL;
     if (SUCCEEDED(hr))
     {
@@ -875,8 +883,8 @@ static void test_console_draw(void *dev, void *queue)
     {
         px = (BYTE *)mapped + 24 * 256 + 32 * 4;
         CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0,
-              "console vertex and pixel shaders draw through AnyPS5 (centre RGB %u %u %u; blue: fell back)",
-              px[0], px[1], px[2]);
+              "console vertex and pixel shaders draw through AnyPS5, %s export (centre RGB %u %u %u; blue: fell back)",
+              packed ? "FP16 (compr)" : "32-bit", px[0], px[1], px[2]);
         ID3D12Resource_Unmap(readback, 0, NULL);
     }
 
@@ -3437,7 +3445,8 @@ static void test_xbox(void)
 
     test_dxgi_device(dev);
     test_pacing(dev, queue);
-    test_console_draw(dev, queue);
+    test_console_draw(dev, queue, FALSE);
+    test_console_draw(dev, queue, TRUE);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
