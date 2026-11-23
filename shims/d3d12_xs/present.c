@@ -31,7 +31,7 @@
  * reach the screen without a timeout, so when the compositor stops taking
  * frames (a Wayland window that is hidden or on another workspace gets no
  * frame callbacks) Present would block the title's render thread for good:
- * a UE5 title stopped after its first frames that way, and Unreal's garbage
+ * A UE5 title stopped after its first frames that way, and Unreal's garbage
  * collector then gave up on textures waiting for the render thread. The
  * swapchain has a frame-latency waitable object instead; when no frame slot
  * frees within 100 ms the frame is dropped, and later ones are dropped

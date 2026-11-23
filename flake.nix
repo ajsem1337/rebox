@@ -255,7 +255,6 @@
         };
 
         scan-imports = pyTool "scan_imports.py" ./tools/scan_imports.py;
-        anyps5-cache = pyTool "anyps5_cache.py" ./tools/anyps5_cache.py;
         # mingw gcc on PATH lets the probe find d3d12.h for GUID and vtable names.
         d3d12x-probe = pyTool "d3d12x_probe.py" ./tools/d3d12x_probe.py;
 
@@ -286,7 +285,6 @@
       apps.${system} = {
         default = { type = "app"; program = "${self.packages.${system}.rebox-run}/bin/rebox-run"; };
         scan-imports = { type = "app"; program = "${self.packages.${system}.scan-imports}/bin/scan_imports.py"; };
-        anyps5-cache = { type = "app"; program = "${self.packages.${system}.anyps5-cache}/bin/anyps5_cache.py"; };
         d3d12x-probe = { type = "app"; program = "${self.packages.${system}.d3d12x-probe}/bin/d3d12x_probe.py"; };
       };
 

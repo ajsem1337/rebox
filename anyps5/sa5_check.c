@@ -3,10 +3,10 @@
  *   sa5_check CODE.bin SKIP RSRC1 RSRC2 X,Y,Z  a dumped shader (e.g. a PS09
  *                                              entry, SKIP = 36), compile only,
  *                                              with no guest memory
- *   sa5_check vs PLAN [FIRST [COUNT]]          the vertex shaders in PLAN (tools/fssm-vs-plan.py);
+ *   sa5_check vs PLAN [FIRST [COUNT]]          the vertex shaders in PLAN (format: vertex_sweep);
  *                                              SA5_USER, SA5_MEMORY: a draw's user SGPRs and guest
  *                                              memory (see vertex_sweep)
- *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (tools/ps-plan.py) with
+ *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (format: pixel_sweep) with
  *                                              their PSO register state, compile only, no guest
  *                                              memory; one "ps NAME ok|FAIL ..." line each */
 #include <stdio.h>
@@ -163,7 +163,7 @@ static int pixel_sweep(const char *plan, int first, int count)
     return 0;
 }
 
-/* Vertex shaders: plan lines NAME CODE SKIP RSRC1 USER_SGPRS INPUTS (tools/fssm-vs-plan.py). Each
+/* Vertex shaders: plan lines NAME CODE SKIP RSRC1 USER_SGPRS INPUTS, one shader per line. Each
  * input r gets a synthetic RGBA32F vertex buffer (stride 16) and v[4+4r..7+4r]. */
 static uint32_t memory[64], memory_words;
 static uint64_t memory_address;

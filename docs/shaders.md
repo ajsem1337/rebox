@@ -2,18 +2,17 @@
 
 > **Superseded translator choice.** The project uses AnyPS5 for shader compilation; see
 > [anyps5.md](anyps5.md). The vkd3d-proton patches below (real heap addresses, SGPR packing,
-> lookup table) carry over; the Leonida contract, `SCSV` packing and `translate-shaders.sh` do not.
+> lookup table) carry over; the Leonida contract and the offline `SCSV` packing do not.
 
 Status: design, nothing below is implemented yet. Written 2026-11-21 after reading the two projects
-that translate the target title's own shaders, [Leonida](https://github.com/ItsNotRexed/Leonida) (GPLv3) and
+that translate console shaders, [Leonida](https://github.com/ItsNotRexed/Leonida) (GPLv3) and
 [americas-recomp](https://github.com/realdody/americas-recomp/tree/xbox-series) (GPLv2, an AnyPS5
 fork), and vkd3d-proton 3.0.1's source. Facts only; no code from either project.
 
 ## The problem
 
 Our plan so far was: translate the console shaders offline with AnyPS5, store the result in the
-`d3d12_xs` shader cache as `.dxil`, and let vkd3d-proton compile it like any PC shader
-(`tools/anyps5_cache.py`, README step 3). That doesn't work, for two reasons:
+`d3d12_xs` shader cache as `.dxil`, and let vkd3d-proton compile it like any PC shader. That doesn't work, for two reasons:
 
 1. **The translators emit SPIR-V, not DXIL.** vkd3d-proton accepts only DXBC/DXIL. Its only SPIR-V
    input is a debugging override (`VKD3D_SHADER_OVERRIDE`, by blob hash). That path drops wave size
@@ -124,7 +123,7 @@ There are two places this could live:
 | Does the game write descriptor bytes itself, in console GFX10.3 format? | if so, the bytes in the heap aren't RADV's, and the hash keys and V# decoding see console layouts | yes |
 | GFX10.3 vs GFX11 descriptor differences (formats, MIP fields, V# swizzle bit) | the 890M writes GFX11 descriptors, while translated shaders decode V#s with console field positions | partly; RADV source has both layouts |
 | Heaps below 4 GiB (on RADV, heaps sit at `0xffff8000_xxxxxxxx`: low dword varies, high dword is RADV's 32-bit range) | Leonida reports shaders that zero a pointer's high dword. Our GPU window is at 0x200000000000 | yes; may need a second window below 4 GiB |
-| Do PSOs carry the same DXBC as `the shader archive`? | the lookup key | yes |
+| Do PSOs carry the same DXBC as the title's shader archive? | the lookup key | yes |
 | Wave mode per shader | 21,545 shaders are wave64. RADV runs wave64 for compute and pixel shaders by default, but vertex shaders vary | no; FSSM header |
 | BVH builder shaders (Xbox DXIL with `@xbox.*` intrinsics) | a separate lowering, not FSSM | no |
 
@@ -147,16 +146,16 @@ There are two places this could live:
    its heap index through the lookup table, for a descriptor written straight into the heap and one
    copied in (RADV only; lavapipe has no descriptor buffers and skips). Verified on the Radeon 890M
    (2026-11-21): indices 2 and 3 found, in 0 and 1 probes. Next: a translated compute shader from
-   Leonida's output (needs the user's `the shader archive`).
+   Leonida's output (needs a title's shader archive).
 5. With the exe: measure the open questions above, then graphics.
 
 Meanwhile `d3d12_xs` keeps its fallback shaders, so a title runs with effects missing rather than
 failing. The `.dxil` cache path stays for PC-format shaders the console title may carry, such as
 the BVH builder's once lowered.
 
-## First run of Leonida's translator on the game's shaders (2026-11-21)
+## First run of Leonida's translator on a title's shaders (2026-11-21)
 
-`the shader archive` (412 MB) carves into 26,503 DXBC containers, all SM 6.6 with `ISG1`/`OSG1` and no
+One title's shader archive (412 MB) carves into 26,503 DXBC containers, all SM 6.6 with `ISG1`/`OSG1` and no
 `RTS0`. They unpack to FSSM and disassemble with LLVM 21 (`gfx1013`): 25,030 clean, 1,473 with
 some invalid words. Leonida's `rdna2spirv.py` translates them, run as a separate program from a
 local clone (GPLv3; its output is data, nothing of it is in this repo). All 26,503 translate and
@@ -175,7 +174,7 @@ Integration so far:
   binding 1 (sampler heap) to the device's real bindless sets, so a glue step only has to
   normalise bindings and turn the hash-table storage buffer into a pointer from push dwords 36-37.
 
-**Blocker: descriptor-table pointers are 32-bit.** The game's shaders read a table pointer's low
+**Blocker: descriptor-table pointers are 32-bit.** The title's shaders read a table pointer's low
 dword and zero the high one (the translator reports `truncates_table_ptr_high`), then load from
 `heap_base + pointer`. On the console, descriptor heaps sit below 4 GiB. RADV puts descriptor
 buffers in its 32-bit window at `0xffff8000_xxxxxxxx`, and `heap_base` can't absorb that, because
@@ -184,29 +183,10 @@ RADV patch so 32-bit allocations come from the kernel's low 32-bit VA range (no
 `AMDGPU_VA_RANGE_HIGH`) with `address32_hi = 0`. Heaps then sit below 4 GiB and `heap_base`
 stays 0.
 
-### Translating the game's shaders (`tools/translate-shaders.sh`)
+### Offline translation (superseded)
 
-`tools/translate-shaders.sh [path/to/the shader archive]` runs the whole chain and writes
-`build/console-shaders` (local, git-ignored): carve, unpack FSSM, disassemble with LLVM 21,
-translate with Leonida's `rdna2spirv.py` (cloned into `build/shader-work/Leonida` at run time,
-latest `origin/main` unless `LEONIDA_REV` is set), then `scsv_pack.py`. Rerun it whenever
-Leonida's translator gets fixes; it records the revision it used in
-`build/console-shaders/LEONIDA_REV`. These shaders come from Leonida, not AnyPS5: AnyPS5's output
-(americas-recomp) resolves descriptors on the CPU per draw, a different runtime contract.
-
-### Packing translated shaders (`tools/scsv_pack.py`)
-
-`scsv_pack.py --dxbc CARVE_DIR --spirv TRANSLATED_DIR --out CACHE [--stage cs] [--validate]`
-retargets the translator's SPIR-V to this contract and writes `<fnv1a64 of the DXBC>.scsv`,
-which `d3d12_xs` looks up before `.dxil`:
-
-- set 0 binding 1 (samplers) stays (sampler heap); every other set 0 binding except 2 becomes
-  binding 0 (CBV/SRV/UAV heap, aliased); vkd3d-proton 0004 maps both to its real sets;
-- binding 2, the hash table, becomes a pointer built from two new push-constant members at bytes
-  144/148 (the resource heap's lookup table), so its loads are PhysicalStorageBuffer loads;
-- wave size 64 only where the translator says wave64 is not emulated.
-
-All 2,689 compute shaders pack and pass `spirv-val`. `tests/run-pso-check.sh CACHE` (through
-`smoke.exe --pso-check`) creates a compute PSO from each with an empty root signature: on
-lavapipe 147 of the first 200 succeed, and the other 53 need 64-wide subgroups (lavapipe has 8).
-`tests/manual-test.sh` runs it on the 890M when `build/console-shaders/` exists (local only).
+An offline path carved a title's shader archive into DXBC, translated it with Leonida's
+`rdna2spirv.py` and packed the SPIR-V into `SCSV` cache entries keyed by the DXBC's hash. AnyPS5 compiling at
+dispatch replaced it ([anyps5.md](anyps5.md)).
+Measured then: all 2,689 compute shaders packed and passed `spirv-val`; on lavapipe 147 of the
+first 200 made a PSO, and the other 53 needed 64-wide subgroups (lavapipe has 8).

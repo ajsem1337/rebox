@@ -1,6 +1,6 @@
 # textures: d3d12_xs's detiling, checked on the real pools
 
-`texcheck.py` puts the target title's own textures through the code d3d12_xs uses for textures placed at
+`texcheck.py` puts a title's own textures through the code d3d12_xs uses for textures placed at
 title addresses, with no game exe needed, and compares the result with an independent decoder.
 For each sampled texture of a pool (`.ttpf`):
 
@@ -20,8 +20,8 @@ program; nothing of Leonida's is copied here. The dev shell's `LEONIDA_SRC` (the
 
 ```sh
 nix develop -c make build/texcheck.exe
-nix develop -c python3 helpers/textures/texcheck.py ../xsx/data/ttdb
-nix develop -c python3 helpers/textures/texcheck.py --shape 2d_array --limit 20 ../xsx/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py path/to/title/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py --shape 2d_array --limit 20 path/to/title/data/ttdb
 ```
 
 `--every N` and `--limit N` sample each pool, `--max-bytes` skips large textures (Leonida's

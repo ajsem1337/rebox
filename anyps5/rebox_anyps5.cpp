@@ -44,7 +44,7 @@ std::shared_ptr<const RecompileResult> RecompileMemoized(const RecompileRequest&
 SpirvTarget DefaultTarget(std::uint32_t wave)
 {
     // Capabilities AnyPS5 gates on, limited to ones RADV and lavapipe both expose and vkd3d-proton
-    // enables. MinLod: without it image_sample_d_cl fails (americas-recomp, 29 the target title pixel shaders).
+    // enables. MinLod: without it image_sample_d_cl fails (americas-recomp, 29 pixel shaders of one title).
     static constexpr std::array<std::uint32_t, 16> capabilities{
         spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess,
         spv::CapabilityClipDistance, spv::CapabilityInt64Atomics, spv::CapabilityMinLod, spv::CapabilityImageQuery,

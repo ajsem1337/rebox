@@ -25,7 +25,7 @@ struct detile_surface
     UINT width, height, layers; /* layers: array size (2D) or depth (3D) */
     UINT mips;
     BOOL volume;
-    BOOL mip_major; /* 2D arrays: each mip's slices together (the target title's pools), not addrlib's
+    BOOL mip_major; /* 2D arrays: each mip's slices together (the texture pools measured), not addrlib's
                        slice-major order; see detile.cpp */
 };
 

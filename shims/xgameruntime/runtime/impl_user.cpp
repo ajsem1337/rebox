@@ -199,8 +199,8 @@ HRESULT register_never_fired(const void* callback, task::RegistrationToken* tok)
 }
 
 // Device association: the gamepad (gameinput's device, id "rebox" 1) belongs to the local user.
-// a GDK title marks a controller connected only from this callback, and its UI screens (create
-// world) take gamepad input only from a connected controller. As in xcl (GPL-2.0-only), the change
+// A GDK title marks a controller connected only from this callback, and some of its menu
+// screens take gamepad input only from a connected controller. As in xcl (GPL-2.0-only), the change
 // (that device, from no user to ours) goes to each registered callback, on its queue, once the
 // title has the user (XUserAddResult): delivered earlier, a GDK title dropped it. A callback
 // registered after that gets it at once.

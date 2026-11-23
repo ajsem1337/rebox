@@ -30,7 +30,14 @@ open(sys.argv[1], "wb").write(header + body)
 PY
 
 mkdir -p "$work/cache"
-hash() { python3 "$here/tools/anyps5_cache.py" hash "$1" | cut -d' ' -f1; }
+# The cache key: FNV-1a 64 of the bytecode (shims/d3d12_xs/shader_cache.h).
+hash() {
+    python3 -c 'import sys
+h = 0xcbf29ce484222325
+for b in open(sys.argv[1], "rb").read():
+    h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+print(f"{h:016x}")' "$1"
+}
 for f in fake.bin console.dxbc; do
     cp "$work/translated.dxbc" "$work/cache/$(hash "$work/$f").dxil"
 done

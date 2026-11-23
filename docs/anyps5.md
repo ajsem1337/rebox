@@ -76,7 +76,7 @@ words (16 dwords), which the dispatch path will have to fill.
    A console compute shader in the game's own container (DXBC → DXIL part → XBCH header + zlib
    FSSM + NOBC stub) becomes one when its PSO is created (`console_fssm.c`; on by default,
    `REBOX_CONSOLE_COMPUTE=0` turns it off). The FSSM header fields were measured on all 2,555
-   compute shaders of `the shader archive` against the PS09 cache, matched by the 24-byte shader ID at
+   compute shaders of one title's shader archive against its PS09 cache, matched by the 24-byte shader ID at
    0x150:
 
    | Offset | Field | Agreement with PS09 |
@@ -89,9 +89,9 @@ words (16 dwords), which the dispatch path will have to fill.
 
    `RSRC1` isn't in the header. AnyPS5 needs only its float mode and clamp bits, which PS09 has
    as 0x402c03xx throughout, so it is rebuilt as 0x402c0000 plus the float mode. The wave size
-   comes from 0xD4; SCRDs without one (wave 0) are inferred with `sa5_analyse`. The console-cs
-   plan takes it from the game's containers too (`tools/console-cs-plan.py DUMP CONTAINERS`),
-   since the analysis can't tell a wave64 shader with no wave-wide instructions from a wave32 one. zlib comes
+   comes from 0xD4; SCRDs without one (wave 0) are inferred with `sa5_analyse`. The container's
+   bit is preferred where present, since the analysis can't tell a wave64 shader with no
+   wave-wide instructions from a wave32 one. zlib comes
    from zlib's `contrib/puff` (zlib licence, `shims/d3d12_xs/puff.c`).
 
    Pixel-shader containers (facts from Leonida, GPLv3, `docs/design.md` rows "Pixel-shader
@@ -106,15 +106,14 @@ words (16 dwords), which the dispatch path will have to fill.
    deferred PS built from the container uses the container's own code. RSRC1/2 for PS aren't
    located yet.
 
-   `smoke.exe --fssm-check DIR` converts every compute container in a carve: all 2,573 in
-   `the shader archive` convert. Whether the exe passes these containers at PSO creation, or PS09 cache
+   Every compute container in that archive (2,573) converts. Whether the exe passes these containers at PSO creation, or PS09 cache
    blobs, is still open question 1. The `FLAT_SCRATCH` setup many console shaders open with
    (`s_setreg_imm32_b32` or `s_setreg_b32` to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size
    `s_nop`s before each compile. Only the scalar prologue is scanned (up to the first vector or memory instruction: a UE5 title's pixel shaders move M0 first), and the first time is logged.
 2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
    from the root parameters, and descriptor tables point at the shadow heaps' title addresses
    (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`). The layout is the console's
-   (patch 0007, measured on a UE5 sample's first compute program, which reads tables through
+   (patch 0007, measured on an Unreal 5 title's first compute program, which reads tables through
    s4, s5 and s7 as 32-bit pointers and has its workgroup ids at s8): root parameters from s4, one
    SGPR per descriptor table, two per root descriptor, one per 32-bit constant; s0-s3 are left 0.
    The earlier guess, from s0 with two per table (a 64-bit pair whose high half the console's
@@ -160,7 +159,7 @@ What AnyPS5's driver would do and this host does instead, from its sources:
 | LDS spill (set 1), scratch (set 2) | not yet: the compile fails and the dispatch is skipped, logged once per shader |
 
 Guest memory matters beyond descriptors. americas-recomp found that user-data pointers into
-memory the recompiler can't read make the SRT walk throw. Backing them took its the target title sample
+memory the recompiler can't read make the SRT walk throw. Backing them took its sample of one title's shaders
 from 25 to 198 of 200 valid compiles. Resources the title creates itself are not in the guest
 memory yet. The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
 `image_sample_d_cl` needs it), limited to what RADV and lavapipe both have.
@@ -177,25 +176,15 @@ finalized module.
 
 These came from the user's lab and are GPL-2.0-only here:
 - the layout analysis (`rdna-run --analyse`, now `anyps5/layout.cpp` behind `sa5_analyse`);
-- the PS09 reader and manifest step (`tools/ps09.py`);
-- the hand-written gfx1030 repros (`tests/rdna/*.s`, assembled into
-  `generated/repro_shaders.h` by `tools/gen_repro_shaders.sh`).
+- the PS09 reader and manifest step (`tools/ps09.py`).
 
-The smoke test runs the repros through the deferred path:
-- the XOR-swapped table pointer (patch 0003);
-- three speculated pointers and descriptors (patch 0004);
-- two exec-masked loops through LDS, whose output is checked.
-
-The loop repro is a known lavapipe-only miscompare (8-wide subgroups split a guest wave; exact on
-RADV), so on lavapipe it is reported, not failed. The lab keeps its native runners (`xsxrun`,
-`rdna-run`), its per-shader Python models and the shader-3094 bisection. That bisection is
-disassembled game code, so it can't be committed.
+The lab keeps its native runners (`xsxrun`, `rdna-run`), its hand-written repros and its
+per-shader Python models; anything disassembled from a title stays out of the repository.
 
 Patch 0004's speculation is on by default: `d3d12_xs` sets `APS5_SPECULATE_DESCRIPTORS` when it
 loads, before anything loads AnyPS5. The patch reads it once, into a static.
 `REBOX_ANYPS5_SPECULATE=0` turns it off. A wrong guess sets the fault buffer, which `d3d12_xs`
-reads back and logs. The smoke test checks that the repro whose clobbering path runs reports one
-fault, and that the others report none.
+reads back and logs.
 
 ## Where AnyPS5 runs
 
@@ -205,8 +194,8 @@ dependencies; mingw is the thing to check first. The alternative, a native Linux
 that Wine talks to over a pipe, avoids cross-compiling AnyPS5 but adds IPC to every compile.
 
 **Licence.** AnyPS5 is GPL-2.0-only. A `d3d12_xs` that loads it in-process, and the vkd3d-proton
-patch that calls it, become a GPL-2 combination. rebox has no licence file yet; this
-choice is yours. A separate compile service limits the GPL-2 part to that program.
+patch that calls it, become a GPL-2 combination. Rebox is GPL-2.0-only for this
+reason ([LICENSE](../LICENSE)); a separate compile service would have limited the GPL-2 part to that program.
 
 ## What carries over
 
@@ -217,7 +206,7 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
 | Patch 3, SGPR packing | kept: the SGPR values are AnyPS5's user data |
 | Patch 4, lookup table | replaced by a CPU lookup over the shadow heaps (`ReboxShadowFind`); `d3d12_xs` no longer sets a table |
 | RADV 32-bit low window | not needed (truncated pointers resolve through the CPU callback) |
-| `scsv_pack.py`, `translate-shaders.sh`, Leonida | retired |
+| Offline `SCSV` translation with Leonida | replaced by compiling at dispatch |
 | `rdna-run`, lab patches | AnyPS5 build and patch set; its sweep stays the compiler's test bench |
 
 ## Order of work
@@ -245,32 +234,16 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    slot 10 now returns title addresses, for pointers the title stores in memory itself. Then
    guest memory beyond the shadow heaps for SRT walks (identity-mapped GPU memory). Then the
    roles marked "not yet", fault-buffer readback, and `SpirvTarget` from the device.
-4. Real the target title compute shaders: `tests/run-console-cs.sh DUMP [FIRST [COUNT]]` runs every compute
-   shader in PercyStar's dump of `the shader archive` (2,684, from the PS09 cache) through the whole path
-   under Wine (`smoke.exe --console-cs`):
-   - `tools/console-cs-plan.py` reads each shader's `RSRC1`/`RSRC2` and thread-group size from
-     the PS09 cache (`tools/ps09.py`).
-   - `smoke.exe` infers its descriptor tables with `sa5_analyse` (`anyps5/layout.cpp`).
-   - It rebuilds the tables in real D3D12 heaps from synthetic resources, passes every user SGPR
-     as a root constant, and gives table pointers as title addresses. Table pointers are single
-     32-bit SGPRs, sometimes adjacent, which root-order packing can't express.
-
-   Inputs are synthetic, so this checks compiling, binding and running without faults, not output
-   values. Skipped: shaders that bind a slot the inferred layout left empty, and one whose layout
-   puts a buffer where it reads an image. Both are artefacts of the inference. The largest shaders
-   (around 400k SPIR-V words) take llvmpipe about a minute each, so a lavapipe sweep takes hours.
-   The first 110 on lavapipe: 102 dispatched, 8 skipped. The 890M (2026-11-22), first run: 232 of
-   the first 290 dispatched, 57 skipped, then a device loss on `sh_01093`, a BDA-path shader. The
-   page table then mapped the whole address space and had a wrong length, so every access through
-   it was invalid. Both are fixed, not yet re-run on hardware. Skips there: 31 bind a slot the
-   inferred layout left empty, 15 have a buffer V# where an image is read (layout artefacts), and
-   11 need role 10 (image table maps: runtime-indexed texture tables, not supported yet). lavapipe
-   segfaults on `sh_01092`, which RADV runs. `smoke.exe --console-cs` reports each shader's AnyPS5
-   faults on its line.
+4. A title's compute shaders, run through the whole path under Wine with synthetic inputs (every
+   compute shader of one title's PS09 cache, 2,684, with descriptor tables inferred by
+   `sa5_analyse` and rebuilt in real D3D12 heaps). This checked compiling, binding and running
+   without faults, not output values. On lavapipe the first 110: 102 dispatched, 8 skipped (layout
+   artefacts of the inference). On the 890M (2026-11-22) the first 290: 232 dispatched, 57
+   skipped, then a device loss traced to a page table with a wrong length (fixed).
 5. Graphics stages (2026-11-23): deferred console vertex and pixel shaders, compiled at each draw.
    - **PSO creation**: a graphics PSO whose vertex and pixel shaders are console containers still
      gets the fallback shaders, and `d3d12_xs` attaches both stages as `SCRD` version 2 blobs
-     (`console_fssm_graphics`: code, RSRC1 and what the code says, as `tools/fssm-*-plan.py` do)
+     (`console_fssm_graphics`: code, RSRC1 and what the code says)
      plus the input layout, as private data (`REBOX_GRAPHICS_GUID`, `struct rebox_graphics`).
      `REBOX_CONSOLE_GRAPHICS=0` turns it off. PSOs made from pipeline streams
      (`CreatePipelineState`, which Unreal 5 uses for all of them) get the same when the stream's only
@@ -370,30 +343,29 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
     match, e.g. 1,491 of 1,542 472-byte blocks. The size differences come after word 49.
 
   `sa5_compile_pixel` (`rebox_anyps5.dll`) builds AnyPS5's `ShaderPixelStageInfo` from these
-  words. `tools/ps-plan.py` reads them for every dumped PS, and `sa5_check ps PLAN` compiles each
-  and runs `spirv-val`. The sweep doesn't give AnyPS5 guest memory, so shaders that walk
+  words. A sweep over every dumped PS with `sa5_check ps PLAN` compiles each and runs
+  `spirv-val`. The sweep doesn't give AnyPS5 guest memory, so shaders that walk
   descriptors fail there; a dispatch-time compile has the memory. Still from the code, not
   registers: the wave size (`sa5_analyse`) and depth export (an `mrtz` export). Next: the NGG
   `MeshConfiguration`, then graphics pipelines at draw time.
-- **a UE5 title's pixel shaders (no PS09 cache).** Its graphics FSSM (older layout) has the code at
+- **Unreal 5 pixel shaders (no PS09 cache).** Its graphics FSSM (older layout) has the code at
   the u32 at 0xC0 plus 0x28 (0xF10 in all its pixel shaders), the code size in bytes at 0xC8,
   `SPI_SHADER_PGM_RSRC1_PS` at 0x108 and the float mode at 0xFC; pointers at 0xE0, 0xE8, 0x118
   and 0x128 (plus 0x28) lead to binding records, an input/output record table and the entry
-  name (e.g. `GaussianBlurMain`). The rest of the pixel state comes from the code
-  (`tools/fssm-ps-plan.py`): 24 user SGPRs (the prologue's `s_mov_b32 m0, s24` takes the
+  name (e.g. `GaussianBlurMain`). The rest of the pixel state comes from the code: 24 user SGPRs (the prologue's `s_mov_b32 m0, s24` takes the
   primitive mask from the SGPR after them), interpolants from `v_interp_*`, flat ones from
   `v_interp_mov`, export formats from `exp` (packed: FP16, else the 32-bit format of the channels
   written), depth from an MRTZ export. 2026-11-23: 32 of the 33 dumped from a run compile with
   `sa5_check ps` and pass `spirv-val`; the other writes a hardware register field with
   `s_setreg_imm32_b32` that AnyPS5 doesn't handle (only MODE's round and denormal fields).
-- **a UE5 title's vertex shaders.** Each opens with `s_swappc_b64 s[4:5], s[4:5]` into the fetch
+- **Unreal 5 vertex shaders.** Each opens with `s_swappc_b64 s[4:5], s[4:5]` into the fetch
   shader the console driver builds from the PSO's input layout (not in the container), which leaves
   input r in `v[4+4r..7+4r]`; the code reuses `s4` as scratch right after. `sa5_compile_vertex`
   (`rebox_anyps5.dll`) gives AnyPS5 the inputs (a V# and those VGPRs each) in its embedded-fetch
   mode, so each becomes a Vulkan vertex attribute (`sa5_result_vertex_input`), and s[4:5] a fetch
   address outside the program. AnyPS5 patch 0006 accepts a fetch call that links into its own
-  pointer pair and lets the code reuse it. `tools/fssm-vs-plan.py` reads the input count from the
-  code; `sa5_check vs PLAN` compiles each with synthetic RGBA32F buffers (`SA5_USER` and
+  pointer pair and lets the code reuse it. The input count comes from the code;
+  `sa5_check vs PLAN` compiles each with synthetic RGBA32F buffers (`SA5_USER` and
   `SA5_MEMORY` give a draw's user SGPRs and descriptors, as `d3d12_xs` logs them, and list the
   bindings AnyPS5 resolves). 2026-11-23: all 11
   dumped from a run compile and pass `spirv-val` (1-5 inputs each).

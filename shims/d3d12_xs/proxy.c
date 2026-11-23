@@ -1869,12 +1869,12 @@ static void note_signal(ID3D12Fence *fence, UINT64 value)
 }
 
 /* Two queue layouts share SDK version 0x20004 (xcl, GPL-2.0-only, crates/xcl/src/hle/d3d12x/real.rs):
- * the older (a UE5 title, a GDK title, another title) is the PC's through 18 (Signal 14, Wait 15,
+ * the older (several titles) is the PC's through 18 (Signal 14, Wait 15,
  * GetTimestampFrequency 16, GetClockCalibration 17) with SignalX 23 and PresentX 30; the newer
  * (a later title) has two methods ahead of Signal (Signal 16 ... SignalX 25, PresentX 32), and
  * its lists' console methods sit two slots later too. Nothing at device creation tells them apart,
  * but Signal and Wait take a fence and the older 16/17 never do: the first fence at 16 or 17 means
- * the newer layouts from then on. a GDK title (0x20004) called 16 as GetTimestampFrequency, which the
+ * the newer layouts from then on. A GDK title (0x20004) called 16 as GetTimestampFrequency, which the
  * newer table took for Signal (vkd3d-proton asserted on the non-fence). fence_vtbl and
  * newer_layouts are declared with the classes. */
 
@@ -2577,7 +2577,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * methods were added at 59 and 60, so every method from 61 on is the 0x20001 one two slots
      * later. The 0x20001 positions are XValkyrie's (a June 2020 kit's header tables): 56-59 PC
      * 56-59, 69-90 console memory writes and waits, 83 CopyTextureRegionX, 105-121 PC 60-76,
-     * 124/125 shading rate, 127 DispatchMesh. the target title's own DLLs fit this layout: FSR's
+     * 124/125 shading rate, 127 DispatchMesh. A newer title's own DLLs fit this layout: FSR's
      * ExecuteIndirect at 61, the BVH builder's write/wait calls at 71, 73 and 90, and 141-148
      * past the end of the older table. docs/d3d12x.md. */
     static struct slot list_v4_slots[96] = {

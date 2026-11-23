@@ -40,31 +40,5 @@ REBOX_HEAP_VA=real SMOKE_ONLY=fake.bin nixx develop -c tests/run-smoke.sh >> "$l
 echo "run-smoke.sh (real heap addresses) exit status: $?"
 sed -n '/REBOX_HEAP_VA=real/,$p' "$log" | grep -E 'heap GPU start|report real|SGPR table|descriptor table set|^(FAIL|PASSED|FAILED)' | uniq
 
-# The game's compute shaders through the deferred console path (AnyPS5 at dispatch), from
-# PercyStar's shader dump (game data, local only): REBOX_SHADER_DUMP, by default
-# ../xsx-shader-lab/dump. REBOX_CONSOLE_CS_COUNT=N limits the run to the first N shaders.
-shader_dump=${REBOX_SHADER_DUMP:-../xsx-shader-lab/dump}
-if [ -f "$shader_dump/ps09.bin" ]; then
-    section "game compute shaders through AnyPS5 at dispatch"
-    cs_log=build/console-cs.log
-    rm -f "$cs_log" 2>/dev/null
-    nixx develop -c tests/run-console-cs.sh "$shader_dump" 0 "${REBOX_CONSOLE_CS_COUNT:-0}" > "$cs_log" 2>&1
-    echo "run-console-cs.sh exit status: $?" | tee -a "$log"
-    { grep -E '^(ok|FAIL) +console-cs' "$cs_log" || tail -5 "$cs_log"
-      grep '^cs ' "$cs_log" | grep -v ' dispatched:' | sed -E 's/^cs [^ ]+ //; s/[0-9]+/N/g' \
-          | sort | uniq -c | sort -rn | head -12
-      grep -c 'AnyPS5 reported a fault' "$cs_log" | sed 's/^/shaders with AnyPS5 faults: /'; } 2>&1 | tee -a "$log"
-    echo "(per-shader lines: build/console-cs.log)"
-fi
-
-# Translated game shaders (tools/scsv_pack.py output, local only): can the
-# driver create compute pipelines from them?
-if [ -d build/console-shaders ]; then
-    section "compute PSOs from translated game shaders"
-    nixx develop -c tests/run-pso-check.sh build/console-shaders >> "$log" 2>&1 || true
-    sed -n '/compute PSOs from translated game shaders/,$p' "$log" | grep -E 'pso-check|:err:' \
-        | sed -E 's/^[0-9.]+:[0-9a-f]+:[0-9a-f]+://; s/0x[0-9a-f]+/X/g' | sort | uniq -c | sort -rn | head -12
-fi
-
 echo
 echo "Full output: $log"

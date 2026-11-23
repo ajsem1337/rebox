@@ -33,9 +33,9 @@ Local changes for mingw, each marked "rebox local change" in the file:
 | Family | Answer |
 |---|---|
 | XTaskQueue, XAsync, XThread | Complete (GrandTheftXbox's layer) |
-| XUser | One offline local user, always signed in (`XGR_GAMERTAG`, `XGR_USER_ID`), every privilege granted. The gamepad is associated with it once the title has it (`XGR_REASSOCIATE_SECONDS=N` reconnects it every N seconds, leaving the user and coming back; `rebox-run` sets 10, which a GDK title's menu screen needs). Tokens fail with `E_GAMEUSER_FAILED_TO_GET_TOKEN`, so nothing reaches Xbox Live |
+| XUser | One offline local user, always signed in (`XGR_GAMERTAG`, `XGR_USER_ID`), every privilege granted. The gamepad is associated with it once the title has it (`XGR_REASSOCIATE_SECONDS=N` reconnects it every N seconds, leaving the user and coming back; `rebox-run` sets 10, which one title's world-creation screen needed). Tokens fail with `E_GAMEUSER_FAILED_TO_GET_TOKEN`, so nothing reaches Xbox Live |
 | XGameSave, XGameSaveFiles | Local storage under `%LOCALAPPDATA%\xgr\saves` in the prefix (`XGR_SAVE_ROOT`); each container is replaced atomically, nothing syncs |
-| XPersistentLocalStorage | A directory with the quota from `MicrosoftGame.Config` (2048 MB for the target title). `rebox-run` puts it in the prefix (`XGR_PLS_DIR`) |
+| XPersistentLocalStorage | A directory with the quota from `MicrosoftGame.Config` (2048 MB in one title's). `rebox-run` puts it in the prefix (`XGR_PLS_DIR`) |
 | XPackage | The title is one fully installed package: identity from `MicrosoftGame.Config`, every chunk Ready, install monitors complete |
 | XStore | An active, full, permanent game licence; no add-ons; anything that needs the Store service fails with `E_GAMESTORE_NETWORK_ERROR` |
 | XSystem, XSystemAnalytics, XDisplay, XNetworking | Series X device info, desktop HDR state, offline connectivity, port 3074 |
@@ -65,5 +65,5 @@ outright:
   phase that changes `XGR_PLS_DIR`. The storage root and quota are read once per process and kept
   in statics, and under Wine the DLL isn't really unloaded between the test's phases, so the
   earlier phase's settings stay. A title sets nothing mid-run: `rebox-run` sets `XGR_PLS_DIR`
-  before it starts, and the target title's `MicrosoftGame.Config` gives the quota (2048 MB).
+  before it starts, and the title's `MicrosoftGame.Config` gives the quota.
 - `test_accessibility` isn't built: it needs the WinRT headers too.

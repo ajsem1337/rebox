@@ -3,7 +3,7 @@
  * addrlib is created as Navi21 (FAMILY_NV, external revision 0x29, gb_addr_config 0x444, the
  * values Mesa's amdgpu_devices.c records). The modes used here, SW_4KB_S and SW_64KB_D, have no
  * pipe or bank XOR, so the pipe configuration doesn't change them: checked against bcpack-rs's
- * measured layout of the target title's texture pools (docs/d3d12x.md, "Texture tiling"). */
+ * measured layout of the texture pools measured (docs/d3d12x.md, "Texture tiling"). */
 
 #include "detile.h"
 
@@ -106,7 +106,7 @@ UINT64 detile_size(const struct detile_surface *s)
 static BOOL copy(const struct detile_surface *s, void *surface, UINT mip, UINT layer, void *linear, UINT64 row_pitch,
                  UINT64 slice_pitch, BOOL to_linear);
 
-/* Mip-major 2D arrays (Leonida, docs/textures_arrays.md, measured on the target title's pools): one slice's
+/* Mip-major 2D arrays (Leonida, docs/textures_arrays.md, measured on the texture pools measured): one slice's
  * layout, with every block scaled by the slice count. The packed tail comes first, slice s's at
  * s * (tail block); then each mip outside it, from the smallest up, slice s at that mip's offset
  * times the slice count plus s * (the mip's size in one slice). So a subresource is addrlib's

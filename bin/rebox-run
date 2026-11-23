@@ -45,7 +45,7 @@ config=$(find "$game_dir" -maxdepth 1 -iname MicrosoftGame.config -print -quit)
 [[ -f $config ]] || die "no MicrosoftGame.Config in $game_dir"
 
 # First <Executable Name="..."> and the TitleId; good enough for MicrosoftGame.Config. The name
-# can be a path in the package (a UE5 title: TitleGame\Binaries\XSX\...), matched without case.
+# can be a path in the package (a UE5 title: <Project>\Binaries\XSX\...), matched without case.
 exe=$(grep -o '<Executable [^>]*' "$config" | head -1 | sed -n 's/.* Name="\([^"]*\)".*/\1/p' | tr '\\' /)
 if [[ -n $exe && ! -e $game_dir/$exe ]]; then
     found=$(find "$game_dir" -ipath "$game_dir/$exe" -print -quit)
@@ -197,7 +197,7 @@ mirror() {
 }
 mirror "$game_dir" "$shadow" "$exe_dir"
 # XCurl under WineGDK wants a CA bundle at \etc\ssl\certs\ca-bundle.crt on the game's drive, or
-# every TLS request fails and some hang (a Linux launcher project, MIT: "the server join hangs forever"). The
+# every TLS request fails and some hang (an MIT-licensed Linux launcher's notes: requests "hang forever"). The
 # title runs from G:, the shadow package, so it goes there.
 if [[ -f ${REBOX_CA_BUNDLE:-} ]]; then
     mkdir -p "$shadow/etc/ssl/certs"
@@ -311,7 +311,7 @@ mkdir -p "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/temporary-storage"
 ln -sfn "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/dosdevices/s:"
 ln -sfn "$WINEPREFIX/temporary-storage" "$WINEPREFIX/dosdevices/t:"
 export XGR_PLS_DIR=${XGR_PLS_DIR:-S:\\}
-# The gamepad reconnects every 10 seconds: a GDK title's menu screen (UI) took no input on
+# The gamepad reconnects every 10 seconds: a GDK title's menu screens took no input on
 # some runs, having missed the association sent when the title got its user; with this it took it
 # on every run, and no disconnection showed in play. XGR_REASSOCIATE_SECONDS=0 turns it off.
 export XGR_REASSOCIATE_SECONDS=${XGR_REASSOCIATE_SECONDS:-10}

@@ -1,6 +1,14 @@
-# rebox
+<p align="center"><img src="logo.png" alt="Rebox" width="480"></p>
 
-Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
+# Rebox
+
+Rebox runs dumped Xbox Series (Scarlett) GDK titles on Linux. It pairs WineGDK with
+vkd3d-proton for D3D12, shims for the console-only DLLs and D3D12.X interfaces, and the AnyPS5
+recompiler, which turns the console's RDNA shaders into SPIR-V at dispatch time. It is
+work in progress: titles start and run their game code, but rendering is incomplete (see
+[Known gaps](#known-gaps-ordered-roughly-by-how-soon-theyll-bite)).
+
+It is built from:
 
 - **WineGDK** for Wine itself. Its Gaming Runtime (`xgameruntime`) answers only five API families
   and its XUser is stubs, so `shims/xgameruntime` replaces it: americas-recomp's stand-in, with an
@@ -17,15 +25,11 @@ Runs a dumped Xbox Series (Scarlett) GDK title on Linux using:
 - **shims for the console-only DLLs** WineGDK doesn't cover: `xmem.dll` and `d3d12_xs.dll` (D3D12.X)
 - **AnyPS5's RDNA → SPIR-V recompiler** for the console shaders (`rebox_anyps5.dll`), run at
   each dispatch against console-format shadow descriptor heaps ([docs/anyps5.md](docs/anyps5.md));
-  compute works end to end in the smoke test, real game shaders and graphics are next
+  compute and graphics stages compile at dispatch and draw time
 
-It's built for a layout like `../xsx`: loose files plus `MicrosoftGame.Config`. It needs the main
-`.exe`, which isn't in that dump yet.
-
-Tested on a Radeon 890M (RADV): a UE5 title reaches its title and loading screens at
-about 8 fps; a GDK title (run `title.exe.original` with `REBOX_EXE`)
-is playable: worlds are created, saved and played with a controller. Neither has audio: the
-audio coprocessor answers but mixes nothing.
+A title is a dumped package: loose files plus `MicrosoftGame.Config` and the main `.exe`.
+Development is on a Radeon 890M (RADV). Audio is silent: the audio coprocessor answers but
+mixes nothing.
 
 ## Layout
 
@@ -48,7 +52,6 @@ shims/common/             logging + REBOX_STUB macro for generated stubs
 generated/                stubs from tools/scan_imports.py --gen-stubs (one-off fill-in exports;
                           dlls/<name>/ for whole DLLs nobody provides) and generated shaders
 tools/scan_imports.py     which imports can't be resolved under Wine + shims; generates stubs
-tools/anyps5_cache.py     links AnyPS5 output into the runtime cache, keyed by hash
 tools/d3d12x_probe.py     recovers D3D12.X IIDs, vtable slots and inlined field accesses from console binaries
 tests/                    smoke test (xmem, forwarders, PSO substitution, negative control);
                           gpuva_probe.c checks whether the Vulkan driver can map GPU VA == CPU VA
@@ -58,27 +61,12 @@ docs/d3d12x.md            what the console DLLs reveal about D3D12.X and unified
 ## Usage
 
 ```sh
-nix run . -- --scan ../xsx    # report imports Wine + vkd3d-proton + shims can't resolve
-nix run . -- ../xsx           # run title.exe
+nix run . -- --scan path/to/title    # report imports Wine + vkd3d-proton + shims can't resolve
+nix run . -- path/to/title           # run title.exe
 nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
-nix develop -c tests/run-rehearsal.sh ../xsx    # the whole launch with a stand-in exe
 ```
 
-`tools/run-loop.sh [SETTINGS]` runs a title unattended, again and again: each run builds from this
-checkout, takes its environment from SETTINGS (default `~/code/run-loop.env`, sourced before
-every run), stops the title once its output shows a fatal error (or after `RUN_TIMEOUT`), and keeps
-a timestamped log in `RUNS_DIR` (`latest.log`, and `status` with how each run ended). A new run
-starts on a new commit or a changed settings file; touching `RUNS_DIR/again` reruns,
-`RUNS_DIR/next` ends the current run at once (closing the window may not end a console title), and
-`RUNS_DIR/stop` ends the loop. With `REBOX_HANG_DUMP` set, a hang leaves every thread's stack
-and the fences' state in the log.
-
-`tests/run-rehearsal.sh` runs `nix run .` on a copy of the package with a stand-in for the exe
-(`tests/rehearsal/title.c`) that makes a console title's first calls: xmem, an Xbox-only API set,
-a name Wine's API sets lack, the Gaming Runtime, `GAME:\` paths, `D3D12XboxCreateDevice` and its
-IDXGIDevice. It needs no exe, so it checks the launch path before the real one arrives.
-
-Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launch:
+`nix run . -- path/to/title` is the whole procedure. Each launch:
 
 1. **Stubs what nothing provides.** `rebox-run` scans the exe and the package's DLLs against
    Wine, vkd3d-proton, DXVK and our shims (the report is `$WINEPREFIX/imports.txt`). A missing
@@ -93,7 +81,7 @@ Once the exe is dumped, `nix run . -- ../xsx` is the whole procedure. Each launc
    titles import, repoints those imports (in DLLs loaded later too) at a stub that logs the name
    and returns `E_NOTIMPL`
    (`REBOX_IMPORT_FIXUP=0` leaves Wine's).
-   Forwarded exports in package DLLs are followed. `nix run . -- --scan ../xsx` prints the report
+   Forwarded exports in package DLLs are followed. `nix run . -- --scan path/to/title` prints the report
    without running. To make an entry point real, implement it in `shims/<dll>/` and add it to that
    DLL's `.def`. `tests/run-stubgen.sh` checks the stub generation end to end.
 2. **Sets up the prefix:** the shims (including the Gaming Runtime stand-in, which logs to
@@ -122,9 +110,9 @@ method the title asked for that isn't implemented.
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |
 | `REBOX_CPU_VISIBLE_BUFFERS=0` | Leave DEFAULT-heap buffers GPU-only (they're then not identity-mapped) |
-| `REBOX_CA_BUNDLE=FILE` | CA certificates placed at `G:\etc\ssl\certs\ca-bundle.crt`, where XCurl under WineGDK looks for them (a Linux launcher project: without them every TLS request fails and some hang). The flake passes Nix's `cacert` |
-| `REBOX_NATIVE_VCRT=0` | Use Wine's builtin Visual C++ runtime. By default the `msvcp140*`, `vcruntime140*`, `concrt140`, `vccorlib140` and `vcomp140` the package ships next to the exe are loaded (a GDK title crashed at startup in Wine's `msvcp140`) |
-| `REBOX_FRAMELESS=0` | Leave the title's top-level windows as it makes them. By default a top-level window with a caption or sizing frame becomes a borderless popup of the size asked for, as the console's screen is (xcl): a GDK title sizes its back buffers from the client area, which a frame cuts to 1912x1046 |
+| `REBOX_CA_BUNDLE=FILE` | CA certificates placed at `G:\etc\ssl\certs\ca-bundle.crt`, where XCurl under WineGDK looks for them (without them every TLS request fails and some hang). The flake passes Nix's `cacert` |
+| `REBOX_NATIVE_VCRT=0` | Use Wine's builtin Visual C++ runtime. By default the `msvcp140*`, `vcruntime140*`, `concrt140`, `vccorlib140` and `vcomp140` the package ships next to the exe are loaded (a title crashed at startup in Wine's `msvcp140`) |
+| `REBOX_FRAMELESS=0` | Leave the title's top-level windows as it makes them. By default a top-level window with a caption or sizing frame becomes a borderless popup of the size asked for, as the console's screen is (xcl): a title that sizes its back buffers from the client area gets 1912x1046 from a framed window |
 | `REBOX_ESCAPE_QUITS=0` | Leave Escape to the title. By default Escape, like closing the title's window, quits: the title is told it is being suspended (when a console title saves) and gets up to `REBOX_QUIT_TIMEOUT` seconds (default 5) before the process ends |
 | `REBOX_GAMEINPUT_LOG=1` | Log the controller state the gameinput shim reads (with XInput's raw values), at most 4 times a second while it changes, 200 lines: for a stick that drifts or an axis that reads off-centre |
 | `REBOX_EXE=FILE` | Run FILE from the game directory under `MicrosoftGame.Config`'s executable name, e.g. `title.exe.original`, the unpatched exe some dumps keep next to a patched one |
@@ -133,7 +121,7 @@ method the title asked for that isn't implemented.
 | `REBOX_CONSOLE_MODE` | `ConsoleMode` value `rebox-run` puts in the registry for `XSystemGetDeviceType` (default `0x64`, Series X; `0x50` is Xbox One X) |
 | `REBOX_KEYBOARD_PAD=0` | Don't drive the gamepad from the keyboard when no controller is connected (`shims/gameinput`: WASD/arrows sticks, Space A, Left Ctrl B, R X, F Y, Q/E shoulders, Z/C triggers, Enter menu, Tab view, IJKL D-pad) |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
-| `REBOX_TEXTURE_ARRAYS=slice-major` | Read placed 2D array textures a slice (its whole mip chain) at a time, addrlib's order, instead of a mip (all its slices) at a time as the target title's pools store them |
+| `REBOX_TEXTURE_ARRAYS=slice-major` | Read placed 2D array textures a slice (its whole mip chain) at a time, addrlib's order, instead of a mip (all its slices) at a time as console texture pools store them |
 | `REBOX_CONSOLE_DLLS` | Console system DLLs taken from the dump's system partition (`EmbeddedXvd/Windows/System32`, next to or inside the game directory) instead of being stubbed; default `xg_xs.dll` (the texture-layout library, pure computation). Empty uses none |
 | `REBOX_CONSOLE_SYSTEM=DIR` | Where that system partition is, if not found next to the game |
 | `REBOX_GAME_ALIAS=0` | Leave out the `GAME:` link in the package directory, which makes console `GAME:\...` paths resolve to the package (the package is also drive `G:`) |
@@ -141,7 +129,7 @@ method the title asked for that isn't implemented.
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
 | `REBOX_CONSOLE_COMPUTE=0` | Console compute shaders (FSSM containers) keep the old path (translation cache, then fallback shaders) instead of AnyPS5 at dispatch ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS` | Run only the console compute programs whose code address hashes to VALUE in its low BITS bits (the rest are skipped), logging each one run: halve the set run by run to find a program that faults the GPU |
-| `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw, as before. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback (Unreal 5's large shaders took hundreds of milliseconds each, and a UE5 sample's game thread gave up waiting for its render thread) |
+| `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw, as before. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback (Unreal 5's large shaders took hundreds of milliseconds each, and an Unreal 5 title's game thread gave up waiting for its render thread) |
 | `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
 | `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
 | `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |
@@ -169,8 +157,8 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 
 The cache key is the 64-bit FNV-1a hash of the bytecode exactly as the title passes it to
-`Create*PipelineState`. **Not yet verified:** whether that matches the raw shader bytes in
-`the shader archive`. If everything misses, dump the missed shaders and diff them against the originals.
+`Create*PipelineState`. **Not yet verified:** whether that matches the shader bytes in a title's own shader archives.
+If everything misses, dump the missed shaders and diff them against the originals.
 
 Console shaders are DXBC containers too, so the shim doesn't treat every `DXBC` blob as PC
 bytecode. Only a container with a `SHEX`/`SHDR` part or a `DXIL` part holding LLVM bitcode passes
@@ -191,7 +179,7 @@ down missing translations.
   `CreatePipelineState` (stream) when a cache entry exists, and fail with `E_FAIL` when it doesn't.
   The same holds for a synthetic console container (`DXIL` part with a `NOBC`/`FSSM` stub). Real
   PC DXBC compiles directly even when a broken cache entry exists for its hash.
-- Against the DLLs in `../xsx`, every import resolves under Wine + vkd3d-proton + shims. The only
+- Against the DLLs in `path/to/title`, every import resolves under Wine + vkd3d-proton + shims. The only
   gap was `XMemGetWorkingSetStatistics`. It's now implemented for the one selector the AMD
   upscaler passes (`0x20000001`): it returns TRUE and writes private commit to the u64 at `+8`.
   That call shape comes from Xbox2Windows's call-site notes and hasn't been checked against a
@@ -222,7 +210,7 @@ down missing translations.
   SPIR-V that reads user SGPRs and raw hardware descriptors. The plan is AnyPS5 compiling at
   dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL, console-format shadow heaps
   and compute compile-and-bind at dispatch (vkd3d-proton patch 0005) work on a hand-written
-  shader and on the game's compute shaders from the lab dump. Console compute containers now become
+  shader and on a title's dumped compute shaders. Console compute containers now become
   deferred PSOs at creation; graphics stages still use fallback shaders.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
@@ -255,13 +243,13 @@ down missing translations.
   their format); inline ray tracing in console shaders and the console BVH builder's output aren't
   translated either. A depth texture that's also a UAV (Unreal 5's Nanite) is a depth target only,
   so writes through its UAV views are lost; TuxBox pairs it with an R32 image and copies the
-  depth plane across, which is the fix. Both matter for the target title.
+  depth plane across, which is the fix. Both matter for titles that use ray tracing or Nanite.
 - **Controllers SDL maps wrongly.** Wine reads controllers through SDL, by SDL's database of
   layouts. For an Xbox One S controller on Bluetooth (045e:02e0, version 0408) that entry has
   another axis order than the kernel's, so the right stick's Y read the right trigger, at full
-  deflection at rest (a GDK title's camera looked at the sky); `rebox-run` sets a corrected
-  `SDL_GAMECONTROLLERCONFIG` for it. Its buttons were numbered wrongly too (RB opened a GDK title's
-  pause menu, Y acted as LB); axes and buttons now checked in a GDK title (View and Xbox
+  deflection at rest (a title's camera looked at the sky); `rebox-run` sets a corrected
+  `SDL_GAMECONTROLLERCONFIG` for it. Its buttons were numbered wrongly too (RB opened a title's
+  pause menu, Y acted as LB); axes and buttons now checked in a title (View and Xbox
   are keys after the others). Hidraw access (NixOS `hardware.steam-hardware.enable`) didn't change
   it. Another controller read wrongly needs its own line in `SDL_GAMECONTROLLERCONFIG`;
   `REBOX_GAMEINPUT_LOG=1` shows what the title is given, with XInput's raw values.
@@ -285,7 +273,7 @@ down missing translations.
   (quality-mode ratios, but no jitter) and scales the colour input into the output with a
   compute blit. There's no temporal anti-aliasing; frame generation reports no provider.
 - **BCPack decodes slowly, and BC6H/BC7 approximately.** BCPack, the console's hardware texture
-  compression (about 14% of the target title's textures), is decoded by Leonida's GPLv3 decoder running as a
+  compression (about 14% of one title's catalogued textures), is decoded by Leonida's GPLv3 decoder running as a
   separate process ([helpers/bcpack](helpers/bcpack/README.md)), at about 3 MB/s per DirectStorage
   queue under PyPy, far below the console's hardware. BC1 is the exception: bcpack-rs
   (`bcpack-serve`, MIT/Apache) decodes it at 34-40 MB/s per core. BC6H and BC7 often need history tables
@@ -303,9 +291,9 @@ down missing translations.
   1, 2, 4, ... up to 1024 submissions). `REBOX_TEXTURE_SWIZZLE=auto` (default): a console
   `Layout` from 0x100 is 0x100 plus the swizzle mode (0x100 linear, 0x105 `SW_4KB_S`, 0x10A
   `SW_64KB_D`); Layout 2 or desc flag 0x08000000 `SW_64KB_D`; otherwise cubemaps, volumes and
-  plain 2D textures `SW_4KB_S` and other arrays `SW_64KB_D` (xcl, TuxBox, the target title's pools); each
+  plain 2D textures `SW_4KB_S` and other arrays `SW_64KB_D` (xcl, TuxBox, measured texture pools); each
   distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one. A texture a GPU copy
-  writes (a UE5 title's font atlas) stops being uploaded from title memory, and textures up to 4 MiB
+  writes (an Unreal 5 title's font atlas) stops being uploaded from title memory, and textures up to 4 MiB
   are compared whole, so small edits are seen.
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
@@ -325,7 +313,7 @@ down missing translations.
 
 ## Licence
 
-rebox is licensed under the GNU General Public License, version 2 only
+Rebox is licensed under the GNU General Public License, version 2 only
 ([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
 `helpers/bcpack` is GPL-3.0-or-later and runs as a separate process, except `bcpack-serve.rs`
 (MIT OR Apache-2.0, a separate program built against bcpack-rs); see its README.

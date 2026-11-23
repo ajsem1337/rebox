@@ -4,7 +4,7 @@
 #include <d3d12.h>
 
 /* 64-bit FNV-1a of the bytecode exactly as the title passes it to PSO
- * creation. tools/anyps5_cache.py computes the same hash. */
+ * creation. */
 UINT64 shader_hash(const void *data, SIZE_T size);
 
 enum shader_lookup

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Checks d3d12_xs's texture detiling on the target title's real texture pools, without the game: each
+# Checks d3d12_xs's texture detiling on a title's real texture pools, without running it: each
 # texture's tiled memory image is read from its pool (as DirectStorage would write it), the swizzle
 # mode is picked by the same rule as shims/d3d12_xs/title_textures.c, and the image is detiled by
 # d3d12_xs's own code (build/texcheck.exe: detile.cpp and addrlib, run under Wine). The result is

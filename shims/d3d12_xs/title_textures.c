@@ -20,7 +20,7 @@
  * 0x105 SW_4KB_S, 0x10A SW_64KB_D; xcl and TuxBox, xcl checked against xg_xs.dll on 29,700 descs).
  * Layout 2, or desc flag 0x08000000 (TuxBox), is SW_64KB_D; Layout 0 (the driver's choice) is
  * SW_4KB_S for a plain single 2D texture whatever its size (the same two). REBOX_TEXTURE_SWIZZLE picks: "auto" (default: those; ROW_MAJOR descs linear;
- * cubemaps and volumes SW_4KB_S, other arrays SW_64KB_D, what the target title's texture pools show),
+ * cubemaps and volumes SW_4KB_S, other arrays SW_64KB_D, what the texture pools measured show),
  * "64KB_D", "4KB_S", "linear",
  * or "off" (no uploads). Each distinct console layout is logged once with what it got. */
 
@@ -194,7 +194,7 @@ static int mode_setting(void)
 }
 
 
-/* 2D arrays are read a mip (all its slices) at a time: the target title's pools store them that way, and a
+/* 2D arrays are read a mip (all its slices) at a time: the texture pools measured store them that way, and a
  * pool is the texture's memory image (helpers/textures: every array matches Leonida's decoder
  * mip-major, cubemaps and 2D textures match as they are). REBOX_TEXTURE_ARRAYS=slice-major
  * reads them in addrlib's order instead, a slice (its whole mip chain) at a time. */

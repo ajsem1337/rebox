@@ -2,7 +2,7 @@
  *
  * A console shader arrives as DXBC whose DXIL part is an XBCH header and a zlib stream (with a
  * NOBC stub where LLVM bitcode would be) holding FSSM: GFX10.3 code plus its register setup.
- * Measured on all 2,555 compute shaders of the target title's the shader archive against the PS09 PSO cache
+ * Measured on all 2,555 compute shaders of one title's shader archive against the PS09 PSO cache
  * (2026-11-22):
  *   0x104  float mode (RSRC1 bits 12-19): equal to PS09's RSRC1 for 2,472
  *   0x138  COMPUTE_PGM_RSRC2: user SGPR count equal for all; the enables and LDS size describe
@@ -18,9 +18,9 @@
  *
  * An older layout, 16 bytes shorter (a UE5 title, SDK 0x20002; told apart by its code at 0x158):
  * the same fields 8 bytes earlier, with no gap before the shader ID. Float mode at 0xFC (0xC0 in
- * all of a UE5 title's, as in the target title's), RSRC2 at 0x130 (0x990: 8 user SGPRs, TGID X/Y; 0x8990 adds
+ * all of a UE5 title's, as in the newer layout), RSRC2 at 0x130 (0x990: 8 user SGPRs, TGID X/Y; 0x8990 adds
  * LDS), the thread-group size at 0x134-0x13C ((8,8,1), (16,16,1), (4,4,4)), the 24-byte shader ID
- * at 0x140. the target title's wave32 bit (0xD4 bit 5) is clear in all of them, which says little, so the wave
+ * at 0x140. The newer layout's wave32 bit (0xD4 bit 5) is clear in all of them, which says little, so the wave
  * size is left for sa5_analyse to infer from the code. */
 
 #include <windows.h>
@@ -133,8 +133,8 @@ void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size
     return h;
 }
 
-/* For checks over shader dumps (smoke.exe --fssm-check): the SCRD console_fssm_compute builds, in
- * memory the caller frees with ReboxConsoleFree. */
+/* For tools that check shader dumps: the SCRD console_fssm_compute builds, in memory the caller
+ * frees with ReboxConsoleFree. */
 void *WINAPI ReboxConsoleFromContainer(const void *container, SIZE_T size, SIZE_T *blob_size)
 {
     return console_fssm_compute(container, size, blob_size);
@@ -147,15 +147,14 @@ void WINAPI ReboxConsoleFree(void *blob)
 
 /* ------------------------------------------------------------------ graphics stages
  *
- * a UE5 title's graphics FSSM (older layout) carries less register state than compute: the code (at
+ * The older graphics FSSM layout (Unreal Engine 5 titles) carries less register state than compute: the code (at
  * the u32 at 0xC0 plus 0x28, its size in bytes at 0xC8), SPI_SHADER_PGM_RSRC1 at 0x108 and the
- * float mode at 0xFC. The rest comes from the code (docs/anyps5.md; tools/fssm-ps-plan.py and
- * fssm-vs-plan.py do the same over dumps):
+ * float mode at 0xFC. The rest comes from the code (docs/anyps5.md):
  * - vertex: the first instruction calls the fetch shader (s_swappc_b64 s[4:5], s[4:5]), which
  *   leaves input r in v[4+4r..7+4r]; the inputs are the consecutive slots from v4 it reads before
  *   writing. Without that call, no inputs (full-screen passes). 32 user SGPRs.
  * - pixel: the prologue's s_mov_b32 m0, sN takes the primitive mask from the SGPR after the user
- *   SGPRs (24 in every a UE5 title PS); interpolants from v_interp_* (flat: only v_interp_mov);
+ *   SGPRs (24 in every PS measured); interpolants from v_interp_* (flat: only v_interp_mov);
  *   export formats from exp (packed: FP16, else the 32-bit format of the channels written);
  *   depth from an MRTZ export. */
 

@@ -108,7 +108,7 @@ ULONG WINAPI ReboxAppStateRegister(void *routine, void *context, void **registra
 }
 
 /* Closing the title (its window closed, or Escape): on a console the title is suspended before
- * it ends, and saves then (a GDK title writes its world). Each app state routine is told the title
+ * it ends, and saves then (a GDK title writes its save). Each app state routine is told the title
  * is quiescing, on a thread of its own, for up to REBOX_QUIT_TIMEOUT seconds (default 5);
  * then the process ends. REBOX_QUIT_EXIT=0 only suspends (tests); REBOX_ESCAPE_QUITS=0
  * leaves Escape to the title. */
@@ -218,7 +218,7 @@ static ULONG WINAPI app_constrained_register(void *routine, void *context, void 
 }
 
 /* The title's top-level windows are the console's screen: frameless, the client area the whole
- * window (xcl). a GDK title asks for an overlapped 1920x1080 window and sizes its back
+ * window (xcl). A GDK title asks for an overlapped 1920x1080 window and sizes its back
  * buffers from the client area, which a frame cut to 1912x1046. Top-level windows with a caption or
  * sizing frame are made popups at the size asked for. REBOX_FRAMELESS=0 leaves them. */
 static DWORD frameless_style(DWORD style, HWND parent)
@@ -262,7 +262,7 @@ static HWND WINAPI create_window_a(DWORD ex, const char *cls, const char *name, 
 }
 
 /* Audio state monitors (windows.media.mediacontrol): Wine's are stubs that abort the process, and
- * a UE5 sample's GameChat2.dll asks for one at startup. A console title's audio is never
+ * A UE5 sample's GameChat2.dll asks for one at startup. A console title's audio is never
  * ducked or muted by the system here, so the monitor says full volume and never calls back.
  * IAudioStateMonitor: IUnknown, RegisterCallback, UnregisterCallback, GetSoundLevel. */
 static HRESULT WINAPI monitor_query(void *self, REFIID iid, void **out)

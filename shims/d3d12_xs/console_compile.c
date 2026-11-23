@@ -703,7 +703,7 @@ static BOOL compute_bisect_skips(const struct rebox_deferred_shader *h, const st
 
 /* Background compiles. A program's first compile (AnyPS5's translation, hundreds of milliseconds
  * for Unreal 5's large shaders) used to run in the title's render thread at the dispatch or draw;
- * a UE5 sample's game thread gave up waiting for it (120 s). Now the first call for a program
+ * A UE5 sample's game thread gave up waiting for it (120 s). Now the first call for a program
  * queues the compile for a worker thread and fails (the dispatch is skipped, the draw uses the
  * fallback); once the worker has compiled it once, AnyPS5's memo and the caches here make later
  * calls quick, and they compile in the calling thread as before. REBOX_CONSOLE_ASYNC=0 turns it

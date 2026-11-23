@@ -50,7 +50,7 @@ struct sa5_binding
     uint32_t role;              /* ShaderRecompiler::DescriptorRole: 0-2 guest buffers/images/samplers */
 };
 
-/* A pixel shader with the register state the console's PSO gives it (docs/anyps5.md: the target title's PS09
+/* A pixel shader with the register state the console's PSO gives it (docs/anyps5.md: a title's PS09
  * register blocks). */
 struct sa5_pixel_request
 {

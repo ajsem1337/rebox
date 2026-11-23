@@ -256,7 +256,7 @@ static UINT format_bytes(DXGI_FORMAT f)
 /* Which vertex shader param each pixel shader attribute reads (SPI_PS_INPUT_CNTL_n.OFFSET), as the
  * console driver links them: attribute n reads the PS input register the FSSM's table names, whose
  * semantic is some VS output register, which the VS's table says param N writes (xcl found
- * a UE5 title's Slate PS reads COLOR0 as attr0 and TEXCOORD1 as attr1, so taking attr n = param n
+ * A UE5 title's Slate PS reads COLOR0 as attr0 and TEXCOORD1 as attr1, so taking attr n = param n
  * sampled every UI texture at the wrong coordinates). Left as attr n = param n where a table or
  * signature is missing. */
 static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *vs_blob, void *ps_blob)
