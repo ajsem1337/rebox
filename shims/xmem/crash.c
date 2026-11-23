@@ -81,12 +81,20 @@ static void log_stack_frames(CONTEXT ctx, ULONG_PTR low, ULONG_PTR high, int fra
     for (int i = 0; i < frames && ctx.Rip; i++)
     {
         DWORD64 image_base;
-        RUNTIME_FUNCTION *fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, NULL);
+        RUNTIME_FUNCTION *fn;
+        HMODULE module;
 
         describe(ctx.Rip, where, sizeof(where));
         rebox_log("  #%-2d %s", i, where);
         if (ctx.Rsp < low || ctx.Rsp >= high || !readable(ctx.Rsp, 8))
             break;
+        /* Only addresses in a module are unwound: for others Wine's RtlLookupFunctionEntry consults
+         * dynamically registered tables, and a stale return address (a UE5 title's render thread gave
+         * 0xc040) made it fault inside the hang dump, which killed the title. */
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (const WCHAR *)(ULONG_PTR)ctx.Rip, &module))
+            break;
+        fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, NULL);
         if (fn)
         {
             void *handler_data;
