@@ -80,14 +80,14 @@ struct proxy
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
 
 static struct proxy_class device_class = { "Device", MAX_SLOTS };
-static struct proxy_class queue_class = { "CommandQueue", 64 };
-static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", 64 };
+static struct proxy_class queue_class = { "CommandQueue", MAX_SLOTS };
+static struct proxy_class queue_v4_class = { "CommandQueue (SDK 0x20004)", MAX_SLOTS };
 static struct proxy_class list_class = { "GraphicsCommandList", MAX_SLOTS };
 static struct proxy_class list_v4_class = { "GraphicsCommandList (SDK 0x20004)", MAX_SLOTS };
 static void *fence_vtbl;              /* vkd3d-proton's fence class (is_fence) */
 static volatile LONG newer_layouts;  /* the title's runtime has the newer queue/list layouts */
-static struct proxy_class copy_list_class = { "CopyCommandList", 64 };
-static struct proxy_class heap_class = { "DescriptorHeap", 16 };
+static struct proxy_class copy_list_class = { "CopyCommandList", MAX_SLOTS };
+static struct proxy_class heap_class = { "DescriptorHeap", MAX_SLOTS };  /* every class: a call past the end traps, not jumps */
 
 static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &list_v4_class,
                                                &copy_list_class,
@@ -2113,6 +2113,13 @@ static HRESULT STDMETHODCALLTYPE queue_Slot17(struct proxy *p, void *a1, UINT64 
     return ID3D12CommandQueue_GetClockCalibration(INNER(p, ID3D12CommandQueue), a1, (UINT64 *)(ULONG_PTR)a2);
 }
 
+/* Slot 18: the newer layout's GetTimestampFrequency(UINT64 *) (xcl). The target title calls it
+ * before any fence reaches 16 or 17, so before the layout is known; it writes 8 bytes either way. */
+static HRESULT STDMETHODCALLTYPE queue_Slot18(struct proxy *p, UINT64 *frequency)
+{
+    return ID3D12CommandQueue_GetTimestampFrequency(INNER(p, ID3D12CommandQueue), frequency);
+}
+
 /* Slots 25 and 32: the newer layout's SignalX and PresentX. */
 static HRESULT STDMETHODCALLTYPE queue_Slot25(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
 {
@@ -2802,6 +2809,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(10, queue_ExecuteCommandLists),
         FN(16, queue_Slot16),
         FN(17, queue_Slot17),
+        FN(18, queue_Slot18),
         FN(25, queue_Slot25),
         FN(32, queue_Slot32),
         FN(23, queue_SignalX),

@@ -156,6 +156,13 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
         rebox_log("  %s %#llx%s", op, (unsigned long long)target,
                      target - window_base < window_size ? " (inside the GPU window: unmapped or freed GPU memory?)" : "");
     }
+    if (!readable(c->Rip, 1) && readable(c->Rsp, 8))
+    {
+        /* A call through a null or stale pointer: where it was called from. */
+        char from[MAX_PATH + 32];
+        describe(*(ULONG_PTR *)c->Rsp, from, sizeof(from));
+        rebox_log("  called from %s (the return address at rsp)", from);
+    }
     if (readable(c->Rip, 16))
         for (int i = 0; i < 16; i++)
             snprintf(bytes + 3 * i, 4, "%02x ", ((BYTE *)c->Rip)[i]);
