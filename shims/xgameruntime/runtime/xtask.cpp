@@ -525,6 +525,9 @@ struct AsyncState {
   size_t required = 0;
   std::atomic<bool> canceled{false};
   AsyncCompletionRoutine callback = nullptr;
+  const char* name = nullptr;          // the GDK function that began the call, for logs
+  std::atomic<bool> scheduled{false};  // its work went to the queue's work port
+  std::atomic<bool> worked{false};     // and ran there
 };
 
 struct BlockInternal {
@@ -586,6 +589,7 @@ void complete_state(AsyncState* s, HRESULT hr, size_t required) {
 
 void CALLBACK do_work_thunk(void* p, bool canceled) {
   auto* s = static_cast<AsyncState*>(p);
+  s->worked = true;
   if (canceled) {
     complete_state(s, E_ABORT, 0);
   } else {
@@ -619,7 +623,7 @@ HRESULT CALLBACK run_provider(AsyncOp op, const AsyncProviderData* data) {
 
 }  // namespace
 
-HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char*, AsyncProvider p) {
+HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char* name, AsyncProvider p) {
   if (!b || !p) return E_INVALIDARG;
   Queue* q = nullptr;
   if (b->queue ? FAILED(Duplicate(b->queue, &q)) : !GetProcessQueue(&q)) return E_INVALIDARG;
@@ -636,6 +640,7 @@ HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char*, 
     s->provider = p;
     s->ctx = ctx;
     s->identity = identity;
+    s->name = name;
     s->queue = q;
     s->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     *in = {s, E_PENDING, kMagic, 0, 0};
@@ -662,6 +667,7 @@ HRESULT AsyncSchedule(AsyncBlock* b, uint32_t delay_ms) {
   if (!s) return E_INVALIDARG;
   HRESULT hr = SubmitDelayed(s->queue, PortId::Work, delay_ms, s, do_work_thunk);
   if (FAILED(hr)) release(s);
+  else s->scheduled = true;
   return hr;
 }
 
@@ -685,7 +691,14 @@ HRESULT AsyncGetStatus(AsyncBlock* b, bool wait) {
     if (hr != E_PENDING || !wait || !bi(b)->state) return hr;
     s = acquire(b);
   }
-  WaitForSingleObject(s->done, INFINITE);
+  // A title waiting on a call that never completes stops there: say which call, once, after 5 s.
+  if (WaitForSingleObject(s->done, 5000) == WAIT_TIMEOUT) {
+    gtx::log::write(gtx::log::Kind::Warn, GTX_SHIM_DLL, "XAsyncGetStatus", nullptr,
+                    "still waiting after 5 s for %s (work %s)", s->name ? s->name : "a call",
+                    s->worked ? "ran" : s->scheduled ? "queued, not yet run: is the queue's work port dispatched?"
+                                                     : "never scheduled");
+    WaitForSingleObject(s->done, INFINITE);
+  }
   HRESULT hr;
   {
     std::lock_guard<std::mutex> lock(g_async_m);
