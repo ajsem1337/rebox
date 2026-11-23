@@ -327,4 +327,37 @@ SA5_API void sa5_result_free(sa5_result* result)
     delete result;
 }
 
+// The tessellation stages that draw a rect list with these vertex and pixel results (AnyPS5's
+// BuildRectListShaders): each 3-vertex patch is a rectangle, its fourth corner made after the vertex
+// shader. Limits are Vulkan's guaranteed minimums (RADV and lavapipe give more).
+SA5_API int sa5_rect_list_stages(const sa5_result* vertex, const sa5_result* pixel, sa5_result** control,
+                                 sa5_result** evaluation, char* error, size_t error_size)
+{
+    static constexpr std::array<std::uint32_t, 17> capabilities{
+        spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess,
+        spv::CapabilityClipDistance, spv::CapabilityInt64Atomics, spv::CapabilityMinLod, spv::CapabilityImageQuery,
+        spv::CapabilityImageGatherExtended, spv::CapabilityDerivativeControl,
+        spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityStorageImageWriteWithoutFormat,
+        spv::CapabilityGroupNonUniformVote, spv::CapabilityGroupNonUniformArithmetic,
+        spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformQuad,
+        spv::CapabilityTessellation,
+    };
+    if (!vertex || !pixel || !control || !evaluation) {
+        SetError(error, error_size, "null argument");
+        return -1;
+    }
+    try {
+        SpirvTarget target = DefaultTarget(32);
+        target.supportedCapabilities = capabilities;
+        target.tessellation = TessellationTargetLimits{32, 64, 64, 120, 2048, 64, 64};
+        auto shaders = BuildRectListShaders(vertex->result, pixel->result, target);
+        *control = new sa5_result(std::make_shared<const RecompileResult>(std::move(shaders.control)));
+        *evaluation = new sa5_result(std::make_shared<const RecompileResult>(std::move(shaders.evaluation)));
+        return 0;
+    } catch (const std::exception& e) {
+        SetError(error, error_size, e.what());
+        return -1;
+    }
+}
+
 }  // extern "C"

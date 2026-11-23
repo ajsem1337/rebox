@@ -1,0 +1,263 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index c9573d9..1a66b48 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7138,6 +7138,8 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+ 
+     list->dynamic_state.primitive_topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+     list->dynamic_state.vk_primitive_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++    list->rebox.rect_list = false;
++    list->rebox.rect_pipeline = false;
+ 
+     list->dynamic_state.fragment_shading_rate.fragment_size = (VkExtent2D) { 1u, 1u };
+     list->dynamic_state.fragment_shading_rate.combiner_ops[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+@@ -7604,6 +7606,7 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+ 
+     /* Deferred console graphics first; when they don't compile, the PSO's fallback pipeline. */
+     vk_pipeline = VK_NULL_HANDLE;
++    list->rebox.rect_pipeline = false;
+     if (pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS && d3d12_pipeline_state_rebox_graphics(list->state))
+         vk_pipeline = d3d12_command_list_rebox_graphics_pipeline(list, &new_active_flags);
+ 
+@@ -8263,6 +8266,21 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+     d3d12_command_list_invalidate_root_parameters(list, bindings, false, NULL);
+ }
+ 
++static PFN_vkd3d_rebox_console_rect_stages vkd3d_rebox_rect_stages_fn(void)
++{
++    static PFN_vkd3d_rebox_console_rect_stages fn;
++    static bool resolved;
++    vkd3d_module_t module;
++
++    if (!resolved)
++    {
++        if ((module = vkd3d_dlopen("d3d12_xs.dll")))
++            fn = (PFN_vkd3d_rebox_console_rect_stages)vkd3d_dlsym(module, "ReboxConsoleRectStages");
++        resolved = true;
++    }
++    return fn;
++}
++
+ static PFN_vkd3d_rebox_console_compile vkd3d_rebox_compile_fn(void)
+ {
+     static PFN_vkd3d_rebox_console_compile fn;
+@@ -8348,9 +8366,12 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_comman
+         uint32_t *dynamic_state_flags)
+ {
+     PFN_vkd3d_rebox_console_compile compile = vkd3d_rebox_compile_fn();
++    PFN_vkd3d_rebox_console_rect_stages rect_stages = vkd3d_rebox_rect_stages_fn();
+     struct d3d12_pipeline_state *state = list->state;
+     const struct vkd3d_rebox_graphics *g = state->rebox_graphics;
+-    struct vkd3d_rebox_compile_out vs, ps;
++    struct vkd3d_rebox_compile_out vs, ps, control, evaluation;
++    bool rect;
++    VkPipeline vk_pipeline;
+     struct vkd3d_rebox_compile_in in;
+     uint32_t sgprs[32], root[32];
+     unsigned int n;
+@@ -8394,6 +8415,9 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_comman
+     in.increment[1] = d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+     vkd3d_rebox_bindless_targets(list->device, in.bindless);
+ 
++    /* A rect list: the stages are kept for ReboxConsoleRectStages. */
++    rect = list->rebox.rect_list && rect_stages;
++    in.rect_list = rect;
+     in.shader = (const uint8_t *)g + g->vs_offset;
+     in.shader_size = g->vs_size;
+     in.push_offset = 0;
+@@ -8411,8 +8435,21 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_comman
+     VKD3D_BREADCRUMB_AUX64(ps.key[0]);
+     memcpy(&list->rebox.push[0], vs.push, 128);
+     memcpy(&list->rebox.push[32], ps.push, 128);
++    if (rect)
++    {
++        memset(&control, 0, sizeof(control));
++        memset(&evaluation, 0, sizeof(evaluation));
++        if (SUCCEEDED(rect_stages(&vs, &ps, &control, &evaluation))
++                && (vk_pipeline = d3d12_pipeline_state_rebox_graphics_variant(state, &list->dynamic_state,
++                list->dsv.format, &vs, &ps, &control, &evaluation, dynamic_state_flags)))
++        {
++            list->rebox.rect_pipeline = true;
++            return vk_pipeline;
++        }
++        /* Without them, each rectangle draws its first triangle. */
++    }
+     return d3d12_pipeline_state_rebox_graphics_variant(state, &list->dynamic_state, list->dsv.format, &vs, &ps,
+-            dynamic_state_flags);
++            NULL, NULL, dynamic_state_flags);
+ }
+ 
+ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
+@@ -12335,6 +12372,15 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetPrimitiveTopology(d3d12_co
+ 
+     TRACE("iface %p, topology %#x.\n", iface, topology);
+ 
++    /* rebox (patch 0011): the console's rect list. */
++    if ((topology == 17) != list->rebox.rect_list)
++    {
++        list->rebox.rect_list = topology == 17;
++        d3d12_command_list_invalidate_current_pipeline(list, false);
++    }
++    if (topology == 17)
++        topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
++
+     if (topology == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
+     {
+         WARN("Ignoring D3D_PRIMITIVE_TOPOLOGY_UNDEFINED.\n");
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 305e324..fb4fde2 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3482,6 +3482,7 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state
+ struct vkd3d_rebox_graphics_override
+ {
+     VkShaderModule vs, ps;
++    VkShaderModule control, evaluation; /* patch 0011: rect-list stages, or VK_NULL_HANDLE */
+     const VkVertexInputAttributeDescription *attributes;
+     uint32_t attribute_count;
+     const VkVertexInputBindingDescription *bindings;
+@@ -3539,6 +3540,7 @@ const struct vkd3d_rebox_graphics *d3d12_pipeline_state_rebox_graphics(struct d3
+ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
+         const struct vkd3d_rebox_compile_out *vs, const struct vkd3d_rebox_compile_out *ps,
++        const struct vkd3d_rebox_compile_out *control, const struct vkd3d_rebox_compile_out *evaluation,
+         uint32_t *dynamic_state_flags)
+ {
+     VkVertexInputAttributeDescription attributes[D3D12_VS_INPUT_REGISTER_COUNT];
+@@ -3570,6 +3572,12 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+     key_hash = hash_data(&pipeline_key, sizeof(pipeline_key));
+     key[0] = vs->key[0] ^ (ps->key[0] * 0x9e3779b97f4a7c15ull) ^ key_hash;
+     key[1] = vs->key[1] ^ (ps->key[1] * 0xff51afd7ed558ccdull) ^ ((uint64_t)key_hash << 32);
++    /* Rect-list stages make another pipeline of the same vertex and pixel stages. */
++    if (control && evaluation)
++    {
++        key[0] ^= (control->key[0] + 0x52454354u) * 0xc2b2ae3d27d4eb4full;
++        key[1] ^= (evaluation->key[1] + 0x52454354u) * 0x165667b19e3779f9ull;
++    }
+ 
+     rwlock_lock_read(&state->lock);
+     for (v = 0; v < state->rebox_variant_count; v++)
+@@ -3641,6 +3649,26 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+         VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
+         return VK_NULL_HANDLE;
+     }
++    if (control && evaluation && graphics->stage_count + 2 <= VKD3D_MAX_SHADER_STAGES)
++    {
++        module_info.codeSize = control->spirv_words * sizeof(uint32_t);
++        module_info.pCode = control->spirv;
++        if (VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.control)) < 0)
++            override.control = VK_NULL_HANDLE;
++        module_info.codeSize = evaluation->spirv_words * sizeof(uint32_t);
++        module_info.pCode = evaluation->spirv;
++        if (override.control
++                && VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.evaluation)) < 0)
++            override.evaluation = VK_NULL_HANDLE;
++    }
++    if (control && evaluation && !override.evaluation)
++    {
++        if (override.control)
++            VK_CALL(vkDestroyShaderModule(device->vk_device, override.control, NULL));
++        VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
++        VK_CALL(vkDestroyShaderModule(device->vk_device, override.ps, NULL));
++        return VK_NULL_HANDLE;
++    }
+ 
+     rebox_override = &override;
+     {
+@@ -3661,6 +3689,10 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+     rebox_override = NULL;
+     VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
+     VK_CALL(vkDestroyShaderModule(device->vk_device, override.ps, NULL));
++    if (override.control)
++        VK_CALL(vkDestroyShaderModule(device->vk_device, override.control, NULL));
++    if (override.evaluation)
++        VK_CALL(vkDestroyShaderModule(device->vk_device, override.evaluation, NULL));
+     if (!vk_pipeline)
+     {
+         ERR("rebox: failed to create a console graphics pipeline.\n");
+@@ -6811,6 +6843,15 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+ 
+     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
+             dynamic_state_buffer, key);
++    /* Rect-list stages (patch 0011): a 3-point patch list, not the PSO's dynamic topology. */
++    if (rebox_override && rebox_override->control)
++    {
++        *dynamic_state_flags &= ~(VKD3D_DYNAMIC_STATE_TOPOLOGY | VKD3D_DYNAMIC_STATE_PATCH_CONTROL_POINTS
++                | VKD3D_DYNAMIC_STATE_PRIMITIVE_RESTART);
++        dynamic_create_info.dynamicStateCount = vkd3d_init_dynamic_state_array(dynamic_state_buffer,
++                *dynamic_state_flags);
++        dynamic_create_info.pDynamicStates = dynamic_create_info.dynamicStateCount ? dynamic_state_buffer : NULL;
++    }
+ 
+     if (!library_flags && graphics->library && !rebox_override)
+     {
+@@ -6974,6 +7015,26 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+             stages[i].pSpecializationInfo = NULL;
+         }
+         pipeline_desc.pStages = stages;
++        if (rebox_override->control)
++        {
++            for (i = 0; i < 2; i++)
++            {
++                VkPipelineShaderStageCreateInfo *s = &stages[pipeline_desc.stageCount + i];
++                memset(s, 0, sizeof(*s));
++                s->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++                s->stage = i ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
++                s->module = i ? rebox_override->evaluation : rebox_override->control;
++                s->pName = "main";
++            }
++            pipeline_desc.stageCount += 2;
++            vertex_input_desc.ia_info.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
++            vertex_input_desc.ia_info.primitiveRestartEnable = VK_FALSE;
++            tessellation_info.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
++            tessellation_info.pNext = NULL;
++            tessellation_info.flags = 0;
++            tessellation_info.patchControlPoints = 3;
++            pipeline_desc.pTessellationState = &tessellation_info;
++        }
+     }
+ 
+     /* If we're using identifiers, set the appropriate flag. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 66cf859..16689d5 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2320,6 +2320,7 @@ struct vkd3d_rebox_compile_in
+     uint32_t increment[2];
+     uint32_t bindless[7][2]; /* per AnyPS5 DescriptorKind: Vulkan set and binding, set ~0u if none */
+     uint32_t push_offset;   /* graphics: where the stage's 128 bytes of push data go (0 or 128) */
++    uint32_t rect_list;     /* graphics (patch 0011): a rect-list draw, whose stages ReboxConsoleRectStages takes */
+ };
+ struct vkd3d_rebox_compile_out
+ {
+@@ -2353,6 +2354,12 @@ struct vkd3d_rebox_graphics
+ };
+ typedef HRESULT (*PFN_vkd3d_rebox_console_compile)(const struct vkd3d_rebox_compile_in *in,
+         struct vkd3d_rebox_compile_out *out);
++/* rebox (patch 0011): the tessellation control and evaluation stages that draw a rect list with
++ * these compiled vertex and pixel stages (AnyPS5's rect-list shaders): each 3-vertex patch is a
++ * rectangle, its fourth corner made after the vertex shader. */
++typedef HRESULT (*PFN_vkd3d_rebox_console_rect_stages)(const struct vkd3d_rebox_compile_out *vs,
++        const struct vkd3d_rebox_compile_out *ps, struct vkd3d_rebox_compile_out *control,
++        struct vkd3d_rebox_compile_out *evaluation);
+ const struct vkd3d_rebox_deferred_header *vkd3d_rebox_deferred_shader(const D3D12_SHADER_BYTECODE *code);
+ void vkd3d_rebox_bindless_targets(struct d3d12_device *device, uint32_t targets[7][2]);
+ struct vkd3d_rebox_variant
+@@ -2418,6 +2425,7 @@ const struct vkd3d_rebox_graphics *d3d12_pipeline_state_rebox_graphics(struct d3
+ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
+         const struct vkd3d_rebox_compile_out *vs, const struct vkd3d_rebox_compile_out *ps,
++        const struct vkd3d_rebox_compile_out *control, const struct vkd3d_rebox_compile_out *evaluation,
+         uint32_t *dynamic_state_flags);
+ 
+ static inline bool d3d12_pipeline_state_is_compute(const struct d3d12_pipeline_state *state)
+@@ -3335,6 +3343,9 @@ struct d3d12_command_list
+         uint64_t heap_cpu[2];
+         uint64_t title_base[2];
+         uint32_t push[64];
++        bool rect_list; /* the console's rect list (topology 17) is set: drawn as a triangle list or, for
++                         * deferred console graphics, with rect-list stages (patch 0011) */
++        bool rect_pipeline; /* the bound pipeline is such a rect-list one (its topology is a patch list) */
+     } rebox;
+     bool has_replaced_shaders;
+ 

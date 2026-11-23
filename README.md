@@ -244,10 +244,11 @@ down missing translations.
   - frame events come from a CPU clock, not the display: `WaitFrameEventX` follows the period the
     title sets, but isn't locked to the monitor's vblank, so with vsync on a mismatched refresh
     rate can judder;
-  - the console's rectangle lists (topology 17, used for full-screen passes) are drawn as two
-    triangles a rectangle, the fourth corner made on the CPU from the vertex buffers (after xcl);
-    a rect list whose vertex shader makes its corners from the vertex index alone, with no vertex
-    buffer, still covers only its first triangle, half of each rectangle;
+  - the console's rectangle lists (topology 17, used for full-screen passes) are drawn by AnyPS5's
+    rect-list stages, a tessellation pair that makes each rectangle's fourth corner after the
+    vertex shader (vkd3d-proton patch 0011); a draw whose pipeline isn't deferred console graphics
+    covers only its first triangle, half of each rectangle. `REBOX_RECT_LISTS=cpu` makes the
+    fourth corner on the CPU from the vertex buffers instead (after xcl);
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
   CPU-visible D3D12 heaps. `rebox-run` loads `VK_LAYER_REBOX_gpuva_identity` and, on AMD,

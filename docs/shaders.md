@@ -33,6 +33,7 @@ is already there:
 | `0008-console-breadcrumbs` | With `VKD3D_CONFIG=breadcrumbs`, records each console variant's key before its dispatch or draw, so a lost device's breadcrumb dump names the console shader (`d3d12_xs` logs the key with each compile). The flake builds vkd3d-proton with `enable_trace` for this |
 | `0009-console-heap-sizes` | Shader-visible CBV/SRV/UAV heaps of up to 2^21 descriptors where the device uses descriptor buffers and its limits allow (D3D12 guarantees 1,000,000; the target title makes one of 1,245,440). The bindless set layouts are sized from the same maximum; elsewhere it stays at 1,000,000 |
 | `0010-dxil-spirv-bodiless-function` | dxil-spirv refuses an entry point or leaf function with no body (console DXIL such as `XboxBvhBuilder`'s, made of console intrinsics) instead of reading its missing entry block; the PSO then fails and gets fallback shaders |
+| `0011-console-rect-lists` | The console's rect lists (topology 17): `IASetPrimitiveTopology` takes 17 and draws it as a triangle list, except that deferred console graphics get a variant with AnyPS5's rect-list tessellation stages (`ReboxConsoleRectStages`), a static 3-point patch list, so each rectangle's fourth corner is made after the vertex shader |
 
 The smoke test covers `0001`-`0004` with hand-written SPIR-V console shaders (GLSL in
 `tools/gen_fallback_shaders.sh`): a compute shader writes s0-s31 to the root UAV in s0:s1, an

@@ -125,6 +125,13 @@ SA5_API void sa5_result_identity(const struct sa5_result *result, uint64_t ident
 SA5_API uint32_t sa5_fault_buffer_bytes(void);
 SA5_API uint32_t sa5_gds_bytes(void);
 SA5_API void sa5_result_free(struct sa5_result *result);
+/* The tessellation control and evaluation stages that draw a console rect list with these vertex
+ * and pixel results (AnyPS5's rect-list shaders): each 3-vertex patch is a rectangle, its fourth
+ * corner made after the vertex shader. The control stage binds AnyPS5's fault buffer (sa5_finalize
+ * it like other stages); the evaluation stage binds nothing. Returns 0, or -1 and a message. */
+SA5_API int sa5_rect_list_stages(const struct sa5_result *vertex, const struct sa5_result *pixel,
+                                 struct sa5_result **control, struct sa5_result **evaluation, char *error,
+                                 size_t error_size);
 
 /* Fitting a result to vkd3d-proton's bindings (spirv_remap.cpp). Specialization constants are
  * frozen to the result's values. Each remap moves a guest descriptor array at (set, binding) to

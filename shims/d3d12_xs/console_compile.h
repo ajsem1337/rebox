@@ -69,6 +69,7 @@ struct rebox_compile_in
     UINT32 increment[2];
     UINT32 bindless[7][2];     /* per AnyPS5 DescriptorKind: Vulkan set and binding, set ~0u if none */
     UINT32 push_offset;        /* graphics: where this stage's 128 bytes of push data go (0 or 128) */
+    UINT32 rect_list;          /* graphics (patch 0011): a rect-list draw: the result is kept for ReboxConsoleRectStages */
 };
 
 struct rebox_compile_out
@@ -83,6 +84,10 @@ struct rebox_compile_out
 };
 
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out);
+/* The tessellation control and evaluation stages that draw a console rect list with two stages
+ * ReboxConsoleCompile gave for a rect-list draw (AnyPS5's rect-list shaders; patch 0011). */
+HRESULT WINAPI ReboxConsoleRectStages(const struct rebox_compile_out *vs, const struct rebox_compile_out *ps,
+                                      struct rebox_compile_out *control, struct rebox_compile_out *evaluation);
 
 /* Before a submission: binds the textures graphics draws read whose T#s the title wrote after
  * recording them (console_compile.c). */

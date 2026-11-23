@@ -1034,7 +1034,9 @@ static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T 
  * shader exports red, as 32-bit floats or (packed) as two FP16 pairs, which every UE5 pixel
  * shader exports. One full-screen triangle over a blue clear: the centre turns red (blue: fell
  * back, or the constant read 0 and the triangle collapsed). */
-static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked, BOOL rect)
+/* rect: 1 a rect list drawn by AnyPS5's rect-list stages (vkd3d-proton patch 0011), 2 the same made
+ * two triangles a rectangle on the CPU (REBOX_RECT_LISTS=cpu). */
+static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked, int rect)
 {
     /* Linked: the vertex shader writes black to param0 and red to param1, whose registers are
      * TEXCOORD0 and COLOR0 (the FSSM table and OSG1); the pixel shader reads its one input, COLOR0,
@@ -1266,9 +1268,9 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked, 
             const BYTE *top_right = (BYTE *)mapped + 6 * 256 + 56 * 4, *bottom_left = (BYTE *)mapped + 42 * 256 + 8 * 4;
             CHECK(bottom_left[0] == 255 && bottom_left[1] == 0 && top_right[0] == 255 && top_right[1] == 0
                   && top_right[2] == 0,
-                  "a console rect list draws the whole rectangle: its fourth corner is made (bottom left RGB %u %u %u, "
-                  "top right %u %u %u)", bottom_left[0], bottom_left[1], bottom_left[2], top_right[0], top_right[1],
-                  top_right[2]);
+                  "a console rect list draws the whole rectangle: its fourth corner is made %s (bottom left RGB "
+                  "%u %u %u, top right %u %u %u)", rect == 2 ? "on the CPU" : "by the rect-list stages",
+                  bottom_left[0], bottom_left[1], bottom_left[2], top_right[0], top_right[1], top_right[2]);
         }
         else
         CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0,
@@ -4519,7 +4521,10 @@ static void test_xbox(void)
     test_console_draw(dev, queue, FALSE, FALSE, FALSE);
     test_console_draw(dev, queue, TRUE, FALSE, FALSE);
     test_console_draw(dev, queue, FALSE, TRUE, FALSE);
-    test_console_draw(dev, queue, FALSE, FALSE, TRUE);
+    test_console_draw(dev, queue, FALSE, FALSE, 1);
+    SetEnvironmentVariableA("REBOX_RECT_LISTS", "cpu");
+    test_console_draw(dev, queue, FALSE, FALSE, 2);
+    SetEnvironmentVariableA("REBOX_RECT_LISTS", NULL);
     test_xbox_root_flags(dev);
     test_console_command_signature(dev);
     test_state_object_placeholder(dev);

@@ -19,6 +19,7 @@ EXPORTS
     ReboxShadowRead
     ReboxShadowFind
     ReboxConsoleCompile
+    ReboxConsoleRectStages
     ReboxConsoleLastResult
     ReboxConsoleFaults
     ReboxConsoleFromContainer

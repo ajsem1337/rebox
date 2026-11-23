@@ -74,6 +74,8 @@ static struct
             UINT32, UINT32, UINT32 **, UINT32 *, char *, size_t);
     UINT32 (*fault_buffer_bytes)(void);
     UINT32 (*gds_bytes)(void);
+    int (*rect_list_stages)(const struct sa5_result *, const struct sa5_result *, struct sa5_result **,
+            struct sa5_result **, char *, size_t);
 } sa5;
 
 /* AnyPS5's settings, made before anything loads rebox_anyps5.dll (it reads some of them once,
@@ -151,6 +153,7 @@ static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
     GET(finalize_draw, "sa5_finalize_draw");
     GET(fault_buffer_bytes, "sa5_fault_buffer_bytes");
     GET(gds_bytes, "sa5_gds_bytes");
+    GET(rect_list_stages, "sa5_rect_list_stages");
 #undef GET
     if (!sa5.finalize || !sa5.identity || !sa5.gds_bytes)
     {
@@ -431,6 +434,7 @@ static UINT64 page_table(UINT32 *bytes)
 /* Buffers the GPU writes (AnyPS5's fault buffer and GDS) can't come from the content-shared pool:
  * one of each for the process, as AnyPS5's own driver keeps them. */
 static struct { UINT64 gpu; volatile UINT32 *cpu; UINT32 size; } fault_buffer, gds_buffer;
+static INIT_ONCE fault_buffer_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK init_fault_buffer(INIT_ONCE *once, void *param, void **context)
 {
@@ -515,7 +519,9 @@ static UINT64 zero_buffer(UINT32 size)
 /* ------------------------------------------------------- finalized modules */
 
 static SRWLOCK modules_lock = SRWLOCK_INIT;
-static struct module { UINT64 key[2]; UINT32 *words, count; struct module *next; } *modules[256];
+/* result: a graphics stage's AnyPS5 result, kept when it was compiled for a rect-list draw
+ * (ReboxConsoleRectStages builds that draw's tessellation stages from it). */
+static struct module { UINT64 key[2]; UINT32 *words, count; struct sa5_result *result; struct module *next; } *modules[256];
 
 static struct module *find_module(const UINT64 key[2])
 {
@@ -540,6 +546,7 @@ static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT3
     memcpy(m->key, key, sizeof(m->key));
     memcpy(m->words, words, count * sizeof(*words));
     m->count = count;
+    m->result = NULL;
     AcquireSRWLockExclusive(&modules_lock);
     for (other = modules[key[0] & 255]; other && memcmp(other->key, key, sizeof(other->key)); other = other->next)
         ;
@@ -997,7 +1004,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     struct sa5_compute_request req;
     struct sa5_result *result = NULL;
     const void *push;
-    struct module *module;
+    struct module *module = NULL;
     char error[1024] = "";
     HRESULT hr = E_FAIL;
     UINT32 *code, nops;
@@ -1673,8 +1680,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             }
             case ROLE_FAULT_BUFFER:
             {
-                static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-                InitOnceExecuteOnce(&once, init_fault_buffer, NULL, NULL);
+                InitOnceExecuteOnce(&fault_buffer_once, init_fault_buffer, NULL, NULL);
                 va = fault_buffer.gpu;
                 bytes = fault_buffer.size;
                 break;
@@ -1844,8 +1850,143 @@ done:
         if (free_words)
             free_words(words);
     }
+    /* A rect-list draw's stages keep their result for ReboxConsoleRectStages. */
+    if (result && module && in && in->rect_list && graphics)
+    {
+        AcquireSRWLockExclusive(&modules_lock);
+        if (!module->result)
+        {
+            module->result = result;
+            result = NULL;
+        }
+        ReleaseSRWLockExclusive(&modules_lock);
+    }
     if (result)
         sa5.result_free(result);
     free(code);
     return hr;
+}
+
+/* ------------------------------------------------------------- rect lists */
+
+/* The console's rect lists (topology 17: three corners of each rectangle, the fourth made by the
+ * hardware) drawn by deferred console graphics: AnyPS5's rect-list shaders, a tessellation control
+ * and evaluation pair over 3-vertex patches that makes the fourth corner after the vertex shader,
+ * built for each pair of vertex and pixel stages (patch 0011). The control stage's fault buffer is
+ * the process's. */
+static struct rect_stages
+{
+    UINT64 vs[2], ps[2];
+    struct module *control, *evaluation; /* NULL: they couldn't be built */
+    struct rect_stages *next;
+} *rect_cache;
+static SRWLOCK rect_lock = SRWLOCK_INIT;
+
+static struct module *rect_module(struct sa5_result *result, UINT64 salt, const UINT64 vs[2], const UINT64 ps[2])
+{
+    struct sa5_host_buffer hosts[4];
+    UINT32 n = 0, *words = NULL, count = 0, bindings = sa5.binding_count(result);
+    UINT64 key[2];
+    struct module *m = NULL;
+    char error[512];
+
+    for (UINT32 i = 0; i < bindings && n < ARRAYSIZE(hosts); i++)
+    {
+        struct sa5_binding b;
+        if (sa5.binding(result, i, &b))
+            continue;
+        if (b.role != ROLE_FAULT_BUFFER)
+        {
+            rebox_log("d3d12_xs: a rect-list stage binds role %u, which isn't handled", b.role);
+            return NULL;
+        }
+        InitOnceExecuteOnce(&fault_buffer_once, init_fault_buffer, NULL, NULL);
+        if (!fault_buffer.gpu)
+            return NULL;
+        hosts[n] = (struct sa5_host_buffer){ b.set, b.binding, n, fault_buffer.size / 4, 0, 0, fault_buffer.gpu };
+        n++;
+    }
+    if (sa5.finalize(result, NULL, 0, hosts, n, &words, &count, error, sizeof(error)))
+    {
+        rebox_log("d3d12_xs: a rect-list stage couldn't be fitted to vkd3d-proton: %s", error);
+        return NULL;
+    }
+    key[0] = hash_bytes(salt ^ vs[0] ^ (ps[0] * 0x9e3779b97f4a7c15ull), words, count * 4);
+    key[1] = vs[1] ^ (ps[1] * 0xff51afd7ed558ccdull) ^ salt;
+    m = add_module(key, words, count);
+    {
+        void (*free_words)(UINT32 *) = (void *)GetProcAddress(GetModuleHandleA("rebox_anyps5.dll"), "sa5_free_words");
+        if (free_words)
+            free_words(words);
+    }
+    return m;
+}
+
+HRESULT WINAPI ReboxConsoleRectStages(const struct rebox_compile_out *vs, const struct rebox_compile_out *ps,
+                                      struct rebox_compile_out *control, struct rebox_compile_out *evaluation)
+{
+    struct sa5_result *vertex_result = NULL, *pixel_result = NULL, *c = NULL, *e = NULL;
+    struct module *vm, *pm;
+    struct rect_stages *r;
+    static LONG logged, failures;
+    char error[512];
+
+    if (!vs || !ps || !control || !evaluation)
+        return E_INVALIDARG;
+    InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
+    if (!sa5.rect_list_stages)
+        return E_NOTIMPL;
+    AcquireSRWLockShared(&rect_lock);
+    for (r = rect_cache; r && (memcmp(r->vs, vs->key, 16) || memcmp(r->ps, ps->key, 16)); r = r->next)
+        ;
+    ReleaseSRWLockShared(&rect_lock);
+    if (!r)
+    {
+        if (!(vm = find_module(vs->key)) || !(pm = find_module(ps->key)))
+            return E_FAIL;
+        AcquireSRWLockShared(&modules_lock);
+        vertex_result = vm->result;
+        pixel_result = pm->result;
+        ReleaseSRWLockShared(&modules_lock);
+        /* Not kept (compiled for another draw first): the next rect-list draw compiles them again. */
+        if (!vertex_result || !pixel_result)
+            return E_PENDING;
+        if (!(r = calloc(1, sizeof(*r))))
+            return E_OUTOFMEMORY;
+        memcpy(r->vs, vs->key, 16);
+        memcpy(r->ps, ps->key, 16);
+        if (sa5.rect_list_stages(vertex_result, pixel_result, &c, &e, error, sizeof(error)))
+        {
+            if (InterlockedIncrement(&failures) <= 8)
+                rebox_log("d3d12_xs: no rect-list stages for console vertex %016llx and pixel %016llx: %s",
+                          (unsigned long long)vs->key[0], (unsigned long long)ps->key[0], error);
+        }
+        else
+        {
+            r->control = rect_module(c, 0x5443u, vs->key, ps->key);
+            r->evaluation = r->control ? rect_module(e, 0x5445u, vs->key, ps->key) : NULL;
+        }
+        if (c)
+            sa5.result_free(c);
+        if (e)
+            sa5.result_free(e);
+        AcquireSRWLockExclusive(&rect_lock);
+        r->next = rect_cache;
+        rect_cache = r;
+        ReleaseSRWLockExclusive(&rect_lock);
+        if (r->control && r->evaluation && !InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: console rect lists are drawn with AnyPS5's rect-list stages (tessellation: the "
+                      "fourth corner made after the vertex shader)");
+    }
+    if (!r->control || !r->evaluation)
+        return E_FAIL;
+    memset(control, 0, sizeof(*control));
+    memset(evaluation, 0, sizeof(*evaluation));
+    control->spirv = r->control->words;
+    control->spirv_words = r->control->count;
+    memcpy(control->key, r->control->key, sizeof(control->key));
+    evaluation->spirv = r->evaluation->words;
+    evaluation->spirv_words = r->evaluation->count;
+    memcpy(evaluation->key, r->evaluation->key, sizeof(evaluation->key));
+    return S_OK;
 }

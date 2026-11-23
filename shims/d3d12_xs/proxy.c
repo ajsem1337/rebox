@@ -1563,21 +1563,32 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(struct proxy *p, UINT star
     ID3D12GraphicsCommandList_IASetVertexBuffers(INNER(p, ID3D12GraphicsCommandList), start, count, views);
 }
 
+/* REBOX_RECT_LISTS=cpu: rect lists made two triangles a rectangle on the CPU (list_DrawInstanced)
+ * instead of by AnyPS5's rect-list stages. Read at each use, so a test can switch it. */
+static BOOL rect_lists_on_cpu(void)
+{
+    char value[8];
+    DWORD n = GetEnvironmentVariableA("REBOX_RECT_LISTS", value, sizeof(value));
+    return n && n < sizeof(value) && !_stricmp(value, "cpu");
+}
+
 /* Slot 20: IASetPrimitiveTopology. The console's topology 17 is a rectangle list: three corners of a
  * screen-aligned rectangle per primitive, the fourth made by the hardware. Unreal 5 draws its
- * full-screen passes so (xcl; a UE5 sample), and vkd3d-proton drops a draw with a topology it
- * doesn't know (its image stayed black). They're triangle lists: list_DrawInstanced makes each
- * rectangle two triangles where its vertices come from vertex buffers, otherwise each rectangle
- * draws its first triangle, half of it. */
+ * full-screen passes so (xcl; a UE5 sample), and stock vkd3d-proton drops a draw with a topology it
+ * doesn't know (its image stayed black). Ours (patch 0011) takes it: deferred console graphics draw
+ * it with AnyPS5's rect-list stages, which make the fourth corner after the vertex shader; other
+ * pipelines draw it as a triangle list, each rectangle's first triangle. With REBOX_RECT_LISTS=cpu
+ * it's a triangle list here, and list_DrawInstanced makes each rectangle two triangles where its
+ * corners come from vertex buffers. */
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12_PRIMITIVE_TOPOLOGY topology)
 {
     p->rect_list = topology == 17;
-    if (topology == 17)
+    if (topology == 17 && rect_lists_on_cpu())
     {
         static LONG logged;
         if (!InterlockedExchange(&logged, 1))
-            rebox_log("d3d12_xs: the console's rectangle lists (topology 17) are drawn as triangle lists (two a "
-                      "rectangle where its corners come from vertex buffers, else its first triangle)");
+            rebox_log("d3d12_xs: the console's rectangle lists (topology 17) are drawn as triangle lists, two a "
+                      "rectangle where its corners come from vertex buffers (REBOX_RECT_LISTS=cpu)");
         topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     }
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(INNER(p, ID3D12GraphicsCommandList), topology);
@@ -3266,7 +3277,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
 {
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
-    if (p->rect_list && draw_rects(p, vertices, instances, first_vertex, first_instance))
+    if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
         return;
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
