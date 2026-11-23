@@ -1379,6 +1379,23 @@ static void test_present(void *dev, void *queue)
             if (cbuf) ID3D12Resource_Release(cbuf);
         }
         if (pheap) XSLOT(pheap, 2, ULONG)(pheap);
+        /* A CPU-only heap placed so keeps its console descriptors in that memory: bytes the title
+         * writes there itself are the shadow's. */
+        {
+            void *cheap = NULL;
+            phd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            pdata = NULL;
+            start = 0;
+            if (SUCCEEDED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &phd,
+                    &IID_ID3D12DescriptorHeap, &cheap)))
+                start = XSLOT(cheap, 9, SIZE_T)(cheap);
+            if (start)
+                ((UINT32 *)(start + 5 * inc))[0] = 0x12345678;
+            hr = shadow_heap && start ? shadow_heap(start, &pva, &pdata, &pstride, &pcount) : E_FAIL;
+            CHECK(SUCCEEDED(hr) && pdata == (void *)start && ((UINT32 *)((BYTE *)pdata + 5 * pstride))[0] == 0x12345678,
+                  "a CPU-only heap placed in title memory keeps its console descriptors there (%#lx, %p)", hr, pdata);
+            if (cheap) XSLOT(cheap, 2, ULONG)(cheap);
+        }
         placement_size = 0;
     }
 

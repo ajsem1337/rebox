@@ -6,7 +6,10 @@
  * stride (the increment the title gets from GetDescriptorHandleIncrementSize),
  * filled in console format (console_desc.c) whenever the title writes a
  * descriptor through the API (Create*View, CreateSampler, CopyDescriptors*).
- * Bytes a title writes into heap memory itself are not seen.
+ * A heap placed in title memory (shadow_place_heap) keeps its shadow there, as the console keeps
+ * descriptors in the heap's memory: bytes the title writes into it itself are seen too. A
+ * shader-visible one needs that memory GPU-visible (gpu_memory_adopt); if it can't be, the shadow
+ * stays apart and those bytes aren't seen.
  *
  * Shader-visible heaps also get a title address: a 32-bit address of our
  * choosing (from 0x10000000, 64 KiB aligned) that descriptor-table pointers
@@ -45,6 +48,7 @@ struct shadow_heap
     ID3D12DescriptorHeap *inner;   /* not referenced: only compared */
     D3D12_DESCRIPTOR_HEAP_TYPE type;
     BOOL shader_visible, gpu_memory;
+    BOOL data_in_title;            /* data is title_cpu's memory: not ours to free */
     SIZE_T cpu_start;              /* vkd3d-proton's CPU handle for descriptor 0 */
     SIZE_T title_cpu;              /* the title's CPU handle for it, when its memory is the title's
                                     * (shadow_place_heap), else 0 */
@@ -228,7 +232,9 @@ static void heap_free(struct shadow_heap *h)
 {
     for (UINT i = 0; i < h->count; i++)
         unindex(h, i);
-    if (h->gpu_memory)
+    if (h->data_in_title)
+        ;
+    else if (h->gpu_memory)
         ReboxGpuFree(h->data);
     else
         free(h->data);
@@ -370,6 +376,7 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
     static int hooks = -1;
     void *(WINAPI *xmem_alloc)(SIZE_T, ULONGLONG);
     SIZE_T size = (SIZE_T)count * increment;
+    BOOL adopted;
     void *memory;
 
     if (hooks < 0)
@@ -383,6 +390,17 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
             rebox_log("d3d12_xs: a descriptor heap of %u descriptors (%llu bytes) is in the title's memory at %p",
                       count, (unsigned long long)size, memory);
     }
+    /* A shader-visible heap's memory is made GPU-visible first (outside the lock: it makes D3D12
+     * objects). */
+    {
+        BOOL visible = FALSE;
+        AcquireSRWLockShared(&lock);
+        for (struct shadow_heap *h = heaps; h; h = h->next)
+            if (h->inner == inner)
+                visible = h->shader_visible;
+        ReleaseSRWLockShared(&lock);
+        adopted = visible && gpu_memory_adopt((UINT64)(ULONG_PTR)memory, size);
+    }
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h; h = h->next)
         if (h->inner == inner)
@@ -390,6 +408,27 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
             h->title_cpu = (SIZE_T)memory;
             h->title_attributes = XALLOC_DESCRIPTOR_HEAP;
             InterlockedIncrement(&placed_heaps);
+            /* The shadow becomes the heap's memory (GPU-visible where it is, for a shader-visible
+             * heap), so descriptors the title writes there itself are read as well. */
+            if (h->stride == increment && (!h->shader_visible || adopted))
+            {
+                static LONG logged;
+                memcpy(memory, h->data, size);
+                if (h->gpu_memory)
+                    ReboxGpuFree(h->data);
+                else
+                    free(h->data);
+                h->data = memory;
+                h->data_in_title = TRUE;
+                if (h->shader_visible)
+                {
+                    h->gpu_memory = TRUE;
+                    h->gpu_va = (UINT64)(ULONG_PTR)memory;
+                }
+                if (InterlockedIncrement(&logged) <= 8)
+                    rebox_log("d3d12_xs: the %u-descriptor heap's console descriptors are its memory at %p%s", count,
+                              memory, h->shader_visible ? " (GPU-visible there)" : "");
+            }
             memory = NULL;
             break;
         }
