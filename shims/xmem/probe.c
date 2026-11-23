@@ -97,22 +97,27 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                 static const char *const register_names[] = { "rcx", "rdx", "r8", "r9" };
                 if (dump_qwords && base && !IsBadReadPtr((void *)base, dump_qwords * 8))
                 {
-                    char line[1024], where[MAX_PATH + 32];
-                    int at = 0;
-                    for (UINT q = 0; q < dump_qwords && at < 900; q++)
+                    char line[900], where[MAX_PATH + 32];
+                    /* Eight qwords a line (the log's lines are short), each labelled with its offset. */
+                    for (UINT first = 0; first < dump_qwords; first += 8)
                     {
-                        ULONG_PTR v = ((ULONG_PTR *)base)[q];
-                        HMODULE m;
-                        if (v && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                                                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)v, &m))
+                        int at = 0;
+                        for (UINT q = first; q < dump_qwords && q < first + 8; q++)
                         {
-                            describe(v, where, sizeof(where));
-                            at += snprintf(line + at, sizeof(line) - at, " %s", where);
+                            ULONG_PTR v = ((ULONG_PTR *)base)[q];
+                            HMODULE m;
+                            if (v && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)v, &m))
+                            {
+                                describe(v, where, sizeof(where));
+                                at += snprintf(line + at, sizeof(line) - at, " %s", where);
+                            }
+                            else
+                                at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)v);
                         }
-                        else
-                            at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)v);
+                        rebox_log("probe %s hit %ld: [%s+%#x]%s", p->name, n, register_names[dump_register], first * 8,
+                                  line);
                     }
-                    rebox_log("probe %s hit %ld: [%s]%s", p->name, n, register_names[dump_register], line);
                 }
                 for (UINT m = 0; m < memory_range_count; m++)
                 {
@@ -230,7 +235,7 @@ void probe_install(void)
         if (dump && atoi(dump) > 0)
         {
             const char *colon = strchr(dump, ':');
-            dump_qwords = min(atoi(dump), 32);
+            dump_qwords = min(atoi(dump), 64);
             dump_register = !colon ? 0 : !_stricmp(colon + 1, "rdx") ? 1 : !_stricmp(colon + 1, "r8") ? 2
                     : !_stricmp(colon + 1, "r9") ? 3 : 0;
         }
