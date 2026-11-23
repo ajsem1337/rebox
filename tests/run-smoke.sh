@@ -87,12 +87,15 @@ REBOX_SHADER_FALLBACK=0 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.
 # ...and succeed through the fallback shaders by default.
 echo "== fake.bin, no cache entry, fallback shaders"
 # This run also counts proxy slot calls (REBOX_SLOT_STATS).
-out=$(REBOX_SLOT_STATS=1 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
+out=$(REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
 echo "$out"
 grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were not used"; exit 1; }
 grep -Eq "slot stats GraphicsCommandList:.* 12=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
 grep -Eq "slot stats Device:.* 100T=1" <<<"$out" || { echo "FAIL slot stats lack the trapped device slot 100"; exit 1; }
 echo "ok   slot stats count forwarded, custom and trapped slots"
+grep -q "ok   an assertion (int3) in the exe was stepped over" <<<"$out" && grep -q "assertion 1 skipped at smoke.exe+" <<<"$out" \
+    || { echo "FAIL REBOX_SKIP_ASSERTS did not step over the exe's int3"; exit 1; }
+echo "ok   REBOX_SKIP_ASSERTS steps over the exe's assertions and logs them"
 # Ray tracing list methods are ours, not forwarded: a state object that isn't vkd3d-proton's must
 # never reach it (SetPipelineState1/DispatchRays at 120/121, and 122/123 from SDK 0x20004), and
 # acceleration structure copies (119, 121) are skipped.

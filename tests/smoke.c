@@ -4528,6 +4528,12 @@ static void test_xaudio2(void)
 int main(int argc, char **argv)
 {
     test_xmem();
+    /* REBOX_SKIP_ASSERTS: an int3 in the exe is stepped over (xmem crash.c). */
+    if (getenv("REBOX_SKIP_ASSERTS"))
+    {
+        __debugbreak();
+        CHECK(1, "an assertion (int3) in the exe was stepped over");
+    }
     test_xcrdapi();
     test_gameinput();
     test_acphal();

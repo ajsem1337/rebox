@@ -279,6 +279,35 @@ static DWORD WINAPI stack_sampler(void *param)
     return 0;
 }
 
+/* REBOX_SKIP_ASSERTS=1 (bring-up): a title's assertions are int3s in its own code ("master" builds
+ * keep them, and a debugger would step past). Each is stepped over and logged with its caller, so
+ * one run lists every assertion a title meets instead of stopping at the first; what follows an
+ * int3 is mostly the title handling the failure. Probes (probe.c) are handled before this. */
+static LONG CALLBACK skip_assert(EXCEPTION_POINTERS *ep)
+{
+    static LONG skipped;
+    EXCEPTION_RECORD *rec = ep->ExceptionRecord;
+    CONTEXT *c = ep->ContextRecord;
+    HMODULE exe = GetModuleHandleA(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)exe + ((IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    char where[MAX_PATH + 32], caller[MAX_PATH + 32];
+    LONG n;
+
+    if (rec->ExceptionCode != EXCEPTION_BREAKPOINT || c->Rip - (ULONG_PTR)exe >= nt->OptionalHeader.SizeOfImage
+            || *(const BYTE *)c->Rip != 0xcc)
+        return EXCEPTION_CONTINUE_SEARCH;
+    n = InterlockedIncrement(&skipped);
+    if (n <= 200)
+    {
+        describe(c->Rip, where, sizeof(where));
+        describe(readable(c->Rsp, 8) ? *(ULONG_PTR *)c->Rsp : 0, caller, sizeof(caller));
+        rebox_log("xmem: assertion %ld skipped at %s (thread %#lx; rax %#llx, [rsp] %s)", n, where,
+                  GetCurrentThreadId(), (unsigned long long)c->Rax, caller);
+    }
+    c->Rip++;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
 {
     char hang[16];
@@ -292,6 +321,14 @@ void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
     window_size = gpu_window_size;
     if (remaining > 0 && (busy_slot = TlsAlloc()) != TLS_OUT_OF_INDEXES)
         AddVectoredExceptionHandler(0, on_exception);
+    {
+        char skip[4];
+        if (GetEnvironmentVariableA("REBOX_SKIP_ASSERTS", skip, sizeof(skip)) && skip[0] == '1')
+        {
+            AddVectoredExceptionHandler(0, skip_assert);
+            rebox_log("xmem: the title's assertions (int3) are stepped over and logged (REBOX_SKIP_ASSERTS)");
+        }
+    }
     if (hang_seconds > 0)
         CloseHandle(CreateThread(NULL, 0, hang_watch, (void *)(ULONG_PTR)hang_seconds, 0, NULL));
     {
