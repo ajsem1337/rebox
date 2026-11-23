@@ -406,10 +406,11 @@ std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base,
             for (std::uint32_t k = 0; k + 2 < structDef.size(); k++) {
                 const std::uint32_t type = structDef[2 + k];
                 const Inst arr = m.Def(type);
-                if (Op(arr) != OpTypeArray || !offsets.count(k) || !strides.count(type) || offsets[k] >= base) continue;
+                if (Op(arr) != OpTypeArray || !offsets.count(k) || offsets[k] >= base) continue;
                 const Inst length = m.Def(arr[3]);
                 if (Op(length) != OpConstant) continue;
-                const std::uint32_t stride = strides[type];
+                // AnyPS5's dword array; a type it shares may carry no stride of its own.
+                const std::uint32_t stride = strides.count(type) ? strides[type] : 4u;
                 if (offsets[k] + length[3] * stride <= base) continue;
                 const std::uint32_t shorter = m.NewId();
                 m.AddGlobal(Make(OpTypeArray, {shorter, arr[2], m.Constant((base - offsets[k]) / stride)}));

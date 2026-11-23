@@ -218,6 +218,7 @@ static int vertex_sweep(const char *plan, int first, int count)
             req.inputs[r].register_start = 4 + 4 * r;
             req.inputs[r].register_count = 4;
         }
+        req.push_size = getenv("SA5_PUSH_SIZE") ? (uint32_t)atoi(getenv("SA5_PUSH_SIZE")) : 0;
         if (sa5_compile_vertex(&req, &result, error, sizeof(error)))
         {
             for (char *p = error; *p; p++)
@@ -234,6 +235,35 @@ static int vertex_sweep(const char *plan, int first, int count)
             printf("vs %s ok %u words, %u vertex inputs, %u bindings, %s%.300s\n", name, words,
                    sa5_result_vertex_input_count(result), sa5_result_binding_count(result),
                    valid ? "valid" : "INVALID: ", valid ? "" : error);
+            /* SA5_PUSH_SIZE set: finalize as a graphics stage does, host buffers' addresses pushed
+             * after the stage's push data (the guest buffer table) or baked (the rest). */
+            if (getenv("SA5_PUSH_SIZE"))
+            {
+                struct sa5_host_buffer hosts[8];
+                uint32_t host_count = 0, *out = NULL, out_count = 0, pushed = 0;
+                for (uint32_t i = 0; i < sa5_result_binding_count(result) && host_count < 8; i++)
+                {
+                    struct sa5_binding b;
+                    sa5_result_binding(result, i, &b);
+                    if (b.role == 0 && b.kind == 1)
+                        hosts[host_count++] = (struct sa5_host_buffer){ b.set, b.binding, pushed++, 0, 1,
+                                req.push_size, 0 };
+                    else if (b.role > 2)
+                        hosts[host_count++] = (struct sa5_host_buffer){ b.set, b.binding, host_count, b.word_count, 0,
+                                0, 0x123450000ull };
+                }
+                if (sa5_finalize(result, NULL, 0, hosts, host_count, &out, &out_count, error, sizeof(error)))
+                {
+                    for (char *p = error; *p; p++)
+                        if (*p == '\n') *p = ' ';
+                    printf("vs %s finalize FAIL (%u host buffers, %u pushed): %.300s\n", name, host_count, pushed, error);
+                }
+                else
+                {
+                    printf("vs %s finalize ok (%u host buffers, %u pushed)\n", name, host_count, pushed);
+                    sa5_free_words(out);
+                }
+            }
             valid_count += valid;
             sa5_result_free(result);
             ok++;
