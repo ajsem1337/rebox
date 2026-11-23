@@ -1067,6 +1067,8 @@ static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
         armed = TRUE;
         if (fence_cell_count == 1)
             rebox_log("d3d12_xs: fence slot 12: completed values in memory, kept by a thread");
+        if (fence_cell_count <= 32)
+            rebox_log("d3d12_xs: fence %p's completed value is at %p", (void *)p, (void *)&cell->value);
     }
     ReleaseSRWLockExclusive(&fence_cells_lock);
     if (!cell)

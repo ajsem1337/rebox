@@ -86,9 +86,12 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                 if (!IsBadReadPtr((void *)(ULONG_PTR)c->Rsp, 8))
                     ret = *(ULONG_PTR *)(ULONG_PTR)c->Rsp;
                 describe(ret, caller, sizeof(caller));
-                rebox_log("probe %s hit %ld, thread %#lx: rcx %#llx rdx %#llx r8 %#llx r9 %#llx, rsp %#llx, from %s",
+                rebox_log("probe %s hit %ld, thread %#lx: rcx %#llx rdx %#llx r8 %#llx r9 %#llx, rsi %#llx rdi %#llx "
+                          "rax %#llx rbx %#llx, rsp %#llx, from %s",
                              p->name, n, GetCurrentThreadId(), (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
-                             (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rsp, caller);
+                             (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rsi,
+                             (unsigned long long)c->Rdi, (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+                             (unsigned long long)c->Rsp, caller);
                 ULONG_PTR base = dump_register == 1 ? c->Rdx : dump_register == 2 ? c->R8 : dump_register == 3 ? c->R9
                         : c->Rcx;
                 static const char *const register_names[] = { "rcx", "rdx", "r8", "r9" };
