@@ -93,6 +93,8 @@ static void test_crash_report(HMODULE xmem)
           GetLastError());
 }
 
+static void test_probe(HMODULE xmem);
+
 static void test_xmem(void)
 {
     HMODULE m = LoadLibraryA("xmem.dll");
@@ -110,6 +112,7 @@ static void test_xmem(void)
     free_default = (free_fn)(void *)GetProcAddress(m, "XMemFreeDefault");
     CHECK(xalloc && xfree && set_hooks && alloc_default && free_default, "xmem exports present");
     CHECK(GetProcAddress(m, "ReboxHeartbeat") != NULL, "xmem exports ReboxHeartbeat (the hang watchdog's)");
+    test_probe(m);
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
     test_crash_report(m);
 
@@ -745,6 +748,30 @@ done:
     if (alloc) ID3D12CommandAllocator_Release(alloc);
     if (readback) ID3D12Resource_Release(readback);
     if (tex) ID3D12Resource_Release(tex);
+}
+
+/* REBOX_PROBE's mechanism (xmem probe.c): an int3 on a function logs each call and the function
+ * still runs, every time (the original byte single-stepped, then rearmed). */
+static __attribute__((noinline)) int probed_function(int a)
+{
+    return a * 3 + 1;
+}
+
+static void test_probe(HMODULE xmem)
+{
+    BOOL (WINAPI *add)(void *, const char *) = (void *)GetProcAddress(xmem, "ReboxProbeAdd");
+    LONG (WINAPI *hits)(const void *) = (void *)GetProcAddress(xmem, "ReboxProbeHits");
+    int (*volatile fn)(int) = probed_function;
+    int sum = 0;
+
+    CHECK(add && hits, "xmem exports ReboxProbeAdd/ReboxProbeHits");
+    if (!add || !hits || !add((void *)probed_function, "smoke probed_function"))
+        return;
+    for (int i = 0; i < 3; i++)
+        sum += fn(i);
+    CHECK(sum == 1 + 4 + 7 && hits((void *)probed_function) == 3,
+          "a probed function logs each call and still runs (sum %d, want 12; %ld hits, want 3)", sum,
+          hits((void *)probed_function));
 }
 
 /* Reads pixel (0,0) of a 32-bit BMP written by PresentX's frame dump. */

@@ -15,6 +15,7 @@
 #include "../common/rebox_log.h"
 #include "crash.h"
 #include "import_fixup.h"
+#include "probe.h"
 
 typedef union
 {
@@ -193,6 +194,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
         if (!fixup || strcmp(fixup, "0"))
             import_fixup_run();
         free(fixup);
+        probe_install();
     }
     return TRUE;
 }
