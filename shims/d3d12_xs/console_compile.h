@@ -95,3 +95,9 @@ void console_resolve_late(void);
 
 /* GPU memory for one draw's data (a ring reused long after the GPU read it): its address, or 0. */
 UINT64 console_draw_buffer(const void *data, SIZE_T size);
+
+/* Draws into a display-sized target (proxy.c): the console stages they compile are noted, and
+ * console_display_draws_log names them (at the first presents). */
+void console_display_draw_begin(int target, UINT count, BOOL rect, BOOL indexed);
+void console_display_draw_end(void);
+void console_display_draws_log(void);

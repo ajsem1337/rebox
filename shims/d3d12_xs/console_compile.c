@@ -962,9 +962,75 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
     WakeConditionVariable(&jobs_ready);
 }
 
+/* Which console stages draw into the display-sized targets (proxy.c brackets those draws): each
+ * distinct (target, vertex stage, pixel stage, count, rect list) with how often, logged at the first
+ * presents, so a draw seen in a frame can be named for REBOX_GRAPHICS_DEBUG=magenta:<id>. */
+static struct display_draw { int target; UINT count; BOOL rect, indexed; UINT64 vs, ps; LONG times; } display_draws[32];
+static UINT display_draw_count;
+static SRWLOCK display_draw_lock = SRWLOCK_INIT;
+static __thread struct display_draw current_draw;
+static __thread BOOL in_display_draw;
+
+void console_display_draw_begin(int target, UINT count, BOOL rect, BOOL indexed)
+{
+    memset(&current_draw, 0, sizeof(current_draw));
+    current_draw.target = target;
+    current_draw.count = count;
+    current_draw.rect = rect;
+    current_draw.indexed = indexed;
+    in_display_draw = TRUE;
+}
+
+void console_display_draw_end(void)
+{
+    UINT i;
+
+    if (!in_display_draw)
+        return;
+    in_display_draw = FALSE;
+    AcquireSRWLockExclusive(&display_draw_lock);
+    for (i = 0; i < display_draw_count; i++)
+        if (display_draws[i].target == current_draw.target && display_draws[i].count == current_draw.count
+                && display_draws[i].rect == current_draw.rect && display_draws[i].indexed == current_draw.indexed
+                && display_draws[i].vs == current_draw.vs && display_draws[i].ps == current_draw.ps)
+            break;
+    if (i == display_draw_count && i < ARRAYSIZE(display_draws))
+        display_draws[display_draw_count++] = current_draw;
+    if (i < display_draw_count)
+        display_draws[i].times++;
+    ReleaseSRWLockExclusive(&display_draw_lock);
+}
+
+void console_display_draws_log(void)
+{
+    AcquireSRWLockExclusive(&display_draw_lock);
+    for (UINT i = 0; i < display_draw_count; i++)
+        rebox_log("d3d12_xs:   display target %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx",
+                  display_draws[i].target, display_draws[i].times, display_draws[i].indexed ? "indexed draws" : "draws",
+                  display_draws[i].count, display_draws[i].rect ? "(rect list)" : "",
+                  (unsigned long long)display_draws[i].vs, (unsigned long long)display_draws[i].ps);
+    display_draw_count = 0;
+    ReleaseSRWLockExclusive(&display_draw_lock);
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     UINT64 key;
+
+    if (in_display_draw && in && in->shader && in->shader_size >= sizeof(struct rebox_deferred_shader))
+    {
+        const struct rebox_deferred_shader *h = in->shader;
+        if (h->version == 2 && (h->stage == 0x1 || h->stage == 0x10) && h->code_offset <= in->shader_size
+                && h->code_dwords * 4ull <= in->shader_size - h->code_offset)
+        {
+            UINT64 id = hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
+                                   (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+            if (h->stage == 0x1)
+                current_draw.vs = id;
+            else
+                current_draw.ps = id;
+        }
+    }
 
     if (!async_compiles() || !in || !in->shader || !in->shader_size || !out)
         return compile_now(in, out, FALSE);

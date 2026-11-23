@@ -1266,6 +1266,17 @@ static void test_console_draw(void *dev, void *queue, BOOL packed, BOOL linked, 
         if (rect)
         {
             const BYTE *top_right = (BYTE *)mapped + 6 * 256 + 56 * 4, *bottom_left = (BYTE *)mapped + 42 * 256 + 8 * 4;
+            UINT missed = 0, first_x = 0, first_y = 0;
+            /* Every pixel: the two triangles share their diagonal, with no seam between them. */
+            for (UINT y = 0; y < 48; y++)
+                for (UINT x = 0; x < 64; x++)
+                {
+                    const BYTE *q = (BYTE *)mapped + y * 256 + x * 4;
+                    if (!(q[0] == 255 && q[1] == 0 && q[2] == 0) && !missed++)
+                        first_x = x, first_y = y;
+                }
+            CHECK(!missed, "a console rect list covers every pixel %s: no seam on its diagonal (%u missed, first at %u,%u)",
+                  rect == 2 ? "on the CPU" : "with the rect-list stages", missed, first_x, first_y);
             CHECK(bottom_left[0] == 255 && bottom_left[1] == 0 && top_right[0] == 255 && top_right[1] == 0
                   && top_right[2] == 0,
                   "a console rect list draws the whole rectangle: its fourth corner is made %s (bottom left RGB "

@@ -3279,17 +3279,24 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
         return;
+    if (p->display_bound)
+        console_display_draw_begin(p->display_bound - 1, vertices, p->rect_list, FALSE);
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
+    console_display_draw_end();
 }
 
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT indices, UINT instances, UINT first_index,
         INT base_vertex, UINT first_instance)
 {
     if (p->display_bound)
+    {
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
+        console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
+    }
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
+    console_display_draw_end();
 }
 
 /* Console memory writes and waits (xcl, ivall/xcl, GPL-2.0-only, list_x.rs and cpu_writes.rs; older
@@ -3950,6 +3957,7 @@ void proxy_frame_presented(void)
                                InterlockedExchange(&display_clears[i], 0), InterlockedExchange(&display_draws[i], 0));
             line[at] = 0;
             rebox_log("d3d12_xs: since the last present, display-sized RGBA8 targets bound/cleared/drawn:%s", line);
+            console_display_draws_log();
         }
     }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
