@@ -320,4 +320,15 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
   descriptors fail there; a dispatch-time compile has the memory. Still from the code, not
   registers: the wave size (`sa5_analyse`) and depth export (an `mrtz` export). Next: the NGG
   `MeshConfiguration`, then graphics pipelines at draw time.
+- **a UE5 title's pixel shaders (no PS09 cache).** Its graphics FSSM (older layout) has the code at
+  the u32 at 0xC0 plus 0x28 (0xF10 in all its pixel shaders), the code size in bytes at 0xC8,
+  `SPI_SHADER_PGM_RSRC1_PS` at 0x108 and the float mode at 0xFC; pointers at 0xE0, 0xE8, 0x118
+  and 0x128 (plus 0x28) lead to binding records, an input/output record table and the entry
+  name (e.g. `GaussianBlurMain`). The rest of the pixel state comes from the code
+  (`tools/fssm-ps-plan.py`): 24 user SGPRs (the prologue's `s_mov_b32 m0, s24` takes the
+  primitive mask from the SGPR after them), interpolants from `v_interp_*`, flat ones from
+  `v_interp_mov`, export formats from `exp` (packed: FP16, else the 32-bit format of the channels
+  written), depth from an MRTZ export. 2026-11-23: 32 of the 33 dumped from a run compile with
+  `sa5_check ps` and pass `spirv-val`; the other writes a hardware register field with
+  `s_setreg_imm32_b32` that AnyPS5 doesn't handle (only MODE's round and denormal fields).
 - **Graphics on Scarlett.** The 7,498 NGG shaders may not map cleanly onto AnyPS5's mesh path.
