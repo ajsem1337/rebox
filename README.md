@@ -132,6 +132,7 @@ method the title asked for that isn't implemented.
 | `REBOX_GAMEINPUT_LOG=1` | Log the controller state the gameinput shim reads (with XInput's raw values), at most 4 times a second while it changes, 200 lines: for a stick that drifts or an axis that reads off-centre |
 | `REBOX_EXE=FILE` | Run FILE from the game directory under `MicrosoftGame.Config`'s executable name, e.g. `title.exe.original`, the unpatched exe some dumps keep next to a patched one |
 | `REBOX_OVERLAY=DIR` | Lay DIR's files over the package at the same relative paths, in the shadow package only (the dump is untouched), e.g. an Unreal title's `<Project>/Config/UserEngine.ini` |
+| `REBOX_ACCELERATION_STRUCTURES=1` | Pass ray tracing acceleration structure builds, postbuild info and copies on to vkd3d-proton. By default they're skipped, since no ray reads them (pipelines are placeholders): a title fills its bottom levels by copies in a mode vkd3d-proton doesn't support, and its top-level build then faulted the GPU |
 | `REBOX_DUMP_STATE_OBJECTS=DIR` | Write each distinct serialized ray tracing state object a title loads (`DeserializeStateObjectX`, Xbox device slot 115) to `DIR\<fnv1a64>.bin`. They get a placeholder that traces nothing: console ray tracing code isn't translated yet |
 | `REBOX_CONSOLE_MODE` | `ConsoleMode` value `rebox-run` puts in the registry for `XSystemGetDeviceType` (default `0x64`, Series X; `0x50` is Xbox One X) |
 | `REBOX_KEYBOARD_PAD=0` | Don't drive the gamepad from the keyboard when no controller is connected (`shims/gameinput`: WASD/arrows sticks, Space A, Left Ctrl B, R X, F Y, Q/E shoulders, Z/C triggers, Enter menu, Tab view, IJKL D-pad) |
@@ -251,8 +252,9 @@ down missing translations.
   heaps keep ordinary GPU addresses.
 - **Ray tracing and depth UAVs are placeholders.** Console ray tracing pipelines
   (`DeserializeStateObjectX`, `CreateStateObject`) get placeholder objects that trace nothing,
-  and their `DispatchRays` are skipped (`REBOX_DUMP_STATE_OBJECTS` saves the blobs to work out
-  their format); inline ray tracing in console shaders and the console BVH builder's output aren't
+  and their `DispatchRays` are skipped, as are state objects the title sets that aren't ours
+  (`REBOX_DUMP_STATE_OBJECTS` saves the blobs to work out their format). Acceleration structure
+  builds and copies are skipped too, since no ray reads them; inline ray tracing in console shaders and the console BVH builder's output aren't
   translated either. A depth texture that's also a UAV (Unreal 5's Nanite) is a depth target only,
   so writes through its UAV views are lost; TuxBox pairs it with an R32 image and copies the
   depth plane across, which is the fix. Both matter for titles that use ray tracing or Nanite.
@@ -276,8 +278,10 @@ down missing translations.
   PulseAudio null sink. Bink's audio is decoded to PCM by Bink and is
   unaffected. Wine also reports a mastering voice as created when there's no audio device, after
   which FAudio crashes on the first source voice; that only matters on machines without audio.
-- **Upscaling is bilinear.** The console FidelityFX upscaler runs precompiled-ISA shaders, which
-  would become no-op fallbacks and leave its output unwritten. `rebox-run` runs the title from
+- **Upscaling is bilinear.** The console FidelityFX upscaler creates its passes from the console
+  driver's own container (FSPX), which `d3d12_xs` defers to AnyPS5 like a title's shaders
+  ([docs/anyps5.md](docs/anyps5.md)); whether its passes compile and run hasn't been tried, so
+  the stub is the default. `rebox-run` runs the title from
   `$WINEPREFIX/package`, a directory of symlinks to the package, with our
   `amd_fidelityfx_loader_xbox.dll` in place of the package's. That stub answers FSR's queries
   (quality-mode ratios, but no jitter) and scales the colour input into the output with a

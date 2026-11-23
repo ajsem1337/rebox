@@ -89,6 +89,12 @@ The `FLAT_SCRATCH` setup many console shaders open with (`s_setreg_imm32_b32` or
 to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size `s_nop`s before each compile. Only the scalar
 prologue is scanned, up to the first vector or memory instruction.
 
+The console driver's own container, **FSPX** in a DXBC part `ACCC`, is read too: AMD FidelityFX's
+console upscaler creates its compute passes from it, with no DXIL (format from xcl). After `FSPX`,
+a version, an entry count and a size come 16-byte entries (type, offset, size, 0) from +0x10. Entry
+0 holds the thread-group size (three u16 at +0x0C) and `COMPUTE_PGM_RSRC1`/`RSRC2` (+0x14, +0x18);
+entry 6 the code behind a 0x24-byte header, up to its last `s_endpgm`.
+
 ## Compute
 
 1. **PSO creation** (patch 0005). A console compute container becomes a deferred console shader,
