@@ -1,8 +1,8 @@
 diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
-index ea78270..a4353b6 100644
+index ea78270..7ac3900 100644
 --- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
 +++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
-@@ -80,6 +80,20 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t
+@@ -80,6 +80,27 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t
     return r;
  }
  
@@ -20,10 +20,27 @@ index ea78270..a4353b6 100644
 +          (flags & RADEON_FLAG_REPLAYABLE ? AMDGPU_VA_RANGE_REPLAYABLE : 0);
 +}
 +
++/* rebox: a lower-half replay address (see radv_amdgpu_va_range_flags). */
++static bool
++radv_amdgpu_low_replay(uint64_t replay_address, enum radeon_bo_flag flags)
++{
++   return replay_address && replay_address < (1ull << 47) && !(flags & RADEON_FLAG_32BIT);
++}
++
  static uint64_t
  radv_amdgpu_canonicalize_va(uint64_t va)
  {
-@@ -470,8 +484,7 @@ radv_amdgpu_winsys_virtual_bo_create(struct radeon_winsys *_ws, uint64_t size, u
+@@ -464,14 +485,17 @@ radv_amdgpu_winsys_virtual_bo_create(struct radeon_winsys *_ws, uint64_t size, u
+    unsigned virt_alignment = alignment;
+    if (size >= ws->info.pte_fragment_size)
+       virt_alignment = MAX2(virt_alignment, ws->info.pte_fragment_size);
++   /* rebox: a lower-half replay address is a title's CPU address, page-aligned but not
++    * necessarily fragment-aligned; take it with the page alignment rather than refuse it. */
++   if (radv_amdgpu_low_replay(replay_address, flags) && replay_address % virt_alignment)
++      virt_alignment = alignment;
+ 
+    assert(!replay_address || (flags & RADEON_FLAG_REPLAYABLE));
+ 
     if (flags & RADEON_FLAG_EMULATE_SPARSE_RESIDENCY)
        replay_address &= ~(1ull << ws->info.address_prt_wa_control_bit);
  
@@ -33,7 +50,15 @@ index ea78270..a4353b6 100644
     const uint64_t va_gap_size = ws->debug_vm ? MAX2(4 * virt_alignment, 64 * 1024) : 0;
  
     r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size + va_gap_size, virt_alignment, replay_address,
-@@ -551,8 +564,7 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned
+@@ -547,12 +571,15 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned
+    unsigned virt_alignment = alignment;
+    if (size >= ws->info.pte_fragment_size)
+       virt_alignment = MAX2(virt_alignment, ws->info.pte_fragment_size);
++   /* rebox: a lower-half replay address is a title's CPU address, page-aligned but not
++    * necessarily fragment-aligned; take it with the page alignment rather than refuse it. */
++   if (radv_amdgpu_low_replay(replay_address, flags) && replay_address % virt_alignment)
++      virt_alignment = alignment;
+ 
     assert(!replay_address || (flags & RADEON_FLAG_REPLAYABLE));
  
     const uint64_t va_size = radv_amdgpu_bo_va_size(size, flags);

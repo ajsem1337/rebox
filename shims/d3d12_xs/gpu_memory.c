@@ -359,11 +359,12 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
     return n;
 }
 
-/* Spans of title memory made GPU memory: 2 MiB-aligned (RADV gives allocations of 2 MiB and more
- * the PTE fragment's alignment, and libdrm refuses a required address that isn't aligned to it),
- * and as much of the committed run around the request as ADOPT_GRANULE allows, so neighbouring
- * placements land in one chunk instead of straddling two. */
-#define ADOPT_ALIGN (2ull << 20)
+/* Spans of title memory made GPU memory: 64 KiB-aligned (.#radv-rebox takes a lower-half address
+ * with the page alignment), at least 2 MiB (vkd3d-proton suballocates smaller buffer heaps, so
+ * the layer would never see the allocation), and as much of the committed run around the request
+ * as ADOPT_GRANULE allows, so neighbouring placements land in one chunk instead of straddling two. */
+#define ADOPT_ALIGN (64ull << 10)
+#define ADOPT_MIN (2ull << 20)
 #define ADOPT_GRANULE (256ull << 20)
 
 /* The run of committed, writable pages around address: [*start, *end). */
@@ -443,28 +444,16 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         }
         if (c->gpu < limit && base < c->gpu + c->size)
         {
+            /* A page apart: RADV maps a guard page past each allocation. */
             if (c->gpu + c->size <= address)
-                base = (c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1);
+                base = ((c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1)) + ADOPT_ALIGN;
             else if (c->gpu >= end)
-                limit = c->gpu & ~(ADOPT_ALIGN - 1);
+                limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_ALIGN;
             else
                 limit = base; /* the request straddles a chunk: nothing to do */
         }
     }
-    if (base > address || limit < end)
-    {
-        /* Below 2 MiB RADV keeps the page alignment: the request's own 64 KiB pages will do. */
-        UINT64 small_base = address & ~0xffffull, small_limit = (end + 0xffff) & ~0xffffull;
-        if (small_limit - small_base < ADOPT_ALIGN && small_base >= run_start && small_limit <= run_end)
-        {
-            base = small_base;
-            limit = small_limit;
-            for (c = chunks; c; c = c->next)
-                if (c->gpu < limit && base < c->gpu + c->size)
-                    limit = base;
-        }
-    }
-    if (base > address || limit < end)
+    if (base > address || limit < end || limit - base < ADOPT_MIN)
     {
         ReleaseSRWLockExclusive(&lock);
         if (InterlockedIncrement(&logged) <= 8)
