@@ -26,12 +26,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+
+#include "gpuva_mailbox.h"
 
 #define LAYER_NAME "VK_LAYER_REBOX_gpuva_identity"
 #define EXPORT __attribute__((visibility("default")))
@@ -80,7 +84,8 @@ static void window_init_locked(void)
     }
     free_cap = 64;
     free_ranges = calloc(free_cap, sizeof(*free_ranges));
-    free_ranges[0] = (struct range){ window_base, window_base + window_size };
+    /* The last 64 KiB is the mailbox (gpuva_mailbox.h), never handed out. */
+    free_ranges[0] = (struct range){ window_base, window_base + window_size - GPUVA_MAILBOX_SIZE };
     free_count = 1;
     window_cursor = window_base;
 
@@ -209,6 +214,7 @@ struct memory
     VkDeviceMemory handle;
     uint64_t address, size, reserved; /* reserved = size + guard, in the window */
     int mapped;
+    int adopted; /* at title memory outside the window (the mailbox's request) */
     struct memory *next;
 };
 
@@ -576,6 +582,57 @@ static int wants_identity(struct device_data *d, const VkMemoryAllocateInfo *inf
     return 1;
 }
 
+/* ------------------------------------------------------------- mailbox */
+
+/* The mailbox, if REBOX_GPUVA_MAILBOX=1 and it is readable (xmem.dll commits it). Read through
+ * process_vm_readv, so an unmapped page is an error, not a fault. */
+static struct gpuva_mailbox *mailbox_get(void)
+{
+    static int state; /* 0 unknown, 1 on, -1 off */
+    static struct gpuva_mailbox *box;
+    struct gpuva_mailbox copy;
+    struct iovec local = { &copy, sizeof(copy) }, remote;
+    const char *env;
+
+    if (state)
+        return state > 0 ? box : NULL;
+    env = getenv("REBOX_GPUVA_MAILBOX");
+    pthread_mutex_lock(&window_lock);
+    window_init_locked();
+    pthread_mutex_unlock(&window_lock);
+    box = (struct gpuva_mailbox *)(uintptr_t)(window_base + window_size - GPUVA_MAILBOX_SIZE);
+    remote = (struct iovec){ box, sizeof(*box) };
+    if (!env || strcmp(env, "1"))
+        state = -1;
+    else if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != sizeof(copy) || copy.magic != GPUVA_MAILBOX_MAGIC)
+    {
+        layer_log("mailbox at %p isn't there: title memory can't be made GPU-visible", (void *)box);
+        state = -1;
+    }
+    else
+    {
+        layer_log("mailbox at %p", (void *)box);
+        state = 1;
+    }
+    return state > 0 ? box : NULL;
+}
+
+/* The address requested for an allocation of this size, or 0. */
+static uint64_t mailbox_request(uint64_t size)
+{
+    struct gpuva_mailbox *box = mailbox_get();
+    uint64_t address;
+
+    if (!box || !(address = __atomic_load_n(&box->address, __ATOMIC_ACQUIRE)))
+        return 0;
+    if (__atomic_load_n(&box->size, __ATOMIC_RELAXED) != size)
+        return 0;
+    /* Taken: a second allocation of the same size doesn't get it too. */
+    if (!__atomic_compare_exchange_n(&box->address, &address, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return 0;
+    return address;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
         const VkAllocationCallbacks *alloc, VkDeviceMemory *memory)
 {
@@ -585,12 +642,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, cons
         .sType = VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO };
     VkMemoryAllocateInfo ai;
     VkMemoryAllocateFlags saved_flags = 0;
-    uint64_t size, align, address;
+    uint64_t size, align, address, adopt;
     struct memory *m;
     VkResult vr;
 
     if (!wants_identity(d, info))
         return d->allocate(device, info, alloc, memory);
+    adopt = mailbox_request(info->allocationSize);
 
     /* Placed maps cover whole allocations, so round sizes to the alignment
      * we use for addresses. RADV maps a guard page past each allocation on
@@ -619,6 +677,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, cons
     /* A refused address may just be taken in the driver's GPU VA space; try
      * a few fresh ones (keeping the refused ranges out of the window) before
      * concluding the driver can't do lower-half addresses at all. */
+    if (adopt)
+    {
+        /* Title memory: exactly there, or not at all (the caller sees result 0). */
+        size = info->allocationSize;
+        oc.opaqueCaptureAddress = adopt;
+        vr = d->allocate(device, &ai, alloc, memory);
+        if (flags)
+            flags->flags = saved_flags;
+        if (vr != VK_SUCCESS)
+        {
+            layer_log("driver refused device address %#" PRIx64 " for title memory (%#" PRIx64 " bytes): %d",
+                      adopt, size, vr);
+            return d->allocate(device, info, alloc, memory);
+        }
+        m = calloc(1, sizeof(*m));
+        m->handle = *memory;
+        m->address = adopt;
+        m->size = size;
+        m->adopted = 1;
+        pthread_mutex_lock(&d->lock);
+        m->next = d->memories[bucket(*memory)];
+        d->memories[bucket(*memory)] = m;
+        pthread_mutex_unlock(&d->lock);
+        __atomic_store_n(&mailbox_get()->result, adopt, __ATOMIC_RELEASE);
+        return VK_SUCCESS;
+    }
     for (int attempt = 0;; attempt++)
     {
         if (!(address = window_alloc(size + align, align)))
@@ -696,7 +780,10 @@ static void unmap_identity(struct device_data *d, struct memory *m)
         return;
     d->unmap2(d->device, &ui);
     m->mapped = 0;
-    if (!d->unmap_reserve)
+    if (m->adopted) /* the title's memory again: readable and writable, its contents gone */
+        mmap((void *)(uintptr_t)m->address, m->size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    else if (!d->unmap_reserve)
         mmap((void *)(uintptr_t)m->address, m->size, PROT_NONE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
 }
@@ -721,7 +808,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_FreeMemory(VkDevice device, VkDeviceMemo
     d->free(device, memory, alloc);
     if (m)
     {
-        window_free(m->address, m->reserved);
+        if (!m->adopted)
+            window_free(m->address, m->reserved);
         free(m);
     }
 }

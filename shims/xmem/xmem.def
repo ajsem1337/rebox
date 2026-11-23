@@ -18,6 +18,7 @@ EXPORTS
     XMemIsToolsMemAvailable
     XMemGetAllocationHysteresis
     ReboxHeartbeat
+    ReboxGpuvaMailbox
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister

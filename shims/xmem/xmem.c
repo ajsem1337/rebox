@@ -13,6 +13,7 @@
 #include <winternl.h>
 
 #include "../common/rebox_log.h"
+#include "../../layers/gpuva_mailbox.h"
 #include "crash.h"
 #include "import_fixup.h"
 #include "probe.h"
@@ -158,9 +159,17 @@ static BOOL is_gpu(const void *address)
     return gpu_query && gpu_query(address, NULL, NULL);
 }
 
+static struct gpuva_mailbox *mailbox;
+
+/* The mailbox for making title memory GPU-visible (layers/gpuva_mailbox.h), or NULL. */
+void *WINAPI ReboxGpuvaMailbox(void)
+{
+    return mailbox;
+}
+
 /* The window VK_LAYER_REBOX_gpuva_identity maps GPU memory into. Reserved
- * here, before anything else runs, so Wine never hands it out. Keep in step
- * with layers/gpuva_identity.c. */
+ * here, before anything else runs, so Wine never hands it out; its last 64 KiB
+ * is committed as the layer's mailbox. Keep in step with layers/gpuva_identity.c. */
 static void reserve_gpu_window(void)
 {
     const char *env = getenv("REBOX_GPUVA_WINDOW");
@@ -180,6 +189,9 @@ static void reserve_gpu_window(void)
     if (!VirtualAlloc((void *)base, size, MEM_RESERVE, PAGE_NOACCESS))
         rebox_log("xmem: could not reserve GPU VA window %#llx+%#llx (error %lu)",
                      (unsigned long long)base, (unsigned long long)size, GetLastError());
+    else if ((mailbox = VirtualAlloc((void *)(base + size - GPUVA_MAILBOX_SIZE), GPUVA_MAILBOX_SIZE, MEM_COMMIT,
+                                     PAGE_READWRITE)))
+        mailbox->magic = GPUVA_MAILBOX_MAGIC;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)

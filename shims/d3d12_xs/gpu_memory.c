@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "../common/rebox_log.h"
+#include "../../layers/gpuva_mailbox.h"
 #include "gpu_memory.h"
 
 #define CHUNK_SIZE (64u << 20)
@@ -31,6 +32,7 @@ struct chunk
     BYTE *cpu;
     UINT64 gpu, size, used;
     BOOL dedicated, dirty; /* dirty: something was freed, so ranges may hold old data */
+    BOOL adopted; /* title memory made GPU-visible in place (gpu_memory_adopt): never freed */
     struct range *free;
     size_t free_count, free_cap;
     struct chunk *next;
@@ -130,13 +132,14 @@ static void range_free(struct chunk *c, UINT64 start, UINT64 size)
 
 /* --------------------------------------------------------------- chunks */
 
-static struct chunk *chunk_create(ID3D12Device *device, UINT64 size, BOOL dedicated)
+static struct chunk *chunk_create(ID3D12Device *device, UINT64 size, BOOL dedicated, BOOL adopted)
 {
     D3D12_HEAP_DESC hd = {
         .SizeInBytes = size,
         .Properties = { D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 0, 0 },
         .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-        .Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        /* Adopted memory gets the title's bytes copied back; zeroing it first is wasted. */
+        .Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | (adopted ? D3D12_HEAP_FLAG_CREATE_NOT_ZEROED : 0),
     };
     D3D12_RESOURCE_DESC rd = {
         .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER, .Width = size, .Height = 1, .DepthOrArraySize = 1,
@@ -172,6 +175,8 @@ static struct chunk *chunk_create(ID3D12Device *device, UINT64 size, BOOL dedica
     c->free[0] = (struct range){ 0, size };
     c->free_count = 1;
 
+    if (adopted)
+        return c;
     if ((UINT64)(ULONG_PTR)c->cpu != c->gpu)
     {
         if (!InterlockedExchange(&reported, 1))
@@ -227,7 +232,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
     if (size > DEDICATED_THRESHOLD || alignment > HEAP_ALIGN)
     {
         UINT64 chunk_size = (size + alignment + HEAP_ALIGN - 1) & ~(UINT64)(HEAP_ALIGN - 1);
-        if ((c = chunk_create(device, chunk_size, TRUE)) && range_alloc(c, size, alignment, &offset))
+        if ((c = chunk_create(device, chunk_size, TRUE, FALSE)) && range_alloc(c, size, alignment, &offset))
         {
             c->next = chunks;
             chunks = c;
@@ -243,7 +248,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
         for (c = chunks; c; c = c->next)
             if (!c->dedicated && range_alloc(c, size, alignment, &offset))
                 break;
-        if (!c && (c = chunk_create(device, CHUNK_SIZE, FALSE)))
+        if (!c && (c = chunk_create(device, CHUNK_SIZE, FALSE, FALSE)))
         {
             range_alloc(c, size, alignment, &offset);
             c->next = chunks;
@@ -352,6 +357,82 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
         out[n++] = (struct gpu_memory_region){ c->gpu, c->cpu, c->size };
     ReleaseSRWLockShared(&lock);
     return n;
+}
+
+/* Makes [address, address + size) of the title's own memory GPU-visible at the same address: a
+ * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address and maps over the
+ * title's pages (asked through the mailbox, layers/gpuva_mailbox.h), with the title's bytes
+ * copied across. The range is widened to 64 KiB pages. TRUE if the range is GPU memory now. */
+BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
+{
+    static struct gpuva_mailbox *(WINAPI *get_mailbox)(void);
+    static LONG logged;
+    ID3D12Device *device = rebox_shared_device();
+    UINT64 base = address & ~0xffffull, end = (address + size + 0xffff) & ~0xffffull, bytes = end - base;
+    struct gpuva_mailbox *box;
+    MEMORY_BASIC_INFORMATION mbi;
+    struct chunk *c;
+    void *saved;
+    BOOL ok = FALSE;
+
+    if (!get_mailbox)
+    {
+        HMODULE xmem = GetModuleHandleA("xmem.dll");
+        get_mailbox = xmem ? (void *)GetProcAddress(xmem, "ReboxGpuvaMailbox") : NULL;
+    }
+    if (!device || !size || !get_mailbox || !(box = get_mailbox()) || box->magic != GPUVA_MAILBOX_MAGIC)
+        return FALSE;
+    /* Only committed, writable memory of the title's: one region, as the console's would be. */
+    for (UINT64 at = base; at < end; at = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize)
+        if (!VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
+                || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+            return FALSE;
+    if (!(saved = VirtualAlloc(NULL, bytes, MEM_COMMIT, PAGE_READWRITE)))
+        return FALSE;
+
+    AcquireSRWLockExclusive(&lock);
+    for (c = chunks; c; c = c->next)
+        if (base < c->gpu + c->size && c->gpu < end)
+            break;
+    if (c) /* already GPU memory, or partly: only if wholly */
+    {
+        ok = address >= c->gpu && address + size <= c->gpu + c->size;
+        ReleaseSRWLockExclusive(&lock);
+        VirtualFree(saved, 0, MEM_RELEASE);
+        return ok;
+    }
+    memcpy(saved, (void *)(ULONG_PTR)base, bytes);
+    box->result = 0;
+    box->size = bytes;
+    MemoryBarrier();
+    box->address = base;
+    c = chunk_create(device, bytes, TRUE, TRUE);
+    box->address = 0;
+    if (c && (UINT64)(ULONG_PTR)c->cpu == base && c->gpu == base && box->result == base)
+    {
+        memcpy((void *)(ULONG_PTR)base, saved, bytes);
+        c->adopted = TRUE;
+        c->used = bytes;
+        c->free_count = 0; /* nothing to suballocate */
+        c->next = chunks;
+        chunks = c;
+        ok = TRUE;
+    }
+    else if (c)
+    {
+        /* Mapped elsewhere: the title's pages are untouched. Mapped there with another device
+         * address can't happen (the layer uses one address for both). */
+        BOOL there = (UINT64)(ULONG_PTR)c->cpu == base;
+        chunk_destroy(c); /* if it was there, the layer puts plain pages back */
+        if (there)
+            memcpy((void *)(ULONG_PTR)base, saved, bytes);
+    }
+    ReleaseSRWLockExclusive(&lock);
+    VirtualFree(saved, 0, MEM_RELEASE);
+    if (InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place", (unsigned long long)base,
+                  (unsigned long long)bytes, ok ? "made" : "could not be made");
+    return ok;
 }
 
 BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset)

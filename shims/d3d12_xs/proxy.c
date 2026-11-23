@@ -2081,9 +2081,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy
 /* Slot 44: CreatePlacedResourceX(address, desc, state, clear, iid, out) (ScarlettX, XValkyrie):
  * a resource on memory the title already has, at a GPU address it chose. A buffer in GPU memory
  * from ReboxGpuAlloc (XMemAlloc's GPU-visible memory) is placed in that chunk's heap at the
- * address, so the title and the GPU share it. Anything else gets its own memory and is logged
- * once per kind: textures (the chunk heaps hold buffers only, and console tilings aren't
- * modelled), addresses outside GPU memory, and placements the heap refuses. */
+ * address, so the title and the GPU share it; a buffer over other title memory has that memory
+ * made GPU memory in place first (gpu_memory_adopt). Anything else gets its own memory and is
+ * logged once per kind: textures (the chunk heaps hold buffers only, and console tilings aren't
+ * modelled), memory that couldn't be made GPU memory, and placements the heap refuses. */
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
         const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
         void **out)
@@ -2101,7 +2102,9 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
         return E_INVALIDARG;
     if (d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         why = 0;
-    else if (!gpu_memory_heap_at(address, &heap, &offset))
+    /* A buffer over the title's own memory: that memory is made GPU memory where it is. */
+    else if (!gpu_memory_heap_at(address, &heap, &offset)
+            && !(gpu_memory_adopt(address, d->Width) && gpu_memory_heap_at(address, &heap, &offset)))
         why = 1;
     else
     {

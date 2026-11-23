@@ -44,6 +44,7 @@
           ./Makefile
           ./shims
           ./anyps5/rebox_anyps5.h
+          ./layers/gpuva_mailbox.h
           (lib.fileset.maybeMissing ./generated)
         ];
       };

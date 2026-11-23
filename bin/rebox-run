@@ -366,6 +366,8 @@ fi
 if [[ -n ${REBOX_GPUVA_LAYER_DIR:-} ]]; then
     export VK_ADD_LAYER_PATH="$REBOX_GPUVA_LAYER_DIR${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
     export VK_INSTANCE_LAYERS="VK_LAYER_REBOX_gpuva_identity${VK_INSTANCE_LAYERS:+:$VK_INSTANCE_LAYERS}"
+    # The layer takes requests to make title memory GPU-visible in place (layers/gpuva_mailbox.h).
+    export REBOX_GPUVA_MAILBOX=${REBOX_GPUVA_MAILBOX:-1}
 fi
 if [[ -z ${VK_ICD_FILENAMES:-} && -n ${REBOX_RADV_ICD:-} && ${REBOX_STOCK_VULKAN:-0} != 1 ]] \
     && grep -qs 0x1002 /sys/class/drm/card*/device/vendor; then

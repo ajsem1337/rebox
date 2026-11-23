@@ -15,7 +15,7 @@ COMMON  := shims/common/rebox_log.c
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
 STUB_DLLS := $(notdir $(wildcard $(GEN)/dlls/*))
 
-all: shims $(BUILD)/smoke.exe
+all: shims layer $(BUILD)/smoke.exe
 
 # What the flake's shims package builds (it has no tests/).
 shims: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll) $(if $(XODUS_IDL),$(BUILD)/xgameruntime.dll)
@@ -115,7 +115,7 @@ $(BUILD)/gpuva_probe: tests/gpuva_probe.c
 # VK_INSTANCE_LAYERS=VK_LAYER_REBOX_gpuva_identity.
 layer: $(BUILD)/librebox_gpuva_identity.so $(BUILD)/VK_LAYER_REBOX_gpuva_identity.json
 
-$(BUILD)/librebox_gpuva_identity.so: layers/gpuva_identity.c
+$(BUILD)/librebox_gpuva_identity.so: layers/gpuva_identity.c layers/gpuva_mailbox.h
 	@mkdir -p $(BUILD)
 	$(CC) -O2 -g -Wall -fPIC -shared -fvisibility=hidden -o $@ $< -lpthread
 

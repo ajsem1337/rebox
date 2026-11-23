@@ -28,3 +28,7 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max);
 /* The chunk heap holding a GPU address, and the address's offset in it (the heap gets a
  * reference); FALSE if the address isn't in GPU memory from ReboxGpuAlloc. */
 BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset);
+/* Makes the title's own memory [address, address + size) GPU-visible at the same address (widened
+ * to 64 KiB pages), keeping its contents; TRUE if it is GPU memory now (or already was). Needs
+ * VK_LAYER_REBOX_gpuva_identity's mailbox (REBOX_GPUVA_MAILBOX=1). */
+BOOL gpu_memory_adopt(UINT64 address, UINT64 size);
