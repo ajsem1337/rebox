@@ -1044,6 +1044,39 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
+    /* REBOX_DUMP_STAGES=<id>,... (with REBOX_DUMP_SPIRV): those stages' code and the first 256 bytes
+     * of the table their s8 points at, once each, for disassembly. */
+    if (graphics && getenv("REBOX_DUMP_STAGES") && getenv("REBOX_DUMP_SPIRV"))
+    {
+        BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+        static UINT64 dumped[16];
+        static LONG dumped_count;
+        char id[24], path[MAX_PATH];
+        BOOL done = FALSE;
+        snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+        for (LONG i = 0; i < dumped_count && i < 16; i++)
+            done |= dumped[i] == stage_id;
+        if (!done && strstr(getenv("REBOX_DUMP_STAGES"), id) && dumped_count < 16)
+        {
+            UINT32 table[64];
+            FILE *f;
+            dumped[InterlockedIncrement(&dumped_count) - 1] = stage_id;
+            snprintf(path, sizeof(path), "%s\\%s.code.bin", getenv("REBOX_DUMP_SPIRV"), id);
+            if ((f = fopen(path, "wb")))
+            {
+                fwrite((const BYTE *)h + h->code_offset, 4, h->code_dwords, f);
+                fclose(f);
+            }
+            snprintf(path, sizeof(path), "%s\\%s.table.bin", getenv("REBOX_DUMP_SPIRV"), id);
+            if (in->user_sgprs[8] && ReboxShadowRead(in->user_sgprs[8], table, sizeof(table)) && (f = fopen(path, "wb")))
+            {
+                fwrite(table, 1, sizeof(table), f);
+                fclose(f);
+            }
+            rebox_log("d3d12_xs: dumped stage %s (%u dwords; s8 %#x, s9 %#x)", id, h->code_dwords, in->user_sgprs[8],
+                      in->user_sgprs[9]);
+        }
+    }
     if (graphics)
     {
         /* The first stages of each kind: the table pointers the code reads (sa5_analyse) next to the
