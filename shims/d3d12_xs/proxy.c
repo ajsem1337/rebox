@@ -3959,6 +3959,13 @@ void proxy_frame_presented(void)
             rebox_log("d3d12_xs: since the last present, display-sized RGBA8 targets bound/cleared/drawn:%s", line);
             console_display_draws_log();
         }
+        /* Later, every 100 presents: the distinct draws since the last of these (a frame can change
+         * long after the first presents). */
+        else if (!(logged % 100))
+        {
+            rebox_log("d3d12_xs: present %ld: draws into display-sized targets since present %ld:", logged, logged - 100);
+            console_display_draws_log();
+        }
     }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
         proxy_log_slot_stats();
