@@ -1332,6 +1332,17 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
                 pc_desc(&descs[i], &copy[i]);
         }
     ((fn)PC_SLOT(p->inner, 25))(p->inner, ret, visible_mask, count, copy ? copy : descs);
+    if (ret->SizeInBytes == ~(UINT64)0 && descs)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            for (UINT i = 0; i < count; i++)
+                rebox_log("d3d12_xs: GetResourceAllocationInfo refused (%u of %u): dimension %u, %llux%ux%u, "
+                          "mips %u, format %u, samples %u, layout %#x, flags %#x, alignment %#llx", i, count,
+                          descs[i].Dimension, (unsigned long long)descs[i].Width, descs[i].Height,
+                          descs[i].DepthOrArraySize, descs[i].MipLevels, descs[i].Format, descs[i].SampleDesc.Count,
+                          descs[i].Layout, (UINT)descs[i].Flags, (unsigned long long)descs[i].Alignment);
+    }
     free(copy);
     return ret;
 }
