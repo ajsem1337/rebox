@@ -2869,6 +2869,9 @@ static void note_signal(ID3D12Fence *fence, UINT64 value)
     for (unsigned i = 0; i < ARRAYSIZE(signalled); i++)
         if (signalled[i].fence == fence || !signalled[i].fence)
         {
+            /* Kept alive for the report (at most 64): a fence released since would be read freed. */
+            if (!signalled[i].fence)
+                ID3D12Fence_AddRef(fence);
             signalled[i].fence = fence;
             signalled[i].value = value;
             signalled[i].signals++;

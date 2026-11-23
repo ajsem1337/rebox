@@ -3653,6 +3653,18 @@ static void test_chad(void)
 {
     /* The title's debug text reaches the log (run-smoke.sh looks for it). */
     OutputDebugStringA("rebox smoke boot line\nsecond line\n");
+    /* REBOX_WRITE_WATCH (set by run-smoke.sh for this run): a write into the watched range is let
+     * through and logged with the writing instruction. */
+    {
+        volatile UINT64 *watched = VirtualAlloc((void *)0x7e0000000ull, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (watched)
+        {
+            Sleep(400); /* the watch arms within 100 ms of the range being committed */
+            watched[1] = 0x1234;
+            watched[0x200] = 0x5678; /* the next page: not watched */
+            CHECK(watched[1] == 0x1234 && watched[0x200] == 0x5678, "writes into a write-watched range land");
+        }
+    }
     /* The title's network is off by default: names other than localhost don't resolve. */
     {
         HMODULE ws = LoadLibraryA("ws2_32.dll");

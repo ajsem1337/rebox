@@ -65,10 +65,113 @@ static void describe(ULONG_PTR addr, char *out, size_t len)
         snprintf(out, len, "%#llx", (unsigned long long)addr);
 }
 
+/* REBOX_WRITE_WATCH=ADDRESS:LENGTH[,...] (hex, absolute addresses): who writes there. Once the range
+ * is committed (a thread looks every 100 ms), its pages are made read-only; a write into them is
+ * let through (the page made writable for one single-stepped instruction, then read-only again)
+ * and, when it lands in the range, logged with the writing instruction, its thread and the address
+ * (each instruction once, the first 64). A write by the system (ReadFile into the range) fails
+ * instead: for finding a writer, not for a title's normal run. */
+static struct watch { ULONG_PTR start, length, page_start, page_end; BOOL armed; } watches[8];
+static UINT watch_count;
+static DWORD watch_slot = TLS_OUT_OF_INDEXES;
+
+static BOOL in_watched_page(ULONG_PTR address, struct watch **found)
+{
+    for (UINT i = 0; i < watch_count; i++)
+        if (watches[i].armed && address >= watches[i].page_start && address < watches[i].page_end)
+        {
+            *found = &watches[i];
+            return TRUE;
+        }
+    return FALSE;
+}
+
+static DWORD WINAPI arm_watches(void *param)
+{
+    for (UINT tries = 0; tries < 6000; tries++)
+    {
+        BOOL all = TRUE;
+        for (UINT i = 0; i < watch_count; i++)
+        {
+            struct watch *w = &watches[i];
+            MEMORY_BASIC_INFORMATION mbi;
+            DWORD old;
+            if (w->armed)
+                continue;
+            if (VirtualQuery((void *)w->page_start, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT
+                    && (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize >= w->page_end
+                    && VirtualProtect((void *)w->page_start, w->page_end - w->page_start, PAGE_READONLY, &old))
+            {
+                w->armed = TRUE;
+                rebox_log("write watch %#llx+%#llx armed (pages %#llx-%#llx, were protect %#lx)",
+                          (unsigned long long)w->start, (unsigned long long)w->length,
+                          (unsigned long long)w->page_start, (unsigned long long)w->page_end, old);
+            }
+            else
+                all = FALSE;
+        }
+        if (all)
+            return 0;
+        Sleep(100);
+    }
+    return 0;
+}
+
 static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
 {
     EXCEPTION_RECORD *rec = ep->ExceptionRecord;
     CONTEXT *c = ep->ContextRecord;
+    struct watch *w;
+
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2
+            && rec->ExceptionInformation[0] == 1 && watch_slot != TLS_OUT_OF_INDEXES
+            && in_watched_page(rec->ExceptionInformation[1], &w))
+    {
+        ULONG_PTR at = rec->ExceptionInformation[1], page = at & ~(ULONG_PTR)0xfff;
+        DWORD old;
+        if (at >= w->start && at < w->start + w->length)
+        {
+            static ULONG_PTR seen[64];
+            static LONG seen_count;
+            ULONG_PTR rip = (ULONG_PTR)rec->ExceptionAddress;
+            BOOL known = FALSE;
+            for (LONG i = 0; i < min(seen_count, 64); i++)
+                known |= seen[i] == rip;
+            if (!known)
+            {
+                LONG n = InterlockedIncrement(&seen_count);
+                char where[MAX_PATH + 32], caller[MAX_PATH + 32];
+                ULONG_PTR ret = 0;
+                if (n <= 64)
+                    seen[n - 1] = rip;
+                if (n <= 64)
+                {
+                    describe(rip, where, sizeof(where));
+                    if (!IsBadReadPtr((void *)c->Rsp, 8))
+                        ret = *(ULONG_PTR *)c->Rsp;
+                    describe(ret, caller, sizeof(caller));
+                    rebox_log("write watch: %s writes %#llx (thread %#lx; [rsp] %s)", where, (unsigned long long)at,
+                              GetCurrentThreadId(), caller);
+                }
+            }
+        }
+        VirtualProtect((void *)page, 0x1000, PAGE_READWRITE, &old);
+        TlsSetValue(watch_slot, (void *)(page | 1));
+        c->EFlags |= 0x100;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && watch_slot != TLS_OUT_OF_INDEXES)
+    {
+        ULONG_PTR page = (ULONG_PTR)TlsGetValue(watch_slot);
+        if (page)
+        {
+            DWORD old;
+            VirtualProtect((void *)(page & ~(ULONG_PTR)1), 0x1000, PAGE_READONLY, &old);
+            TlsSetValue(watch_slot, NULL);
+            c->EFlags &= ~0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
 
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT)
     {
@@ -156,6 +259,13 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static void ensure_handler(void)
+{
+    static LONG installed;
+    if (!InterlockedExchange(&installed, 1))
+        AddVectoredExceptionHandler(1, on_probe);
+}
+
 static BOOL add_probe(BYTE *address, const char *name)
 {
     struct probe *p;
@@ -163,11 +273,7 @@ static BOOL add_probe(BYTE *address, const char *name)
         return FALSE;
     if (rearm_slot == TLS_OUT_OF_INDEXES && (rearm_slot = TlsAlloc()) == TLS_OUT_OF_INDEXES)
         return FALSE;
-    {
-        static LONG handler;
-        if (!InterlockedExchange(&handler, 1))
-            AddVectoredExceptionHandler(1, on_probe);
-    }
+    ensure_handler();
     p = &probes[probe_count];
     p->address = address;
     p->original = *address;
@@ -226,6 +332,31 @@ LONG WINAPI ReboxProbeHits(const void *address)
 void probe_install(void)
 {
     char *spec = rebox_getenv("REBOX_PROBE"), *max = rebox_getenv("REBOX_PROBE_MAX"), *tok, *save = NULL;
+    char *watch = rebox_getenv("REBOX_WRITE_WATCH");
+
+    for (char *t = watch ? strtok_s(watch, ",", &save) : NULL; t && watch_count < ARRAYSIZE(watches);
+         t = strtok_s(NULL, ",", &save))
+    {
+        char *colon = strchr(t, ':');
+        struct watch *w = &watches[watch_count];
+        w->start = strtoull(t, NULL, 16);
+        w->length = colon ? strtoull(colon + 1, NULL, 16) : 8;
+        if (!w->start || !w->length)
+            continue;
+        w->page_start = w->start & ~(ULONG_PTR)0xfff;
+        w->page_end = (w->start + w->length + 0xfff) & ~(ULONG_PTR)0xfff;
+        watch_count++;
+    }
+    free(watch);
+    save = NULL;
+    if (watch_count)
+    {
+        if ((watch_slot = TlsAlloc()) != TLS_OUT_OF_INDEXES)
+        {
+            ensure_handler();
+            CloseHandle(CreateThread(NULL, 0, arm_watches, NULL, 0, NULL));
+        }
+    }
 
     if (max && atoi(max) > 0)
         probe_max = atoi(max);
