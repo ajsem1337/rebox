@@ -2650,7 +2650,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     }
     list_slots[n++] = (struct slot)FWD(78, 14);  /* DispatchX */
     for (unsigned pc = 60; pc <= 76; pc++)
-        list_slots[n++] = (struct slot)FWD(pc + 45, pc);
+    {
+        BOOL taken = FALSE;
+        for (unsigned j = 0; j < customs; j++)
+            taken |= list_slots[j].xbox == pc + 45;
+        if (!taken)
+            list_slots[n++] = (struct slot)FWD(pc + 45, pc);
+    }
     list_slots[n++] = (struct slot)FWD(124, 77); /* RSSetShadingRate */
     list_slots[n++] = (struct slot)FWD(125, 78); /* RSSetShadingRateImage */
     list_slots[n++] = (struct slot)FWD(127, 79); /* DispatchMesh */
