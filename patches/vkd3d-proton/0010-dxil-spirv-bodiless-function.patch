@@ -1,0 +1,19 @@
+diff --git a/subprojects/dxil-spirv/dxil_converter.cpp b/subprojects/dxil-spirv/dxil_converter.cpp
+index 2e4a105..822c045 100644
+--- a/subprojects/dxil-spirv/dxil_converter.cpp
++++ b/subprojects/dxil-spirv/dxil_converter.cpp
+@@ -8667,6 +8667,14 @@ bool Converter::Impl::analyze_instructions(llvm::Function *func)
+ 	// optimally implement the loads and stores. We need to do this late, because we depend on results
+ 	// of ExtractValue analysis.
+ 
++	// rebox: an entry point or leaf with no body (console DXIL, such as XboxBvhBuilder's, whose
++	// functions are console intrinsics) has no entry block; refuse it rather than read one.
++	if (func && !(func->begin() != func->end()))
++	{
++		LOGE("Function has no body; cannot convert it.\n");
++		return false;
++	}
++
+ 	if (func && options.propagate_precise && !options.force_precise)
+ 		propagate_precise(func);
+ 
