@@ -24,7 +24,8 @@ It's built for a layout like `../xsx`: loose files plus `MicrosoftGame.Config`. 
 
 Tested on a Radeon 890M (RADV): a UE5 title reaches its title and loading screens at
 about 8 fps; a GDK title (run `title.exe.original` with `REBOX_EXE`)
-reaches its title screen. Neither has audio: the audio coprocessor answers but mixes nothing.
+is playable: worlds are created, saved and played with a controller. Neither has audio: the
+audio coprocessor answers but mixes nothing.
 
 ## Layout
 
