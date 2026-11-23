@@ -244,8 +244,8 @@ down missing translations.
   another axis order than the kernel's, so the right stick's Y read the right trigger, at full
   deflection at rest (a GDK title's camera looked at the sky); `rebox-run` sets a corrected
   `SDL_GAMECONTROLLERCONFIG` for it. Its buttons were numbered wrongly too (RB opened a GDK title's
-  pause menu, Y acted as LB); the axes are checked in a GDK title, the buttons follow the kernel's numbers (View
-  and Xbox are keys after the others), not yet checked. Hidraw access (NixOS `hardware.steam-hardware.enable`) didn't change
+  pause menu, Y acted as LB); axes and buttons now checked in a GDK title (View and Xbox
+  are keys after the others). Hidraw access (NixOS `hardware.steam-hardware.enable`) didn't change
   it. Another controller read wrongly needs its own line in `SDL_GAMECONTROLLERCONFIG`;
   `REBOX_GAMEINPUT_LOG=1` shows what the title is given, with XInput's raw values.
 - **Audio: XMA2 decoding is untested on real data.** Under WineGDK, FAudio sends XMA2 to Wine's

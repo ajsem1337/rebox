@@ -280,6 +280,10 @@ mkdir -p "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/temporary-storage"
 ln -sfn "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/dosdevices/s:"
 ln -sfn "$WINEPREFIX/temporary-storage" "$WINEPREFIX/dosdevices/t:"
 export XGR_PLS_DIR=${XGR_PLS_DIR:-S:\\}
+# The gamepad reconnects every 10 seconds: a GDK title's menu screen (UI) took no input on
+# some runs, having missed the association sent when the title got its user; with this it took it
+# on every run, and no disconnection showed in play. XGR_REASSOCIATE_SECONDS=0 turns it off.
+export XGR_REASSOCIATE_SECONDS=${XGR_REASSOCIATE_SECONDS:-10}
 export XGR_LOG=${XGR_LOG:-$(winpath "$WINEPREFIX/xgameruntime.log")}
 export GTX_LOG=${GTX_LOG:-$(winpath "$WINEPREFIX/xgameruntime-tasks.log")}
 if [[ ${REBOX_LOG:-} == /* ]]; then
