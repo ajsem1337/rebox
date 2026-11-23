@@ -1424,6 +1424,31 @@ static void test_present(void *dev, void *queue)
         }
     }
 
+    /* Command allocators are proxies: the console's slot 9 takes an allocation callback (the target
+     * title registers one), and a list made and reset with one records and closes. */
+    {
+        void *palloc = NULL, *plist = NULL;
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, &palloc);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(palloc, 9, HRESULT, void *, void *)(palloc, (void *)GetProcAddress, NULL);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, void *, void *, REFIID, void **)(dev, 0,
+                       D3D12_COMMAND_LIST_TYPE_DIRECT, palloc, NULL, &IID_ID3D12GraphicsCommandList, &plist);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(plist, 9, HRESULT)(plist);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(palloc, 8, HRESULT)(palloc);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(plist, 10, HRESULT, void *, void *)(plist, palloc, NULL);
+        if (SUCCEEDED(hr))
+            hr = XSLOT(plist, 9, HRESULT)(plist);
+        CHECK(SUCCEEDED(hr), "a command allocator takes the console's slot 9 callback and serves a list's creation "
+              "and Reset (%#lx)", hr);
+        if (plist) XSLOT(plist, 2, ULONG)(plist);
+        if (palloc) XSLOT(palloc, 2, ULONG)(palloc);
+    }
+
     /* Device slot 133 (SDK 0x20004): CreatePlacedResourceX, as the target title places a buffer over
      * its physical pages, with state 0xffffffff. Past the old end of the device vtable (128). */
     {

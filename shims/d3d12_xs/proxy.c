@@ -87,11 +87,12 @@ static struct proxy_class list_v4_class = { "GraphicsCommandList (SDK 0x20004)",
 static void *fence_vtbl;              /* vkd3d-proton's fence class (is_fence) */
 static volatile LONG newer_layouts;  /* the title's runtime has the newer queue/list layouts */
 static struct proxy_class copy_list_class = { "CopyCommandList", MAX_SLOTS };
-static struct proxy_class heap_class = { "DescriptorHeap", MAX_SLOTS };  /* every class: a call past the end traps, not jumps */
+static struct proxy_class heap_class = { "DescriptorHeap", MAX_SLOTS };
+static struct proxy_class allocator_class = { "CommandAllocator", MAX_SLOTS };  /* every class: a call past the end traps, not jumps */
 
 static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &list_v4_class,
                                                &copy_list_class,
-                                               &heap_class };
+                                               &heap_class, &allocator_class };
 
 /* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
 static UINT32 sdk_version;
@@ -802,13 +803,36 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(struct proxy *p, cons
     return wrap_result(hr, (IUnknown *)queue, &queue_class, out);
 }
 
+/* Command allocators: the console's has a tenth method, slot 9, with which the target title registers
+ * an allocation callback (it gives a size and alignment and returns memory of the title's) right
+ * after making one. vkd3d-proton's has nine, so the call went past its vtable to a null pointer.
+ * Allocators are proxies now: slots 0-8 forwarded, 9 accepted (vkd3d-proton manages its own
+ * command memory), and lists unwrap them. */
+static HRESULT STDMETHODCALLTYPE allocator_SetAllocationCallbackX(struct proxy *p, void *callback, void *context)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("d3d12_xs: command allocator slot 9: the title's allocation callback (%p) is accepted, not called",
+                  callback);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(struct proxy *p, D3D12_COMMAND_LIST_TYPE type,
+        REFIID riid, void **out)
+{
+    ID3D12CommandAllocator *alloc = NULL;
+    HRESULT hr = ID3D12Device_CreateCommandAllocator(INNER(p, ID3D12Device), pc_list_type(type),
+                                                     &IID_ID3D12CommandAllocator, (void **)&alloc);
+    return wrap_result(hr, (IUnknown *)alloc, &allocator_class, out);
+}
+
 static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
         void **out)
 {
     D3D12_COMMAND_LIST_TYPE t = pc_list_type(type);
     ID3D12GraphicsCommandList *list = NULL;
 
-    HRESULT hr = ID3D12Device_CreateCommandList(INNER(p, ID3D12Device), 0, t, alloc, pso,
+    HRESULT hr = ID3D12Device_CreateCommandList(INNER(p, ID3D12Device), 0, t, proxy_unwrap(alloc), pso,
                                                 &IID_ID3D12GraphicsCommandList, (void **)&list);
 
     return wrap_result(hr, (IUnknown *)list, t == D3D12_COMMAND_LIST_TYPE_COPY ? &copy_list_class
@@ -2463,7 +2487,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     p->retired = keep;
     embedded_free_list(drop);
     p->heap_count = 0;
-    return ID3D12GraphicsCommandList_Reset(INNER(p, ID3D12GraphicsCommandList), alloc, pso);
+    return ID3D12GraphicsCommandList_Reset(INNER(p, ID3D12GraphicsCommandList), proxy_unwrap(alloc), pso);
 }
 
 /* Slot 148 (XboxBvhBuilder.dll 0x180020ed6): allocate(size, alignment)
@@ -2751,6 +2775,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     /* Device: PC through slot 43 (original ID3D12Device). */
     static const struct slot device_slots[] = {
         FN(8, device_CreateCommandQueue),
+        FN(9, device_CreateCommandAllocator),
         FN(10, device_CreateGraphicsPipelineState),
         FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
@@ -2968,6 +2993,13 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     build(&list_v4_class, 27, list_v4_slots, n);
     build(&copy_list_class, 11, copy_slots, ARRAYSIZE(copy_slots));
     build(&heap_class, 9, heap_slots, ARRAYSIZE(heap_slots));
+    {
+        static const struct slot allocator_slots[] = {
+            FN(7, child_GetDevice),
+            FN(9, allocator_SetAllocationCallbackX),
+        };
+        build(&allocator_class, 9, allocator_slots, ARRAYSIZE(allocator_slots));
+    }
     return TRUE;
 }
 
