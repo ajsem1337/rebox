@@ -5,7 +5,8 @@
  * address and the stack pointer, then the original byte is put back for one single-stepped
  * instruction and the int3 rearmed. Each probe logs its first REBOX_PROBE_MAX hits (default 20;
  * later hits are counted, not logged). Up to 64 probes. REBOX_PROBE_DUMP=N also logs the first N
- * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA).
+ * qwords at rcx (an object's fields: a vtable or function pointer is shown as module+RVA);
+ * REBOX_PROBE_DUMP=N:rdx (or r8, r9) dumps at that register instead.
  * REBOX_PROBE_MEMORY=RVA:BYTES[,...] (hex, relative to the exe) also logs those ranges of the exe's
  * memory (its globals) at each logged hit, as dwords. This is how to see what a title's own code
  * is called with without changing its file: xcl's XCL_PROBE does the same with hardware
@@ -32,7 +33,7 @@ static struct probe
 } probes[MAX_PROBES];
 static UINT probe_count;
 static LONG probe_max = 20;
-static UINT dump_qwords;
+static UINT dump_qwords, dump_register; /* 0 rcx, 1 rdx, 2 r8, 3 r9 */
 static struct { ULONG_PTR rva, bytes; } memory_ranges[8];
 static UINT memory_range_count;
 static DWORD rearm_slot = TLS_OUT_OF_INDEXES; /* the probe a thread is single-stepping past, plus one */
@@ -88,13 +89,16 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                 rebox_log("probe %s hit %ld, thread %#lx: rcx %#llx rdx %#llx r8 %#llx r9 %#llx, rsp %#llx, from %s",
                              p->name, n, GetCurrentThreadId(), (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
                              (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rsp, caller);
-                if (dump_qwords && c->Rcx && !IsBadReadPtr((void *)(ULONG_PTR)c->Rcx, dump_qwords * 8))
+                ULONG_PTR base = dump_register == 1 ? c->Rdx : dump_register == 2 ? c->R8 : dump_register == 3 ? c->R9
+                        : c->Rcx;
+                static const char *const register_names[] = { "rcx", "rdx", "r8", "r9" };
+                if (dump_qwords && base && !IsBadReadPtr((void *)base, dump_qwords * 8))
                 {
                     char line[1024], where[MAX_PATH + 32];
                     int at = 0;
                     for (UINT q = 0; q < dump_qwords && at < 900; q++)
                     {
-                        ULONG_PTR v = ((ULONG_PTR *)(ULONG_PTR)c->Rcx)[q];
+                        ULONG_PTR v = ((ULONG_PTR *)base)[q];
                         HMODULE m;
                         if (v && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                                                     | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)v, &m))
@@ -105,7 +109,7 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
                         else
                             at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)v);
                     }
-                    rebox_log("probe %s hit %ld: [rcx]%s", p->name, n, line);
+                    rebox_log("probe %s hit %ld: [%s]%s", p->name, n, register_names[dump_register], line);
                 }
                 for (UINT m = 0; m < memory_range_count; m++)
                 {
@@ -221,7 +225,12 @@ void probe_install(void)
     {
         char *dump = rebox_getenv("REBOX_PROBE_DUMP"), *memory = rebox_getenv("REBOX_PROBE_MEMORY"), *t, *ctx = NULL;
         if (dump && atoi(dump) > 0)
+        {
+            const char *colon = strchr(dump, ':');
             dump_qwords = min(atoi(dump), 32);
+            dump_register = !colon ? 0 : !_stricmp(colon + 1, "rdx") ? 1 : !_stricmp(colon + 1, "r8") ? 2
+                    : !_stricmp(colon + 1, "r9") ? 3 : 0;
+        }
         free(dump);
         for (t = memory ? strtok_s(memory, ",", &ctx) : NULL; t && memory_range_count < ARRAYSIZE(memory_ranges);
              t = strtok_s(NULL, ",", &ctx))
