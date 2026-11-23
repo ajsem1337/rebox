@@ -2401,6 +2401,20 @@ static void test_xcrdapi(void)
         CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 2) == S_OK && !memcmp(copy, "0123456789abcdef", 16),
               "DirectStorage memory copy");
         CHECK(XSLOT(status, 3, BOOL, UINT32)(status, 3), "an unused status entry reads complete");
+
+        /* The console submits on its own (a UE5 title never calls Submit): a request and an event
+         * through slot 5 (EnqueueSetEvent), with no Submit. */
+        {
+            BYTE again[16] = { 0 };
+            struct req r4 = { 1ull << 22, again, 0, sizeof(again), 0, (void *)"fedcba9876543210", 0, 16 };
+            HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+            XSLOT(mq, 3, void, const struct req *)(mq, &r4);
+            XSLOT(mq, 5, void, HANDLE, UINT64)(mq, done, 0);
+            CHECK(WaitForSingleObject(done, 5000) == WAIT_OBJECT_0 && !memcmp(again, "fedcba9876543210", 16),
+                  "DirectStorage runs requests without Submit and sets an event from slot 5 (EnqueueSetEvent)");
+            CloseHandle(done);
+        }
     }
     if (file) XSLOT(file, 2, ULONG)(file);
     if (status) XSLOT(status, 2, ULONG)(status);

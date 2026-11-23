@@ -3,8 +3,14 @@
  * A title imports DStorageGetFactory and drives everything through COM-style objects: the
  * factory, queues, files and status arrays. Structure layouts are the public GDK reference's
  * (DSTORAGE_QUEUE_DESC, DSTORAGE_REQUEST); vtable slots are the ones ScarlettX saw a retail title
- * call. Queue slot 5 is taken to be EnqueueSignal(ID3D12Fence *, UINT64), as on PC: it sits
- * between EnqueueStatus and Submit there too. Other slots log their first calls and return 0.
+ * call. The queue's methods are dstorage_xs.h's (OpenScarlett's compat header, from Microsoft's
+ * MIT samples): 3 EnqueueRequest, 4 EnqueueStatus, 5 EnqueueSetEvent (PC's EnqueueSignal sits
+ * there; a fence is told from an event handle and signalled), 6 Submit, 7-11 CancelRequestsWithTag,
+ * Close, GetErrorEvent, RetrieveErrorRecord, Query, then X1's EnqueueSignal (12) and X2's Query1,
+ * SetAutoSubmitDisabled and GetAutoSubmitDisabled (13-15). Auto-submit is on unless the title turns
+ * it off: everything enqueued runs without waiting for Submit, as on the console (a UE5 title never
+ * calls Submit, and its streaming textures stayed pending until garbage collection gave up on
+ * them). Other slots log their first calls and return 0.
  *
  * Requests run in order on one worker thread per queue, reading from host files or memory.
  * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests go to
@@ -180,7 +186,7 @@ static void *const file_vtbl[] = {
 
 /* ----------------------------------------------------------------------------- queues */
 
-enum entry_kind { ENTRY_REQUEST, ENTRY_STATUS, ENTRY_SIGNAL };
+enum entry_kind { ENTRY_REQUEST, ENTRY_STATUS, ENTRY_SIGNAL, ENTRY_EVENT };
 
 struct entry
 {
@@ -191,6 +197,7 @@ struct entry
     UINT32 index;
     ID3D12Fence *fence;
     UINT64 value;
+    HANDLE event;               /* ENTRY_EVENT: duplicated, closed once set */
 };
 
 struct queue
@@ -204,6 +211,7 @@ struct queue
     UINT32 pending_count, pending_size, submitted_count, submitted_size, submitted_head;
     HANDLE worker;
     BOOL stop;
+    BOOL manual_submit;         /* SetAutoSubmitDisabled(TRUE) */
     HRESULT first_failure; /* since the last status entry; worker only */
 };
 
@@ -481,6 +489,11 @@ static DWORD WINAPI queue_worker(void *param)
         }
         else if (e.kind == ENTRY_SIGNAL)
             ID3D12Fence_Signal(e.fence, e.value);
+        else if (e.kind == ENTRY_EVENT)
+        {
+            SetEvent(e.event);
+            CloseHandle(e.event);
+        }
         else
         {
             HRESULT hr = run_request(q, &e);
@@ -519,7 +532,7 @@ static void submit_locked(struct queue *q)
 static void enqueue_locked(struct queue *q, const struct entry *e)
 {
     push(&q->pending, &q->pending_count, &q->pending_size, e);
-    if (q->pending_count * 2 > q->capacity)
+    if (!q->manual_submit || q->pending_count * 2 > q->capacity)
         submit_locked(q);
 }
 
@@ -565,18 +578,53 @@ static void WINAPI queue_EnqueueStatus(struct queue *q, struct status_array *sta
 static void WINAPI queue_EnqueueSignal(struct queue *q, ID3D12Fence *fence, UINT64 value)
 {
     struct entry e = { ENTRY_SIGNAL };
-    static LONG logged;
 
     if (!fence)
         return;
-    if (!InterlockedExchange(&logged, 1))
-        rebox_log("xcrdapi: queue slot 5 taken as EnqueueSignal(fence %p, %llu)", fence, (unsigned long long)value);
     e.fence = fence;
     e.value = value;
     ID3D12Fence_AddRef(fence);
     EnterCriticalSection(&q->cs);
     enqueue_locked(q, &e);
     LeaveCriticalSection(&q->cs);
+}
+
+/* Slot 5: the console's EnqueueSetEvent(HANDLE); PC's EnqueueSignal(fence, value) sits there, so
+ * an object pointer is taken for a fence. Handles are small multiples of 4. */
+static void WINAPI queue_EnqueueSetEvent(struct queue *q, void *handle, UINT64 value)
+{
+    struct entry e = { ENTRY_EVENT };
+    static LONG logged;
+
+    if (!handle)
+        return;
+    if ((ULONG_PTR)handle > 0x100000)
+    {
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("xcrdapi: queue slot 5 called with an object: taken as EnqueueSignal(fence, %llu)",
+                         (unsigned long long)value);
+        queue_EnqueueSignal(q, handle, value);
+        return;
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &e.event, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return;
+    EnterCriticalSection(&q->cs);
+    enqueue_locked(q, &e);
+    LeaveCriticalSection(&q->cs);
+}
+
+/* X2: SetAutoSubmitDisabled(bool) and GetAutoSubmitDisabled(). */
+static HRESULT WINAPI queue_SetAutoSubmitDisabled(struct queue *q, BOOL disabled)
+{
+    EnterCriticalSection(&q->cs);
+    q->manual_submit = (BYTE)disabled != 0;
+    LeaveCriticalSection(&q->cs);
+    return S_OK;
+}
+
+static BOOL WINAPI queue_GetAutoSubmitDisabled(struct queue *q)
+{
+    return q->manual_submit;
 }
 
 static void WINAPI queue_Submit(struct queue *q)
@@ -608,10 +656,11 @@ static void queue_destroy(struct object *self)
     free(q);
 }
 
-UNNAMED(queue, 7) UNNAMED(queue, 8) UNNAMED(queue, 9) UNNAMED(queue, 10) UNNAMED(queue, 11)
+UNNAMED(queue, 7) UNNAMED(queue, 8) UNNAMED(queue, 9) UNNAMED(queue, 10) UNNAMED(queue, 11) UNNAMED(queue, 13)
 static void *const queue_vtbl[] = {
     object_QueryInterface, object_AddRef, object_Release, queue_EnqueueRequest, queue_EnqueueStatus,
-    queue_EnqueueSignal, queue_Submit, queue_slot7, queue_slot8, queue_slot9, queue_slot10, queue_slot11,
+    queue_EnqueueSetEvent, queue_Submit, queue_slot7, queue_slot8, queue_slot9, queue_slot10, queue_slot11,
+    queue_EnqueueSignal, queue_slot13, queue_SetAutoSubmitDisabled, queue_GetAutoSubmitDisabled,
 };
 
 /* ---------------------------------------------------------------------------- factory */
