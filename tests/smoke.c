@@ -4276,6 +4276,31 @@ static void test_xbox(void)
     hr = XSLOT(dev, 8, HRESULT, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **)(dev, &qd,
             &IID_ID3D12CommandQueue, &queue);
     CHECK(SUCCEEDED(hr), "Xbox CreateCommandQueue (slot 8) %#lx", hr);
+    if (queue)
+    /* Fence slot 12: the address of the completed value, kept current for a queue's Signal and
+     * a CPU Signal (fences made SHARED, as the target title does). */
+    {
+        void *f = NULL;
+        volatile UINT64 *cell = NULL;
+        HRESULT fhr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_SHARED,
+                &IID_ID3D12Fence, &f);
+        if (SUCCEEDED(fhr) && f)
+        {
+            int i;
+            cell = XSLOT(f, 12, UINT64 *)(f);
+            fhr = XSLOT(queue, 14, HRESULT, void *, UINT64)(queue, f, 5);
+            for (i = 0; i < 500 && *cell != 5; i++)
+                Sleep(10);
+            CHECK(SUCCEEDED(fhr) && *cell == 5 && XSLOT(f, 12, UINT64 *)(f) == cell,
+                  "fence slot 12: the completed value's address follows a queue Signal (%llu, %#lx)",
+                  (unsigned long long)*cell, fhr);
+            XSLOT(f, 10, HRESULT, UINT64)(f, 9);
+            CHECK(*cell == 9, "fence slot 12: and a CPU Signal (%llu)", (unsigned long long)*cell);
+            XSLOT(f, 2, ULONG)(f);
+        }
+        else
+            CHECK(0, "a shared fence from device slot 36 (%#lx)", fhr);
+    }
     hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
             &IID_ID3D12CommandAllocator, (void **)&alloc);
     CHECK(SUCCEEDED(hr), "CreateCommandAllocator through forward thunk (slot 9) %#lx", hr);

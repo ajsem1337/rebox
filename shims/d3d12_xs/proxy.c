@@ -75,6 +75,8 @@ struct proxy
     ID3D12DescriptorHeap *heaps[2]; /* lists: last SetDescriptorHeaps, for ReboxBlit to restore */
     UINT heap_count;
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
+    struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
+    volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -89,10 +91,11 @@ static volatile LONG newer_layouts;  /* the title's runtime has the newer queue/
 static struct proxy_class copy_list_class = { "CopyCommandList", MAX_SLOTS };
 static struct proxy_class heap_class = { "DescriptorHeap", MAX_SLOTS };
 static struct proxy_class allocator_class = { "CommandAllocator", MAX_SLOTS };  /* every class: a call past the end traps, not jumps */
+static struct proxy_class fence_class = { "Fence", MAX_SLOTS };
 
 static struct proxy_class *const classes[] = { &device_class, &queue_class, &queue_v4_class, &list_class, &list_v4_class,
                                                &copy_list_class,
-                                               &heap_class, &allocator_class };
+                                               &heap_class, &allocator_class, &fence_class };
 
 /* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
 static UINT32 sdk_version;
@@ -892,6 +895,128 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(struct proxy *p, 
     HRESULT hr = ID3D12Device_CreateCommandAllocator(INNER(p, ID3D12Device), pc_list_type(type),
                                                      &IID_ID3D12CommandAllocator, (void **)&alloc);
     return wrap_result(hr, (IUnknown *)alloc, &allocator_class, out);
+}
+
+/* Slot 36: fences are proxies for slot 12 (fence_CompletedValueAddressX). The console's SHARED flag
+ * is dropped: the desktop's shared fences are cross-process ones (vkd3d-proton makes them of
+ * exportable semaphores), which nothing here needs. */
+static HRESULT STDMETHODCALLTYPE device_CreateFence(struct proxy *p, UINT64 initial, D3D12_FENCE_FLAGS flags,
+        REFIID riid, void **out)
+{
+    ID3D12Fence *fence = NULL;
+    HRESULT hr;
+
+    if (flags & D3D12_FENCE_FLAG_SHARED)
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: CreateFence flags %#x: made without D3D12_FENCE_FLAG_SHARED", flags);
+        flags &= ~D3D12_FENCE_FLAG_SHARED;
+    }
+    hr = ID3D12Device_CreateFence(INNER(p, ID3D12Device), initial, flags, &IID_ID3D12Fence, (void **)&fence);
+    return wrap_result(hr, (IUnknown *)fence, &fence_class, out);
+}
+
+/* Fence slot 12 (the newer layout; xcl, crates/xcl/src/hle/d3d12x/fence_x.rs): the address of the
+ * fence's completed value, which the title reads and sleeps on. The console GPU writes that
+ * memory; here each fence asked gets a cache line of its own that a thread keeps equal to
+ * GetCompletedValue: a queue's Signal of such a fence arms an event for its value, and a CPU
+ * Signal refreshes at once. Fences with a cell are kept (a reference each). */
+struct fence_cell
+{
+    volatile UINT64 value;
+    BYTE pad[56];
+};
+
+static struct proxy *fence_cells[256];
+static unsigned fence_cell_count;
+static SRWLOCK fence_cells_lock = SRWLOCK_INIT;
+static HANDLE fence_event;
+
+static void fence_refresh(void)
+{
+    AcquireSRWLockShared(&fence_cells_lock);
+    for (unsigned i = 0; i < fence_cell_count; i++)
+        fence_cells[i]->fence_cell->value = ID3D12Fence_GetCompletedValue(INNER(fence_cells[i], ID3D12Fence));
+    ReleaseSRWLockShared(&fence_cells_lock);
+}
+
+static DWORD WINAPI fence_thread(void *arg)
+{
+    for (;;)
+    {
+        WaitForSingleObject(fence_event, INFINITE);
+        fence_refresh();
+    }
+    return 0;
+}
+
+static BOOL CALLBACK fence_thread_init(INIT_ONCE *once, void *param, void **ctx)
+{
+    HANDLE thread;
+
+    if (!(fence_event = CreateEventA(NULL, FALSE, FALSE, NULL)))
+        return FALSE;
+    if ((thread = CreateThread(NULL, 0, fence_thread, NULL, 0, NULL)))
+        CloseHandle(thread);
+    return TRUE;
+}
+
+/* A queue was told to signal fence (as the title passed it) with value. */
+static void fence_note_signal(void *fence, UINT64 value)
+{
+    struct proxy *f = fence;
+    LONG64 old;
+
+    if (!is_proxy(f) || f->cls != &fence_class)
+        return;
+    while ((old = f->fence_signalled) < (LONG64)value
+            && InterlockedCompareExchange64(&f->fence_signalled, value, old) != old)
+        ;
+    if (f->fence_cell)
+        ID3D12Fence_SetEventOnCompletion(INNER(f, ID3D12Fence), value, fence_event);
+}
+
+static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    struct fence_cell *cell;
+    BOOL armed = FALSE;
+
+    InitOnceExecuteOnce(&once, fence_thread_init, NULL, NULL);
+    AcquireSRWLockExclusive(&fence_cells_lock);
+    if (!(cell = p->fence_cell) && fence_cell_count < ARRAYSIZE(fence_cells)
+            && (cell = _aligned_malloc(sizeof(*cell), 64)))
+    {
+        memset(cell, 0, sizeof(*cell));
+        InterlockedIncrement(&p->refs);
+        fence_cells[fence_cell_count++] = p;
+        p->fence_cell = cell;
+        armed = TRUE;
+        if (fence_cell_count == 1)
+            rebox_log("d3d12_xs: fence slot 12: completed values in memory, kept by a thread");
+    }
+    ReleaseSRWLockExclusive(&fence_cells_lock);
+    if (!cell)
+    {
+        static struct fence_cell overflow;
+        rebox_log("d3d12_xs: fence slot 12: no room for another fence's completed value");
+        overflow.value = ID3D12Fence_GetCompletedValue(INNER(p, ID3D12Fence));
+        return (UINT64 *)&overflow.value;
+    }
+    if (armed && p->fence_signalled && fence_event)
+        ID3D12Fence_SetEventOnCompletion(INNER(p, ID3D12Fence), p->fence_signalled, fence_event);
+    fence_refresh();
+    return (UINT64 *)&cell->value;
+}
+
+/* Slot 10: a CPU Signal, which the completed values follow at once. */
+static HRESULT STDMETHODCALLTYPE fence_Signal(struct proxy *p, UINT64 value)
+{
+    HRESULT hr = ID3D12Fence_Signal(INNER(p, ID3D12Fence), value);
+    if (p->fence_cell)
+        fence_refresh();
+    return hr;
 }
 
 static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
@@ -2204,6 +2329,8 @@ static void note_signal(ID3D12Fence *fence, UINT64 value)
 static BOOL is_fence(const void *p)
 {
     MEMORY_BASIC_INFORMATION mbi;
+    if (is_proxy(p))
+        return ((const struct proxy *)p)->cls == &fence_class;
     if (!p || !fence_vtbl || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
             || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || (const BYTE *)p + 8 > (const BYTE *)mbi.BaseAddress + mbi.RegionSize)
         return FALSE;
@@ -2221,6 +2348,19 @@ static void note_newer_layouts(UINT slot)
 }
 
 static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags);
+
+/* Signal and Wait: the fence is the title's proxy. */
+static HRESULT STDMETHODCALLTYPE queue_Signal(struct proxy *p, ID3D12Fence *fence, UINT64 value)
+{
+    fence_note_signal(fence, value);
+    return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
+}
+
+static HRESULT STDMETHODCALLTYPE queue_Wait(struct proxy *p, ID3D12Fence *fence, UINT64 value)
+{
+    return ID3D12CommandQueue_Wait(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
+}
+
 static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, const void *plane_params,
         const void *params);
 
@@ -2230,7 +2370,7 @@ static HRESULT STDMETHODCALLTYPE queue_Slot16(struct proxy *p, void *a1, UINT64 
     if (is_fence(a1))
     {
         note_newer_layouts(16);
-        return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), a1, a2);
+        return queue_Signal(p, a1, a2);
     }
     return ID3D12CommandQueue_GetTimestampFrequency(INNER(p, ID3D12CommandQueue), a1);
 }
@@ -2241,7 +2381,7 @@ static HRESULT STDMETHODCALLTYPE queue_Slot17(struct proxy *p, void *a1, UINT64 
     if (is_fence(a1))
     {
         note_newer_layouts(17);
-        return ID3D12CommandQueue_Wait(INNER(p, ID3D12CommandQueue), a1, a2);
+        return queue_Wait(p, a1, a2);
     }
     return ID3D12CommandQueue_GetClockCalibration(INNER(p, ID3D12CommandQueue), a1, (UINT64 *)(ULONG_PTR)a2);
 }
@@ -2276,7 +2416,7 @@ static HRESULT STDMETHODCALLTYPE queue_Slot32(struct proxy *p, UINT planes, cons
 static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fence, UINT64 value, UINT flags)
 {
     note_signal(proxy_unwrap(fence), value);
-    return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
+    return queue_Signal(p, fence, value);
 }
 
 /* xmem's hang watchdog calls this after the thread stacks (crash.c). */
@@ -2962,6 +3102,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static const struct slot device_slots[] = {
         FN(8, device_CreateCommandQueue),
         FN(9, device_CreateCommandAllocator),
+        FN(36, device_CreateFence),
         FN(10, device_CreateGraphicsPipelineState),
         FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
@@ -3018,6 +3159,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static const struct slot queue_slots[] = {
         FN(7, child_GetDevice),
         FN(10, queue_ExecuteCommandLists),
+        FN(14, queue_Signal),
+        FN(15, queue_Wait),
         FN(16, queue_Slot16),
         FN(17, queue_Slot17),
         FN(18, queue_Slot18),
@@ -3035,8 +3178,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static const struct slot queue_v4_slots[] = {
         FN(7, child_GetDevice),
         FN(10, queue_ExecuteCommandLists),
-        FWD(16, 14), /* Signal */
-        FWD(17, 15), /* Wait, assumed to follow Signal */
+        FN(16, queue_Signal),
+        FN(17, queue_Wait), /* assumed to follow Signal */
         FN(25, queue_SignalX), /* inferred: 23 + 2, as PresentX 30 + 2 */
         FN(28, queue_GetDesc), /* inferred: 26 + 2 */
         FN(32, queue_PresentX),
@@ -3201,6 +3344,14 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
             FN(9, allocator_SetAllocationCallbackX),
         };
         build(&allocator_class, 9, allocator_slots, ARRAYSIZE(allocator_slots));
+    }
+    {
+        static const struct slot fence_slots[] = {
+            FN(7, child_GetDevice),
+            FN(10, fence_Signal),
+            FN(12, fence_CompletedValueAddressX),
+        };
+        build(&fence_class, 12, fence_slots, ARRAYSIZE(fence_slots));
     }
     return TRUE;
 }
