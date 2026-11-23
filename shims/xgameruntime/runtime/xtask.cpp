@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -591,6 +592,16 @@ void CALLBACK completion_thunk(void* p, bool) {
 // Calls begun and not yet completed, for log_calls_in_flight. Guarded by g_async_m.
 std::set<AsyncState*> g_in_flight;
 
+// XGR_TRACE_ASYNC=1: each call's beginning and its completion (with the queue and whether a
+// completion callback goes to it), for a title waiting on its queue for something.
+bool trace_async() {
+  static const bool on = [] {
+    const char* e = std::getenv("XGR_TRACE_ASYNC");
+    return e && *e && *e != '0';
+  }();
+  return on;
+}
+
 void complete_state(AsyncState* s, HRESULT hr, size_t required) {
   if (hr == E_PENDING) return;
   bool no_payload;
@@ -607,6 +618,10 @@ void complete_state(AsyncState* s, HRESULT hr, size_t required) {
     in->required = s->required;
     if (no_payload) in->state = nullptr;  // block no longer needs the state
   }
+  if (trace_async())
+    gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XAsync", nullptr, "%s completed: %#lx (queue %p, %s)",
+                    s->name ? s->name : "a call", static_cast<unsigned long>(hr), static_cast<void*>(s->queue),
+                    s->callback ? "callback queued on the completion port" : "no callback");
   if (no_payload) call(s, AsyncOp::Cleanup);
   SetEvent(s->done);
   if (s->callback) {
@@ -675,6 +690,9 @@ HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char* n
     s->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     *in = {s, E_PENDING, kMagic, 0, 0};
   }
+  if (trace_async())
+    gtx::log::write(gtx::log::Kind::Info, GTX_SHIM_DLL, "XAsync", nullptr, "%s begun (queue %p)",
+                    name ? name : "a call", static_cast<void*>(q));
   add_ref(s);  // the provider may complete synchronously
   HRESULT hr = call(s, AsyncOp::Begin);
   // A failing Begin completes the call with that error (cleanup + completion callback) and

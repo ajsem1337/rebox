@@ -47,6 +47,11 @@ interface asked for, each unimplemented method's first call, and interface IDs i
 and `xgameruntime-tasks.log` (`GTX_LOG`). After a title's first run, the unknown IDs and
 unimplemented methods in `xgameruntime.log` are what to implement next.
 
+A title that stops waiting on the runtime shows it in `xgameruntime-tasks.log`: a wait in
+`XAsyncGetStatus` or an untimed `XTaskQueueDispatch` that lasts 5 s logs the call, or the queue
+and port with every async call in flight. `XGR_TRACE_ASYNC=1` also logs each call's beginning and
+completion, with its queue and whether a completion callback goes there.
+
 ## Tests
 
 `tests/run-xgr.sh` builds upstream's tests with mingw and runs them under Wine, `test_save`
