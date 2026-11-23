@@ -58,9 +58,10 @@ static ULONG_PTR __attribute__((ms_abi)) unimplemented(struct stub_info *info)
     return E_NOTIMPL;
 }
 
-/* Process lifetime notifications (api-ms-win-core-psm-appnotify): Wine's returns
- * ERROR_CALL_NOT_IMPLEMENTED, and a GDK title then exits a second after creating its window.
- * Registered here, never called: a title isn't suspended or resumed under Wine. */
+/* Process lifetime and constrained-mode notifications (api-ms-win-core-psm-appnotify): Wine's
+ * return ERROR_CALL_NOT_IMPLEMENTED, and a GDK title then stops its game thread and exits
+ * with 1 a second after creating its window. Registered here, never called: a title isn't
+ * suspended, resumed or constrained under Wine. */
 static int app_state_registration;
 
 static ULONG WINAPI app_state_register(void *routine, void *context, void **registration)
@@ -77,6 +78,16 @@ static void WINAPI app_state_unregister(void *registration)
 {
 }
 
+static ULONG WINAPI app_constrained_register(void *routine, void *context, void **registration)
+{
+    static LONG logged;
+    if (!InterlockedExchange(&logged, 1))
+        rebox_log("RegisterAppConstrainedChangeNotification: registered (the title is never constrained here)");
+    if (registration)
+        *registration = &app_state_registration;
+    return ERROR_SUCCESS;
+}
+
 static struct
 {
     const char *dll, *name;
@@ -84,6 +95,8 @@ static struct
 } replacements[] = {
     { "twinapi.appcore.dll", "RegisterAppStateChangeNotification", app_state_register },
     { "twinapi.appcore.dll", "UnregisterAppStateChangeNotification", app_state_unregister },
+    { "twinapi.appcore.dll", "RegisterAppConstrainedChangeNotification", app_constrained_register },
+    { "twinapi.appcore.dll", "UnregisterAppConstrainedChangeNotification", app_state_unregister },
 };
 
 static void *replacement(void *target)
