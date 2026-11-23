@@ -255,7 +255,24 @@ choice is yours. A separate compile service limits the GPL-2 part to that progra
    11 need role 10 (image table maps: runtime-indexed texture tables, not supported yet). lavapipe
    segfaults on `sh_01092`, which RADV runs. `smoke.exe --console-cs` reports each shader's AnyPS5
    faults on its line.
-5. Graphics stages, starting with a pixel shader.
+5. Graphics stages (2026-11-23): deferred console vertex and pixel shaders, compiled at each draw.
+   - **PSO creation**: a graphics PSO whose vertex and pixel shaders are console containers still
+     gets the fallback shaders, and `d3d12_xs` attaches both stages as `SCRD` version 2 blobs
+     (`console_fssm_graphics`: code, RSRC1 and what the code says, as `tools/fssm-*-plan.py` do)
+     plus the input layout, as private data (`REBOX_GRAPHICS_GUID`, `struct rebox_graphics`).
+     `REBOX_CONSOLE_GRAPHICS=0` turns it off.
+   - **Draw** (vkd3d-proton patch 0006): at the first draw the PSO's private data is read; its
+     vertex buffers join the PSO's mask and it pushes the console block. At each draw both stages
+     are compiled through `ReboxConsoleCompile` with user SGPRs as TomBox reads the console's
+     graphics layout (root parameters from s8, the fetch shader's address at s[4:5]); the vertex
+     stage via `sa5_compile_vertex`, whose attributes (location r = input layout element r) make
+     the vertex input; push data is the vertex stage's 128 bytes then the pixel stage's (host buffer
+     addresses are baked into the modules, `sa5_host_buffer.address`). The pipeline is
+     vkd3d-proton's own variant with those two modules and that vertex input, cached per PSO by
+     both compiles' keys and the pipeline key. A failed compile draws with the fallback pipeline.
+   - `test_console_draw` (smoke): a console vertex shader that calls the fetch and exports input 0
+     as the position, and a pixel shader exporting red, in real containers, draw a full-screen
+     triangle on lavapipe.
 
 ## Open questions
 

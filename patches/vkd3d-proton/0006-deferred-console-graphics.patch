@@ -1,0 +1,495 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index be9f25c..bf3f621 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7555,6 +7555,9 @@ static void d3d12_command_list_check_vbo_alignment(struct d3d12_command_list *li
+     }
+ }
+ 
++static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_command_list *list,
++        uint32_t *dynamic_state_flags);
++
+ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_list *list,
+         enum vkd3d_pipeline_type pipeline_type)
+ {
+@@ -7566,7 +7569,10 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     VkPipeline vk_pipeline;
+     uint32_t view_mask;
+ 
+-    if (list->current_pipeline != VK_NULL_HANDLE)
++    /* Deferred console graphics compile for each draw's descriptors (d3d12_xs caches). */
++    if (list->current_pipeline != VK_NULL_HANDLE
++            && !(list->state && d3d12_pipeline_state_is_graphics(list->state)
++            && d3d12_pipeline_state_rebox_graphics(list->state)))
+         return true;
+ 
+     if (!list->state)
+@@ -7596,8 +7602,13 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+         return false;
+     }
+ 
++    /* Deferred console graphics first; when they don't compile, the PSO's fallback pipeline. */
++    vk_pipeline = VK_NULL_HANDLE;
++    if (pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS && d3d12_pipeline_state_rebox_graphics(list->state))
++        vk_pipeline = d3d12_command_list_rebox_graphics_pipeline(list, &new_active_flags);
++
+     /* Try to grab the pipeline we compiled ahead of time. If we cannot do so, fall back. */
+-    if (!(vk_pipeline = d3d12_pipeline_state_get_pipeline(list->state,
++    if (!vk_pipeline && !(vk_pipeline = d3d12_pipeline_state_get_pipeline(list->state,
+             &list->dynamic_state, list->dsv.format, &new_active_flags)))
+     {
+         if (!(vk_pipeline = d3d12_pipeline_state_get_or_create_pipeline(list->state,
+@@ -8223,9 +8234,10 @@ static void d3d12_command_list_rebox_push(struct d3d12_command_list *list,
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     uint32_t data[VKD3D_REBOX_CONSOLE_PUSH_SIZE / sizeof(uint32_t)];
+ 
+-    if (list->state->rebox_deferred)
++    if (list->state->rebox_deferred || list->state->rebox_graphics)
+     {
+-        /* AnyPS5's push data, prepared with the pipeline. */
++        /* AnyPS5's push data, prepared with the pipeline (graphics: the vertex stage's 128 bytes,
++         * then the pixel stage's; zero when the draw fell back). */
+         memcpy(data, list->rebox.push, sizeof(data));
+     }
+     else
+@@ -8289,10 +8301,60 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
+         WARN("rebox: console shader compile failed, hr %#x; skipping the dispatch.\n", hr);
+         return VK_NULL_HANDLE;
+     }
+-    memcpy(list->rebox.push, out.push, sizeof(list->rebox.push));
++    memset(list->rebox.push, 0, sizeof(list->rebox.push));
++    memcpy(list->rebox.push, out.push, sizeof(out.push));
+     return d3d12_pipeline_state_rebox_variant(state, &out);
+ }
+ 
++/* Compiles the bound PSO's deferred console vertex and pixel stages for this draw (d3d12_xs caches)
++ * and returns their pipeline, or VK_NULL_HANDLE to draw with the fallback. User SGPRs follow
++ * TomBox's reading of the console's graphics layout: root parameters from s8, the fetch shader's
++ * address at s[4:5] (d3d12_xs puts one there). */
++static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_command_list *list,
++        uint32_t *dynamic_state_flags)
++{
++    PFN_vkd3d_rebox_console_compile compile = vkd3d_rebox_compile_fn();
++    struct d3d12_pipeline_state *state = list->state;
++    const struct vkd3d_rebox_graphics *g = state->rebox_graphics;
++    struct vkd3d_rebox_compile_out vs, ps;
++    struct vkd3d_rebox_compile_in in;
++    uint32_t sgprs[32], root[32];
++    unsigned int n;
++    HRESULT hr;
++
++    memset(list->rebox.push, 0, sizeof(list->rebox.push));
++    if (!compile || !g || !state->root_signature)
++        return VK_NULL_HANDLE;
++    memset(&in, 0, sizeof(in));
++    memset(sgprs, 0, sizeof(sgprs));
++    memset(root, 0, sizeof(root));
++    n = d3d12_command_list_rebox_sgprs(list, &list->graphics_bindings, root);
++    memcpy(&sgprs[8], root, min(n, 24u) * sizeof(uint32_t));
++    in.user_sgprs = sgprs;
++    in.user_sgpr_count = 32;
++    memcpy(in.heap_cpu, list->rebox.heap_cpu, sizeof(in.heap_cpu));
++    in.increment[0] = d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    in.increment[1] = d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
++    vkd3d_rebox_bindless_targets(list->device, in.bindless);
++
++    in.shader = (const uint8_t *)g + g->vs_offset;
++    in.shader_size = g->vs_size;
++    in.push_offset = 0;
++    memset(&vs, 0, sizeof(vs));
++    if (FAILED(hr = compile(&in, &vs)))
++        return VK_NULL_HANDLE;
++    in.shader = (const uint8_t *)g + g->ps_offset;
++    in.shader_size = g->ps_size;
++    in.push_offset = 128;
++    memset(&ps, 0, sizeof(ps));
++    if (FAILED(hr = compile(&in, &ps)))
++        return VK_NULL_HANDLE;
++    memcpy(&list->rebox.push[0], vs.push, 128);
++    memcpy(&list->rebox.push[32], ps.push, 128);
++    return d3d12_pipeline_state_rebox_graphics_variant(state, &list->dynamic_state, list->dsv.format, &vs, &ps,
++            dynamic_state_flags);
++}
++
+ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *list)
+ {
+     d3d12_command_list_end_current_render_pass(list, false);
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 06eab1b..d82ecfa 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2462,6 +2462,7 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
+             VK_CALL(vkDestroyPipeline(device->vk_device, state->rebox_variants[v].vk_pipeline, NULL));
+         vkd3d_free(state->rebox_variants);
+         vkd3d_free(state->rebox_deferred);
++        vkd3d_free(state->rebox_graphics);
+ 
+         VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
+ 
+@@ -3475,6 +3476,205 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *st
+     return vk_pipeline;
+ }
+ 
++/* rebox (patch 0006): set while d3d12_pipeline_state_rebox_graphics_variant builds a
++ * pipeline, so d3d12_pipeline_state_create_pipeline_variant uses console stages and vertex input
++ * in place of the PSO's own. */
++struct vkd3d_rebox_graphics_override
++{
++    VkShaderModule vs, ps;
++    const VkVertexInputAttributeDescription *attributes;
++    uint32_t attribute_count;
++    const VkVertexInputBindingDescription *bindings;
++    uint32_t binding_count;
++};
++static VKD3D_THREAD_LOCAL const struct vkd3d_rebox_graphics_override *rebox_override;
++
++/* {53435247-0001-4000-8000-736361726c74}: d3d12_xs's REBOX_GRAPHICS_GUID. */
++static const GUID vkd3d_rebox_graphics_guid =
++        {0x53435247, 0x0001, 0x4000, {0x80, 0x00, 0x73, 0x63, 0x61, 0x72, 0x6c, 0x74}};
++
++/* The PSO's deferred console graphics, read from its private data at the first draw. */
++const struct vkd3d_rebox_graphics *d3d12_pipeline_state_rebox_graphics(struct d3d12_pipeline_state *state)
++{
++    struct vkd3d_rebox_graphics *g;
++    unsigned int size = 0, i;
++
++    if (state->rebox_graphics_checked)
++        return state->rebox_graphics;
++    if (!d3d12_pipeline_state_is_graphics(state))
++        return NULL;
++    rwlock_lock_write(&state->lock);
++    if (!state->rebox_graphics_checked)
++    {
++        if (SUCCEEDED(vkd3d_get_private_data(&state->private_store, &vkd3d_rebox_graphics_guid, &size, NULL))
++                && size >= sizeof(*g) && (g = vkd3d_malloc(size)))
++        {
++            if (SUCCEEDED(vkd3d_get_private_data(&state->private_store, &vkd3d_rebox_graphics_guid, &size, g))
++                    && g->magic == VKD3D_REBOX_GRAPHICS_MAGIC && g->version == 1 && g->size == size
++                    && g->element_count <= ARRAY_SIZE(g->elements)
++                    && g->vs_offset <= size && g->vs_size <= size - g->vs_offset
++                    && g->ps_offset <= size && g->ps_size <= size - g->ps_offset)
++            {
++                state->rebox_graphics = g;
++                /* Push the console block (patch 0002) instead of root constants, and bind the
++                 * input layout's vertex buffers, which the fallback vertex shader doesn't read. */
++                state->rebox_console = true;
++                for (i = 0; i < g->element_count; i++)
++                    if (g->elements[i].slot < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
++                        state->graphics.vertex_buffer_mask |= 1u << g->elements[i].slot;
++            }
++            else
++                vkd3d_free(g);
++        }
++        state->rebox_graphics_checked = true;
++    }
++    rwlock_unlock_write(&state->lock);
++    return state->rebox_graphics;
++}
++
++/* The pipeline for one compile of a PSO's deferred console stages, made on first use: the PSO's own
++ * state with the two modules and vertex input from the vertex stage's attributes. Attribute
++ * location r reads input layout element r (the console's fetch fills input r in the element's
++ * order). */
++VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_state *state,
++        const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
++        const struct vkd3d_rebox_compile_out *vs, const struct vkd3d_rebox_compile_out *ps,
++        uint32_t *dynamic_state_flags)
++{
++    VkVertexInputAttributeDescription attributes[D3D12_VS_INPUT_REGISTER_COUNT];
++    VkVertexInputBindingDescription bindings[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    const struct vkd3d_rebox_graphics *g = state->rebox_graphics;
++    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
++    struct vkd3d_rebox_graphics_override override;
++    uint32_t offsets[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    struct d3d12_device *device = state->device;
++    struct vkd3d_pipeline_key pipeline_key;
++    VkShaderModuleCreateInfo module_info;
++    VkPipeline vk_pipeline = VK_NULL_HANDLE;
++    uint32_t i, slot_mask = 0, key_hash;
++    uint64_t key[2];
++    size_t v;
++
++    memset(&pipeline_key, 0, sizeof(pipeline_key));
++    if (graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
++            graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
++        pipeline_key.dynamic_topology = true;
++    else
++        pipeline_key.topology = dyn_state->primitive_topology;
++    pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
++    pipeline_key.view_mask = graphics->multiview.dynamic_mask ? dyn_state->view_mask : 0;
++    if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
++        pipeline_key.rasterization_samples = dyn_state->rasterization_samples
++                ? dyn_state->rasterization_samples : graphics->ms_desc.rasterizationSamples;
++    key_hash = hash_data(&pipeline_key, sizeof(pipeline_key));
++    key[0] = vs->key[0] ^ (ps->key[0] * 0x9e3779b97f4a7c15ull) ^ key_hash;
++    key[1] = vs->key[1] ^ (ps->key[1] * 0xff51afd7ed558ccdull) ^ ((uint64_t)key_hash << 32);
++
++    rwlock_lock_read(&state->lock);
++    for (v = 0; v < state->rebox_variant_count; v++)
++        if (!memcmp(state->rebox_variants[v].key, key, sizeof(key)))
++        {
++            vk_pipeline = state->rebox_variants[v].vk_pipeline;
++            *dynamic_state_flags = state->rebox_variants[v].dynamic_state_flags;
++        }
++    rwlock_unlock_read(&state->lock);
++    if (vk_pipeline)
++        return vk_pipeline;
++
++    /* Vertex input: element r's slot, format and offset (D3D12_APPEND_ALIGNED_ELEMENT follows the
++     * slot's previous element). */
++    memset(&override, 0, sizeof(override));
++    memset(offsets, 0, sizeof(offsets));
++    for (i = 0; i < vs->vertex_input_count && override.attribute_count < ARRAY_SIZE(attributes); i++)
++    {
++        uint32_t r = vs->vertex_inputs[i][0], k, offset = 0;
++        const struct vkd3d_rebox_graphics_element *e;
++        const struct vkd3d_format *format;
++
++        if (r >= g->element_count)
++        {
++            WARN("rebox: console vertex input %u has no input layout element.\n", r);
++            continue;
++        }
++        e = &g->elements[r];
++        if (e->slot >= ARRAY_SIZE(bindings) || !(format = vkd3d_get_format(device, e->dxgi_format, false)))
++            continue;
++        for (k = 0; k <= r; k++)
++        {
++            const struct vkd3d_rebox_graphics_element *p = &g->elements[k];
++            const struct vkd3d_format *f;
++            if (p->slot != e->slot)
++                continue;
++            offset = p->offset != D3D12_APPEND_ALIGNED_ELEMENT ? p->offset : offsets[p->slot];
++            if ((f = vkd3d_get_format(device, p->dxgi_format, false)))
++                offsets[p->slot] = offset + f->byte_count;
++        }
++        attributes[override.attribute_count].location = r;
++        attributes[override.attribute_count].binding = e->slot;
++        attributes[override.attribute_count].format = format->vk_format;
++        attributes[override.attribute_count].offset = offset;
++        override.attribute_count++;
++        if (!(slot_mask & (1u << e->slot)))
++        {
++            bindings[override.binding_count].binding = e->slot;
++            bindings[override.binding_count].stride = 0; /* dynamic */
++            bindings[override.binding_count].inputRate = e->per_instance
++                    ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
++            override.binding_count++;
++            slot_mask |= 1u << e->slot;
++        }
++    }
++    override.attributes = attributes;
++    override.bindings = bindings;
++
++    memset(&module_info, 0, sizeof(module_info));
++    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    module_info.codeSize = vs->spirv_words * sizeof(uint32_t);
++    module_info.pCode = vs->spirv;
++    if (VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.vs)) < 0)
++        return VK_NULL_HANDLE;
++    module_info.codeSize = ps->spirv_words * sizeof(uint32_t);
++    module_info.pCode = ps->spirv;
++    if (VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.ps)) < 0)
++    {
++        VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
++        return VK_NULL_HANDLE;
++    }
++
++    rebox_override = &override;
++    vk_pipeline = d3d12_pipeline_state_create_pipeline_variant(state, &pipeline_key, dsv_format, VK_NULL_HANDLE, 0,
++            dynamic_state_flags);
++    rebox_override = NULL;
++    VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
++    VK_CALL(vkDestroyShaderModule(device->vk_device, override.ps, NULL));
++    if (!vk_pipeline)
++    {
++        ERR("rebox: failed to create a console graphics pipeline.\n");
++        return VK_NULL_HANDLE;
++    }
++
++    rwlock_lock_write(&state->lock);
++    for (v = 0; v < state->rebox_variant_count; v++)
++        if (!memcmp(state->rebox_variants[v].key, key, sizeof(key)))
++            break;
++    if (v < state->rebox_variant_count)
++    {
++        VK_CALL(vkDestroyPipeline(device->vk_device, vk_pipeline, NULL));
++        vk_pipeline = state->rebox_variants[v].vk_pipeline;
++        *dynamic_state_flags = state->rebox_variants[v].dynamic_state_flags;
++    }
++    else if (vkd3d_array_reserve((void **)&state->rebox_variants, &state->rebox_variant_capacity,
++            state->rebox_variant_count + 1, sizeof(*state->rebox_variants)))
++    {
++        memcpy(state->rebox_variants[state->rebox_variant_count].key, key, sizeof(key));
++        state->rebox_variants[state->rebox_variant_count].vk_pipeline = vk_pipeline;
++        state->rebox_variants[state->rebox_variant_count++].dynamic_state_flags = *dynamic_state_flags;
++    }
++    rwlock_unlock_write(&state->lock);
++    return vk_pipeline;
++}
++
+ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+         const struct d3d12_cached_pipeline_state *cached_pso)
+@@ -4561,7 +4761,7 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
+     /* Enable dynamic states as necessary */
+     dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VIEWPORT | VKD3D_DYNAMIC_STATE_SCISSOR;
+ 
+-    if (graphics->attribute_binding_count && !is_mesh_pipeline)
++    if ((graphics->attribute_binding_count || state->rebox_graphics) && !is_mesh_pipeline)
+         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
+ 
+     if (is_tess_pipeline && state->device->device_info.extended_dynamic_state2_features.extendedDynamicState2PatchControlPoints)
+@@ -6599,7 +6799,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
+             dynamic_state_buffer, key);
+ 
+-    if (!library_flags && graphics->library)
++    if (!library_flags && graphics->library && !rebox_override)
+     {
+         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
+                 vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
+@@ -6614,6 +6814,16 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+     {
+         vkd3d_vertex_input_pipeline_desc_init(&vertex_input_desc, state, key, *dynamic_state_flags);
++        if (rebox_override)
++        {
++            memcpy(vertex_input_desc.vi_attributes, rebox_override->attributes,
++                    rebox_override->attribute_count * sizeof(*vertex_input_desc.vi_attributes));
++            memcpy(vertex_input_desc.vi_bindings, rebox_override->bindings,
++                    rebox_override->binding_count * sizeof(*vertex_input_desc.vi_bindings));
++            vertex_input_desc.vi_info.vertexAttributeDescriptionCount = rebox_override->attribute_count;
++            vertex_input_desc.vi_info.vertexBindingDescriptionCount = rebox_override->binding_count;
++            vertex_input_desc.vi_divisor_info.vertexBindingDivisorCount = 0;
++        }
+         vkd3d_vertex_input_pipeline_desc_prepare(&vertex_input_desc);
+ 
+         tessellation_info.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+@@ -6728,6 +6938,31 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+         rwlock_unlock_read(&state->lock);
+     }
+ 
++    if (rebox_override)
++    {
++        /* The console stages in place of the PSO's vertex and pixel shaders. */
++        if (pipeline_desc.pStages != stages)
++            memcpy(stages, graphics->stages, graphics->stage_count * sizeof(stages[0]));
++        for (i = 0; i < graphics->stage_count; i++)
++        {
++            VkShaderModule module = stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT ? rebox_override->vs
++                    : stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? rebox_override->ps : VK_NULL_HANDLE;
++            if (!module)
++                continue;
++            if (stages_module_dup_mask & (1u << i))
++            {
++                VK_CALL(vkDestroyShaderModule(device->vk_device, stages[i].module, NULL));
++                stages_module_dup_mask &= ~(1u << i);
++            }
++            stages[i].pNext = NULL;
++            stages[i].flags = 0;
++            stages[i].module = module;
++            stages[i].pName = "main";
++            stages[i].pSpecializationInfo = NULL;
++        }
++        pipeline_desc.pStages = stages;
++    }
++
+     /* If we're using identifiers, set the appropriate flag. */
+     for (i = 0; i < graphics->stage_count; i++)
+         if (pipeline_desc.pStages[i].module == VK_NULL_HANDLE)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 16b25cd..11008fd 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2278,7 +2278,8 @@ struct vkd3d_pipeline_cache_compatibility
+  * heap_base and code_base, then the descriptor lookup tables of the bound
+  * resource and sampler heaps (all 64-bit). */
+ #define VKD3D_REBOX_CONSOLE_MAGIC 0x56534353u /* "SCSV" */
+-#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 192u
++/* 256 for deferred graphics (patch 0006): 128 bytes for each of the vertex and pixel stages. */
++#define VKD3D_REBOX_CONSOLE_PUSH_SIZE 256u
+ struct vkd3d_rebox_console_shader
+ {
+     uint32_t magic;
+@@ -2318,6 +2319,7 @@ struct vkd3d_rebox_compile_in
+     uint64_t heap_cpu[2];   /* CPU handle of descriptor 0 of the bound CBV/SRV/UAV and sampler heaps, or 0 */
+     uint32_t increment[2];
+     uint32_t bindless[7][2]; /* per AnyPS5 DescriptorKind: Vulkan set and binding, set ~0u if none */
++    uint32_t push_offset;   /* graphics: where the stage's 128 bytes of push data go (0 or 128) */
+ };
+ struct vkd3d_rebox_compile_out
+ {
+@@ -2325,7 +2327,29 @@ struct vkd3d_rebox_compile_out
+     uint32_t spirv_words;
+     uint32_t subgroup_size; /* 0: any */
+     uint64_t key[2];        /* identifies the SPIR-V */
+-    uint32_t push[48];      /* bytes 0-191 of the push block */
++    uint32_t push[48];      /* bytes 0-191 of the push block (graphics: the stage's 128 bytes) */
++    uint32_t vertex_input_count;  /* vertex stage: the attributes it reads */
++    uint32_t vertex_inputs[32][3]; /* location (= input layout element), components, fetch index */
++};
++
++/* rebox: deferred console graphics (patch 0006). d3d12_xs attaches this to a graphics PSO
++ * it created with fallback shaders, as private data (VKD3D_REBOX_GRAPHICS_GUID): the console
++ * vertex and pixel stages (deferred blobs) and the input layout. At each draw both are compiled by
++ * ReboxConsoleCompile, and the pipeline is the PSO's own with those two modules and vertex input
++ * made from the vertex stage's attributes; if a compile fails, the fallback pipeline draws. */
++#define VKD3D_REBOX_GRAPHICS_MAGIC 0x47524353u /* "SCRG" */
++struct vkd3d_rebox_graphics_element
++{
++    uint32_t slot, dxgi_format, offset, per_instance;
++};
++struct vkd3d_rebox_graphics
++{
++    uint32_t magic;
++    uint32_t version;       /* 1 */
++    uint32_t size;
++    uint32_t vs_offset, vs_size, ps_offset, ps_size;
++    uint32_t element_count;
++    struct vkd3d_rebox_graphics_element elements[32];
+ };
+ typedef HRESULT (*PFN_vkd3d_rebox_console_compile)(const struct vkd3d_rebox_compile_in *in,
+         struct vkd3d_rebox_compile_out *out);
+@@ -2335,6 +2359,7 @@ struct vkd3d_rebox_variant
+ {
+     uint64_t key[2];
+     VkPipeline vk_pipeline;
++    uint32_t dynamic_state_flags; /* graphics */
+ };
+ 
+ struct d3d12_pipeline_state
+@@ -2349,6 +2374,10 @@ struct d3d12_pipeline_state
+     size_t rebox_deferred_size;
+     struct vkd3d_rebox_variant *rebox_variants;
+     size_t rebox_variant_count, rebox_variant_capacity;
++    /* rebox: deferred console graphics (vkd3d_rebox_graphics), read from the PSO's
++     * private data at its first draw. */
++    struct vkd3d_rebox_graphics *rebox_graphics;
++    bool rebox_graphics_checked;
+ 
+     union
+     {
+@@ -2384,6 +2413,12 @@ HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
+ struct vkd3d_rebox_compile_out;
+ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_rebox_compile_out *out);
++struct vkd3d_dynamic_state;
++const struct vkd3d_rebox_graphics *d3d12_pipeline_state_rebox_graphics(struct d3d12_pipeline_state *state);
++VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_state *state,
++        const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
++        const struct vkd3d_rebox_compile_out *vs, const struct vkd3d_rebox_compile_out *ps,
++        uint32_t *dynamic_state_flags);
+ 
+ static inline bool d3d12_pipeline_state_is_compute(const struct d3d12_pipeline_state *state)
+ {
+@@ -3299,7 +3334,7 @@ struct d3d12_command_list
+     {
+         uint64_t heap_cpu[2];
+         uint64_t title_base[2];
+-        uint32_t push[48];
++        uint32_t push[64];
+     } rebox;
+     bool has_replaced_shaders;
+ 

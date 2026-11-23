@@ -12,7 +12,8 @@
 //    load from a private table of the binding's heap indices.
 // 3. Each host buffer (FlattenedSrt, BDA page table, fault buffer, ...) becomes a
 //    PhysicalStorageBuffer pointer read from the push block: AnyPS5's 128 bytes of push data, then
-//    one 64-bit address per host buffer from byte 128.
+//    one 64-bit address per host buffer from byte 128; or, given its address, a constant (graphics:
+//    each stage's push data takes 128 bytes of the block).
 #define REBOX_ANYPS5_BUILD
 #include "rebox_anyps5.h"
 
@@ -445,10 +446,13 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     if (count > MaxHostBuffers) Fail("too many host buffers");
     const std::uint32_t uintType = m.UintType();
     const std::uint32_t uvec2 = m.Type(OpTypeVector, {uintType, 2});
-    const auto [pushVar, member] = PushBlock(m);
+    bool pushed = false;
+    for (std::uint32_t i = 0; i < count; i++) pushed |= buffers[i].address == 0;
+    // Only buffers without a baked address need the push block's address array.
+    const auto [pushVar, member] = pushed ? PushBlock(m) : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
     const std::uint32_t pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
 
-    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; };
+    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; std::uint32_t address; };
     std::vector<Buffer> list;
     std::set<std::uint32_t> vars;
     const std::uint32_t psbUint = m.Pointer(StorageClassPhysicalStorageBuffer, uintType);
@@ -468,8 +472,14 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
         } else if (Op(m.Def(block)) != OpTypeStruct) {
             Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is an array");
         }
+        std::uint32_t address = 0;
+        if (buffers[i].address) {
+            address = m.NewId();
+            m.AddGlobal(Make(OpConstantComposite, {uvec2, address, m.Constant(static_cast<std::uint32_t>(buffers[i].address)),
+                                                   m.Constant(static_cast<std::uint32_t>(buffers[i].address >> 32u))}));
+        }
         list.push_back({var, block, m.Pointer(StorageClassPhysicalStorageBuffer, block), buffers[i].push_slot,
-                        buffers[i].array_length, buffers[i].guest_array != 0});
+                        buffers[i].array_length, buffers[i].guest_array != 0, address});
         vars.insert(var);
     }
     std::map<std::uint32_t, const Buffer*> tableOf;
@@ -486,7 +496,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
     for (const auto& b : list) lengthConstants[b.var] = m.Constant(b.length);
     std::map<std::uint32_t, std::uint32_t> slotConstants;
     for (const auto& b : list) slotConstants[b.slot] = m.Constant(b.slot);
-    const std::uint32_t memberConstant = m.Constant(member);
+    const std::uint32_t memberConstant = pushed ? m.Constant(member) : 0u;
 
     std::vector<Inst> out;
     std::map<std::uint32_t, std::uint32_t> current;  // host buffer variable -> this function's pointer
@@ -524,9 +534,14 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count)
             !(op == OpVariable && inst[3] == StorageClassFunction)) {
             // First instruction after the entry block's variables: load each host buffer's address.
             for (const auto& b : list) {
-                const std::uint32_t chain = m.NewId(), value = m.NewId(), pointer = m.NewId();
-                out.push_back(Make(OpAccessChain, {pushUvec2, chain, pushVar, memberConstant, slotConstants[b.slot]}));
-                out.push_back(Make(OpLoad, {uvec2, value, chain}));
+                const std::uint32_t pointer = m.NewId();
+                std::uint32_t value = b.address;
+                if (!value) {
+                    const std::uint32_t chain = m.NewId();
+                    value = m.NewId();
+                    out.push_back(Make(OpAccessChain, {pushUvec2, chain, pushVar, memberConstant, slotConstants[b.slot]}));
+                    out.push_back(Make(OpLoad, {uvec2, value, chain}));
+                }
                 out.push_back(Make(OpBitcast, {b.psbPtr, pointer, value}));
                 current[b.var] = pointer;
                 rootOf[pointer] = b.var;

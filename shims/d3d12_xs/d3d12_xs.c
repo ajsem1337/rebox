@@ -17,6 +17,8 @@
 #include <string.h>
 
 #include "../common/rebox_log.h"
+#include "console_compile.h"
+#include "console_fssm.h"
 #include "gpu_memory.h"
 #include "proxy.h"
 #include "shader_cache.h"
@@ -177,6 +179,61 @@ static BOOL retry_without_cache(HRESULT hr, const D3D12_CACHED_PIPELINE_STATE *c
     return TRUE;
 }
 
+/* A PSO with fallback shaders whose real stages are a console vertex and pixel shader gets them
+ * attached (REBOX_GRAPHICS_GUID): vkd3d-proton (patch 0006) then compiles both with AnyPS5 at
+ * each draw, as compute shaders are at dispatch, and keeps the fallback pipeline for draws whose
+ * compile fails. REBOX_CONSOLE_GRAPHICS=0 turns it off. */
+static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
+{
+    static LONG attached, refused;
+    struct rebox_graphics *g;
+    void *vs = NULL, *ps = NULL;
+    SIZE_T vs_size = 0, ps_size = 0;
+    const char *env = getenv("REBOX_CONSOLE_GRAPHICS");
+
+    if ((env && *env == '0') || !pso || !desc->VS.BytecodeLength || !desc->PS.BytecodeLength
+            || desc->HS.BytecodeLength || desc->DS.BytecodeLength || desc->GS.BytecodeLength
+            || desc->InputLayout.NumElements > ARRAYSIZE(g->elements))
+        return;
+    if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0x1, &vs_size))
+            || !(ps = console_fssm_graphics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, 0x10, &ps_size))
+            || !(g = calloc(1, sizeof(*g) + vs_size + ps_size)))
+    {
+        if (InterlockedIncrement(&refused) <= 4)
+            rebox_log("d3d12_xs: graphics PSO: a stage isn't a console vertex/pixel shader we can defer (%s)",
+                         vs ? "pixel" : "vertex");
+        free(vs);
+        free(ps);
+        return;
+    }
+    g->magic = REBOX_GRAPHICS_MAGIC;
+    g->version = 1;
+    g->size = (UINT32)(sizeof(*g) + vs_size + ps_size);
+    g->vs_offset = sizeof(*g);
+    g->vs_size = (UINT32)vs_size;
+    g->ps_offset = (UINT32)(sizeof(*g) + vs_size);
+    g->ps_size = (UINT32)ps_size;
+    g->element_count = desc->InputLayout.NumElements;
+    for (UINT i = 0; i < g->element_count; i++)
+    {
+        const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
+        g->elements[i] = (struct rebox_graphics_element){ e->InputSlot, e->Format, e->AlignedByteOffset,
+                e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA };
+    }
+    memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
+    memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
+    if (SUCCEEDED(ID3D12PipelineState_SetPrivateData((ID3D12PipelineState *)pso, &REBOX_GRAPHICS_GUID, g->size, g))
+            && InterlockedIncrement(&attached) <= 4)
+        rebox_log("d3d12_xs: graphics PSO: console vertex shader (%u inputs) and pixel shader (%u interpolants) "
+                     "deferred to draw time, %u input elements",
+                     ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)vs + 1))->input_count,
+                     ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)ps + 1))->interpolator_count,
+                     g->element_count);
+    free(g);
+    free(vs);
+    free(ps);
+}
+
 static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
@@ -214,6 +271,8 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
         hr = orig_create_graphics(device, &copy, riid, pso);
     }
+    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso)
+        attach_console_graphics(desc, *pso);
     /* Bytecode that passed as PC's or came from the cache can still fail to compile: Xbox DXIL
      * calling @xbox.* intrinsics (XboxBvhBuilder), or a bad translation. Fallbacks then, too. */
     if (FAILED(hr) && !miss && fallback_enabled() && hr != E_OUTOFMEMORY)

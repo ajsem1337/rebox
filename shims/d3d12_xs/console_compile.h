@@ -20,6 +20,39 @@ struct rebox_deferred_shader
     UINT64 code_address;       /* the code's guest address */
 };
 
+/* Graphics stages (version 2): the header above with stage VK_SHADER_STAGE_VERTEX_BIT (1) or
+ * FRAGMENT_BIT (0x10), then this, then the code (console_fssm.c). rsrc2's user SGPR count is the
+ * stage's. */
+struct rebox_deferred_graphics
+{
+    UINT32 input_count;          /* vertex: inputs r at v[4+4r..7+4r] */
+    UINT32 input_ena;            /* pixel: SPI_PS_INPUT_ENA */
+    UINT32 interpolator_count;
+    UINT32 interpolators[32];    /* SPI_PS_INPUT_CNTL_n */
+    UINT32 col_format;           /* SPI_SHADER_COL_FORMAT */
+    UINT32 depth_export;
+};
+
+/* What d3d12_xs attaches to a graphics PSO whose stages are console vertex and pixel shaders,
+ * as private data under REBOX_GRAPHICS_GUID (patch 0006 reads it at the first draw): the two
+ * deferred stages and the input layout, AlignedByteOffset resolved. */
+#define REBOX_GRAPHICS_MAGIC 0x47524353u /* "SCRG" */
+struct rebox_graphics_element
+{
+    UINT32 slot, dxgi_format, offset, per_instance;
+};
+struct rebox_graphics
+{
+    UINT32 magic;
+    UINT32 version;              /* 1 */
+    UINT32 size;
+    UINT32 vs_offset, vs_size, ps_offset, ps_size;
+    UINT32 element_count;
+    struct rebox_graphics_element elements[32];
+};
+/* {53435247-0001-4000-8000-736361726c74} */
+DEFINE_GUID(REBOX_GRAPHICS_GUID, 0x53435247, 0x0001, 0x4000, 0x80, 0x00, 0x73, 0x63, 0x61, 0x72, 0x6c, 0x74);
+
 /* ReboxConsoleCompile's arguments; mirrored in patch 0005 (vkd3d_rebox_compile_in/out). */
 struct rebox_compile_in
 {
@@ -30,6 +63,7 @@ struct rebox_compile_in
     UINT64 heap_cpu[2];        /* CPU handle of descriptor 0 of the bound CBV/SRV/UAV and sampler heaps */
     UINT32 increment[2];
     UINT32 bindless[7][2];     /* per AnyPS5 DescriptorKind: Vulkan set and binding, set ~0u if none */
+    UINT32 push_offset;        /* graphics: where this stage's 128 bytes of push data go (0 or 128) */
 };
 
 struct rebox_compile_out
@@ -39,6 +73,8 @@ struct rebox_compile_out
     UINT32 subgroup_size;
     UINT64 key[2];
     UINT32 push[48];
+    UINT32 vertex_input_count; /* vertex: the Vulkan attributes it reads */
+    UINT32 vertex_inputs[32][3]; /* location, components, input r */
 };
 
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out);

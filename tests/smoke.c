@@ -640,6 +640,225 @@ static BOOL read_dump_pixel(const char *dir, int frame, BYTE bgra[4])
  * to it. The frame dumps (run-smoke.sh sets REBOX_DUMP_FRAMES) show
  * whether the right pixels were copied out; a window is shown only if
  * there's a display. */
+/* A console container (DXBC, DXIL part, XBCH, zlib FSSM) around graphics FSSM in a UE5 title's older
+ * layout (console_fssm.c): code at 0x160 (the u32 at 0xC0 plus 0x28), its size at 0xC8, RSRC1 at
+ * 0x108, float mode at 0xFC. zlib in stored blocks, which puff reads. Free with free(). */
+static BYTE *console_graphics_container(const UINT32 *code, UINT dwords, SIZE_T *size)
+{
+    UINT fssm_size = 0x160 + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part, total;
+    BYTE *fssm = calloc(1, fssm_size), *out;
+    UINT32 a = 1, b = 0;
+
+    memcpy(fssm, "FSSM", 4);
+    *(UINT32 *)(fssm + 0xc0) = 0x160 - 0x28;
+    *(UINT32 *)(fssm + 0xc8) = dwords * 4;
+    *(UINT32 *)(fssm + 0xfc) = 0xc0;
+    *(UINT32 *)(fssm + 0x108) = 0x002c0003;
+    memcpy(fssm + 0x160, code, dwords * 4);
+    part = 4 + 0x60 + 4 + 0x14 + zsize;
+    part = (part + 3) & ~3u;
+    total = 0x24 + 8 + part;
+    out = calloc(1, total);
+    memcpy(out, "DXBC", 4);
+    *(UINT32 *)(out + 20) = 1;
+    *(UINT32 *)(out + 24) = total;
+    *(UINT32 *)(out + 28) = 1;
+    *(UINT32 *)(out + 32) = 0x24;
+    memcpy(out + 0x24, "DXIL", 4);
+    *(UINT32 *)(out + 0x28) = part;
+    {
+        BYTE *p = out + 0x2c;
+        memcpy(p, "XBCH", 4);
+        memcpy(p + 4 + 0x60, "NOBC", 4);
+        p += 4 + 0x60 + 4 + 0x14;
+        p[0] = 0x78;
+        p[1] = 0x01;
+        p[2] = 0x01; /* final stored block */
+        p[3] = fssm_size & 0xff;
+        p[4] = fssm_size >> 8;
+        p[5] = ~fssm_size & 0xff;
+        p[6] = (~fssm_size >> 8) & 0xff;
+        memcpy(p + 7, fssm, fssm_size);
+        for (UINT i = 0; i < fssm_size; i++)
+        {
+            a = (a + fssm[i]) % 65521;
+            b = (b + a) % 65521;
+        }
+        p[7 + fssm_size] = b >> 8;
+        p[8 + fssm_size] = b & 0xff;
+        p[9 + fssm_size] = a >> 8;
+        p[10 + fssm_size] = a & 0xff;
+    }
+    free(fssm);
+    *size = total;
+    return out;
+}
+
+/* Deferred console graphics (patch 0006): a PSO whose stages are console vertex and pixel shaders
+ * in their containers draws with AnyPS5's compiles of them. The vertex shader calls the fetch
+ * shader as a UE5 title's do (s_swappc_b64 s[4:5], s[4:5]) and exports input 0 as the position; the
+ * pixel shader exports red. One full-screen triangle over a blue clear: the centre turns red. */
+static void test_console_draw(void *dev, void *queue)
+{
+    static const UINT32 vs_code[] = {
+        0xbe842104,             /* s_swappc_b64 s[4:5], s[4:5]: the fetch, input 0 in v4-v7 */
+        0xf80008cf, 0x07060504, /* exp pos0 v4, v5, v6, v7 done */
+        0xbf810000,             /* s_endpgm */
+    };
+    static const UINT32 ps_code[] = {
+        0x7e0002f2,             /* v_mov_b32 v0, 1.0 */
+        0x7e020280,             /* v_mov_b32 v1, 0 */
+        0xf800180f, 0x00010100, /* exp mrt0 v0, v1, v1, v0 done vm */
+        0xbf810000,             /* s_endpgm */
+    };
+    static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, up = { D3D12_HEAP_TYPE_UPLOAD },
+                          rb = { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 48, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256 * 48, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_CLEAR_VALUE clear = { DXGI_FORMAT_R8G8B8A8_UNORM, { { 0.0f, 0.0f, 1.0f, 1.0f } } };
+    D3D12_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                                         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void *)
+            GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "D3D12SerializeRootSignature");
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 0, NULL, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = { 0 };
+    D3D12_VIEWPORT vp = { 0, 0, 64, 48, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 64, 48 };
+    D3D12_RESOURCE_BARRIER barrier = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+    D3D12_TEXTURE_COPY_LOCATION dst = { 0 }, src = { 0 };
+    D3D12_VERTEX_BUFFER_VIEW vbv;
+    ID3D12Resource *tex = NULL, *vb = NULL, *readback = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *rtv_heap = NULL, *list = NULL, *rs = NULL, *pso = NULL, *mapped;
+    BYTE *vs = NULL, *ps = NULL, *px;
+    SIZE_T vs_size, ps_size, rtv;
+    ID3D10Blob *blob = NULL;
+    HRESULT hr;
+
+    if (getenv("REBOX_SHADER_FALLBACK") && *getenv("REBOX_SHADER_FALLBACK") == '0')
+        return;
+    vs = console_graphics_container(vs_code, ARRAYSIZE(vs_code), &vs_size);
+    ps = console_graphics_container(ps_code, ARRAYSIZE(ps_code), &ps_size);
+    hr = serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, NULL)) ? S_OK : E_FAIL;
+    if (SUCCEEDED(hr))
+    {
+        hr = XSLOT(dev, 16, HRESULT, UINT, const void *, SIZE_T, REFIID, void **)(dev, 0,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, &rs);
+        ID3D10Blob_Release(blob);
+    }
+    gd.pRootSignature = rs;
+    gd.VS.pShaderBytecode = vs;
+    gd.VS.BytecodeLength = vs_size;
+    gd.PS.pShaderBytecode = ps;
+    gd.PS.BytecodeLength = ps_size;
+    gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    gd.SampleMask = ~0u;
+    gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    gd.InputLayout.pInputElementDescs = &element;
+    gd.InputLayout.NumElements = 1;
+    gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    gd.NumRenderTargets = 1;
+    gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    gd.SampleDesc.Count = 1;
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 10, HRESULT, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &gd,
+                &IID_ID3D12PipelineState, &pso);
+    CHECK(SUCCEEDED(hr), "graphics PSO from console vertex and pixel containers (%#lx)", hr);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+                &IID_ID3D12DescriptorHeap, &rtv_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &def, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, &IID_ID3D12Resource, (void **)&tex);
+    bd.Width = sizeof(tri);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &up, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&vb);
+    bd.Width = 256 * 48;
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &rb, D3D12_HEAP_FLAG_NONE,
+                &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&readback);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    CHECK(SUCCEEDED(hr), "render target, vertex buffer and list for a console draw (%#lx)", hr);
+    if (FAILED(hr))
+        goto done;
+    if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, &mapped)))
+    {
+        memcpy(mapped, tri, sizeof(tri));
+        ID3D12Resource_Unmap(vb, 0, NULL);
+    }
+
+    rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
+    XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, tex, NULL, rtv);
+    XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, clear.Color, 0, NULL);
+    XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
+    XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
+    XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
+    XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    XSLOT(list, 34, void, void *)(list, rs);
+    XSLOT(list, 25, void, void *)(list, pso);
+    vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vb);
+    vbv.SizeInBytes = sizeof(tri);
+    vbv.StrideInBytes = sizeof(tri[0]);
+    XSLOT(list, 48, void, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW *)(list, 0, 1, &vbv); /* PC 44 */
+    XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
+    barrier.Transition.pResource = tex;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, &barrier);
+    dst.pResource = readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 64, 48, 1, 256 };
+    src.pResource = tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+          const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    hr = XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 1; i++)
+        Sleep(10);
+    if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, &mapped)))
+    {
+        px = (BYTE *)mapped + 24 * 256 + 32 * 4;
+        CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0,
+              "console vertex and pixel shaders draw through AnyPS5 (centre RGB %u %u %u; blue: fell back)",
+              px[0], px[1], px[2]);
+        ID3D12Resource_Unmap(readback, 0, NULL);
+    }
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (readback) ID3D12Resource_Release(readback);
+    if (vb) ID3D12Resource_Release(vb);
+    if (tex) ID3D12Resource_Release(tex);
+    if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
+    if (pso) XSLOT(pso, 2, ULONG)(pso);
+    if (rs) XSLOT(rs, 2, ULONG)(rs);
+    free(vs);
+    free(ps);
+}
+
 static void test_present(void *dev, void *queue)
 {
     const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
@@ -3181,6 +3400,7 @@ static void test_xbox(void)
 
     test_dxgi_device(dev);
     test_pacing(dev, queue);
+    test_console_draw(dev, queue);
     test_xbox_root_flags(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);

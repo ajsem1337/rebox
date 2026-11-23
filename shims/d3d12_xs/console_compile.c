@@ -48,6 +48,10 @@ static struct
 {
     INIT_ONCE once;
     int (*compile)(const struct sa5_compute_request *, struct sa5_result **, char *, size_t);
+    int (*compile_vertex)(const struct sa5_vertex_request *, struct sa5_result **, char *, size_t);
+    int (*compile_pixel)(const struct sa5_pixel_request *, struct sa5_result **, char *, size_t);
+    UINT32 (*vertex_input_count)(const struct sa5_result *);
+    int (*vertex_input)(const struct sa5_result *, UINT32, UINT32 *, UINT32 *, UINT32 *);
     const UINT32 *(*spirv)(const struct sa5_result *, UINT32 *);
     UINT32 (*binding_count)(const struct sa5_result *);
     int (*binding)(const struct sa5_result *, UINT32, struct sa5_binding *);
@@ -117,6 +121,10 @@ static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
     }
 #define GET(field, name) sa5.field = (void *)GetProcAddress(m, name)
     GET(compile, "sa5_compile_compute");
+    GET(compile_vertex, "sa5_compile_vertex");
+    GET(compile_pixel, "sa5_compile_pixel");
+    GET(vertex_input_count, "sa5_result_vertex_input_count");
+    GET(vertex_input, "sa5_result_vertex_input");
     GET(spirv, "sa5_result_spirv");
     GET(binding_count, "sa5_result_binding_count");
     GET(binding, "sa5_result_binding");
@@ -500,16 +508,24 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     UINT32 *code, nops;
     UINT32 push_size;
 
-    if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC || h->version != 1
+    const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
+    BOOL graphics;
+
+    if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC
+            || (h->version != 1 && h->version != 2)
             || h->size > in->shader_size || h->code_offset % 4 || h->code_offset > h->size
             || h->code_dwords > (h->size - h->code_offset) / 4)
+        return E_INVALIDARG;
+    /* Version 2: a vertex (0x1) or pixel (0x10) stage, rebox_deferred_graphics after the header. */
+    graphics = h->version == 2;
+    if (graphics && ((h->stage != 0x1 && h->stage != 0x10) || h->code_offset < sizeof(*h) + sizeof(*g)))
         return E_INVALIDARG;
     set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
-    if (!sa5.compile)
+    if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input)))
     {
-        set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable", NULL);
+        set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable (or too old for graphics stages)", NULL);
         return E_NOTIMPL;
     }
     {
@@ -579,7 +595,73 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     /* One compile at a time: AnyPS5's caches are thread-safe, but this keeps the static index
      * table simple and compiles are rare once warm. */
     AcquireSRWLockExclusive(&compile_lock);
-    if (sa5.compile(&req, &result, error, sizeof(error)))
+    if (graphics && h->stage == 0x1)
+    {
+        /* The console's fetch call (s_swappc_b64 s[4:5]) becomes Vulkan vertex attributes: input r
+         * fills v[4+4r..7+4r]. The V#s only steer AnyPS5's grouping; the attributes' formats and
+         * buffers come from the PSO's input layout (patch 0006). s[4:5] holds a fetch address
+         * outside the program, as the console driver's. */
+        struct sa5_vertex_request vreq;
+        UINT32 user[32];
+        memset(&vreq, 0, sizeof(vreq));
+        memset(user, 0, sizeof(user));
+        memcpy(user, req.user_data, min(req.user_data_count, 32u) * 4);
+        user[4] = 0x30000000u;
+        user[5] = 0;
+        vreq.code = req.code;
+        vreq.code_dwords = req.code_dwords;
+        vreq.code_address = req.code_address;
+        vreq.wave = req.wave;
+        vreq.user_data = user;
+        vreq.user_data_count = max(req.user_data_count, 6u);
+        vreq.rsrc1 = h->rsrc1;
+        vreq.input_count = min(g->input_count, 32u);
+        for (UINT32 r = 0; r < vreq.input_count; r++)
+        {
+            vreq.inputs[r].vsharp[0] = 0x20000000u + r * 0x100000u;
+            vreq.inputs[r].vsharp[1] = 16u << 16;
+            vreq.inputs[r].vsharp[2] = 0x10000;
+            vreq.inputs[r].vsharp[3] = (77u << 12) | 0xfacu; /* 32_32_32_32_FLOAT, identity swizzle */
+            vreq.inputs[r].register_start = 4 + 4 * r;
+            vreq.inputs[r].register_count = 4;
+        }
+        vreq.push_offset = in->push_offset;
+        vreq.regions = regions;
+        vreq.region_count = n;
+        vreq.use_cache = 1;
+        if (sa5.compile_vertex(&vreq, &result, error, sizeof(error)))
+        {
+            log_failure(h, "AnyPS5 failed (vertex)", error);
+            goto done;
+        }
+    }
+    else if (graphics)
+    {
+        struct sa5_pixel_request preq;
+        memset(&preq, 0, sizeof(preq));
+        preq.code = req.code;
+        preq.code_dwords = req.code_dwords;
+        preq.code_address = req.code_address;
+        preq.wave = req.wave;
+        preq.user_data = req.user_data;
+        preq.user_data_count = req.user_data_count;
+        preq.rsrc1 = h->rsrc1;
+        preq.rsrc2 = h->rsrc2;
+        preq.input_ena = g->input_ena;
+        preq.interpolator_count = min(g->interpolator_count, 32u);
+        memcpy(preq.interpolator_settings, g->interpolators, sizeof(preq.interpolator_settings));
+        preq.col_format = g->col_format;
+        preq.depth_export = g->depth_export;
+        preq.regions = regions;
+        preq.region_count = n;
+        preq.use_cache = 1;
+        if (sa5.compile_pixel(&preq, &result, error, sizeof(error)))
+        {
+            log_failure(h, "AnyPS5 failed (pixel)", error);
+            goto done;
+        }
+    }
+    else if (sa5.compile(&req, &result, error, sizeof(error)))
     {
         log_failure(h, "AnyPS5 failed", error);
         goto done;
@@ -587,6 +669,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
     sa5.identity(result, key);
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
+    if (graphics)
+    {
+        /* The same code as another stage or at another push offset is another module. */
+        key[1] = hash_bytes(key[1], &h->stage, sizeof(h->stage));
+        key[1] = hash_bytes(key[1], &in->push_offset, sizeof(in->push_offset));
+    }
     for (UINT32 i = 0; i < sa5.binding_count(result); i++)
     {
         struct sa5_binding b;
@@ -623,7 +711,9 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 goto done;
             }
             host_va[host_count] = va;
-            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, 0, 1 };
+            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, 0, 1, 0, graphics ? va : 0 };
+            if (graphics)
+                key[0] = hash_bytes(key[0], &va, sizeof(va));
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
         }
@@ -758,7 +848,10 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 goto done;
             }
             host_va[host_count] = va;
-            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, bytes / 4 };
+            /* Graphics stages share the push block (128 bytes each): their addresses are baked in. */
+            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, bytes / 4, 0, 0, graphics ? va : 0 };
+            if (graphics)
+                key[0] = hash_bytes(key[0], &va, sizeof(va));
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
         }
@@ -798,8 +891,14 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     memcpy(out->key, key, sizeof(key));
     push = sa5.push_constants(result, &push_size);
     memcpy(out->push, push, min(push_size, 128u));
-    for (UINT32 i = 0; i < host_count; i++)
+    for (UINT32 i = 0; i < host_count && !graphics; i++)
         memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
+    if (graphics && h->stage == 0x1)
+    {
+        out->vertex_input_count = min(sa5.vertex_input_count(result), 32u);
+        for (UINT32 i = 0; i < out->vertex_input_count; i++)
+            sa5.vertex_input(result, i, &out->vertex_inputs[i][0], &out->vertex_inputs[i][1], &out->vertex_inputs[i][2]);
+    }
     hr = S_OK;
     {
         char detail[96];

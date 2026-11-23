@@ -147,6 +147,10 @@ struct sa5_host_buffer
      * a 16-byte entry per element, {64-bit address, u32 length in dwords, 0}. Each element becomes
      * a pointer to its address, and OpArrayLength on it reads the length. */
     uint32_t guest_array;
+    uint32_t pad;
+    /* Nonzero: the buffer's address, baked into the module as a constant; push_slot is then unused
+     * and the push block untouched (graphics stages share it: 128 bytes each). */
+    uint64_t address;
 };
 
 /* Returns 0 and the validated module in *out (free with sa5_free_words), or -1 and a message. */
