@@ -358,11 +358,10 @@ static HWND title_window(void)
 }
 
 /* Console planes are 4K and titles size their windows from that, which can be larger than the
- * screen: the compositor then cuts the frame off (and a frame fitted to the work area still
- * overflowed it with decorations). A window larger than its monitor's work area becomes borderless
- * and covers the monitor, which Wine's display drivers show fullscreen; the swapchain stretches the
- * plane into it. REBOX_PRESENT_FIT=0 leaves it as it is; REBOX_PRESENT_FIT=WxH sizes it so
- * (window pixels, for when the display's scaling makes Wine's pixels larger than the screen's). */
+ * screen. The window is left as the title made it (a tiling compositor sizes it anyway, and the
+ * swapchain stretches the plane into whatever size it gets). REBOX_PRESENT_FIT=1 makes a window
+ * larger than its monitor's work area borderless over the monitor, which Wine shows fullscreen;
+ * REBOX_PRESENT_FIT=WxH gives it that size. */
 static void fit_to_monitor(HWND hwnd)
 {
     const char *fit = getenv("REBOX_PRESENT_FIT");
@@ -372,7 +371,7 @@ static void fit_to_monitor(HWND hwnd)
     UINT w, h;
     RECT r;
 
-    if ((fit && *fit == '0') || !(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
+    if (!(monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))
             || !GetMonitorInfoW(monitor, &mi) || !GetWindowRect(hwnd, &r))
         return;
     rebox_log("d3d12_xs: PresentX: window %ldx%ld; monitor %ldx%ld (work area %ldx%ld), window DPI %u, system DPI %u",
@@ -386,7 +385,8 @@ static void fit_to_monitor(HWND hwnd)
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         return;
     }
-    if (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top)
+    if (!fit || strcmp(fit, "1")
+            || (r.right - r.left <= mi.rcWork.right - mi.rcWork.left && r.bottom - r.top <= mi.rcWork.bottom - mi.rcWork.top))
         return;
     rebox_log("d3d12_xs: PresentX: window %ldx%ld is larger than its monitor's work area; making it borderless "
                  "over the monitor, %ldx%ld", r.right - r.left, r.bottom - r.top,
