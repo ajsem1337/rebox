@@ -109,6 +109,7 @@ static void test_xmem(void)
     alloc_default = (alloc_fn)(void *)GetProcAddress(m, "XMemAllocDefault");
     free_default = (free_fn)(void *)GetProcAddress(m, "XMemFreeDefault");
     CHECK(xalloc && xfree && set_hooks && alloc_default && free_default, "xmem exports present");
+    CHECK(GetProcAddress(m, "ReboxHeartbeat") != NULL, "xmem exports ReboxHeartbeat (the hang watchdog's)");
     if (!(xalloc && xfree && set_hooks && alloc_default && free_default)) return;
     test_crash_report(m);
 

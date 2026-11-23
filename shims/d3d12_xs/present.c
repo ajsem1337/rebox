@@ -598,6 +598,20 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
                      params, p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0);
     }
     proxy_frame_presented();
+    {
+        /* xmem.dll's hang watchdog (crash.c). */
+        static void (WINAPI *heartbeat)(void);
+        static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+        BOOL pending = FALSE;
+        if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending)
+        {
+            HMODULE xmem = GetModuleHandleA("xmem.dll");
+            heartbeat = xmem ? (void *)GetProcAddress(xmem, "ReboxHeartbeat") : NULL;
+            InitOnceComplete(&once, 0, NULL);
+        }
+        if (heartbeat)
+            heartbeat();
+    }
     if (!s && !(s = *state = present_create(queue)))
         return S_OK;
     frame = ++s->frames;

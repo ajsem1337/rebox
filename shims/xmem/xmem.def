@@ -16,3 +16,4 @@ EXPORTS
     XMemMakeTag
     XMemIsToolsMemAvailable
     XMemGetAllocationHysteresis
+    ReboxHeartbeat
