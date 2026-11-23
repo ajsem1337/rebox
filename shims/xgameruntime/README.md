@@ -55,7 +55,7 @@ completion, with its queue and whether a completion callback goes there.
 ## Tests
 
 `tests/run-xgr.sh` builds upstream's tests with mingw and runs them under Wine, `test_save`
-twice (the second run checks that saves survived). Under Wine 11.21 (2026-11-22), 9 of 12 pass
+twice (the second run checks that saves survived). Under Wine 11.21, 9 of 12 pass
 outright:
 
 - `test_launch`: 5 checks fail. Launching a URI through the program registered for its scheme,

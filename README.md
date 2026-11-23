@@ -55,7 +55,9 @@ tools/scan_imports.py     which imports can't be resolved under Wine + shims; ge
 tools/d3d12x_probe.py     recovers D3D12.X IIDs, vtable slots and inlined field accesses from console binaries
 tests/                    smoke test (xmem, forwarders, PSO substitution, negative control);
                           gpuva_probe.c checks whether the Vulkan driver can map GPU VA == CPU VA
-docs/d3d12x.md            what the console DLLs reveal about D3D12.X and unified memory, and the plan
+docs/d3d12x.md            D3D12.X interfaces, unified memory and presentation
+docs/anyps5.md            console shaders through AnyPS5: shadow heaps, compute and graphics
+docs/shaders.md           the vkd3d-proton patches and the shader cache
 ```
 
 ## Usage
@@ -87,9 +89,9 @@ nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
 2. **Sets up the prefix:** the shims (including the Gaming Runtime stand-in, which logs to
    `$WINEPREFIX/xgameruntime.log`), `ConsoleMode`, persistent local storage in the prefix, and
    the package as a shadow directory with our FidelityFX stub.
-3. **Runs the title.** Console compute shaders compile through AnyPS5 at dispatch
-   ([docs/anyps5.md](docs/anyps5.md)); graphics stages still get fallback shaders, so effects are
-   missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
+3. **Runs the title.** Console compute and graphics shaders compile through AnyPS5 at their first
+   dispatch or draw ([docs/anyps5.md](docs/anyps5.md)); pipelines it doesn't take (mesh,
+   tessellation) get fallback shaders, so those effects are missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
    ([docs/d3d12x.md](docs/d3d12x.md)).
 
 The prefix keeps what a run leaves behind: `imports.txt` (the scan), `last-run.log` (everything
@@ -127,13 +129,13 @@ method the title asked for that isn't implemented.
 | `REBOX_GAME_ALIAS=0` | Leave out the `GAME:` link in the package directory, which makes console `GAME:\...` paths resolve to the package (the package is also drive `G:`) |
 | `REBOX_SHADER_FALLBACK=0` | Fail PSO creation on a missing translation, instead of using fallback shaders |
 | `REBOX_STUB_FATAL=1` | Exit on the first unimplemented stub call |
-| `REBOX_CONSOLE_COMPUTE=0` | Console compute shaders (FSSM containers) keep the old path (translation cache, then fallback shaders) instead of AnyPS5 at dispatch ([docs/anyps5.md](docs/anyps5.md)) |
+| `REBOX_CONSOLE_COMPUTE=0` | Don't defer console compute shaders to AnyPS5: they're looked up in the shader cache, then get fallback shaders ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS` | Run only the console compute programs whose code address hashes to VALUE in its low BITS bits (the rest are skipped), logging each one run: halve the set run by run to find a program that faults the GPU |
-| `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw, as before. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback (Unreal 5's large shaders took hundreds of milliseconds each, and an Unreal 5 title's game thread gave up waiting for its render thread) |
+| `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback: large shaders take hundreds of milliseconds each, and a title's game thread can give up waiting for its render thread |
 | `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
 | `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
 | `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |
-| `REBOX_HEAP_VA=title\|real\|virtual` | What descriptor heaps report as their GPU address (heap slot 10). `title` (default): the shadow heap's 32-bit title address, which AnyPS5 resolves in the console-format copy ([docs/anyps5.md](docs/anyps5.md)). `real`: the real GPU address of vkd3d-proton's descriptors (patched vkd3d-proton with descriptor buffers, as on RADV). `virtual`: vkd3d-proton's own handles. `REBOX_REAL_HEAP_VA=0` still means `virtual` |
+| `REBOX_HEAP_VA=title\|real\|virtual` | What descriptor heaps report as their GPU address (heap slot 10). `title` (default): the shadow heap's 32-bit title address, which AnyPS5 resolves in the console-format copy ([docs/anyps5.md](docs/anyps5.md)). `real`: the real GPU address of vkd3d-proton's descriptors (patched vkd3d-proton with descriptor buffers, as on RADV). `virtual`: vkd3d-proton's own handles. `REBOX_REAL_HEAP_VA=0` also selects `virtual` |
 | `REBOX_CRASH_LOG=N` | Report the first N faults (access violations, illegal instructions, divide by zero, stack overflow) with module+RVA, target address, a GPU-window hint, registers and an unwound stack; default 8, 0 turns it off. Reports are first-chance, so a fault the title handles itself also appears |
 | `REBOX_HANG_DUMP=N` | When no frame has been presented for N seconds (default 60, 0 off), log every thread's name and unwound stack once, to see what a stuck title waits on; again after the next frame, three times at most |
 | `VKD3D_CONFIG=breadcrumbs` | vkd3d-proton's breadcrumbs: when the GPU device is lost, log the commands each queue was running. Before a console dispatch or draw they record the variant's key, which d3d12_xs logs with each compile (`compiled a variant ... key K`), so the dump names the console shader. Slower |
@@ -156,9 +158,8 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_FRAMES=DIR` | Write presented frames to `DIR/frame_<n>.bmp` (8-bit RGBA/BGRA planes) or `.bin` |
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 
-The cache key is the 64-bit FNV-1a hash of the bytecode exactly as the title passes it to
-`Create*PipelineState`. **Not yet verified:** whether that matches the shader bytes in a title's own shader archives.
-If everything misses, dump the missed shaders and diff them against the originals.
+The shader cache ([docs/shaders.md](docs/shaders.md)) is keyed by the 64-bit FNV-1a hash of the
+bytecode exactly as the title passes it to `Create*PipelineState`.
 
 Console shaders are DXBC containers too, so the shim doesn't treat every `DXBC` blob as PC
 bytecode. Only a container with a `SHEX`/`SHDR` part or a `DXIL` part holding LLVM bitcode passes
@@ -169,21 +170,21 @@ A miss would fail PSO creation, which a title rarely survives. So by default the
 gets fallback shaders instead (`generated/fallback_shaders.h`, from `tools/gen_fallback_shaders.sh`):
 graphics draws nothing, compute does nothing, and the effect is just missing. Each one is logged.
 Mesh pipelines get a mesh shader that emits nothing and an amplification shader that launches
-nothing (DXIL from `dxc`). `REBOX_SHADER_FALLBACK=0` restores failing, for hunting
+nothing (DXIL from `dxc`). `REBOX_SHADER_FALLBACK=0` makes a miss fail instead, for hunting
 down missing translations.
 
-## Verified so far
+## What the tests cover
 
 - Shims build with mingw. `tests/run-smoke.sh` passes under stock Wine 11.21 + vkd3d-proton 3.0.1
   on lavapipe. Bytes vkd3d-proton can't compile succeed in both `CreateComputePipelineState` and
-  `CreatePipelineState` (stream) when a cache entry exists, and fail with `E_FAIL` when it doesn't.
+  `CreatePipelineState` (stream) when a cache entry exists, and, with fallbacks off, fail with
+  `E_FAIL` when it doesn't.
   The same holds for a synthetic console container (`DXIL` part with a `NOBC`/`FSSM` stub). Real
   PC DXBC compiles directly even when a broken cache entry exists for its hash.
-- Against the DLLs in `path/to/title`, every import resolves under Wine + vkd3d-proton + shims. The only
-  gap was `XMemGetWorkingSetStatistics`. It's now implemented for the one selector the AMD
-  upscaler passes (`0x20000001`): it returns TRUE and writes private commit to the u64 at `+8`.
-  That call shape comes from Xbox2Windows's call-site notes and hasn't been checked against a
-  disassembly here.
+- Every import of the console DLLs titles bundle resolves under Wine + vkd3d-proton + shims.
+  `XMemGetWorkingSetStatistics` answers the selector the AMD upscaler passes (`0x20000001`):
+  TRUE, with private commit in the u64 at `+8` (the call shape is from Xbox2Windows's call-site
+  notes).
 - `XMemVirtualQuery` takes `(process, address, info)` with a 0x40-byte info struct, as
   XboxBvhBuilder.dll calls it, and the smoke test covers that call.
 - The FidelityFX stub answers a render-resolution query as FSR does. It scales a cleared 32x24
@@ -206,12 +207,10 @@ down missing translations.
 
 ## Known gaps (ordered roughly by how soon they'll bite)
 
-- **Console shaders don't render** ([docs/shaders.md](docs/shaders.md)). The translators emit
-  SPIR-V that reads user SGPRs and raw hardware descriptors. The plan is AnyPS5 compiling at
-  dispatch ([docs/anyps5.md](docs/anyps5.md)): the recompiler DLL, console-format shadow heaps
-  and compute compile-and-bind at dispatch (vkd3d-proton patch 0005) work on a hand-written
-  shader and on a title's dumped compute shaders. Console compute containers now become
-  deferred PSOs at creation; graphics stages still use fallback shaders.
+- **Console shaders are partly covered** ([docs/anyps5.md](docs/anyps5.md)). Compute, vertex and
+  pixel shaders compile through AnyPS5 at their first dispatch or draw. Mesh, tessellation and
+  geometry pipelines get fallback shaders, shaders that need LDS spilling or scratch are skipped,
+  and so are shaders using instructions AnyPS5 doesn't handle yet; each is logged once.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
@@ -246,12 +245,10 @@ down missing translations.
   depth plane across, which is the fix. Both matter for titles that use ray tracing or Nanite.
 - **Controllers SDL maps wrongly.** Wine reads controllers through SDL, by SDL's database of
   layouts. For an Xbox One S controller on Bluetooth (045e:02e0, version 0408) that entry has
-  another axis order than the kernel's, so the right stick's Y read the right trigger, at full
-  deflection at rest (a title's camera looked at the sky); `rebox-run` sets a corrected
-  `SDL_GAMECONTROLLERCONFIG` for it. Its buttons were numbered wrongly too (RB opened a title's
-  pause menu, Y acted as LB); axes and buttons now checked in a title (View and Xbox
-  are keys after the others). Hidraw access (NixOS `hardware.steam-hardware.enable`) didn't change
-  it. Another controller read wrongly needs its own line in `SDL_GAMECONTROLLERCONFIG`;
+  another axis order than the kernel's (the right stick's Y reads the right trigger, at full
+  deflection at rest); `rebox-run` sets a corrected
+  `SDL_GAMECONTROLLERCONFIG` for it, with its buttons numbered as the kernel reports them.
+  Another controller read wrongly needs its own line in `SDL_GAMECONTROLLERCONFIG`;
   `REBOX_GAMEINPUT_LOG=1` shows what the title is given, with XInput's raw values.
 - **Audio: XMA2 decoding is untested on real data.** Under WineGDK, FAudio sends XMA2 to Wine's
   WMA decoder, which accepts only WMA formats, so creating an XMA2 source voice fails.

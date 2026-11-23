@@ -27,4 +27,4 @@ nix develop -c python3 helpers/textures/texcheck.py --shape 2d_array --limit 20 
 `--every N` and `--limit N` sample each pool, `--max-bytes` skips large textures (Leonida's
 decoder is pure Python), and `--shape` checks only 2D textures, arrays, cubemaps or volumes.
 
-Results on 2026-11-22 are in [docs/d3d12x.md](../../docs/d3d12x.md), "Texture tiling".
+Results are in [docs/d3d12x.md](../../docs/d3d12x.md), "Texture tiling".

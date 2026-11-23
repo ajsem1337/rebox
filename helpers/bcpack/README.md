@@ -33,9 +33,9 @@ the code's licence.
   more than ten times the PyPy path, with tables validated on held-out pools. Each connection
   starts one on its first BC1 chunk; a chunk it rejects goes to Leonida's decoder.
   `REBOX_BCPACK_SERVE=` (empty) keeps Leonida's for BC1 too.
-- Without the helper, BCPack requests fail with `E_NOTIMPL` and are logged, as before.
+- Without the helper, BCPack requests fail with `E_NOTIMPL` and are logged.
 
-On 14 BC1 chunks sampled from two of that title's texture pools (2026-11-22, local data), bcpack-serve matched
+On 14 BC1 chunks sampled from two of that title's texture pools (local data), bcpack-serve matched
 bcpack-rs's own decoder byte for byte. Leonida's decoder agreed on every block of 4 chunks and
 differed on the rest, mostly in a few blocks' indices (one chunk: 1,021 of 1,024 blocks). Neither
 is shown better: on the differing blocks each gives the smoother pixels about as often (excluding

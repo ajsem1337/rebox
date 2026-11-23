@@ -1153,7 +1153,7 @@ static const D3D12_HEAP_PROPERTIES *buffer_heap(const D3D12_HEAP_PROPERTIES *pro
 }
 
 /* Xbox resource descs can carry console texture layouts (>= 0x100). The
- * FidelityFX upscaler's recurrent texture uses 0x101 (Xbox2Windows,
+ * FidelityFX upscaler's recurrent texture uses 0x101 (Xbox2Windows's
  * docs/experiments.md). They select console tilings vkd3d-proton doesn't
  * know, so they become UNKNOWN, the driver's choice; titles that address
  * texels themselves go through scratch GPU VAs instead. Each distinct

@@ -342,7 +342,7 @@ BOOL WINAPI XMemVirtualQuery(HANDLE process, const void *address, XMEM_BASIC_INF
 }
 
 /* Not checked against a disassembly here. Per Xbox2Windows's call-site notes
- * (docs/experiments.md, "Six API call sites"), the AMD upscaler calls this
+ * (its docs/experiments.md, "Six API call sites"), the AMD upscaler calls this
  * seven times with selector 0x20000001 and a local output struct. A zero
  * return counts as zero; otherwise it reads the 64-bit value at +8 and diffs
  * before/after readings to update a counter. The caller probably measures its
