@@ -2247,6 +2247,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FWD(85, 46),                                  /* SetResidencyPriority */
         FN(86, device_CreatePipelineState),
         FN(101, device_CreateStateObject),
+        FWD(102, 63),                                 /* GetRaytracingAccelerationStructurePrebuildInfo */
+        FWD(103, 64),                                 /* CheckDriverMatchingIdentifier */
         FN(115, device_DeserializeStateObjectX),
         FN(43, device_GetAdapterLuid),
         FN(44, device_CreatePlacedResourceX),

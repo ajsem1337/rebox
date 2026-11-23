@@ -1728,6 +1728,22 @@ static void test_stream_pso(void *dev)
         IUnknown_Release((IUnknown *)rs);
 }
 
+/* Device slot 102: GetRaytracingAccelerationStructurePrebuildInfo (PC 63), forwarded: the sizes
+ * come back written (Unreal's ray tracing used them unset and crashed). */
+static void test_prebuild_info(void *dev)
+{
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE, 1,
+        D3D12_ELEMENTS_LAYOUT_ARRAY };
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info;
+    memset(&info, 0xcc, sizeof(info));
+    XSLOT(dev, 102, void, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *,
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *)(dev, &inputs, &info);
+    CHECK(info.ResultDataMaxSizeInBytes != 0xccccccccccccccccull && info.ScratchDataSizeInBytes != 0xccccccccccccccccull,
+          "GetRaytracingAccelerationStructurePrebuildInfo (device slot 102) answers (%llu, %llu bytes)",
+          (unsigned long long)info.ResultDataMaxSizeInBytes, (unsigned long long)info.ScratchDataSizeInBytes);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -4058,6 +4074,7 @@ static void test_xbox(void)
     test_console_command_signature(dev);
     test_state_object_placeholder(dev);
     test_stream_pso(dev);
+    test_prebuild_info(dev);
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);
