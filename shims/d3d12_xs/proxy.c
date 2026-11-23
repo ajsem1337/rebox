@@ -1973,10 +1973,39 @@ static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(struct proxy *p
 /* Barriers are forwarded and also feed PresentX's resource-state tracking:
  * graphics slot 26 / copy slot 15 (PC 26), and enhanced barriers at slot 146
  * (PC 80, ID3D12GraphicsCommandList7::Barrier). */
+/* Transition barriers with no resource, which vkd3d-proton reads through (a UE5 sample,
+ * Unreal 5, crashed in its ResourceBarrier reading address 4): left out. UAV and aliasing barriers
+ * may name no resource, as on the desktop. */
 static void STDMETHODCALLTYPE list_ResourceBarrier(struct proxy *p, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
 {
+    D3D12_RESOURCE_BARRIER local[32], *kept = NULL;
+    UINT n = 0, i;
+
+    if (!barriers)
+        return;
+    for (i = 0; i < count; i++)
+        if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && !barriers[i].Transition.pResource)
+            break;
+    if (i < count)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: ResourceBarrier: a transition with no resource (barrier %u of %u, states %#x -> %#x) "
+                         "left out", i, count, barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+        kept = count <= ARRAYSIZE(local) ? local : malloc(count * sizeof(*kept));
+        if (!kept)
+            return;
+        for (i = 0; i < count; i++)
+            if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barriers[i].Transition.pResource)
+                kept[n++] = barriers[i];
+        barriers = kept;
+        count = n;
+    }
     present_track_barriers(count, barriers);
-    ID3D12GraphicsCommandList_ResourceBarrier(INNER(p, ID3D12GraphicsCommandList), count, barriers);
+    if (count)
+        ID3D12GraphicsCommandList_ResourceBarrier(INNER(p, ID3D12GraphicsCommandList), count, barriers);
+    if (kept && kept != local)
+        free(kept);
 }
 
 static void STDMETHODCALLTYPE list_Barrier(struct proxy *p, UINT32 count, const D3D12_BARRIER_GROUP *groups)

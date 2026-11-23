@@ -4036,6 +4036,13 @@ static void test_xbox(void)
                         XSLOT(pipeline, 2, ULONG)(pipeline);
                     }
                 }
+                /* Barriers the desktop can't take (Unreal 5 passed a count with no array): left out. */
+                {
+                    D3D12_RESOURCE_BARRIER no_resource = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+                    no_resource.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                    XSLOT(list4, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list4, 1, NULL);
+                    XSLOT(list4, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list4, 1, &no_resource);
+                }
                 hr = XSLOT(list4, 9, HRESULT)(list4);
             }
             if (SUCCEEDED(hr))
@@ -4046,7 +4053,8 @@ static void test_xbox(void)
             for (i = 0; SUCCEEDED(hr) && i < 200 && ID3D12Fence_GetCompletedValue(fence4) != 8; i++)
                 Sleep(10);
             CHECK(SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence4) == 8,
-                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder pipeline's rays, executed (%#lx)", hr);
+                  "SDK 0x20004 command list: markers at 57/58, PC 62 at 109, a placeholder pipeline's rays, barriers with nothing to "
+                  "transition, executed (%#lx)", hr);
             if (list4) XSLOT(list4, 2, ULONG)(list4);
             if (alloc4) ID3D12CommandAllocator_Release(alloc4);
         }
