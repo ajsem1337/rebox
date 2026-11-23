@@ -88,6 +88,15 @@ if ! grep -qi "\"ConsoleMode\"=dword:$console_mode" "$WINEPREFIX/system.reg" 2>/
         /t REG_DWORD /d "0x$console_mode" /f >/dev/null 2>&1 || die "couldn't set ConsoleMode in $WINEPREFIX"
 fi
 
+# Controllers reach the title through Wine's SDL bus. SDL's database maps an Xbox One S controller
+# on Bluetooth (045e:02e0, version 0408) with the axis order of another layout; this kernel gives
+# X, Y (left stick), Z, RZ (right stick), GAS (right trigger), BRAKE (left trigger), so the right
+# stick's Y read the right trigger, at full deflection at rest (a GDK title's camera looked at the
+# sky). Corrected here; a SDL_GAMECONTROLLERCONFIG of the user's own comes after it.
+xbox_one_s_bt='050000005e040000e002000008040000,Xbox Wireless Controller (Bluetooth),a:b0,b:b1,back:b6,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b10,leftshoulder:b4,leftstick:b8,lefttrigger:a5,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b9,righttrigger:a4,rightx:a2,righty:a3,start:b7,x:b2,y:b3,platform:Linux,'
+export SDL_GAMECONTROLLERCONFIG="$xbox_one_s_bt${SDL_GAMECONTROLLERCONFIG:+
+$SDL_GAMECONTROLLERCONFIG}"
+
 # Console system DLLs that are pure computation, taken from the dump's own system partition
 # (EmbeddedXvd/Windows/System32, next to or inside the game directory, or REBOX_CONSOLE_SYSTEM)
 # rather than stubbed: xg_xs.dll, the console's texture-layout library (Unreal's D3D12 RHI needs
