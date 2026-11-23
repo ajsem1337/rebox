@@ -252,8 +252,13 @@ export REBOX_SHADER_CACHE="Z:${cache//\//\\}"
 # its default, next to the executable, is the shadow package directory, remade every run. Its
 # logs name every interface and method a title asks for that it doesn't implement.
 winpath() { local p; p=$(realpath -m "$1"); echo "Z:${p//\//\\}"; }
-mkdir -p "$WINEPREFIX/persistent-local-storage"
-export XGR_PLS_DIR=${XGR_PLS_DIR:-$(winpath "$WINEPREFIX/persistent-local-storage")\\}
+# On the console persistent local storage is a drive root, S:\ (xcl), and titles take the drive
+# from its path: a GDK title built Z:/Users/... from Z:\home\...\persistent-local-storage. So S: is
+# that directory, and T:, the console's temporary storage drive, another in the prefix.
+mkdir -p "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/temporary-storage"
+ln -sfn "$WINEPREFIX/persistent-local-storage" "$WINEPREFIX/dosdevices/s:"
+ln -sfn "$WINEPREFIX/temporary-storage" "$WINEPREFIX/dosdevices/t:"
+export XGR_PLS_DIR=${XGR_PLS_DIR:-S:\\}
 export XGR_LOG=${XGR_LOG:-$(winpath "$WINEPREFIX/xgameruntime.log")}
 export GTX_LOG=${GTX_LOG:-$(winpath "$WINEPREFIX/xgameruntime-tasks.log")}
 if [[ ${REBOX_LOG:-} == /* ]]; then
