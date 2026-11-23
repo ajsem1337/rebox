@@ -112,8 +112,14 @@ words (16 dwords), which the dispatch path will have to fill.
    (`s_setreg_imm32_b32` or `s_setreg_b32` to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size
    `s_nop`s before each compile. Only the scalar prologue is scanned (up to the first vector or memory instruction: a UE5 title's pixel shaders move M0 first), and the first time is logged.
 2. **Dispatch** (patch 0005, `d3d12_command_list_update_compute_pipeline`). User SGPRs are packed
-   from the root parameters as for SCSV shaders, except that descriptor tables point at the
-   shadow heaps' title addresses (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`).
+   from the root parameters, and descriptor tables point at the shadow heaps' title addresses
+   (recorded at `SetDescriptorHeaps` through `ReboxShadowHeap`). The layout is the console's
+   (patch 0007, measured on a UE5 sample's first compute program, which reads tables through
+   s4, s5 and s7 as 32-bit pointers and has its workgroup ids at s8): root parameters from s4, one
+   SGPR per descriptor table, two per root descriptor, one per 32-bit constant; s0-s3 are left 0.
+   The earlier guess, from s0 with two per table (a 64-bit pair whose high half the console's
+   shaders read as the next table's pointer: a load from address 0 and a lost device), stays
+   behind `REBOX_CONSOLE_COMPUTE_LAYOUT=pairs` for the smoke test's hand-written programs.
    vkd3d-proton calls `d3d12_xs`'s `ReboxConsoleCompile` with the blob, the SGPRs, the bound
    heaps and, for each AnyPS5 descriptor kind, the bindless set and binding that holds it (as
    `vkd3d_bindless_state_find_binding` numbers them).

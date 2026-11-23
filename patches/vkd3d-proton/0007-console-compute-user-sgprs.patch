@@ -1,0 +1,40 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ef6a130..e4c3be2 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8282,6 +8282,26 @@ static PFN_vkd3d_rebox_console_compile vkd3d_rebox_compile_fn(void)
+ 
+ /* Compiles the bound deferred console shader for this dispatch (d3d12_xs caches) and returns its
+  * pipeline; the push data goes to list->rebox.push. */
++/* A console compute shader's user SGPRs. Measured on a UE5 sample (Unreal 5): its first
++ * compute program reads tables through s4, s5 and s7, each a 32-bit pointer (s_mov_b32 hi, 0), its
++ * workgroup ids following at s8: root parameters start at s4, one SGPR per descriptor table, as
++ * the graphics layout does from s8. s0-s3 are left 0 (what the console puts there isn't known).
++ * REBOX_CONSOLE_COMPUTE_LAYOUT=pairs keeps the earlier guess (Leonida's, from s0, two per
++ * table), which the smoke test's hand-written programs use. */
++static unsigned int d3d12_command_list_rebox_compute_sgprs(struct d3d12_command_list *list, uint32_t *sgprs)
++{
++    uint32_t root[32];
++    unsigned int n;
++    char layout[16];
++
++    if (vkd3d_get_env_var("REBOX_CONSOLE_COMPUTE_LAYOUT", layout, sizeof(layout)) && !strcmp(layout, "pairs"))
++        return d3d12_command_list_rebox_sgprs(list, &list->compute_bindings, sgprs);
++    n = d3d12_command_list_rebox_sgprs_layout(list, &list->compute_bindings, root, true);
++    n = min(n, 28u);
++    memcpy(&sgprs[4], root, n * sizeof(uint32_t));
++    return n + 4;
++}
++
+ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_command_list *list)
+ {
+     PFN_vkd3d_rebox_console_compile compile = vkd3d_rebox_compile_fn();
+@@ -8297,7 +8317,7 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
+     memset(sgprs, 0, sizeof(sgprs));
+     in.shader = state->rebox_deferred;
+     in.shader_size = state->rebox_deferred_size;
+-    in.user_sgpr_count = d3d12_command_list_rebox_sgprs(list, &list->compute_bindings, sgprs);
++    in.user_sgpr_count = d3d12_command_list_rebox_compute_sgprs(list, sgprs);
+     in.user_sgprs = sgprs;
+     memcpy(in.heap_cpu, list->rebox.heap_cpu, sizeof(in.heap_cpu));
+     in.increment[0] = d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);

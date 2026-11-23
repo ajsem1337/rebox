@@ -45,6 +45,9 @@ install -m 644 "$REBOX_SHIMS_DIR"/xmem.dll "$REBOX_SHIMS_DIR"/d3d12_xs.dll "$REB
     "$REBOX_SHIMS_DIR"/amd_fidelityfx_loader_xbox.dll "$REBOX_SHIMS_DIR"/pixevt.dll \
     "$REBOX_SHIMS_DIR"/xcrdapi.dll "$REBOX_SHIMS_DIR"/gameinput.dll "$sys32"/
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,xaudio2_9,gameinput=n"
+# The hand-written console compute programs here read their table at s[0:1], the earlier layout
+# (vkd3d-proton patch 0007 defaults to the console's, measured on a UE5 sample).
+export REBOX_CONSOLE_COMPUTE_LAYOUT=pairs
 # AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
 if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
     install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/
