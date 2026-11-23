@@ -508,7 +508,16 @@ static UINT64 failed_stages[256];
 static LONG failed_stage_count;
 
 static volatile LONG graphics_calls;
-static volatile LONG64 graphics_ticks;
+static volatile LONG64 graphics_ticks, phase_ticks[4]; /* regions, AnyPS5, bindings, module */
+
+static void phase_end(LARGE_INTEGER *mark, UINT phase)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (mark->QuadPart)
+        InterlockedAdd64(&phase_ticks[phase], now.QuadPart - mark->QuadPart);
+    *mark = now;
+}
 
 static double qpc_frequency(void)
 {
@@ -550,7 +559,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
     BOOL graphics;
     UINT64 stage_id;
-    LARGE_INTEGER started = { 0 };
+    LARGE_INTEGER started = { 0 }, mark = { 0 };
 
     if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC
             || (h->version != 1 && h->version != 2)
@@ -569,10 +578,15 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
          * draw waits for them), and stages AnyPS5 refused. */
         LONG n = InterlockedIncrement(&graphics_calls);
         if (!(n & (n - 1)))
-            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average; %ld "
-                         "distinct stages refused so far", n, graphics_ticks * 1000.0 / qpc_frequency() / max(n - 1, 1),
-                         min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
+        {
+            double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
+            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average (memory "
+                         "regions %.2f, AnyPS5 %.2f, bindings %.2f, module %.2f); %ld distinct stages refused so far", n,
+                         graphics_ticks * ms, phase_ticks[0] * ms, phase_ticks[1] * ms, phase_ticks[2] * ms,
+                         phase_ticks[3] * ms, min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
+        }
         QueryPerformanceCounter(&started);
+        mark = started;
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
@@ -651,6 +665,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     /* One compile at a time: AnyPS5's caches are thread-safe, but this keeps the static index
      * table simple and compiles are rare once warm. */
     AcquireSRWLockExclusive(&compile_lock);
+    if (graphics)
+        phase_end(&mark, 0);
     if (graphics && h->stage == 0x1)
     {
         /* The console's fetch call (s_swappc_b64 s[4:5]) becomes Vulkan vertex attributes: input r
@@ -747,6 +763,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         goto done;
     }
 
+    if (graphics)
+        phase_end(&mark, 1);
     sa5.identity(result, key);
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
     if (graphics)
@@ -960,6 +978,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         }
     }
 
+    if (graphics)
+        phase_end(&mark, 2);
     if (!(module = find_module(key)))
     {
         if (sa5.finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error, sizeof(error)))
@@ -987,6 +1007,8 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                      req.code_dwords * 4u), module->count, remap_count, host_count);
     }
 
+    if (graphics)
+        phase_end(&mark, 3);
     memset(out, 0, sizeof(*out));
     out->spirv = module->words;
     out->spirv_words = module->count;
