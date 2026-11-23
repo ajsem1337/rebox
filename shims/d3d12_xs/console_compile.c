@@ -205,6 +205,23 @@ void console_resolve_late(void)
             {
                 if (shadow_slot_view(t->heap, index) == SHADOW_VIEW_UAV_TEXTURE)
                     shadow_reserve_srv_for_uav(t->heap, index, &index);
+                {
+                    static LONG shown;
+                    ID3D12Resource *r = console_texture_of(w);
+                    if (InterlockedIncrement(&shown) <= 8)
+                    {
+                        D3D12_RESOURCE_DESC rd = { 0 };
+                        UINT64 at = 0;
+                        UINT uploads = 0;
+                        BOOL title = r && title_texture_info(r, &at, &uploads);
+                        if (r)
+                            rd = ID3D12Resource_GetDesc(r);
+                        rebox_log("d3d12_xs: late T# %08x %08x %08x %08x: heap slot %u, texture %p %llux%u format %u "
+                                  "flags %#x, %s (uploaded %u times)", w[0], w[1], w[2], w[3], index, (void *)r,
+                                  (unsigned long long)rd.Width, rd.Height, rd.Format, (UINT)rd.Flags,
+                                  title ? "from title memory" : "GPU-made or API-filled", uploads);
+                    }
+                }
                 *t->slot = index;
                 resolved++;
                 done = TRUE;
