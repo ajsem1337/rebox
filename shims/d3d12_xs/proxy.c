@@ -579,11 +579,18 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
     UINT64 size;
     static LONG logged;
 
+    UINT64 title_address;
+    UINT uploads;
+
     if (va || !device_proxy)
         return va;
     ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)self)[10])(self, &desc);
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return 0;
+    /* A texture the title placed at its own address has that address, as on the console (a title
+     * clears a texture through the CPU pointer its address is; after xcl, ivall/xcl#168). */
+    if (title_texture_info(self, &title_address, &uploads) && title_address)
+        return title_address;
 
     AcquireSRWLockShared(&scratch_lock);
     for (sc = scratch_list; sc && sc->resource != self; sc = sc->next)

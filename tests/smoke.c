@@ -4124,6 +4124,9 @@ static void test_placed_texture(void *dev, void *queue)
         CHECK(texture_of && tex && texture_of(t) == tex, "a T# with a placed texture's address finds it (%p, %p)",
               texture_of ? texture_of(t) : NULL, (void *)tex);
     }
+    CHECK(tex && ID3D12Resource_GetGPUVirtualAddress(tex) == gpu,
+          "a placed texture's GPU VA is the address the title placed it at (%#llx, %#llx)",
+          tex ? (unsigned long long)ID3D12Resource_GetGPUVirtualAddress(tex) : 0, (unsigned long long)gpu);
     if (SUCCEEDED(hr))
         hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
                    D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
