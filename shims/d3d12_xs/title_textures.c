@@ -489,7 +489,9 @@ static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommand
         return NULL;
     }
     ID3D12Device_GetCopyableFootprints(device, &desc, 0, t->subresources, 0, fp, rows, NULL, &total);
-    bd.Width = total;
+    /* Slack past the last footprint: detiling writes whole tiles, padded rows included, so the
+     * last subresource's can run past its footprint's end (it wrote past the buffer and crashed). */
+    bd.Width = total + (256u << 10);
     if (FAILED(ID3D12Device_CreateCommittedResource(device, &upload, D3D12_HEAP_FLAG_NONE, &bd,
                                                     D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
                                                     (void **)&buffer))
