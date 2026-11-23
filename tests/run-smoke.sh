@@ -87,7 +87,7 @@ REBOX_SHADER_FALLBACK=0 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.
 # ...and succeed through the fallback shaders by default.
 echo "== fake.bin, no cache entry, fallback shaders"
 # This run also counts proxy slot calls (REBOX_SLOT_STATS).
-out=$(REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
+out=$(REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 REBOX_STACK_SAMPLE=1,3 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
 echo "$out"
 grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were not used"; exit 1; }
 grep -Eq "slot stats GraphicsCommandList:.* 12c?=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
@@ -117,4 +117,7 @@ echo "ok   ray tracing list slots are handled by d3d12_xs on both layouts"
 grep -Eq "first-chance access violation \(0xc0000005\) at smoke.exe\+0x" <<<"$out" \
     && grep -Eq "  reading 0x10\s*$" <<<"$out" && grep -q "reading 0x20ff00000040 (inside the GPU window" <<<"$out" \
     && grep -Eq "  #1  smoke.exe\+0x" <<<"$out" || { echo "FAIL fault report missing or incomplete"; exit 1; }
+grep -q "xmem: stack sample 1 " <<<"$out" && grep -A3 "xmem: stack sample 1 " <<<"$out" | grep -q "xmem: thread " \
+    || { echo "FAIL REBOX_STACK_SAMPLE logged no thread stacks"; exit 1; }
+echo "ok   REBOX_STACK_SAMPLE logs every thread's stack from a copy, without faulting"
 echo "ok   fault reports name module+RVA, the target, the GPU window and the stack"

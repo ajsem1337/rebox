@@ -189,6 +189,34 @@ void WINAPI ReboxHeartbeat(void)
 
 /* The stack of another thread of this process: its context while briefly
  * suspended, unwound live (a hung thread's stack doesn't move). */
+/* Another thread's frames from a copy of its stack: rip, then each stack value that is a return
+ * address, one just after a call instruction (E8 rel32, or FF /2 of 2, 3 or 6 bytes) in a loaded
+ * module. A scan, not an unwind: a stale return address can show up, but nothing can fault. */
+static void log_stack_scan(ULONG_PTR rip, const ULONG_PTR *stack, SIZE_T count, int frames)
+{
+    char where[MAX_PATH + 32];
+    int n = 0;
+
+    describe(rip, where, sizeof(where));
+    rebox_log("  #%-2d %s", n++, where);
+    for (SIZE_T i = 0; i < count && n < frames; i++)
+    {
+        ULONG_PTR v = stack[i];
+        HMODULE module;
+        const BYTE *b = (const BYTE *)v;
+        if (v < 0x10000 || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                                   | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (const WCHAR *)v, &module)
+                || IsBadReadPtr(b - 6, 6))
+            continue;
+        if (b[-5] != 0xe8 && !(b[-2] == 0xff && (b[-1] & 0x38) == 0x10) && !(b[-3] == 0xff && (b[-2] & 0x38) == 0x10)
+                && !(b[-6] == 0xff && (b[-5] & 0x38) == 0x10))
+            continue;
+        describe(v, where, sizeof(where));
+        rebox_log("  #%-2d %s", n++, where);
+    }
+}
+
 static void log_thread(DWORD tid)
 {
     typedef HRESULT (WINAPI *get_description_fn)(HANDLE, WCHAR **);
@@ -197,17 +225,48 @@ static void log_thread(DWORD tid)
                                FALSE, tid);
     CONTEXT ctx = { .ContextFlags = CONTEXT_FULL };
     WCHAR *name = NULL;
-    MEMORY_BASIC_INFORMATION mbi;
     BOOL ok;
+    /* The top 32 KiB of its stack, copied while it is suspended, between bounds read from its TEB
+     * before: while it is stopped, only GetThreadContext and a copy (it may hold a lock: the
+     * heap's, the loader's). */
+    ULONG_PTR *stack = HeapAlloc(GetProcessHeap(), 0, 4096 * sizeof(ULONG_PTR));
+    ULONG_PTR stack_base = 0, stack_limit = 0;
+    SIZE_T copied = 0;
 
     if (!thread)
+    {
+        HeapFree(GetProcessHeap(), 0, stack);
         return;
+    }
     if (!get_description)
         get_description = (get_description_fn)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "GetThreadDescription");
+    {
+        struct { LONG status; void *teb; ULONG_PTR pid, tid, affinity; LONG priority, base_priority; } info;
+        NTSTATUS (WINAPI *query)(HANDLE, int, void *, ULONG, ULONG *) =
+                (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+        HANDLE q = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        if (q && query && !query(q, 0 /* ThreadBasicInformation */, &info, sizeof(info), NULL) && info.teb
+                && !IsBadReadPtr(info.teb, sizeof(NT_TIB)))
+        {
+            stack_base = (ULONG_PTR)((NT_TIB *)info.teb)->StackBase;
+            stack_limit = (ULONG_PTR)((NT_TIB *)info.teb)->StackLimit;
+        }
+        if (q)
+            CloseHandle(q);
+    }
+
     ok = SuspendThread(thread) != (DWORD)-1;
     if (ok)
     {
         ok = GetThreadContext(thread, &ctx);
+        /* Copied while the thread can't change it, with nothing that takes a lock (the thread may
+         * hold one); the walk below reads only the copy. Walking the live stack with Wine's
+         * unwinder after resuming it faulted inside ntdll and ended the title (a stack sample). */
+        if (ok && stack && ctx.Rsp >= stack_limit && ctx.Rsp < stack_base)
+        {
+            copied = min(stack_base - ctx.Rsp, 4096 * sizeof(ULONG_PTR)) & ~(SIZE_T)7;
+            memcpy(stack, (void *)ctx.Rsp, copied);
+        }
         ResumeThread(thread);
     }
     if (get_description && FAILED(get_description(thread, &name)))
@@ -216,8 +275,9 @@ static void log_thread(DWORD tid)
                  name && *name ? "\"" : "");
     if (name)
         LocalFree(name);
-    if (ok && VirtualQuery((void *)ctx.Rsp, &mbi, sizeof(mbi)))
-        log_stack_frames(ctx, ctx.Rsp, (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize, 16);
+    if (ok)
+        log_stack_scan(ctx.Rip, stack, copied / 8, 20);
+    HeapFree(GetProcessHeap(), 0, stack);
     CloseHandle(thread);
 }
 
