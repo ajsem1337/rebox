@@ -806,6 +806,13 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
         return S_OK;
     }
     frame = ++s->frames; /* frames shown, as REBOX_DUMP_FRAMES_AT counts them */
+    /* A running count in the log: 1, 2, 5, 10, 20, 50, 100 ... */
+    for (UINT64 step = 1; step <= frame; step *= 10)
+        if (frame == step || frame == 2 * step || frame == 5 * step)
+        {
+            rebox_log("d3d12_xs: PresentX: %llu frames", (unsigned long long)frame);
+            break;
+        }
     if (planes > 1)
     {
         static LONG once;
