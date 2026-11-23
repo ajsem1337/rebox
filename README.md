@@ -8,6 +8,19 @@ recompiler, which turns the console's RDNA shaders into SPIR-V at dispatch time.
 work in progress: titles start and run their game code, but rendering is incomplete (see
 [Known gaps](#known-gaps-ordered-roughly-by-how-soon-theyll-bite)).
 
+Rebox targets the same titles as other Xbox-on-PC projects. It runs a GDK title to gameplay and
+an Unreal Engine 5 title to its title screen, and is bringing up an Unreal Engine 5 sample.
+
+### Why AnyPS5
+
+Rebox compiles the console's RDNA shaders straight to SPIR-V with AnyPS5, at a shader's first
+dispatch or draw, rather than lifting them to HLSL and compiling that with DXC. There is no DXC
+step: other projects report single shaders taking minutes in DXC, while AnyPS5 builds pipelines in
+milliseconds, and a shader keeps one module however its descriptors move. The cost is that AnyPS5
+has to model the hardware closely (user SGPRs, descriptor formats, wave size). Titles render
+frames through AnyPS5-compiled shaders today; frame rates haven't been compared with other projects
+yet.
+
 It is built from:
 
 - **WineGDK** for Wine itself. Its Gaming Runtime (`xgameruntime`) answers only five API families
