@@ -80,14 +80,94 @@ static BYTE *inflate_fssm(const BYTE *data, SIZE_T size, SIZE_T *out_size)
     return NULL;
 }
 
+/* The console driver's own container, FSPX, in a DXBC part ACCC: what AMD FidelityFX's console
+ * upscaler (FSR4) creates its compute passes from, with no DXIL (xcl, GPL-2.0-only, fdeacf0529).
+ * 'FSPX', version, entry count, size, then 16-byte entries (type, offset, size, 0) from +0x10,
+ * offsets from the start of FSPX. Type 0: the thread-group size as three u16 at +0x0C,
+ * COMPUTE_PGM_RSRC1 at +0x14 and RSRC2 at +0x18; type 6: the code behind a 0x24-byte header, up to
+ * its last s_endpgm (the driver pads with s_code_end). */
+#define FSPX_HEAD 0
+#define FSPX_CODE 6
+#define FSPX_CODE_HEADER 0x24
+#define S_ENDPGM 0xbf810000u
+
+static const BYTE *fspx_entry(const BYTE *fspx, SIZE_T size, UINT32 type, SIZE_T *entry_size)
+{
+    UINT32 count = size >= 0x10 ? min(u32(fspx + 8), 32u) : 0;
+
+    for (UINT32 e = 0; e < count && 0x10 + 16 * (SIZE_T)(e + 1) <= size; e++)
+    {
+        const BYTE *at = fspx + 0x10 + 16 * e;
+        SIZE_T offset = u32(at + 4), bytes = u32(at + 8);
+
+        if (u32(at) == type && offset <= size && bytes <= size - offset)
+        {
+            *entry_size = bytes;
+            return fspx + offset;
+        }
+    }
+    return NULL;
+}
+
+static void *fspx_compute(const BYTE *data, SIZE_T size, SIZE_T *blob_size)
+{
+    const BYTE *fspx = NULL, *head, *code;
+    SIZE_T fspx_size = 0, head_size, code_size, dwords;
+    struct rebox_deferred_shader *h;
+    UINT32 parts, threads[3];
+
+    if (size < 0x20 || memcmp(data, "DXBC", 4))
+        return NULL;
+    parts = u32(data + 0x1c);
+    for (UINT32 i = 0; i < parts && 0x20 + 4 * (SIZE_T)(i + 1) <= size && !fspx; i++)
+    {
+        SIZE_T at = u32(data + 0x20 + 4 * i);
+
+        if (at <= size - 8 && !memcmp(data + at, "ACCC", 4) && u32(data + at + 4) <= size - at - 8
+                && u32(data + at + 4) >= 4 && !memcmp(data + at + 8, "FSPX", 4))
+        {
+            fspx = data + at + 8;
+            fspx_size = u32(data + at + 4);
+        }
+    }
+    if (!fspx || !(head = fspx_entry(fspx, fspx_size, FSPX_HEAD, &head_size)) || head_size < 0x1c
+            || !(code = fspx_entry(fspx, fspx_size, FSPX_CODE, &code_size)) || code_size <= FSPX_CODE_HEADER)
+        return NULL;
+    for (int i = 0; i < 3; i++)
+        threads[i] = head[0x0c + 2 * i] | head[0x0d + 2 * i] << 8;
+    if (!threads[0] || !threads[1] || !threads[2] || threads[0] * threads[1] * threads[2] > 1024)
+        return NULL;
+    code += FSPX_CODE_HEADER;
+    for (dwords = (code_size - FSPX_CODE_HEADER) / 4; dwords && u32(code + 4 * (dwords - 1)) != S_ENDPGM; dwords--)
+        ;
+    if (!dwords || !(h = calloc(1, sizeof(*h) + dwords * 4)))
+        return NULL;
+    h->magic = REBOX_DEFERRED_MAGIC;
+    h->version = 1;
+    h->size = (UINT32)(sizeof(*h) + dwords * 4);
+    h->stage = 0x20; /* VK_SHADER_STAGE_COMPUTE_BIT */
+    h->wave_size = 0; /* inferred from the code (console_compile.c) */
+    memcpy(h->workgroup_size, threads, sizeof(threads));
+    h->rsrc1 = u32(head + 0x14);
+    h->rsrc2 = u32(head + 0x18);
+    h->code_offset = sizeof(*h);
+    h->code_dwords = (UINT32)dwords;
+    h->code_address = 0x10000000000ull;
+    memcpy(h + 1, code, dwords * 4);
+    *blob_size = h->size;
+    return h;
+}
+
 void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size)
 {
     struct rebox_deferred_shader *h;
     SIZE_T fssm_size, code_offset, code_bytes;
-    BYTE *fssm = inflate_fssm(container, size, &fssm_size);
+    BYTE *fssm;
     BOOL short_layout;
 
-    if (!fssm)
+    if ((h = fspx_compute(container, size, blob_size)))
+        return h;
+    if (!(fssm = inflate_fssm(container, size, &fssm_size)))
         return NULL;
     code_offset = u32(fssm + FSSM_CODE_POINTER) + 0x28;
     short_layout = code_offset == FSSM_SHORT_CODE;

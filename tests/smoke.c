@@ -2739,6 +2739,42 @@ static const UINT32 rdna_uav_write[] = {
  * stream (here one stored deflate block) of FSSM, then a NOBC stub. The FSSM header gives the code
  * offset (u32 at 0xC0, plus 0x28), float mode (0x104), RSRC2 (0x138) and thread-group size (0x13C).
  * Returns the container's size; free *out. */
+/* The console driver's own container (FSPX in a DXBC part ACCC), as FidelityFX's console upscaler
+ * creates its passes from: a head entry (thread-group size, RSRC1, RSRC2) and the code behind a
+ * 0x24-byte header, padded after s_endpgm with s_code_end as the driver does. */
+static SIZE_T make_fspx_container(const UINT32 *code, UINT dwords, UINT32 rsrc2, BYTE **out)
+{
+    enum { PAD = 4 };
+    SIZE_T code_entry = 0x24 + (dwords + PAD) * 4, fspx_size = 0x30 + 0x1c + code_entry;
+    SIZE_T total = 0x24 + 8 + ((fspx_size + 3) & ~(SIZE_T)3);
+    BYTE *c = calloc(1, total), *f = c + 0x24 + 8;
+    UINT32 *e = (UINT32 *)(f + 0x10);
+
+    memcpy(c, "DXBC", 4);
+    *(UINT32 *)(c + 0x14) = 1;
+    *(UINT32 *)(c + 0x18) = (UINT32)total;
+    *(UINT32 *)(c + 0x1c) = 1;
+    *(UINT32 *)(c + 0x20) = 0x24;
+    memcpy(c + 0x24, "ACCC", 4);
+    *(UINT32 *)(c + 0x28) = (UINT32)fspx_size;
+    memcpy(f, "FSPX", 4);
+    *(UINT32 *)(f + 4) = 1;
+    *(UINT32 *)(f + 8) = 2;
+    *(UINT32 *)(f + 12) = (UINT32)fspx_size;
+    e[0] = 0; e[1] = 0x30; e[2] = 0x1c;                     /* head */
+    e[4] = 6; e[5] = 0x30 + 0x1c; e[6] = (UINT32)code_entry; /* code */
+    *(UINT16 *)(f + 0x30 + 0x0c) = 1;
+    *(UINT16 *)(f + 0x30 + 0x0e) = 1;
+    *(UINT16 *)(f + 0x30 + 0x10) = 1;
+    *(UINT32 *)(f + 0x30 + 0x14) = 0x40000000u | 1u << 21 | 0xc0u << 12;
+    *(UINT32 *)(f + 0x30 + 0x18) = rsrc2;
+    memcpy(f + 0x4c + 0x24, code, dwords * 4);
+    for (int i = 0; i < PAD; i++)
+        ((UINT32 *)(f + 0x4c + 0x24))[dwords + i] = 0xbf9f0000; /* s_code_end */
+    *out = c;
+    return total;
+}
+
 static SIZE_T make_console_container(const UINT32 *code, UINT dwords, UINT32 rsrc2, BYTE **out)
 {
     SIZE_T fssm_size = 0x168 + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part = 4 + 0x60 + zsize + 4 + 0x14;
@@ -2972,6 +3008,38 @@ static void test_console_dispatch(void *dev, void *queue)
                     Sleep(10);
                 CHECK(out[0] == 0x1234abcd, "the console container's FSSM code ran through AnyPS5 at dispatch "
                       "(wrote %#x)", out[0]);
+            }
+            if (fpso) XSLOT(fpso, 2, ULONG)(fpso);
+            free(container);
+        }
+
+        /* The same code in an FSPX container (FidelityFX's console upscaler). */
+        {
+            void *fpso = NULL;
+            BYTE *container = NULL;
+            SIZE_T csize = make_fspx_container(rdna_uav_write, ARRAYSIZE(rdna_uav_write), 2 << 1, &container);
+
+            out[0] = 0;
+            cd.pRootSignature = rs;
+            cd.CS = (D3D12_SHADER_BYTECODE){ container, csize };
+            hr = XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                    &IID_ID3D12PipelineState, &fpso);
+            CHECK(SUCCEEDED(hr), "a compute PSO from a console FSPX container (%#lx)", hr);
+            if (SUCCEEDED(hr) && SUCCEEDED(ID3D12CommandAllocator_Reset(alloc))
+                    && SUCCEEDED(XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL)))
+            {
+                XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+                XSLOT(list, 33, void, void *)(list, rs);
+                XSLOT(list, 25, void, void *)(list, fpso);
+                XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+                XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+                XSLOT(list, 9, HRESULT)(list);
+                XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+                XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 4);
+                for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 4; i++)
+                    Sleep(10);
+                CHECK(out[0] == 0x1234abcd, "the FSPX container's code ran through AnyPS5 at dispatch (wrote %#x)",
+                      out[0]);
             }
             if (fpso) XSLOT(fpso, 2, ULONG)(fpso);
             free(container);
