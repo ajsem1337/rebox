@@ -97,6 +97,10 @@ static struct proxy_class *const classes[] = { &device_class, &queue_class, &que
                                                &copy_list_class,
                                                &heap_class, &allocator_class, &fence_class };
 
+/* The console's primitive topology type for rectangle lists (TuxBox): drawn as triangle lists
+ * here (see the rectangle lists' topology), so the pipeline is a triangle one. */
+#define CONSOLE_TOPOLOGY_TYPE_RECTANGLE 0x13
+
 /* D3D12XBOX_CREATE_DEVICE_PARAMETERS.Version the title passed (0 if none). */
 static UINT32 sdk_version;
 
@@ -1611,7 +1615,16 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(struct proxy *p, 
 static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(struct proxy *p,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
 {
-    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(INNER(p, ID3D12Device), desc, riid, out);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC triangles;
+    HRESULT hr;
+
+    if (desc && desc->PrimitiveTopologyType == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
+    {
+        triangles = *desc;
+        triangles.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc = &triangles;
+    }
+    hr = ID3D12Device_CreateGraphicsPipelineState(INNER(p, ID3D12Device), desc, riid, out);
     if (SUCCEEDED(hr) && out)
     {
         patch_child(*out);
@@ -1666,22 +1679,27 @@ static void stream_payload(UINT type, SIZE_T *size, SIZE_T *align)
 
 /* The console numbers the mesh pipeline's stages one lower than the desktop: 23 the amplification
  * shader, 24 the mesh shader (a UE5 sample's Nanite streams: 23 a null bytecode, 24 the mesh
- * shader, a pixel shader, no 25). A stream with a 23 is so numbered; its 23 and 24 become the
- * desktop's 24 and 25. */
+ * shader, a pixel shader, no 25; the target title's: a 24 and a pixel shader, no 23 or 25). A
+ * stream with a 23, or a 24 without a 25 (on the desktop an amplification shader with no mesh
+ * shader, which it refuses), is so numbered; its 23 and 24 become the desktop's 24 and 25. */
 static BOOL console_mesh_numbering(const BYTE *base, const BYTE *end)
 {
+    BOOL has24 = FALSE, has25 = FALSE;
+
     for (const BYTE *s = base; s + sizeof(UINT) <= end;)
     {
         UINT type = *(const UINT *)s;
         SIZE_T size, align;
         if (type == 23)
             return TRUE;
+        has24 |= type == 24;
+        has25 |= type == 25;
         stream_payload(type, &size, &align);
         if (!size || type == 26)
-            return FALSE; /* past here the walk can't be trusted, and 23 comes before the shaders */
+            break; /* past here the walk can't be trusted; the shaders come before */
         s += (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
     }
-    return FALSE;
+    return has24 && !has25;
 }
 
 /* The stream without what the desktop can't take: type 26 that isn't a desktop DEPTH_STENCIL2 (The
@@ -1727,7 +1745,7 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
     /* Pass 0 finds whether anything is dropped; pass 1 copies the rest. */
     for (int pass = 0; pass < 2; pass++)
     {
-        BOOL depth_stencil = FALSE, dropped = FALSE;
+        BOOL depth_stencil = FALSE, dropped = FALSE, rectangles = FALSE;
         for (const BYTE *s = base; s + sizeof(UINT) <= end;)
         {
             UINT type = *(const UINT *)s;
@@ -1745,6 +1763,9 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
                     || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
                 depth_stencil = TRUE;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && s + 2 * sizeof(UINT) <= end
+                    && ((const UINT *)s)[1] == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
+                rectangles = TRUE;
             next = (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
             if (next > (SIZE_T)(end - s))
                 next = end - s;
@@ -1764,16 +1785,34 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
                 memcpy(*copy + kept, s, next);
                 if (renumber && (type == 23 || type == 24))
                     *(UINT *)(*copy + kept) = type + 1;
+                if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && next >= 2 * sizeof(UINT)
+                        && ((UINT *)(*copy + kept))[1] == CONSOLE_TOPOLOGY_TYPE_RECTANGLE)
+                    ((UINT *)(*copy + kept))[1] = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
                 kept += next;
             }
             s += next;
         }
-        if (pass == 0 && ((!dropped && !renumber) || !(*copy = malloc(desc->SizeInBytes))))
+        if (pass == 0 && ((!dropped && !renumber && !rectangles) || !(*copy = malloc(desc->SizeInBytes))))
             return desc;
     }
     storage->SizeInBytes = kept;
     storage->pPipelineStateSubobjectStream = *copy;
     return storage;
+}
+
+/* For tests: the stream as the desktop gets it, copied to out (up to max bytes). Returns its size. */
+SIZE_T WINAPI ReboxDesktopStream(const void *stream, SIZE_T size, void *out, SIZE_T max)
+{
+    D3D12_PIPELINE_STATE_STREAM_DESC desc = { size, (void *)stream }, storage;
+    const D3D12_PIPELINE_STATE_STREAM_DESC *result;
+    BYTE *copy = NULL;
+    SIZE_T n;
+
+    result = desktop_stream(&desc, &storage, &copy);
+    n = result->SizeInBytes;
+    memcpy(out, result->pPipelineStateSubobjectStream, min(n, max));
+    free(copy);
+    return n;
 }
 
 /* For tests: the subobject types of a stream as the desktop gets it. Returns how many. */

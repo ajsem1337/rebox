@@ -2017,8 +2017,8 @@ static void test_depth_uav_texture(void *dev)
         IUnknown_Release((IUnknown *)resource);
 }
 
-/* The console numbers mesh stages one lower (23 AS, 24 MS) and has a 26 of its own (The Matrix
- * Awakens' Nanite streams): the desktop gets 24 and 25, and no 26. */
+/* The console numbers mesh stages one lower (23 AS, 24 MS) and has a 26 of its own (a UE5
+ * sample's Nanite streams): the desktop gets 24 and 25, and no 26. */
 static void test_console_mesh_stream(void)
 {
     UINT (WINAPI *types_of)(const void *, SIZE_T, UINT *, UINT) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"),
@@ -2039,6 +2039,26 @@ static void test_console_mesh_stream(void)
     CHECK(n == 4 && types[0] == 0 && types[1] == 24 && types[2] == 25 && types[3] == 2,
           "a console mesh stream reaches the desktop as AS 24, MS 25, without its 26 (%u types: %u %u %u %u)", n, types[0],
           types[1], types[2], types[3]);
+    /* The target title's: a 24 (its mesh shader) and a pixel shader, no 23; and a pipeline of
+     * rectangles (topology type 0x13), which becomes a triangle one. */
+    {
+        SIZE_T (WINAPI *desktop)(const void *, SIZE_T, void *, SIZE_T) = (void *)GetProcAddress(
+                GetModuleHandleA("d3d12_xs.dll"), "ReboxDesktopStream");
+        struct
+        {
+            struct { UINT type; void *rs; } __attribute__((aligned(8))) root;
+            struct { UINT type; D3D12_SHADER_BYTECODE bc; } __attribute__((aligned(8))) ms, ps;
+            struct { UINT type; UINT value; } __attribute__((aligned(8))) topology;
+        } mesh = { { 0, NULL }, { 24, { ms_bytes, sizeof(ms_bytes) } }, { 2, { ps_bytes, sizeof(ps_bytes) } }, { 14, 0x13 } },
+          out = { { 0 } };
+        n = types_of(&mesh, sizeof(mesh), types, ARRAYSIZE(types));
+        CHECK(n == 4 && types[1] == 25 && types[2] == 2,
+              "a console mesh stream without a 23 reaches the desktop with its 24 as MS 25 (%u types: %u %u %u)", n,
+              types[0], types[1], types[2]);
+        CHECK(desktop && desktop(&mesh, sizeof(mesh), &out, sizeof(out)) == sizeof(mesh) && out.topology.type == 14
+              && out.topology.value == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+              "a stream's rectangle topology type 0x13 reaches the desktop as TRIANGLE (%u)", out.topology.value);
+    }
 }
 
 static void test_xbox_root_flags(void *dev)

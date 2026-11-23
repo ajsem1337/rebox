@@ -65,3 +65,4 @@ EXPORTS
     IID_IGraphicsUnknown DATA
     WKPDID_D3DDebugObjectNameW DATA
     ReboxDesktopStreamTypes
+    ReboxDesktopStream
