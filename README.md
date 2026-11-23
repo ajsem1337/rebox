@@ -60,7 +60,8 @@ nix develop -c tests/run-rehearsal.sh ../xsx    # the whole launch with a stand-
 checkout, takes its environment from SETTINGS (default `~/code/run-loop.env`, sourced before
 every run), stops the title once its output shows a fatal error (or after `RUN_TIMEOUT`), and keeps
 a timestamped log in `RUNS_DIR` (`latest.log`, and `status` with how each run ended). A new run
-starts on a new commit or a changed settings file; touching `RUNS_DIR/again` reruns, and
+starts on a new commit or a changed settings file; touching `RUNS_DIR/again` reruns,
+`RUNS_DIR/next` ends the current run at once (closing the window may not end a console title), and
 `RUNS_DIR/stop` ends the loop. With `REBOX_HANG_DUMP` set, a hang leaves every thread's stack
 and the fences' state in the log.
 
