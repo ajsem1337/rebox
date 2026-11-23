@@ -1791,6 +1791,30 @@ static void test_depth_uav_texture(void *dev)
         IUnknown_Release((IUnknown *)resource);
 }
 
+/* The console numbers mesh stages one lower (23 AS, 24 MS) and has a 26 of its own (The Matrix
+ * Awakens' Nanite streams): the desktop gets 24 and 25, and no 26. */
+static void test_console_mesh_stream(void)
+{
+    UINT (WINAPI *types_of)(const void *, SIZE_T, UINT *, UINT) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"),
+            "ReboxDesktopStreamTypes");
+    static const char ms_bytes[] = "MS", ps_bytes[] = "PS";
+    struct
+    {
+        struct { UINT type; void *rs; } __attribute__((aligned(8))) root;
+        struct { UINT type; D3D12_SHADER_BYTECODE bc; } __attribute__((aligned(8))) as, ms, ps;
+        struct { UINT type; UINT pad; UINT words[4]; UINT64 value; } __attribute__((aligned(8))) console;
+    } stream = { { 0, NULL }, { 23, { NULL, 0 } }, { 24, { ms_bytes, sizeof(ms_bytes) } }, { 2, { ps_bytes, sizeof(ps_bytes) } },
+                 { 26, 0, { 0, 0, 0, 0xffff }, 1 } };
+    UINT types[8] = { 0 }, n;
+
+    CHECK(types_of != NULL, "d3d12_xs exports ReboxDesktopStreamTypes");
+    if (!types_of) return;
+    n = types_of(&stream, sizeof(stream), types, ARRAYSIZE(types));
+    CHECK(n == 4 && types[0] == 0 && types[1] == 24 && types[2] == 25 && types[3] == 2,
+          "a console mesh stream reaches the desktop as AS 24, MS 25, without its 26 (%u types: %u %u %u %u)", n, types[0],
+          types[1], types[2], types[3]);
+}
+
 static void test_xbox_root_flags(void *dev)
 {
     HMODULE m = GetModuleHandleA("d3d12_xs.dll");
@@ -4124,6 +4148,7 @@ static void test_xbox(void)
     test_prebuild_info(dev);
     test_title_heap_properties(dev);
     test_depth_uav_texture(dev);
+    test_console_mesh_stream();
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue);
     test_placed_texture_array(dev, queue);

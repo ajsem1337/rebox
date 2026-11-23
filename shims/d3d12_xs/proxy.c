@@ -1287,12 +1287,33 @@ static void stream_payload(UINT type, SIZE_T *size, SIZE_T *align)
         [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS] = { 4, 4 },
         [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1] = { 56, 4 },
         [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING] = { 24, 8 },
+        [23] = { 16, 8 },                          /* the console's AS (see desktop_stream) */
         [24] = { 16, 8 }, [25] = { 16, 8 },        /* AS, MS */
         [26] = { 68, 4 },                          /* DEPTH_STENCIL2 */
         [27] = { 44, 4 }, [28] = { 40, 4 },        /* RASTERIZER1, RASTERIZER2 */
     };
     *size = type < ARRAYSIZE(payloads) ? payloads[type].size : 0;
     *align = type < ARRAYSIZE(payloads) ? payloads[type].align : 0;
+}
+
+/* The console numbers the mesh pipeline's stages one lower than the desktop: 23 the amplification
+ * shader, 24 the mesh shader (a UE5 sample's Nanite streams: 23 a null bytecode, 24 the mesh
+ * shader, a pixel shader, no 25). A stream with a 23 is so numbered; its 23 and 24 become the
+ * desktop's 24 and 25. */
+static BOOL console_mesh_numbering(const BYTE *base, const BYTE *end)
+{
+    for (const BYTE *s = base; s + sizeof(UINT) <= end;)
+    {
+        UINT type = *(const UINT *)s;
+        SIZE_T size, align;
+        if (type == 23)
+            return TRUE;
+        stream_payload(type, &size, &align);
+        if (!size || type == 26)
+            return FALSE; /* past here the walk can't be trusted, and 23 comes before the shaders */
+        s += (((sizeof(UINT) + align - 1) & ~(align - 1)) + size + 7) & ~(SIZE_T)7;
+    }
+    return FALSE;
 }
 
 /* The stream without what the desktop can't take: type 26 that isn't a desktop DEPTH_STENCIL2 (The
@@ -1303,6 +1324,7 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
         D3D12_PIPELINE_STATE_STREAM_DESC *storage, BYTE **copy)
 {
     const BYTE *base = desc->pPipelineStateSubobjectStream, *end = base + desc->SizeInBytes;
+    BOOL renumber = console_mesh_numbering(base, end);
     SIZE_T kept = 0;
 
     *copy = NULL;
@@ -1372,16 +1394,41 @@ static const D3D12_PIPELINE_STATE_STREAM_DESC *desktop_stream(const D3D12_PIPELI
             else if (pass == 1)
             {
                 memcpy(*copy + kept, s, next);
+                if (renumber && (type == 23 || type == 24))
+                    *(UINT *)(*copy + kept) = type + 1;
                 kept += next;
             }
             s += next;
         }
-        if (pass == 0 && (!dropped || !(*copy = malloc(desc->SizeInBytes))))
+        if (pass == 0 && ((!dropped && !renumber) || !(*copy = malloc(desc->SizeInBytes))))
             return desc;
     }
     storage->SizeInBytes = kept;
     storage->pPipelineStateSubobjectStream = *copy;
     return storage;
+}
+
+/* For tests: the subobject types of a stream as the desktop gets it. Returns how many. */
+UINT WINAPI ReboxDesktopStreamTypes(const void *stream, SIZE_T size, UINT *types, UINT max)
+{
+    D3D12_PIPELINE_STATE_STREAM_DESC desc = { size, (void *)stream }, storage;
+    const D3D12_PIPELINE_STATE_STREAM_DESC *out;
+    BYTE *copy = NULL;
+    UINT n = 0;
+
+    out = desktop_stream(&desc, &storage, &copy);
+    for (const BYTE *s = out->pPipelineStateSubobjectStream, *end = s + out->SizeInBytes; s + sizeof(UINT) <= end && n < max;)
+    {
+        UINT type = *(const UINT *)s;
+        SIZE_T payload, align;
+        types[n++] = type;
+        stream_payload(type, &payload, &align);
+        if (!payload)
+            break;
+        s += (((sizeof(UINT) + align - 1) & ~(align - 1)) + payload + 7) & ~(SIZE_T)7;
+    }
+    free(copy);
+    return n;
 }
 
 /* Slot 86: ID3D12Device2::CreatePipelineState (PC 47), a pipeline from a stream of subobjects, as
