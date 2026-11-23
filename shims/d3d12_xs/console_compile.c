@@ -852,6 +852,22 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
                 table[e * 4] = (UINT32)base;
                 table[e * 4 + 1] = (UINT32)(base >> 32);
                 table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
+                if (graphics)
+                {
+                    /* The first graphics stages' buffers and their first values (where guest
+                     * memory has them): do vertex shaders get real transforms, or zeros? */
+                    static LONG shown;
+                    const float *f = NULL;
+                    for (UINT r = 0; r < n && !f; r++)
+                        if (base >= regions[r].address && base + 32 <= regions[r].address + regions[r].size)
+                            f = (const float *)((const BYTE *)regions[r].data + (base - regions[r].address));
+                    if (InterlockedIncrement(&shown) <= 48)
+                        rebox_log("d3d12_xs: console %s shader %016llx buffer %u.%u: base %#llx, stride %u, "
+                                     "%u records%s %g %g %g %g %g %g %g %g", h->stage == 0x10 ? "pixel" : "vertex",
+                                     (unsigned long long)stage_id, i, e, (unsigned long long)base, stride, w[2],
+                                     f ? ";" : " (not in guest memory)", f ? f[0] : 0, f ? f[1] : 0, f ? f[2] : 0,
+                                     f ? f[3] : 0, f ? f[4] : 0, f ? f[5] : 0, f ? f[6] : 0, f ? f[7] : 0);
+                }
             }
             va = host_buffer(table, (b.count ? b.count : 1) * 16);
             free(table);
@@ -1077,6 +1093,18 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         out->vertex_input_count = min(sa5.vertex_input_count(result), 32u);
         for (UINT32 i = 0; i < out->vertex_input_count; i++)
             sa5.vertex_input(result, i, &out->vertex_inputs[i][0], &out->vertex_inputs[i][1], &out->vertex_inputs[i][2]);
+        {
+            static LONG shown;
+            char line[256];
+            int at = 0;
+            for (UINT32 i = 0; i < out->vertex_input_count && at < 200; i++)
+                at += snprintf(line + at, sizeof(line) - at, " %u:%u/%u", out->vertex_inputs[i][0],
+                               out->vertex_inputs[i][1], out->vertex_inputs[i][2]);
+            line[at] = 0;
+            if (InterlockedIncrement(&shown) <= 12)
+                rebox_log("d3d12_xs: console vertex shader %016llx: %u inputs (location:components/fetch)%s",
+                             (unsigned long long)stage_id, out->vertex_input_count, line);
+        }
     }
     hr = S_OK;
     {
