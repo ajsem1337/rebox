@@ -687,6 +687,38 @@ static void test_texture_va_upload(void *dev, void *queue)
         ID3D12Resource_Unmap(readback, 0, NULL);
     }
 
+    /* One texel changed later, between the points a sampled fingerprint reads (Unreal's font
+     * atlas gains glyphs so): the next submission uploads it. Wherever the tiling puts it. */
+    texels[1000] = 0xff0000ff;
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, &barrier);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    XSLOT(list, 26, void, UINT, const D3D12_RESOURCE_BARRIER *)(list, 1, &barrier);
+    XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+          const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
+    for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
+        Sleep(10);
+    if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, &mapped)))
+    {
+        UINT changed = 0, other = 0;
+        for (UINT i = 0; i < 256 * 256; i++)
+        {
+            UINT32 v = ((UINT32 *)mapped)[i];
+            changed += v == 0xff0000ff;
+            other += v != 0xff0000ff && v != 0xff20c040;
+        }
+        CHECK(changed == 1 && !other, "a one-texel edit through the GPU VA reaches the texture (%u changed, %u other)",
+              changed, other);
+        ID3D12Resource_Unmap(readback, 0, NULL);
+    }
+
 done:
     if (fence) ID3D12Fence_Release(fence);
     if (list) XSLOT(list, 2, ULONG)(list);

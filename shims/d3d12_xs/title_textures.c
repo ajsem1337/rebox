@@ -10,8 +10,10 @@
  * texture starts dirty, for data written before it was created. Writes nothing reports (the CPU,
  * or GPU copies to the address) are caught by sampling: each upload keeps a fingerprint of a few
  * bytes spread over the texture's memory, and before each submission a slice of the textures
- * (WATCH_BUDGET, round robin) is fingerprinted again; a change makes it dirty. That sees a
- * texture rewritten (a streaming slot refilled), not a small edit between the samples.
+ * (WATCH_BUDGET, round robin) is fingerprinted again; a change makes it dirty. Textures up to
+ * FULL_HASH_MAX are hashed whole, within FULL_HASH_BUDGET bytes a submission, so a small edit is
+ * seen too (Unreal's font atlas gains glyphs as text is first drawn); larger ones are sampled,
+ * which sees a texture rewritten (a streaming slot refilled), not a small edit between samples.
  * REBOX_TEXTURE_WATCH=0 turns the sampling off.
  *
  * The swizzle mode for a console layout isn't known yet (docs/d3d12x.md). REBOX_TEXTURE_SWIZZLE
@@ -57,13 +59,34 @@ static UINT watch_cursor;
 static UINT submissions;
 
 #define WATCH_SAMPLES 32
-#define WATCH_BUDGET 512 /* textures fingerprinted per submission */
+#define WATCH_BUDGET 512                   /* textures fingerprinted per submission */
+#define FULL_HASH_MAX (4u << 20)           /* textures this size or smaller are hashed whole */
+#define FULL_HASH_BUDGET (8u << 20)        /* bytes hashed whole per submission */
 
-/* FNV-1a over 8 bytes at each of WATCH_SAMPLES points spread over the texture, the first and
- * last included. */
+static BOOL full_hash(const struct title_texture *t)
+{
+    return t->size <= FULL_HASH_MAX;
+}
+
+/* Small textures: a multiply-xor hash over every 8 bytes. Others: FNV-1a over 8 bytes at each of
+ * WATCH_SAMPLES points spread over the texture, the first and last included. */
 static UINT64 fingerprint(const struct title_texture *t)
 {
     UINT64 h = 0xcbf29ce484222325ull, step = t->size > 8 ? (t->size - 8) / (WATCH_SAMPLES - 1) : 0;
+
+    if (full_hash(t))
+    {
+        UINT64 i, v;
+        for (i = 0; i + 8 <= t->size; i += 8)
+        {
+            memcpy(&v, t->cpu + i, 8);
+            h = (h ^ v) * 0x9e3779b97f4a7c15ull;
+            h ^= h >> 29;
+        }
+        for (; i < t->size; i++)
+            h = (h ^ t->cpu[i]) * 0x100000001b3ull;
+        return h;
+    }
 
     for (UINT i = 0; i < WATCH_SAMPLES; i++)
     {
@@ -128,16 +151,18 @@ static void watch(void)
 {
     struct title_texture *t = textures;
     UINT skipped = 0, checked = 0, changed = 0;
+    UINT64 hashed = 0;
     BOOL sample = watch_enabled();
 
     for (; t && skipped < watch_cursor; t = t->next)
         skipped++;
     if (!t)
         t = textures, watch_cursor = 0;
-    for (; t && checked < WATCH_BUDGET; t = t->next, checked++)
+    for (; t && checked < WATCH_BUDGET && hashed < FULL_HASH_BUDGET; t = t->next, checked++)
         if (t->unreadable)
             recheck(t);
-        else if (sample && !t->dirty && still_readable(t) && fingerprint(t) != t->fingerprint)
+        else if (sample && !t->dirty && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, TRUE)
+                 && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
             InterlockedIncrement(&dirty_count);
