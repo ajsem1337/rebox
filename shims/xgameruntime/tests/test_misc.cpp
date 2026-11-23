@@ -294,6 +294,27 @@ static void CheckCompletionWithoutCallback() {
   g_tq.Close(q);
 }
 
+// Terminate, then dispatch the completion port without a timeout until the queue is done (Unreal's
+// way of closing a queue): the dispatch returns once the port is empty.
+static void CheckDispatchEndsOnTermination() {
+  void* q = nullptr;
+  Check(g_tq.Create(kThreadPool, kManual, &q) == S_OK && q, "XTaskQueueCreate (thread pool work, manual completion)");
+  std::atomic<int> result{-1};
+  std::thread dispatcher([&] { result = g_tq.Dispatch(q, kCompletion, INFINITE) ? 1 : 0; });
+  Sleep(200);
+  Check(result == -1, "an untimed XTaskQueueDispatch waits while the queue is open");
+  g_tq.Terminate(q, false);
+  for (int i = 0; i < 200 && result == -1; i++) Sleep(10);
+  Check(result == 0, "XTaskQueueTerminate ends an untimed XTaskQueueDispatch with nothing to run");
+  if (result == -1) {
+    dispatcher.detach();
+    return;
+  }
+  dispatcher.join();
+  Check(!g_tq.Dispatch(q, kCompletion, INFINITE), "and a later untimed dispatch of the terminated queue returns at once");
+  g_tq.Close(q);
+}
+
 static void CheckGameEvent() {
   Api user = Get("IXUserImpl", kUser);
   AsyncBlock add{};
@@ -482,6 +503,7 @@ int main() {
   g_tq.api = Get("IXThreadingImpl", kThreading);
   CheckManualQueue();
   CheckCompletionWithoutCallback();
+  CheckDispatchEndsOnTermination();
   CheckTermination();
   CheckComposite();
   CheckThreadPool();

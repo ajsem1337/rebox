@@ -70,7 +70,7 @@ struct Queue {
   std::mutex m;
   std::condition_variable idle;
   long inflight = 0;
-  bool terminated = false;
+  std::atomic<bool> terminated{false};  // written under m; read without it by Dispatch's wait
   std::map<uint64_t, Monitor> monitors;
   std::map<uint64_t, Waiter*> waiters;
 };
@@ -310,8 +310,11 @@ bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
   Item item;
   {
     std::unique_lock<std::mutex> lock(p->m);
-    if (p->items.empty() && timeout_ms) {
-      auto ready = [p] { return !p->items.empty(); };
+    // A terminated queue's dispatcher stops waiting once the port is empty: Unreal terminates a
+    // queue, then dispatches its completion port without a timeout until it's done (The Matrix
+    // Awakens' startup waited there for good).
+    if (p->items.empty() && timeout_ms && !q->terminated) {
+      auto ready = [p, q] { return !p->items.empty() || q->terminated; };
       if (timeout_ms == INFINITE) {
         // A title that dispatches a port for good, waiting for a callback that never comes,
         // stops there: after 5 s say which queue and port, and what calls are in flight.
