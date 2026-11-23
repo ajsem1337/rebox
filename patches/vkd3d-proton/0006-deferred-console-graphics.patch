@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index be9f25c..ef230ad 100644
+index be9f25c..ef6a130 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -7555,6 +7555,9 @@ static void d3d12_command_list_check_vbo_alignment(struct d3d12_command_list *li
@@ -84,7 +84,7 @@ index be9f25c..ef230ad 100644
          memcpy(data, list->rebox.push, sizeof(data));
      }
      else
-@@ -8289,10 +8309,61 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
+@@ -8289,10 +8309,84 @@ static VkPipeline d3d12_command_list_rebox_deferred_pipeline(struct d3d12_com
          WARN("rebox: console shader compile failed, hr %#x; skipping the dispatch.\n", hr);
          return VK_NULL_HANDLE;
      }
@@ -118,6 +118,29 @@ index be9f25c..ef230ad 100644
 +    memset(sgprs, 0, sizeof(sgprs));
 +    memset(root, 0, sizeof(root));
 +    n = d3d12_command_list_rebox_sgprs_layout(list, &list->graphics_bindings, root, true);
++    {
++        /* The first root signatures seen here, to check the packing against what shaders read. */
++        static unsigned int shown;
++        const struct d3d12_root_signature *rs = list->graphics_bindings.root_signature;
++        if (rs && shown < 6)
++        {
++            char line[512];
++            unsigned int i, at = 0;
++            shown++;
++            for (i = 0; i < rs->parameter_count && at < 480; i++)
++            {
++                const struct vkd3d_shader_root_parameter *p = &rs->parameters[i];
++                at += snprintf(line + at, sizeof(line) - at, " %u:%s", i,
++                        p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? "table"
++                        : p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? "const" : "desc");
++                if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS && at < 480)
++                    at += snprintf(line + at, sizeof(line) - at, "x%u", p->constant.constant_count);
++            }
++            line[at] = 0;
++            ERR("rebox: console graphics root signature %p: %u parameters,%s -> %u SGPRs from s8.\n",
++                    rs, rs->parameter_count, line, n);
++        }
++    }
 +    memcpy(&sgprs[8], root, min(n, 24u) * sizeof(uint32_t));
 +    in.user_sgprs = sgprs;
 +    in.user_sgpr_count = 32;

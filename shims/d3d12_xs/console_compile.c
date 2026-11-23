@@ -594,6 +594,33 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
+    if (graphics)
+    {
+        /* The first stages of each kind: the table pointers the code reads (sa5_analyse) next to the
+         * user SGPRs it gets, to check the root parameter packing. */
+        static LONG shown[2];
+        if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 6)
+        {
+            struct sa5_layout layout;
+            static struct sa5_slot slots[64];
+            char line[512], ignored[64];
+            int at = 0;
+            InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
+            memset(&layout, 0, sizeof(layout));
+            if (sa5.analyse && !sa5.analyse((const UINT32 *)((const BYTE *)h + h->code_offset), h->code_dwords,
+                                            32, &layout, slots, ARRAYSIZE(slots), ignored, sizeof(ignored)))
+                for (UINT32 t = 0; t < layout.table_count && t < 16 && at < 400; t++)
+                    at += snprintf(line + at, sizeof(line) - at, " s%u", layout.table_sgprs[t]);
+            line[at] = 0;
+            rebox_log("d3d12_xs: console %s shader %016llx reads tables through%s; user SGPRs s0-s15: %08x %08x %08x "
+                         "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                         h->stage == 0x10 ? "pixel" : "vertex", (unsigned long long)stage_id, at ? line : " (none found)",
+                         in->user_sgprs[0], in->user_sgprs[1], in->user_sgprs[2], in->user_sgprs[3], in->user_sgprs[4],
+                         in->user_sgprs[5], in->user_sgprs[6], in->user_sgprs[7], in->user_sgprs[8], in->user_sgprs[9],
+                         in->user_sgprs[10], in->user_sgprs[11], in->user_sgprs[12], in->user_sgprs[13],
+                         in->user_sgprs[14], in->user_sgprs[15]);
+        }
+    }
     set_last(E_FAIL, "no result (out of memory?)", NULL);
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
