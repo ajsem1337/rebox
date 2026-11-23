@@ -230,6 +230,21 @@ static BOOL is_proxy(const void *object)
     return FALSE;
 }
 
+/* A struct-returning method (GetResourceAllocationInfo, GetCustomHeapProperties, GetDesc...) is
+ * called either as (object, result) or in the console's order (result, object): TRUE for the
+ * console's. When both look like objects (a title's stack buffer can hold a stale copy of the
+ * object's vtable pointer; xcl, ivall/xcl 7a033c8: the result then went over the device), the one on
+ * this thread's stack is the result. */
+static BOOL result_first(const void *first, const void *second)
+{
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    BOOL first_object = is_proxy(first), second_object = is_proxy(second);
+
+    if (!first_object || !second_object)
+        return !first_object && second_object;
+    return (ULONG_PTR)first >= (ULONG_PTR)tib->StackLimit && (ULONG_PTR)first < (ULONG_PTR)tib->StackBase;
+}
+
 void *proxy_unwrap(void *object)
 {
     return is_proxy(object) ? ((struct proxy *)object)->inner : object;
@@ -1771,7 +1786,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
             UINT, const D3D12_RESOURCE_DESC *);
     D3D12_RESOURCE_DESC *copy = NULL;
 
-    if (!is_proxy(p) && is_proxy(ret)) /* console order: (result, device, ...) */
+    if (result_first(p, ret)) /* console order: (result, device, ...) */
     {
         struct proxy *device = (struct proxy *)ret;
         ret = (D3D12_RESOURCE_ALLOCATION_INFO *)p;
@@ -1815,7 +1830,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE device_GetResourceAlloc
     UINT64 total = 0, alignment = 0;
 
     note_newer_device_method(108);
-    if (!is_proxy(p) && is_proxy(ret)) /* console order: (result, device, ...) */
+    if (result_first(p, ret)) /* console order: (result, device, ...) */
     {
         struct proxy *device = (struct proxy *)ret;
         ret = (D3D12_RESOURCE_ALLOCATION_INFO *)p;
@@ -1852,7 +1867,7 @@ static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE device_GetCustomHeapProperties(s
 {
     typedef D3D12_HEAP_PROPERTIES *(STDMETHODCALLTYPE *fn)(void *, D3D12_HEAP_PROPERTIES *, UINT, D3D12_HEAP_TYPE);
 
-    if (!is_proxy(p) && is_proxy(ret))
+    if (result_first(p, ret))
     {
         struct proxy *device = (struct proxy *)ret;
         ret = (D3D12_HEAP_PROPERTIES *)p;
@@ -2984,7 +2999,7 @@ void WINAPI ReboxHangReport(void)
 /* GetDesc, in either argument order (see resource_GetDesc). */
 static D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_GetDesc(struct proxy *p, D3D12_COMMAND_QUEUE_DESC *ret)
 {
-    if (!is_proxy(p) && is_proxy(ret))
+    if (result_first(p, ret))
     {
         struct proxy *queue = (struct proxy *)ret;
         ret = (D3D12_COMMAND_QUEUE_DESC *)p;
@@ -3407,10 +3422,14 @@ static void STDMETHODCALLTYPE list_Wait32BitValueX(struct proxy *p, UINT64 addre
     list_wait(p, address, comparison, value, mask, 4);
 }
 
+/* The whole 64-bit value is compared: what follows it isn't a mask. A retail title passes a 32-bit
+ * 1 there, the upper half of the stack slot left over (0x231_0000_0001); read as a mask, its waits
+ * for a counter (2 >= 1, 4 >= 2...) never held and each ran to the timeout, every frame (xcl,
+ * ivall/xcl d4f17ca, PR #218). */
 static void STDMETHODCALLTYPE list_Wait64BitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value,
-        UINT64 mask, UINT flags)
+        UINT64 not_a_mask, UINT flags)
 {
-    list_wait(p, address, comparison, value, mask, 8);
+    list_wait(p, address, comparison, value, ~(UINT64)0, 8);
 }
 
 /* (memory & mask) <comparison> value, D3D12_COMPARISON_FUNC; TRUE for what can't be read. */

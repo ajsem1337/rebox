@@ -3913,11 +3913,24 @@ static void test_list_queries(void *dev, void *queue)
             XSLOT(list, 70, void, UINT64, UINT64)(list, va + 8, 0x1122334455667788ull);
             XSLOT(list, 88, void, UINT64, UINT32)(list, va + 4, 0xabcd);
             XSLOT(list, 71, void, UINT64, UINT32, UINT64, UINT64, UINT)(list, va, 3, 0x1234, ~0ull, 0);
+            /* Wait64BitValueX (72) for a counter at 2 >= 1, as a retail title records it: a 32-bit 1
+             * after the value with garbage above it, which isn't a mask (it held only at a 2 s
+             * timeout when it was taken for one). */
+            {
+                static volatile UINT64 counter = 2;
+                XSLOT(list, 72, void, UINT64, UINT32, UINT64, UINT64, UINT)(list, (UINT64)(ULONG_PTR)&counter,
+                        D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1, 0x23100000001ull, 0);
+            }
             XSLOT(list, 69, void, UINT64, UINT32)(list, (UINT64)(ULONG_PTR)&cpu_only, 77);
             CHECK(cpu_only == 0, "Write32BitValueBottomOfPipeX outside GPU memory isn't made when recorded");
             XSLOT(list, 9, HRESULT)(list);
             /* Submitted through queue slot 35, the console's ExecuteCommandLists. */
-            XSLOT(queue, 35, HRESULT, UINT, void *const *, UINT64, UINT)(queue, 1, &list, 1, 3);
+            {
+                ULONGLONG start = GetTickCount64();
+                XSLOT(queue, 35, HRESULT, UINT, void *const *, UINT64, UINT)(queue, 1, &list, 1, 3);
+                CHECK(GetTickCount64() - start < 1500, "Wait64BitValueX compares the whole value, not under the "
+                      "garbage after it (submitted in %llu ms)", (unsigned long long)(GetTickCount64() - start));
+            }
             XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 2);
             for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < 2; i++)
                 Sleep(10);
