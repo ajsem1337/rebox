@@ -1,0 +1,8 @@
+LIBRARY chad.dll
+EXPORTS
+    XDspActivate
+    XDspConnect
+    XDspConnectWithMaximumStreamLimit
+    XDspDeactivate
+    XDspDisconnect
+    XDspSubmitCommand

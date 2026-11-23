@@ -3318,6 +3318,28 @@ static void test_acphal(void)
 
 /* xapu.dll: the decoder queue answers each command at once, a Process with silence of the
  * length asked for (FMOD in a GDK title drives it); acphal's other FMOD imports answer too. */
+/* chad.dll, the console's audio DSP: connecting says it isn't there and leaves no connection, so a
+ * title's audio engine goes on without it; the rest fail or do nothing. */
+static void test_chad(void)
+{
+    HMODULE m = LoadLibraryA("chad.dll");
+    HRESULT (WINAPI *connect)(void *, UINT32, UINT32, UINT32, UINT32, HANDLE *) =
+            m ? (void *)GetProcAddress(m, "XDspConnectWithMaximumStreamLimit") : NULL;
+    HRESULT (WINAPI *activate)(HANDLE, UINT64, UINT64, UINT64) = m ? (void *)GetProcAddress(m, "XDspActivate") : NULL;
+    HRESULT (WINAPI *submit)(HANDLE, const void *) = m ? (void *)GetProcAddress(m, "XDspSubmitCommand") : NULL;
+    HRESULT (WINAPI *disconnect)(HANDLE) = m ? (void *)GetProcAddress(m, "XDspDisconnect") : NULL;
+    HANDLE h = (HANDLE)1;
+    BYTE command[64] = { 0 };
+
+    CHECK(connect && activate && submit && disconnect && GetProcAddress(m, "XDspDeactivate"),
+          "chad.dll exports the five XDsp functions a title imports");
+    if (!connect || !activate || !submit || !disconnect)
+        return;
+    CHECK(FAILED(connect(command, 0, 0, 0x80, 1, &h)) && !h, "XDspConnectWithMaximumStreamLimit: no DSP, no connection");
+    CHECK(FAILED(activate(NULL, 0, 0, 0)) && FAILED(submit(NULL, command)) && disconnect(NULL) == S_OK,
+          "XDspActivate and XDspSubmitCommand fail without a DSP; XDspDisconnect succeeds");
+}
+
 static void test_xapu(void)
 {
 #pragma pack(push, 1)
@@ -4387,6 +4409,7 @@ int main(int argc, char **argv)
     test_gameinput();
     test_acphal();
     test_xapu();
+    test_chad();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();
