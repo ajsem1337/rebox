@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -289,6 +290,18 @@ void Close(Queue* q) {
   if (q) release(q);
 }
 
+void log_calls_in_flight();  // below, with the async state
+
+const char* mode_name(DispatchMode m) {
+  switch (m) {
+    case DispatchMode::Manual: return "manual";
+    case DispatchMode::ThreadPool: return "thread pool";
+    case DispatchMode::SerializedThreadPool: return "serialized thread pool";
+    case DispatchMode::Immediate: return "immediate";
+  }
+  return "?";
+}
+
 bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
   if (!q || !valid_port(port)) return false;
   Port* p = q->ports[static_cast<uint32_t>(port)];
@@ -298,9 +311,21 @@ bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
     std::unique_lock<std::mutex> lock(p->m);
     if (p->items.empty() && timeout_ms) {
       auto ready = [p] { return !p->items.empty(); };
-      if (timeout_ms == INFINITE)
-        p->cv.wait(lock, ready);
-      else
+      if (timeout_ms == INFINITE) {
+        // A title that dispatches a port for good, waiting for a callback that never comes,
+        // stops there: after 5 s say which queue and port, and what calls are in flight.
+        if (!p->cv.wait_for(lock, std::chrono::seconds(5), ready)) {
+          Port* other = q->ports[port == PortId::Work ? 1 : 0];
+          gtx::log::write(gtx::log::Kind::Warn, GTX_SHIM_DLL, "XTaskQueueDispatch", nullptr,
+                          "queue %p: the %s port (%s) has had nothing for 5 s; the %s port is %s", static_cast<void*>(q),
+                          port == PortId::Work ? "work" : "completion", mode_name(p->mode),
+                          port == PortId::Work ? "completion" : "work", mode_name(other->mode));
+          lock.unlock();
+          log_calls_in_flight();
+          lock.lock();
+          p->cv.wait(lock, ready);
+        }
+      } else
         p->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
     }
     if (p->items.empty()) return false;
@@ -563,12 +588,16 @@ void CALLBACK completion_thunk(void* p, bool) {
   release(s);
 }
 
+// Calls begun and not yet completed, for log_calls_in_flight. Guarded by g_async_m.
+std::set<AsyncState*> g_in_flight;
+
 void complete_state(AsyncState* s, HRESULT hr, size_t required) {
   if (hr == E_PENDING) return;
   bool no_payload;
   {
     std::lock_guard<std::mutex> lock(g_async_m);
     if (s->status != E_PENDING) return;
+    g_in_flight.erase(s);
     s->status = hr;
     s->required = SUCCEEDED(hr) ? required : 0;
     no_payload = FAILED(hr) || s->required == 0;
@@ -642,6 +671,7 @@ HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char* n
     s->identity = identity;
     s->name = name;
     s->queue = q;
+    g_in_flight.insert(s);
     s->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     *in = {s, E_PENDING, kMagic, 0, 0};
   }
@@ -652,6 +682,16 @@ HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char* n
   if (FAILED(hr) && hr != E_NOTIMPL) complete_state(s, hr, 0);
   release(s);
   return S_OK;
+}
+
+void log_calls_in_flight() {
+  std::lock_guard<std::mutex> lock(g_async_m);
+  if (g_in_flight.empty())
+    gtx::log::write(gtx::log::Kind::Warn, GTX_SHIM_DLL, "XTaskQueueDispatch", nullptr, "no async calls in flight");
+  for (AsyncState* s : g_in_flight)
+    gtx::log::write(gtx::log::Kind::Warn, GTX_SHIM_DLL, "XTaskQueueDispatch", nullptr,
+                    "in flight: %s on queue %p (work %s)", s->name ? s->name : "a call", static_cast<void*>(s->queue),
+                    s->worked ? "ran" : s->scheduled ? "queued, not run" : "not scheduled");
 }
 
 HRESULT AsyncSchedule(AsyncBlock* b, uint32_t delay_ms) {
