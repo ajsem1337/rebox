@@ -32,6 +32,8 @@ shims/d3d12_xs/           d3d12_xs.dll: Xbox device/queue/command-list/descripto
                           GPU memory (gpu_memory.c), shader substitution, forwards to vkd3d-proton
 shims/amd_fidelityfx_loader_xbox/  FidelityFX API stub: FSR-style queries, bilinear upscale via d3d12_xs
 shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA2 voices played as silence
+shims/acphal/             acphal.dll: the APU heap, and an audio coprocessor channel that acknowledges
+                          commands and ticks audio frames (nothing is mixed)
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
 patches/                  Mesa patch letting RADV place memory at lower-half device addresses;

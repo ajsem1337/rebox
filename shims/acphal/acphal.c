@@ -3,8 +3,8 @@
  * Unreal titles create the APU heap at startup and stop with a fatal error if that fails
  * (a UE5 title: "Failed to create APU heap: 80004001" with a stub). Here the heap is ordinary
  * memory and the coprocessor (SHAPE: XMA decoding, sample-rate conversion, mixing) isn't
- * emulated: IAcpHal is an inert object that logs its calls, and XMA is decoded on the CPU by
- * shims/xaudio2_9 instead. Signatures and the SHAPE_CONTEXTS layout follow TomBox's notes, read
+ * emulated: IAcpHal acknowledges commands and ticks audio frames (below), and XMA is decoded
+ * on the CPU by shims/xaudio2_9 instead. Signatures and the SHAPE_CONTEXTS layout follow TomBox's notes, read
  * from a UE5 title's call sites (facts only):
  *   HRESULT ApuCreateHeap(UINT32 size, UINT32 flags)
  *   HRESULT ApuAlloc(void **block, APU_ADDRESS *address, UINT32 size, UINT32 alignment, UINT32 flags)
@@ -94,38 +94,177 @@ HRESULT WINAPI ApuHeapGetState(UINT32 *state, UINT32 flags)
     return S_OK;
 }
 
-/* IAcpHal: every method logs its first calls and succeeds; nothing is ever processed. */
+/* IAcpHal: the coprocessor's command and message channel. The layout and the behaviour follow
+ * xcl (ivall/xcl, GPL-2.0-only, crates/xcl/src/hle/acphal.rs): the vtable is
+ *   0 HRESULT Connect(UINT32 commands, UINT32 messages)   1 HRESULT Disconnect()
+ *   2 HRESULT SubmitCommand(UINT32 type, UINT64 id, UINT32 frame, const void *data, UINT32 size)
+ *   3 BOOL PopMessage(ACP_MESSAGE *message)               4 UINT32 GetNumMessages()
+ *   5 void Release()
+ * and a message is { UINT32 type; UINT32 reserved; UINT64 value; UINT64 id; }: 2 an audio frame,
+ * 0x10 a command done (its id), 0x80 disconnected. Nothing runs here, but the channel answers
+ * as hardware with nothing to do: each command is done at once, and an audio frame comes every
+ * 128 samples at 48 kHz. Titles wait for both (a GDK title submits a command at startup and polls
+ * PopMessage until it is done: with no answer it spun there forever, at 34% loaded). */
+enum { ACP_AUDIO_FRAME = 2, ACP_COMMAND_DONE = 0x10, ACP_DISCONNECTED = 0x80 };
+#define ACP_QUEUE 1024
 #define HAL_SLOTS 32
-static void *hal_vtbl[HAL_SLOTS];
-static void *const hal_object = hal_vtbl;
 
-static HRESULT hal_method(UINT slot, UINT64 a, UINT64 b, UINT64 c)
+struct acp_message { UINT32 type, reserved; UINT64 value, id; };
+
+struct hal
+{
+    void *const *vtbl;
+    SRWLOCK lock;
+    BOOL connected;
+    struct acp_message queue[ACP_QUEUE];
+    UINT head, count;
+    LONGLONG next_frame, frame_ticks; /* QueryPerformanceCounter ticks */
+};
+
+static void hal_log(UINT slot, UINT64 a, UINT64 b, UINT64 c)
 {
     static LONG seen[HAL_SLOTS];
-    if (InterlockedIncrement(&seen[slot]) <= 2)
-        rebox_log("acphal: IAcpHal slot %u (%#llx, %#llx, %#llx): no coprocessor, S_OK", slot,
-                     (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+    /* Saturating: a title polling a slot millions of times a second would wrap a counter. */
+    if (seen[slot] < 2 && InterlockedIncrement(&seen[slot]) <= 2)
+        rebox_log("acphal: IAcpHal slot %u (%#llx, %#llx, %#llx)", slot, (unsigned long long)a,
+                     (unsigned long long)b, (unsigned long long)c);
+}
+
+static LONGLONG now_ticks(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static void hal_push(struct hal *h, UINT32 type, UINT64 id)
+{
+    struct acp_message *m;
+    if (h->count == ACP_QUEUE)
+        return; /* nobody is reading: drop it */
+    m = &h->queue[(h->head + h->count++) % ACP_QUEUE];
+    memset(m, 0, sizeof(*m));
+    m->type = type;
+    m->id = id;
+}
+
+static BOOL frame_due(struct hal *h, LONGLONG now)
+{
+    return h->connected && now >= h->next_frame;
+}
+
+static HRESULT WINAPI hal_connect(struct hal *h, UINT32 commands, UINT32 messages)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    AcquireSRWLockExclusive(&h->lock);
+    h->connected = TRUE;
+    h->frame_ticks = f.QuadPart * 128 / 48000;
+    h->next_frame = now_ticks() + h->frame_ticks;
+    ReleaseSRWLockExclusive(&h->lock);
+    rebox_log("acphal: coprocessor connected (%u commands, %u messages): commands are done at once, "
+                 "nothing runs", commands, messages);
     return S_OK;
 }
 
-#define HAL(n) static HRESULT WINAPI hal_##n(void *self, UINT64 a, UINT64 b, UINT64 c) { return hal_method(n, a, b, c); }
-HAL(0) HAL(1) HAL(2) HAL(3) HAL(4) HAL(5) HAL(6) HAL(7) HAL(8) HAL(9) HAL(10) HAL(11) HAL(12) HAL(13) HAL(14) HAL(15)
+static HRESULT WINAPI hal_disconnect(struct hal *h)
+{
+    AcquireSRWLockExclusive(&h->lock);
+    h->connected = FALSE;
+    hal_push(h, ACP_DISCONNECTED, 0);
+    ReleaseSRWLockExclusive(&h->lock);
+    return S_OK;
+}
+
+static HRESULT WINAPI hal_submit(struct hal *h, UINT32 type, UINT64 id, UINT32 frame, const void *data, UINT32 size)
+{
+    static UINT32 seen[64];
+    static LONG seen_count;
+    BOOL connected, known = FALSE;
+
+    for (LONG i = 0; i < seen_count && i < 64; i++)
+        known |= seen[i] == type;
+    if (!known && seen_count < 64)
+    {
+        seen[seen_count++] = type;
+        rebox_log("acphal: coprocessor command %#x first seen (id %#llx, frame %#x, %u bytes)", type,
+                     (unsigned long long)id, frame, size);
+    }
+    AcquireSRWLockExclusive(&h->lock);
+    if ((connected = h->connected) && id)
+        hal_push(h, ACP_COMMAND_DONE, id); /* id 0: nobody waits for it */
+    ReleaseSRWLockExclusive(&h->lock);
+    return connected ? S_OK : E_UNEXPECTED;
+}
+
+/* The next message: queued ones first, else an audio frame when one is due (more than 8 frames
+ * late are not made up for). */
+static BOOL WINAPI hal_pop(struct hal *h, struct acp_message *out)
+{
+    BOOL got = FALSE;
+    LONGLONG now;
+
+    if (!out)
+        return FALSE;
+    now = now_ticks();
+    AcquireSRWLockExclusive(&h->lock);
+    if (h->count)
+    {
+        *out = h->queue[h->head];
+        h->head = (h->head + 1) % ACP_QUEUE;
+        h->count--;
+        got = TRUE;
+    }
+    else if (frame_due(h, now))
+    {
+        LONGLONG next = h->next_frame + h->frame_ticks, floor = now - 8 * h->frame_ticks;
+        h->next_frame = next > floor ? next : floor;
+        memset(out, 0, sizeof(*out));
+        out->type = ACP_AUDIO_FRAME;
+        got = TRUE;
+    }
+    ReleaseSRWLockExclusive(&h->lock);
+    return got;
+}
+
+static UINT32 WINAPI hal_count(struct hal *h)
+{
+    UINT32 n;
+    LONGLONG now = now_ticks();
+    AcquireSRWLockShared(&h->lock);
+    n = h->count + (frame_due(h, now) ? 1 : 0);
+    ReleaseSRWLockShared(&h->lock);
+    return n;
+}
+
+static void WINAPI hal_release(struct hal *h)
+{
+    HeapFree(GetProcessHeap(), 0, h);
+}
+
+/* Slots past Release aren't known: they log and succeed. */
+#define HAL(n) static HRESULT WINAPI hal_##n(void *self, UINT64 a, UINT64 b, UINT64 c) { hal_log(n, a, b, c); return S_OK; }
+HAL(6) HAL(7) HAL(8) HAL(9) HAL(10) HAL(11) HAL(12) HAL(13) HAL(14) HAL(15)
 HAL(16) HAL(17) HAL(18) HAL(19) HAL(20) HAL(21) HAL(22) HAL(23) HAL(24) HAL(25) HAL(26) HAL(27) HAL(28) HAL(29)
 HAL(30) HAL(31)
 
-HRESULT WINAPI AcpHalCreate(void **hal)
+HRESULT WINAPI AcpHalCreate(void **out)
 {
     static void *const methods[HAL_SLOTS] = {
-        hal_0, hal_1, hal_2, hal_3, hal_4, hal_5, hal_6, hal_7, hal_8, hal_9, hal_10, hal_11, hal_12, hal_13, hal_14,
-        hal_15, hal_16, hal_17, hal_18, hal_19, hal_20, hal_21, hal_22, hal_23, hal_24, hal_25, hal_26, hal_27,
-        hal_28, hal_29, hal_30, hal_31,
+        hal_connect, hal_disconnect, hal_submit, hal_pop, hal_count, hal_release, hal_6, hal_7, hal_8, hal_9,
+        hal_10, hal_11, hal_12, hal_13, hal_14, hal_15, hal_16, hal_17, hal_18, hal_19, hal_20, hal_21, hal_22,
+        hal_23, hal_24, hal_25, hal_26, hal_27, hal_28, hal_29, hal_30, hal_31,
     };
+    struct hal *h;
 
-    if (!hal)
+    if (!out)
         return E_INVALIDARG;
-    memcpy(hal_vtbl, methods, sizeof(methods));
-    *hal = (void *)&hal_object;
-    rebox_log("acphal: AcpHalCreate: an inert IAcpHal (no SHAPE coprocessor)");
+    if (!(h = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*h))))
+        return E_OUTOFMEMORY;
+    h->vtbl = methods;
+    InitializeSRWLock(&h->lock);
+    *out = h;
+    rebox_log("acphal: AcpHalCreate: a coprocessor channel that acknowledges commands (no SHAPE)");
     return S_OK;
 }
 

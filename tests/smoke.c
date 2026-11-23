@@ -3057,6 +3057,48 @@ static void test_gameinput(void)
               && !none, "GameInput has no keyboard readings");
 }
 
+/* acphal.dll: the coprocessor channel acknowledges each command with its id and ticks audio
+ * frames, so a title polling PopMessage for its command (a GDK title at startup) goes on. */
+static void test_acphal(void)
+{
+    struct { UINT32 type, reserved; UINT64 value, id; } msg;
+    HMODULE m = LoadLibraryA("acphal.dll");
+    HRESULT (WINAPI *create)(void **) = m ? (void *)GetProcAddress(m, "AcpHalCreate") : NULL;
+    void *hal = NULL;
+    BOOL got_frame = FALSE;
+    DWORD start;
+
+    CHECK(create != NULL, "acphal.dll exports AcpHalCreate");
+    if (!create || FAILED(create(&hal)) || !hal) return;
+    CHECK(XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 2, 1, ~0u, NULL, 0) == E_UNEXPECTED,
+          "IAcpHal SubmitCommand fails before Connect");
+    CHECK(XSLOT(hal, 0, HRESULT, UINT32, UINT32)(hal, 0x804, 0x804) == S_OK, "IAcpHal Connect");
+    CHECK(XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 2, 1, ~0u, NULL, 0) == S_OK
+              && XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 3, 0, ~0u, NULL, 0) == S_OK,
+          "IAcpHal SubmitCommand");
+    CHECK(XSLOT(hal, 4, UINT32)(hal) >= 1, "IAcpHal GetNumMessages counts the done command");
+    memset(&msg, 0xcc, sizeof(msg));
+    CHECK(XSLOT(hal, 3, BOOL, void *)(hal, &msg) && msg.type == 0x10 && msg.id == 1,
+          "IAcpHal PopMessage gives command 1 done (type %#x, id %#llx)", msg.type, (unsigned long long)msg.id);
+    /* Command id 0 has no message; then an audio frame comes within a few ms. */
+    for (start = GetTickCount(); !got_frame && GetTickCount() - start < 1000;)
+    {
+        if (XSLOT(hal, 3, BOOL, void *)(hal, &msg))
+        {
+            CHECK(msg.type == 2, "only audio frames follow (type %#x)", msg.type);
+            got_frame = msg.type == 2;
+        }
+        else
+            Sleep(1);
+    }
+    CHECK(got_frame, "IAcpHal PopMessage ticks audio frames");
+    CHECK(XSLOT(hal, 1, HRESULT)(hal) == S_OK, "IAcpHal Disconnect");
+    while (XSLOT(hal, 3, BOOL, void *)(hal, &msg) && msg.type == 2)
+        ;
+    CHECK(msg.type == 0x80 && !XSLOT(hal, 3, BOOL, void *)(hal, &msg), "IAcpHal says it disconnected, then nothing");
+    XSLOT(hal, 5, void)(hal);
+}
+
 /* A texture placed at a title address (slot 44) is filled from the tiled memory there: at first
  * use, and again after a reported write (DirectStorage reports its writes the same way). */
 /* A texture placed on memory the title has only reserved: it is filled once the memory is
@@ -4573,6 +4615,7 @@ int main(int argc, char **argv)
     test_xmem();
     test_xcrdapi();
     test_gameinput();
+    test_acphal();
     if (argc > 1)
         test_d3d12(argv[1], !(argc > 2 && !strcmp(argv[2], "nocache")));
     test_xbox();
