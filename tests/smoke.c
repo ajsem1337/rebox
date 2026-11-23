@@ -1305,7 +1305,8 @@ static void test_present(void *dev, void *queue)
              * OMSetRenderTargets 50, DrawInstanced 12. */
             XSLOT(list, 21, void, UINT, const D3D12_VIEWPORT *)(list, 1, &vp);
             XSLOT(list, 22, void, UINT, const D3D12_RECT *)(list, 1, &sc);
-            XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            /* 17: the console rectangle list, drawn as a triangle list. */
+            XSLOT(list, 20, void, D3D12_PRIMITIVE_TOPOLOGY)(list, (D3D12_PRIMITIVE_TOPOLOGY)17);
             XSLOT(list, 34, void, void *)(list, rs);
             XSLOT(list, 25, void, void *)(list, pso);
             XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);

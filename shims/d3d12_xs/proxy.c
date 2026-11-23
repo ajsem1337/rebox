@@ -1047,6 +1047,24 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
     return hr;
 }
 
+/* Slot 20: IASetPrimitiveTopology. The console's topology 17 is a rectangle list: three corners of a
+ * screen-aligned rectangle per primitive, the fourth made by the hardware. Unreal 5 draws its
+ * full-screen passes so (xcl; a UE5 sample), and vkd3d-proton drops a draw with a topology it
+ * doesn't know (its image stayed black). For now they're triangle lists: each rectangle draws its
+ * first triangle, half of it. */
+static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12_PRIMITIVE_TOPOLOGY topology)
+{
+    if (topology == 17)
+    {
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: the console's rectangle lists (topology 17) are drawn as triangle lists: each "
+                         "rectangle's first triangle");
+        topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    }
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(INNER(p, ID3D12GraphicsCommandList), topology);
+}
+
 /* ExecuteIndirect (PC 59): rays with no real pipeline set are skipped (see ray_signatures). */
 static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
         void *count_buffer, UINT64 count_offset)
@@ -2536,6 +2554,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static struct slot list_slots[96] = {
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
+        FN(20, list_IASetPrimitiveTopology),
         FN(10, list_Reset),
         FN(26, list_ResourceBarrier),
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
@@ -2564,6 +2583,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     static struct slot list_v4_slots[96] = {
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
+        FN(20, list_IASetPrimitiveTopology),
         FN(114, list_SetPipelineState1),              /* PC 67 */
         FN(115, list_DispatchRays),                   /* PC 68 */
         FN(10, list_Reset),

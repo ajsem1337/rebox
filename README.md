@@ -236,6 +236,8 @@ down missing translations.
   - frame events come from a CPU clock, not the display: `WaitFrameEventX` follows the period the
     title sets, but isn't locked to the monitor's vblank, so with vsync on a mismatched refresh
     rate can judder;
+  - the console's rectangle lists (topology 17, which Unreal 5 uses for full-screen passes) are
+    drawn as triangle lists, so each rectangle covers only its first triangle, half of it;
 - **Unified memory** ([docs/d3d12x.md](docs/d3d12x.md)). Titles use GPU VAs as CPU pointers and
   the reverse. GPU-visible `XMemAlloc` memory and command-list embedded data come from
   CPU-visible D3D12 heaps. `rebox-run` loads `VK_LAYER_REBOX_gpuva_identity` and, on AMD,
