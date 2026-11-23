@@ -674,6 +674,17 @@ static void test_present(void *dev, void *queue)
     CHECK(SUCCEEDED(hr), "render target, RTV heap and list for PresentX (%#lx)", hr);
     if (FAILED(hr)) goto done;
 
+    /* A title's own top-level window (a GDK title makes one): the swapchain goes there. Without a
+     * display there is none, and PresentX makes a window of its own. */
+    {
+        WNDCLASSW wc = { .lpfnWndProc = DefWindowProcW, .hInstance = GetModuleHandleW(NULL),
+                         .lpszClassName = L"SmokeTitleWindow" };
+        RegisterClassW(&wc);
+        if (CreateWindowExW(0, wc.lpszClassName, L"title", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 320, 240,
+                            NULL, NULL, wc.hInstance, NULL))
+            printf("info a title window exists for PresentX\n");
+    }
+
     /* A texture's GPU VA is 0 under vkd3d-proton; titles write texels
      * through it, so d3d12_xs hands out scratch GPU memory instead. */
     {

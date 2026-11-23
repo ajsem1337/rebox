@@ -20,6 +20,12 @@
  * Environment:
  *   REBOX_PRESENT=0        no window or swapchain (frame dumps still work)
  *   REBOX_VSYNC=N          Present sync interval, default 1
+ *   REBOX_PRESENT_WINDOW=own  always present into a window of our own
+ *
+ * The swapchain goes on the title's own window when it has made one: a GDK
+ * title (a UE5 title) creates a top-level window that on the console is the
+ * screen and is never painted, so under Wine it stays white on top of a
+ * window of ours. Without one, a window of our own is made.
  *
  * A present never blocks the title. vkd3d-proton waits for each present to
  * reach the screen without a timeout, so when the compositor stops taking
@@ -73,6 +79,7 @@ struct present_queue
     UINT convert_w, convert_h;
 
     HWND hwnd;
+    BOOL own_window;  /* ours, not the title's: ours to close */
     IDXGISwapChain3 *swapchain;
     UINT width, height;
     DXGI_FORMAT format;
@@ -301,6 +308,45 @@ static DWORD WINAPI window_thread(void *param)
     return 0;
 }
 
+/* The title's largest visible top-level window, if it made one. */
+static BOOL CALLBACK find_title_window(HWND hwnd, LPARAM param)
+{
+    HWND *best = (HWND *)param;
+    WCHAR cls[64];
+    DWORD pid = 0;
+    RECT r, b;
+
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) || GetParent(hwnd)
+            || (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) && !wcscmp(cls, L"ReboxPresent"))
+            || !GetClientRect(hwnd, &r) || r.right - r.left < 64 || r.bottom - r.top < 64)
+        return TRUE;
+    if (!*best || (GetClientRect(*best, &b)
+                   && (r.right - r.left) * (r.bottom - r.top) > (b.right - b.left) * (b.bottom - b.top)))
+        *best = hwnd;
+    return TRUE;
+}
+
+static HWND title_window(void)
+{
+    const char *mode = getenv("REBOX_PRESENT_WINDOW");
+    HWND best = NULL;
+    WCHAR cls[64] = L"";
+    RECT r = { 0 };
+
+    if (mode && !strcmp(mode, "own"))
+        return NULL;
+    EnumWindows(find_title_window, (LPARAM)&best);
+    if (best)
+    {
+        GetClassNameW(best, cls, ARRAYSIZE(cls));
+        GetClientRect(best, &r);
+        rebox_log("d3d12_xs: PresentX: presenting into the title's window %p (class %ls, %ldx%ld)", (void *)best,
+                     cls, r.right - r.left, r.bottom - r.top);
+    }
+    return best;
+}
+
 static HWND create_window(UINT width, UINT height)
 {
     struct window_args *args = calloc(1, sizeof(*args)); /* the thread outlives this call */
@@ -406,7 +452,9 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
             CloseHandle(s->latency);
         s->latency = NULL;
     }
-    if (!s->hwnd && !(s->hwnd = create_window(width, height)))
+    if (!s->hwnd)
+        s->hwnd = title_window();
+    if (!s->hwnd && (s->own_window = TRUE) && !(s->hwnd = create_window(width, height)))
     {
         rebox_log("d3d12_xs: PresentX: could not create a window (no display?); frames are not shown");
         s->swapchain_failed = TRUE;
@@ -790,7 +838,7 @@ void present_queue_destroy(struct present_queue *s)
         CloseHandle(s->latency);
     if (s->convert)
         ID3D12Resource_Release(s->convert);
-    if (s->hwnd)
+    if (s->hwnd && s->own_window)
         PostMessageW(s->hwnd, WM_QUIT, 0, 0);
     for (int i = 0; i < RING; i++)
     {
