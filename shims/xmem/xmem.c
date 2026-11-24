@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <stdio.h>
 #include <psapi.h>
 #include <winternl.h>
 
