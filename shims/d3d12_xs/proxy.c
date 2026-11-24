@@ -84,6 +84,7 @@ struct proxy
     UINT topology;     /* lists: the last IASetPrimitiveTopology (logged at a watched stage's draws) */
     D3D12_VERTEX_BUFFER_VIEW vertex_buffers[8]; /* lists: as bound, for rect lists (list_DrawInstanced) */
     UINT vertex_buffer_mask;
+    D3D12_INDEX_BUFFER_VIEW index_buffer;      /* lists: as bound, for REBOX_WATCH_STAGE's vertex log */
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
     UINT cpu_write_count, cpu_write_capacity;
     struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
@@ -1579,6 +1580,10 @@ static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12
 {
     if (view)
         ia_adopt("an index buffer", view->BufferLocation, view->SizeInBytes);
+    if (view)
+        p->index_buffer = *view;
+    else
+        memset(&p->index_buffer, 0, sizeof(p->index_buffer));
     ID3D12GraphicsCommandList_IASetIndexBuffer(INNER(p, ID3D12GraphicsCommandList), view);
 }
 
@@ -3427,6 +3432,16 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
+    if (console_stage_watched(console_last_draw_vs()) && p->index_buffer.BufferLocation)
+    {
+        /* The vertices from the draw's first index on (a quad batch's indices run in order). */
+        BOOL wide = p->index_buffer.Format == DXGI_FORMAT_R32_UINT;
+        const BYTE *at = (const BYTE *)(ULONG_PTR)p->index_buffer.BufferLocation + (UINT64)first_index * (wide ? 4 : 2);
+        UINT first = 0;
+        if (!IsBadReadPtr(at, wide ? 4 : 2))
+            first = wide ? *(const UINT32 *)at : *(const UINT16 *)at;
+        log_watched_vertex_buffers(p, base_vertex + first, indices);
+    }
     console_display_draw_end();
 }
 
