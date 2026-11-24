@@ -1180,7 +1180,7 @@ static DWORD WINAPI compile_worker(void *unused)
     return 0;
 }
 
-static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
+static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL front)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     BOOL pending;
@@ -1221,11 +1221,20 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
     }
     InterlockedIncrement(&jobs_queued);
     AcquireSRWLockExclusive(&jobs_lock);
-    if (jobs_tail)
-        jobs_tail->next = job;
-    else
+    if (front)
+    {
+        if (!(job->next = jobs_head))
+            jobs_tail = job;
         jobs_head = job;
-    jobs_tail = job;
+    }
+    else
+    {
+        if (jobs_tail)
+            jobs_tail->next = job;
+        else
+            jobs_head = job;
+        jobs_tail = job;
+    }
     ReleaseSRWLockExclusive(&jobs_lock);
     WakeConditionVariable(&jobs_ready);
 }
@@ -1389,7 +1398,10 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
     switch (program_claim(key, TRUE))
     {
     case PROGRAM_COLD: /* claimed: compile it in the background */
-        queue_compile(key, in);
+        /* Ahead of the rest: a stage drawing into a display-sized target (the UI, text, the final
+         * composite). A scene queues hundreds of programs at once, and the intro's title card's
+         * text waited behind them until the run ended. */
+        queue_compile(key, in, in_display_draw && current_draw.target >= 0);
         set_last(E_PENDING, "compiling in the background", NULL);
         return E_PENDING;
     case PROGRAM_PENDING:
