@@ -76,28 +76,50 @@ static BOOL full_hash(const struct title_texture *t)
 
 /* Small textures: a multiply-xor hash over every 8 bytes. Others: FNV-1a over 8 bytes at each of
  * WATCH_SAMPLES points spread over the texture, the first and last included. */
+/* Bytes of title memory, or FALSE if they can't be read now: the title can unmap a texture's
+ * physical pages at any moment (a read between a readability check and the unmap faulted). */
+static BOOL read_title(const BYTE *from, void *to, SIZE_T size)
+{
+    SIZE_T done = 0;
+    return ReadProcessMemory(GetCurrentProcess(), from, to, size, &done) && done == size;
+}
+
 static UINT64 fingerprint(const struct title_texture *t)
 {
     UINT64 h = 0xcbf29ce484222325ull, step = t->size > 8 ? (t->size - 8) / (WATCH_SAMPLES - 1) : 0;
 
     if (full_hash(t))
     {
-        UINT64 i, v;
-        for (i = 0; i + 8 <= t->size; i += 8)
+        BYTE *chunk = malloc(64u << 10);
+        if (!chunk)
+            return t->fingerprint;
+        for (UINT64 at = 0; at < t->size; at += 64u << 10)
         {
-            memcpy(&v, t->cpu + i, 8);
-            h = (h ^ v) * 0x9e3779b97f4a7c15ull;
-            h ^= h >> 29;
+            SIZE_T n = (SIZE_T)min(t->size - at, 64u << 10), i;
+            UINT64 v;
+            if (!read_title(t->cpu + at, chunk, n))
+            {
+                free(chunk);
+                return t->fingerprint; /* gone now: unchanged, nothing to upload */
+            }
+            for (i = 0; i + 8 <= n; i += 8)
+            {
+                memcpy(&v, chunk + i, 8);
+                h = (h ^ v) * 0x9e3779b97f4a7c15ull;
+                h ^= h >> 29;
+            }
+            for (; i < n; i++)
+                h = (h ^ chunk[i]) * 0x100000001b3ull;
         }
-        for (; i < t->size; i++)
-            h = (h ^ t->cpu[i]) * 0x100000001b3ull;
+        free(chunk);
         return h;
     }
 
     for (UINT i = 0; i < WATCH_SAMPLES; i++)
     {
-        UINT64 v;
-        memcpy(&v, t->cpu + (t->size > 8 ? i * step : 0), t->size >= 8 ? 8 : t->size);
+        UINT64 v = 0;
+        if (!read_title(t->cpu + (t->size > 8 ? i * step : 0), &v, t->size >= 8 ? 8 : t->size))
+            return t->fingerprint;
         h = (h ^ v) * 0x100000001b3ull;
     }
     return h;
@@ -566,12 +588,19 @@ static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommand
                       (unsigned long long)desc.Width, desc.Height, desc.MipLevels, desc.Format);
         t->gpu_written = TRUE;
     }
-    for (UINT i = 0; i < t->subresources && ok; i++)
     {
-        UINT mip = i % t->surface.mips, layer = i / t->surface.mips;
-        /* rows: rows of pixels, or of 4x4 blocks for BC formats; a 3D slice is that many rows. */
-        ok = detile_to_linear(&t->surface, t->cpu, mip, layer, mapped + fp[i].Offset,
-                              fp[i].Footprint.RowPitch, (UINT64)fp[i].Footprint.RowPitch * rows[i]);
+        /* Copied out first: the title can unmap the texture's pages while this reads them. */
+        BYTE *source = ok ? malloc(t->size) : NULL;
+        if (ok && (!source || !read_title(t->cpu, source, t->size)))
+            ok = FALSE;
+        for (UINT i = 0; i < t->subresources && ok; i++)
+        {
+            UINT mip = i % t->surface.mips, layer = i / t->surface.mips;
+            /* rows: rows of pixels, or of 4x4 blocks for BC formats; a 3D slice is that many rows. */
+            ok = detile_to_linear(&t->surface, source, mip, layer, mapped + fp[i].Offset,
+                                  fp[i].Footprint.RowPitch, (UINT64)fp[i].Footprint.RowPitch * rows[i]);
+        }
+        free(source);
     }
     ID3D12Resource_Unmap(buffer, 0, NULL);
     if (!ok)
