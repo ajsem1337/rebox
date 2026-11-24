@@ -1993,7 +1993,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 at += snprintf(line + at, sizeof(line) - at, " %u:%u/%u", out->vertex_inputs[i][0],
                                out->vertex_inputs[i][1], out->vertex_inputs[i][2]);
             line[at] = 0;
-            if (InterlockedIncrement(&shown) <= 12)
+            if (console_stage_watched(stage_id) || InterlockedIncrement(&shown) <= 12)
                 rebox_log("d3d12_xs: console vertex shader %016llx: %u inputs (location:components/fetch)%s",
                              (unsigned long long)stage_id, out->vertex_input_count, line);
         }
