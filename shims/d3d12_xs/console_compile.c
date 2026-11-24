@@ -1503,7 +1503,13 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
         return E_PENDING;
     }
     started = ticks_now();
-    hr = bounded_compile(in, out, graphics);
+    /* Those draws also compile on their own thread, as long as it takes: on the shared workers
+     * they queued behind a loading scene's compiles, overran the wait, and a loading screen's
+     * layers went black for a frame whenever they needed a new variant. */
+    if (in_display_draw && current_draw.target >= 0)
+        hr = compile_now(in, out, FALSE);
+    else
+        hr = bounded_compile(in, out, graphics);
     InterlockedAdd64(&frame_compile_ticks, ticks_now() - started);
     return hr;
 }
