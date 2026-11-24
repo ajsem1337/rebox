@@ -38,7 +38,9 @@
  * without waiting until a slot is free again.
  *   REBOX_DUMP_FRAMES=DIR  write presented frames to DIR\frame_<n>.bmp
  *                             (8-bit RGBA/BGRA planes) or .bin
- *   REBOX_DUMP_FRAMES_AT   which frames, comma-separated; default 1,60,600 */
+ *   REBOX_DUMP_FRAMES_AT   which frames, comma-separated; default 1,60,600
+ *   REBOX_DUMP_FRAMES_EVERY=N  also a frame every N seconds (the first presented frame, then
+ *                             the first one N seconds after the last dump) */
 
 #define COBJMACROS
 /* Struct-returning methods (GetDesc) as hidden-pointer calls, matching
@@ -562,11 +564,21 @@ static BOOL ensure_swapchain(struct present_queue *s, UINT width, UINT height, D
 
 static BOOL dump_wanted(UINT64 frame)
 {
-    const char *at = getenv("REBOX_DUMP_FRAMES_AT");
+    const char *at = getenv("REBOX_DUMP_FRAMES_AT"), *every = getenv("REBOX_DUMP_FRAMES_EVERY");
+    static ULONGLONG last_dump;
     char *end;
 
     if (!getenv("REBOX_DUMP_FRAMES"))
         return FALSE;
+    if (every && strtoul(every, NULL, 10))
+    {
+        ULONGLONG now = GetTickCount64();
+        if (!last_dump || now - last_dump >= strtoul(every, NULL, 10) * 1000ull)
+        {
+            last_dump = now;
+            return TRUE;
+        }
+    }
     if (!at || !*at)
         at = "1,60,600";
     while (*at)

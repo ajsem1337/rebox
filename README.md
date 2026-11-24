@@ -179,6 +179,7 @@ method the title asked for that isn't implemented.
 | `REBOX_FRAME_PACING=0` | Make `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX` no-ops, so the title runs as fast as `PresentX` allows |
 | `REBOX_DUMP_FRAMES=DIR` | Write presented frames to `DIR/frame_<n>.bmp` (8-bit RGBA/BGRA planes) or `.bin` |
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
+| `REBOX_DUMP_FRAMES_EVERY=N` | Also dump a frame every N seconds (the first frame, then the first one N seconds after the last dump) |
 
 The shader cache ([docs/shaders.md](docs/shaders.md)) is keyed by the 64-bit FNV-1a hash of the
 bytecode exactly as the title passes it to `Create*PipelineState`.
