@@ -4553,6 +4553,29 @@ static void test_placed_texture_tracked(void *dev, void *queue)
               "differ)", ok ? 0 : GetLastError(), changed);
         CloseHandle(file);
     }
+    {
+        /* A system call's write held over a submission (a DirectStorage request reading, then
+         * decoding into its destination): the hold made the texture dirty, and its upload must not
+         * arm the pages again before the write is done, or the request finds its destination
+         * read-only and fails. What it wrote is uploaded once it's done. */
+        void *(WINAPI *prepare)(ULONGLONG, ULONGLONG) = (void *)GetProcAddress(x, "ReboxPrepareWrite");
+        void (WINAPI *finish)(void *) = (void *)GetProcAddress(x, "ReboxFinishWrite");
+        UINT64 at = AWAY(60, 0x200);
+        void *hold = prepare && finish ? prepare((ULONG_PTR)memory + 60 * UNIT, UNIT) : NULL;
+        changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+        CHECK(hold && VirtualQuery(memory + at, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_READWRITE,
+              "a held write's pages stay writable over a submission that uploads the texture (protect %#lx)",
+              mbi.Protect);
+        if (hold && mbi.Protect == PAGE_READWRITE)
+            *(volatile UINT32 *)(memory + at) = 0xff0a0b0c;
+        expected[where[at / 4]] = 0xff0a0b0c;
+        if (finish)
+            finish(hold);
+        changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+        CHECK(!changed && VirtualQuery(memory + at, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_READONLY,
+              "what a held write wrote is uploaded once it's done, and the pages armed again (%u texels differ, "
+              "protect %#lx)", changed, mbi.Protect);
+    }
 #undef AWAY
 done:
     CHECK(SUCCEEDED(hr) && list, "a texture placed in physical-page views (%#lx)", hr);

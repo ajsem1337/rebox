@@ -25,6 +25,7 @@ EXPORTS
     ReboxTrackPages
     ReboxTrackedDirty
     ReboxPrepareWrite
+    ReboxFinishWrite
     ReboxPhysicalAdopted
     ReboxPhysicalDescribe
     ReboxMapPhysicalAlias
