@@ -273,8 +273,9 @@ down missing translations.
   heaps keep ordinary GPU addresses. The title's own memory becomes GPU memory where it is when a
   buffer is placed over it or a descriptor heap lives in it (spans of 2 MiB to 256 MiB, through the
   layer's mailbox); memory it never places anything over stays CPU-only, so a shader reading it
-  through a pointer the title built itself reads nothing, and physical pages mapped at two
-  addresses don't alias.
+  through a pointer the title built itself reads nothing. Physical pages are shared sections, so a
+  page mapped at two addresses is the same memory at both, unless one address lies outside the
+  ranges reserved for physical pages (there it gets a copy).
 - **Ray tracing and depth UAVs are placeholders.** Console ray tracing pipelines
   (`DeserializeStateObjectX`, `CreateStateObject`) get placeholder objects that trace nothing,
   and their `DispatchRays` are skipped, as are state objects the title sets that aren't ours

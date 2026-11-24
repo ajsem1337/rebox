@@ -456,6 +456,23 @@ static void test_xmem(void)
                 }
                 if (r2) VirtualFree(r2, 0, MEM_RELEASE);
             }
+            /* Two pages mapped twice at once into a range reserved for physical pages (MEM_PHYSICAL),
+             * as a page pool and streaming do: both addresses are the same memory. */
+            {
+                typedef BOOL (WINAPI *vfree_fn)(void *, SIZE_T, DWORD);
+                vfree_fn vfree = (vfree_fn)(void *)GetProcAddress(m, "XMemVirtualFree");
+                BYTE *r3 = valloc(NULL, 4 << 16, MEM_RESERVE | 0x400000 /* MEM_PHYSICAL */, 0x3, PAGE_READWRITE);
+                BOOL shared = r3 && vfree && pmap(r3, 2, pages + 4) && pmap(r3 + (2 << 16), 2, pages + 4);
+                if (shared)
+                {
+                    r3[(1 << 16) + 7] = 0x3c;
+                    r3[(2 << 16) + 9] = 0xc3;
+                    shared = r3[(3 << 16) + 7] == 0x3c && r3[9] == 0xc3;
+                }
+                CHECK(shared, "a physical page mapped at two addresses is the same memory at both");
+                CHECK(r3 && pmap(r3, 4, NULL) && vfree && vfree(r3, 0, MEM_RELEASE),
+                      "a range reserved for physical pages unmaps and releases");
+            }
             CHECK(pfree(16, pages), "XMemFreePhysicalPages");
         }
     }
