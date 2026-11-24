@@ -1349,6 +1349,127 @@ static LONG64 frame_budget_ticks(void)
     return budget;
 }
 
+/* Compiles of known programs from the title's recording threads run on a pool of their own, and the
+ * caller waits a bounded time: almost all are AnyPS5 memo hits taking well under a millisecond, but
+ * a new variant of a large program can take tens of seconds, and the title's render thread, waiting
+ * for that recording job, stopped presenting until its GPU watchdog fired. Past the wait the draw or
+ * dispatch is skipped and the compile goes on; the next call finds it in AnyPS5's memo.
+ * REBOX_INLINE_COMPILE_WAIT_MS (default 50; compute 250; 0: compile in the caller as before). */
+struct bounded_job
+{
+    struct bounded_job *next;
+    volatile LONG refs;
+    HANDLE done;
+    HRESULT hr;
+    struct rebox_compile_out out;
+    struct rebox_compile_in in;
+    UINT32 sgprs[64];
+    BYTE shader[];
+};
+static struct bounded_job *bounded_head, *bounded_tail;
+static SRWLOCK bounded_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE bounded_ready = CONDITION_VARIABLE_INIT;
+
+static void bounded_release(struct bounded_job *job)
+{
+    if (!InterlockedDecrement(&job->refs))
+    {
+        CloseHandle(job->done);
+        free(job);
+    }
+}
+
+static DWORD WINAPI bounded_worker(void *unused)
+{
+    for (;;)
+    {
+        struct bounded_job *job;
+        AcquireSRWLockExclusive(&bounded_lock);
+        while (!bounded_head)
+            SleepConditionVariableSRW(&bounded_ready, &bounded_lock, INFINITE, 0);
+        job = bounded_head;
+        if (!(bounded_head = job->next))
+            bounded_tail = NULL;
+        ReleaseSRWLockExclusive(&bounded_lock);
+        job->hr = compile_now(&job->in, &job->out, FALSE);
+        SetEvent(job->done);
+        bounded_release(job);
+    }
+    return 0;
+}
+
+static DWORD inline_wait_ms(BOOL graphics)
+{
+    static LONG ms = -1;
+    if (ms < 0)
+    {
+        char v[16];
+        DWORD n = GetEnvironmentVariableA("REBOX_INLINE_COMPILE_WAIT_MS", v, sizeof(v));
+        ms = n && n < sizeof(v) ? atol(v) : 50;
+    }
+    return !ms ? 0 : graphics ? (DWORD)ms : (DWORD)max(ms, 250);
+}
+
+static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics)
+{
+    static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
+    static LONG timeouts;
+    DWORD wait = inline_wait_ms(graphics);
+    struct bounded_job *job;
+    BOOL pending;
+    HRESULT hr;
+
+    if (!wait || !(job = calloc(1, sizeof(*job) + in->shader_size)))
+        return compile_now(in, out, FALSE);
+    if (!(job->done = CreateEventA(NULL, TRUE, FALSE, NULL)))
+    {
+        free(job);
+        return compile_now(in, out, FALSE);
+    }
+    job->refs = 2;
+    job->in = *in;
+    memcpy(job->shader, in->shader, in->shader_size);
+    job->in.shader = job->shader;
+    job->in.user_sgpr_count = min(in->user_sgpr_count, (UINT32)ARRAYSIZE(job->sgprs));
+    if (in->user_sgprs)
+        memcpy(job->sgprs, in->user_sgprs, job->in.user_sgpr_count * 4u);
+    job->in.user_sgprs = job->sgprs;
+    if (InitOnceBeginInitialize(&started, 0, &pending, NULL) && pending)
+    {
+        for (UINT w = 0; w < 8; w++)
+        {
+            HANDLE t = CreateThread(NULL, 0, bounded_worker, NULL, 0, NULL);
+            if (t)
+                CloseHandle(t);
+        }
+        InitOnceComplete(&started, 0, NULL);
+    }
+    AcquireSRWLockExclusive(&bounded_lock);
+    if (bounded_tail)
+        bounded_tail->next = job;
+    else
+        bounded_head = job;
+    bounded_tail = job;
+    ReleaseSRWLockExclusive(&bounded_lock);
+    WakeConditionVariable(&bounded_ready);
+    if (WaitForSingleObject(job->done, wait) == WAIT_OBJECT_0)
+    {
+        hr = job->hr;
+        *out = job->out;
+    }
+    else
+    {
+        LONG n = InterlockedIncrement(&timeouts);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: console shaders: %ld %s compiles took past their wait and went on without "
+                      "their draw or dispatch", n, graphics ? "graphics" : "compute");
+        set_last(E_PENDING, "compiling past its wait", NULL);
+        hr = E_PENDING;
+    }
+    bounded_release(job);
+    return hr;
+}
+
 static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     const struct rebox_deferred_shader *h = in->shader;
@@ -1368,7 +1489,7 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
         return E_PENDING;
     }
     started = ticks_now();
-    hr = compile_now(in, out, FALSE);
+    hr = bounded_compile(in, out, graphics);
     InterlockedAdd64(&frame_compile_ticks, ticks_now() - started);
     return hr;
 }
