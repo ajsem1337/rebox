@@ -845,8 +845,38 @@ static void log_large(void)
     }
 }
 
+/* Where title_textures_upload's time goes, logged every 1024 submissions with uploads to make or
+ * changes to look for: the change scan, the batch's objects, recording uploads (buffer, copy-out,
+ * detiling), and how many bytes. */
+static struct { LONG64 scan, objects, record, submit, bytes; LONG calls, uploads; } upload_stats;
+
+static LONG64 stat_ticks(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static void upload_stats_log(void)
+{
+    LARGE_INTEGER f;
+    double ms;
+    LONG n = InterlockedIncrement(&upload_stats.calls);
+
+    if (n % 1024)
+        return;
+    QueryPerformanceFrequency(&f);
+    ms = 1000.0 / (double)f.QuadPart / 1024;
+    rebox_log("d3d12_xs: title textures, ms per submission over 1024: change scan %.2f, batch objects %.2f, "
+              "recording %.2f, submitting %.2f; %ld uploads, %.1f MiB", upload_stats.scan * ms,
+              upload_stats.objects * ms, upload_stats.record * ms, upload_stats.submit * ms, upload_stats.uploads,
+              upload_stats.bytes / 1048576.0);
+    memset(&upload_stats, 0, sizeof(upload_stats));
+}
+
 void title_textures_upload(ID3D12CommandQueue *queue)
 {
+    LONG64 t0, t1;
     struct title_texture *t;
     struct batch *b = NULL;
     ID3D12Device *device = NULL;
@@ -855,12 +885,16 @@ void title_textures_upload(ID3D12CommandQueue *queue)
 
     if (!textures)
         return;
+    t0 = stat_ticks();
     slot = batches_reclaim(queue);
     AcquireSRWLockExclusive(&lock);
     submissions++;
     watch();
     log_large();
     ReleaseSRWLockExclusive(&lock);
+    t1 = stat_ticks();
+    upload_stats.scan += t1 - t0;
+    upload_stats_log();
     if (!dirty_count || slot < 0)
         return;
     qd = ID3D12CommandQueue_GetDesc(queue);
@@ -875,6 +909,8 @@ void title_textures_upload(ID3D12CommandQueue *queue)
             || FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&b->fence)))
         goto done;
     b->queue = queue;
+    t0 = stat_ticks();
+    upload_stats.objects += t0 - t1;
 
     /* Under the lock so a texture can't be destroyed while its upload is recorded; up to 64 a
      * submission, the rest the next time. */
@@ -889,9 +925,13 @@ void title_textures_upload(ID3D12CommandQueue *queue)
             {
                 b->count++;
                 t->uploads++;
+                upload_stats.uploads++;
+                upload_stats.bytes += t->size;
             }
         }
     ReleaseSRWLockExclusive(&lock);
+    t1 = stat_ticks();
+    upload_stats.record += t1 - t0;
     if (FAILED(ID3D12GraphicsCommandList_Close(b->list)) || !b->count)
         goto done;
     ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&b->list);
@@ -907,6 +947,7 @@ void title_textures_upload(ID3D12CommandQueue *queue)
         if (InterlockedIncrement(&uploads) <= 8)
             rebox_log("d3d12_xs: uploaded %u placed texture(s) from title memory", b->count);
     }
+    upload_stats.submit += stat_ticks() - t1;
     /* Another queue may have taken the slot meanwhile: any free one will do. */
     AcquireSRWLockExclusive(&batch_lock);
     for (int i = 0; i < (int)ARRAYSIZE(batches) && b; i++)
