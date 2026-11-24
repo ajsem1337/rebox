@@ -81,6 +81,7 @@ struct proxy
     BOOL ray_pipeline; /* lists: a real ray tracing pipeline is set (not none, not a placeholder: state_object.c) */
     int display_bound; /* lists: 1 + which display-sized target is bound, or 0 (counted for the log) */
     BOOL rect_list;    /* lists: the console's rectangle list (topology 17) is set */
+    UINT topology;     /* lists: the last IASetPrimitiveTopology (logged at a watched stage's draws) */
     D3D12_VERTEX_BUFFER_VIEW vertex_buffers[8]; /* lists: as bound, for rect lists (list_DrawInstanced) */
     UINT vertex_buffer_mask;
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
@@ -1618,6 +1619,7 @@ static BOOL rect_lists_on_cpu(void)
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12_PRIMITIVE_TOPOLOGY topology)
 {
     p->rect_list = topology == 17;
+    p->topology = topology;
     if (topology == 17 && rect_lists_on_cpu())
     {
         static LONG logged;
@@ -3382,8 +3384,8 @@ static void log_watched_vertex_buffers(struct proxy *p, UINT first_vertex, UINT 
             for (UINT k = 0; k < n && !IsBadReadPtr(d + k, 4) && at < 280; k++)
                 at += snprintf(line + at, sizeof(line) - at, " %08x", d[k]);
             line[at] = 0;
-            rebox_log("d3d12_xs: watched stage's draw: vertex buffer %u at %#llx, %u bytes, stride %u:%s", i,
-                      (unsigned long long)v->BufferLocation, v->SizeInBytes, v->StrideInBytes, line);
+            rebox_log("d3d12_xs: watched stage's draw (topology %u): vertex buffer %u at %#llx, %u bytes, stride %u:%s",
+                      p->topology, i, (unsigned long long)v->BufferLocation, v->SizeInBytes, v->StrideInBytes, line);
         }
 }
 
