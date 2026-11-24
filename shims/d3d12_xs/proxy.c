@@ -3051,10 +3051,91 @@ volatile UINT64 rebox_table_watch; /* console_compile.c: a table to show at the 
 volatile UINT64 rebox_value_watch; /* console_compile.c (REBOX_WATCH_STAGE): 4 floats to show at the next submission */
 BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
 
-static void lists_wait(UINT count, ID3D12CommandList *const *lists);
+static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists);
 static volatile LONG timed_out_count;
 static BOOL after_timed_out_wait(UINT64 address, UINT bytes);
 static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists);
+
+/* Console memory waits on the GPU. A title's lists wait for a value at an address (a counter
+ * another queue's list writes at the bottom of its pipe), and the console's GPU waits while the
+ * title goes on submitting, the writer's list among them, often after the waiter's, from the same
+ * thread. A wait on the CPU before the submission blocked that thread until it timed out (2 s a
+ * list, frames seconds apart). So each address written so gets a fence, signalled with the value
+ * after the writing list's submission, on its queue; a wait for a counter (greater, greater or
+ * equal, all bits) is that queue waiting for the fence, on the GPU. */
+struct value_fence { UINT64 address; ID3D12Fence *fence; UINT64 signalled; struct value_fence *next; };
+static struct value_fence *value_fences[4096];
+static SRWLOCK value_fence_lock = SRWLOCK_INIT;
+
+/* Under value_fence_lock, exclusive. */
+static struct value_fence *value_fence(UINT64 address)
+{
+    struct value_fence **at = &value_fences[(address >> 3) * 0x9e3779b97f4a7c15ull >> 52];
+    struct value_fence *f;
+    ID3D12Device *device = rebox_shared_device();
+
+    for (f = *at; f; f = f->next)
+        if (f->address == address)
+            return f;
+    if (!device || !(f = calloc(1, sizeof(*f))))
+        return NULL;
+    if (FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&f->fence)))
+    {
+        free(f);
+        return NULL;
+    }
+    f->address = address;
+    f->next = *at;
+    *at = f;
+    return f;
+}
+
+/* After a submission on queue: each write in the lists signals its address's fence (values only
+ * go up: a fence can't go back). */
+static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists)
+{
+    AcquireSRWLockExclusive(&value_fence_lock);
+    for (UINT i = 0; i < count; i++)
+    {
+        struct proxy *l = (struct proxy *)lists[i];
+        if (!is_proxy(l))
+            continue;
+        for (UINT pass = 0; pass < 2; pass++)
+        {
+            const struct cpu_write *w = pass ? l->cpu_writes : l->gpu_writes;
+            UINT n = pass ? l->cpu_write_count : l->gpu_write_count;
+            for (UINT k = 0; k < n; k++)
+            {
+                UINT64 value = w[k].count == 2 ? (UINT64)w[k].values[1] << 32 | w[k].values[0] : w[k].values[0];
+                struct value_fence *f = value_fence(w[k].address);
+                if (f && value > f->signalled)
+                {
+                    ID3D12CommandQueue_Signal(queue, f->fence, value);
+                    f->signalled = value;
+                }
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&value_fence_lock);
+}
+
+/* A counter wait not met in memory now: queue waits on the GPU for the address's fence. FALSE for
+ * a wait this can't express (another comparison, a partial mask), which stays on the CPU. */
+static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wait *w)
+{
+    UINT64 all = w->width == 8 ? ~0ull : 0xffffffffull, target;
+    struct value_fence *f;
+
+    if ((w->comparison != D3D12_COMPARISON_FUNC_GREATER && w->comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL)
+            || (w->mask & all) != all)
+        return FALSE;
+    target = w->comparison == D3D12_COMPARISON_FUNC_GREATER ? w->value + 1 : w->value;
+    AcquireSRWLockExclusive(&value_fence_lock);
+    if ((f = value_fence(w->address)))
+        ID3D12CommandQueue_Wait(queue, f->fence, target);
+    ReleaseSRWLockExclusive(&value_fence_lock);
+    return f != NULL;
+}
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
@@ -3079,8 +3160,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
                     rebox_log("d3d12_xs: list %p writing %#llx by the CPU (where a wait timed out) submitted on queue %p "
                               "(thread %#lx)", l, (unsigned long long)l->cpu_writes[k].address, p, GetCurrentThreadId());
         }
-    /* Memory waits the lists start with, on the CPU (lists_wait). */
-    lists_wait(count, lists);
+    /* Memory waits the lists start with: on the GPU for counters, else on the CPU (lists_wait). */
+    lists_wait(INNER(p, ID3D12CommandQueue), count, lists);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
     /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
@@ -3103,6 +3184,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
                       t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
     }
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
+    /* Waits elsewhere for the values these lists write (signal_value_fences). */
+    signal_value_fences(INNER(p, ID3D12CommandQueue), count, lists);
     /* Their writes outside GPU memory, once the GPU is there (cpu_writes_after). */
     cpu_writes_after(p, count, lists);
     if (raw != stack)
@@ -3891,8 +3974,9 @@ static BOOL wait_satisfied(const struct memory_wait *w)
     }
 }
 
-/* Before a submission: each list's waits, on the CPU (up to 2 s each, then logged and passed). */
-static void lists_wait(UINT count, ID3D12CommandList *const *lists)
+/* Before a submission: each list's waits; a counter not reached yet on the GPU (gpu_wait_for_value),
+ * others on the CPU (up to 2 s each, then logged and passed). */
+static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists)
 {
     for (UINT i = 0; i < count; i++)
     {
@@ -3904,6 +3988,8 @@ static void lists_wait(UINT count, ID3D12CommandList *const *lists)
             const struct memory_wait *w = &l->waits[k];
             LARGE_INTEGER start, now, freq;
             BOOL ok;
+            if (wait_satisfied(w) || gpu_wait_for_value(queue, w))
+                continue;
             QueryPerformanceCounter(&start);
             QueryPerformanceFrequency(&freq);
             while (!(ok = wait_satisfied(w)))
