@@ -122,11 +122,13 @@ entry 6 the code behind a 0x24-byte header, up to its last `s_endpgm`.
    keeps variants and resource plans across runs, and with patch 0009 the plan builds and
    variants that failed as well, with their errors: a later run fails them at once instead of
    compiling them again. Each guest binding's elements are found in the
-   bound heap's shadow, which gives heap slots. `sa5_finalize` (`anyps5/spirv_remap.cpp`) then
-   freezes the specialisation constants, moves each guest descriptor array onto the bindless set
-   as a runtime array indexed by those slots, turns host buffers into BDA pointers read from push
-   bytes 128-191 (up to 8), and validates the module. Modules are cached by AnyPS5's pipeline
-   identity plus the slots.
+   bound heap's shadow, which gives heap slots. `sa5_finalize_draw` (`anyps5/spirv_remap.cpp`)
+   then freezes the specialisation constants, moves each guest descriptor array onto the bindless
+   set as a runtime array indexed by slots read from the dispatch's **draw block**, turns host
+   buffers into BDA pointers read from that block (up to 8), and validates the module. The draw
+   block's address is at push byte 128. Modules are cached by AnyPS5's pipeline identity, not the
+   slots: a world's compute passes take new slots every frame, and with the slots in the module
+   each made a module and a pipeline, its dispatches skipped while the pipeline was built.
 5. **Bind.** vkd3d-proton makes one pipeline per key with the root signature's own layout, so its
    bindless sets are already bound. After its descriptors are updated it pushes the 192 bytes from
    the compile and marks its own root parameters dirty for the next ordinary pipeline.

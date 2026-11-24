@@ -42,6 +42,7 @@
  * pipeline per draw: a UE5 title's render thread spent its frames compiling). */
 #define GRAPHICS_PUSH_DATA 112u
 #define GRAPHICS_PUSHED_MAX SA5_DRAW_ADDRESSES /* per-draw host buffers: in the draw block */
+#define COMPUTE_DRAW_BLOCK 128 /* where a dispatch's draw block address is in its push block */
 /* A mesh stage's push data ends earlier: AnyPS5's mesh path reads its draw parameters from push bytes
  * 104-127 (sa5_finalize_draw freezes them, so nothing is pushed there). */
 #define MESH_PUSH_DATA 96u
@@ -2431,10 +2432,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                                         index_count };
             key[0] = hash_bytes(key[0], &b.binding, sizeof(b.binding));
             key[0] = hash_bytes(key[0], &b.count, sizeof(b.count));
-            /* Graphics: the heap slots are in the draw block, not the module (a UE5 title copies its
-             * descriptors to new slots every draw: one module per draw, and a pipeline each). */
-            if (!graphics)
-                key[0] = hash_bytes(key[0], &indices[index_count], b.count * sizeof(UINT32));
+            /* The heap slots are in the draw block, not the module (a UE5 title copies its
+             * descriptors to new slots every draw, and a world's compute passes theirs: a module per
+             * draw or dispatch, and a pipeline each, compute's built while its dispatches were
+             * skipped). */
             index_count += b.count;
         }
         else
@@ -2525,10 +2526,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     phase_end(&mark, PHASE_BINDINGS);
     if (!(module = find_module(key)))
     {
-        if (graphics ? sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
-                                         in->push_offset + stage_push, &words, &word_count, error, sizeof(error))
-                     : sa5.finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error,
-                                    sizeof(error)))
+        if (sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
+                              graphics ? in->push_offset + stage_push : COMPUTE_DRAW_BLOCK, &words, &word_count, error,
+                              sizeof(error)))
         {
             log_failure(h, "fitting it to vkd3d-proton's bindings failed", error);
             binding_failure_note(failure_id);
@@ -2563,8 +2563,22 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     memcpy(out->key, key, sizeof(key));
     push = sa5.push_constants(result, &push_size);
     memcpy(out->push, push, min(push_size, graphics ? stage_push : 128u));
-    for (UINT32 i = 0; i < host_count && !graphics; i++)
-        memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
+    if (!graphics)
+    {
+        /* A dispatch's draw block: its host buffers' addresses (by push slot, their index here),
+         * then its bindings' heap slots; its address at push byte COMPUTE_DRAW_BLOCK. */
+        static __thread UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS];
+        UINT64 va;
+        memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
+        memcpy(block, host_va, min(host_count, (UINT32)SA5_DRAW_ADDRESSES) * sizeof(UINT64));
+        memcpy(block + 2 * SA5_DRAW_ADDRESSES, indices, index_count * sizeof(UINT32));
+        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32), NULL)))
+        {
+            log_failure(h, "no GPU memory for the draw block", NULL);
+            goto done;
+        }
+        memcpy(&out->push[COMPUTE_DRAW_BLOCK / 4], &va, sizeof(UINT64));
+    }
     if (graphics)
     {
         /* The draw block: the per-draw host buffers' addresses, then every remapped binding's heap
