@@ -3,13 +3,18 @@
  * Unreal titles create the APU heap at startup and stop with a fatal error if that fails
  * (a UE5 title: "Failed to create APU heap: 80004001" with a stub). Here the heap is ordinary
  * memory and the coprocessor (SHAPE: XMA decoding, sample-rate conversion, mixing) isn't
- * emulated: IAcpHal acknowledges commands and ticks audio frames (below), and XMA is decoded
- * on the CPU by shims/xaudio2_9 instead. Signatures and the SHAPE_CONTEXTS layout follow TomBox's notes, read
+ * emulated: IAcpHal acknowledges commands and ticks audio frames (below). XMA contexts are
+ * decoded on a thread of ours (xma.c); XAudio2's XMA voices are decoded by shims/xaudio2_9.
+ * Signatures and the SHAPE_CONTEXTS layout follow TomBox's notes, read
  * from a UE5 title's call sites (facts only):
  *   HRESULT ApuCreateHeap(UINT32 size, UINT32 flags)
  *   HRESULT ApuAlloc(void **block, APU_ADDRESS *address, UINT32 size, UINT32 alignment, UINT32 flags)
  *       APU_ADDRESS is 32 bits: the block's offset in the heap
  *   HRESULT ApuFree(void *block)
+ *   UINT32 ApuMapVirtualAddress(const void *va): the APU address of memory the title has
+ *       (both the target title and FMOD pass only the pointer and keep the result, after
+ *       ApuIsVirtualAddressValid(va, alignment) says yes)
+ *   void *ApuMapApuAddress(UINT32 apu)
  *   HRESULT ApuHeapGetState(UINT32 *state, UINT32 flags): state[0] bytes free, state[1] in use
  *   HRESULT AcpHalCreate(IAcpHal **hal)
  *   HRESULT AcpHalAllocateShapeContexts(SHAPE_CONTEXTS *contexts)
@@ -19,6 +24,14 @@
 #include <windows.h>
 
 #include "../common/rebox_log.h"
+#include "acphal.h"
+
+/* APU addresses are a heap offset plus this: 0 means "none" to titles. Memory outside the heap
+ * gets addresses past the heap's, kept in `mapped` so they map back. */
+#define APU_BASE 0x10000u
+
+static struct { UINT32 apu; SIZE_T size; BYTE *va; } mapped[1024];
+static unsigned mapped_count;
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static BYTE *heap;
@@ -56,7 +69,7 @@ HRESULT WINAPI ApuAlloc(void **block, UINT32 *address, UINT32 size, UINT32 align
         p = heap + start;
         heap_used = start + size;
         if (address)
-            *address = (UINT32)start;
+            *address = APU_BASE + (UINT32)start;
     }
     ReleaseSRWLockExclusive(&lock);
     if (!p)
@@ -69,8 +82,14 @@ HRESULT WINAPI ApuAlloc(void **block, UINT32 *address, UINT32 size, UINT32 align
             rebox_log("acphal: APU heap full (%zu bytes); further blocks get memory of their own", heap_size);
         AcquireSRWLockExclusive(&lock);
         if (address)
-            *address = (UINT32)(heap_size + outside);
-        outside += size;
+            *address = APU_BASE + (UINT32)(heap_size + outside);
+        if (mapped_count < ARRAYSIZE(mapped))
+        {
+            mapped[mapped_count].apu = APU_BASE + (UINT32)(heap_size + outside);
+            mapped[mapped_count].size = size;
+            mapped[mapped_count++].va = p;
+        }
+        outside += (size + 0xfff) & ~0xfff;
         ReleaseSRWLockExclusive(&lock);
     }
     *block = p;
@@ -190,6 +209,7 @@ static HRESULT WINAPI hal_submit(struct hal *h, UINT32 type, UINT64 id, UINT32 f
         rebox_log("acphal: coprocessor command %#x first seen (id %#llx, frame %#x, %u bytes)", type,
                      (unsigned long long)id, frame, size);
     }
+    xma_command(type, data);
     AcquireSRWLockExclusive(&h->lock);
     if ((connected = h->connected) && id)
         hal_push(h, ACP_COMMAND_DONE, id); /* id 0: nobody waits for it */
@@ -291,6 +311,8 @@ HRESULT WINAPI AcpHalAllocateShapeContexts(BYTE *contexts)
             memcpy(contexts + 0x18 + 8 * i, &array, sizeof(array));
         if (counts[i])
             rebox_log("acphal: %u %s contexts at %p", counts[i], names[i], array);
+        if (i == 4 && counts[i])
+            xma_contexts(array, counts[i]);
     }
     return S_OK;
 }
@@ -301,32 +323,35 @@ HRESULT WINAPI AcpHalReleaseShapeContexts(void)
     return S_OK; /* the arrays stay in the heap, which never gives memory back */
 }
 
-/* An APU address for the title's own memory: its heap offset if it's in the heap, else a new
- * address past the heap's (as ApuAlloc gives a block that didn't fit). */
-/* Memory outside the heap gets APU addresses past it, kept so ApuMapApuAddress can map them back. */
-static struct { UINT32 apu, size; BYTE *va; } mapped[256];
-static unsigned mapped_count;
-
-HRESULT WINAPI ApuMapVirtualAddress(UINT32 *address, void *va, UINT32 size)
+/* The APU address of the title's memory: in the heap, its offset; elsewhere, an address past the
+ * heap's for the whole allocation the memory is in (it is kept, so it maps back). An earlier
+ * version took (UINT32 *address, void *va, UINT32 size), after xcl: titles pass the pointer
+ * alone, so it wrote an address into the title's buffer and returned 0 for every XMA context. */
+UINT32 WINAPI ApuMapVirtualAddress(const void *va)
 {
-    if (!address)
-        return E_INVALIDARG;
+    const BYTE *p = va;
+    MEMORY_BASIC_INFORMATION info;
+    UINT32 apu = 0;
+
+    if (!p)
+        return 0;
     AcquireSRWLockExclusive(&lock);
-    if (heap && (BYTE *)va >= heap && (BYTE *)va < heap + heap_size)
-        *address = (UINT32)((BYTE *)va - heap);
-    else
+    if (heap && p >= heap && p < heap + heap_size)
+        apu = APU_BASE + (UINT32)(p - heap);
+    for (unsigned i = 0; i < mapped_count && !apu; i++)
+        if (p >= mapped[i].va && (SIZE_T)(p - mapped[i].va) < mapped[i].size)
+            apu = mapped[i].apu + (UINT32)(p - mapped[i].va);
+    if (!apu && mapped_count < ARRAYSIZE(mapped) && VirtualQuery(p, &info, sizeof(info)) && info.State == MEM_COMMIT)
     {
-        *address = (UINT32)(heap_size + outside);
+        SIZE_T size = (BYTE *)info.BaseAddress + info.RegionSize - (BYTE *)p;
+        mapped[mapped_count].apu = APU_BASE + (UINT32)(heap_size + outside);
+        mapped[mapped_count].size = size;
+        mapped[mapped_count++].va = (BYTE *)p;
+        apu = APU_BASE + (UINT32)(heap_size + outside);
         outside += (size + 0xfff) & ~0xfff;
-        if (mapped_count < ARRAYSIZE(mapped))
-        {
-            mapped[mapped_count].apu = *address;
-            mapped[mapped_count].size = size;
-            mapped[mapped_count++].va = va;
-        }
     }
     ReleaseSRWLockExclusive(&lock);
-    return S_OK;
+    return apu;
 }
 
 /* The memory an APU address stands for, or NULL (xcl: ApuMapApuAddress(apu) -> va). */
@@ -334,13 +359,15 @@ void *WINAPI ApuMapApuAddress(UINT32 apu)
 {
     void *va = NULL;
 
-    AcquireSRWLockExclusive(&lock);
-    if (heap && apu < heap_size)
-        va = heap + apu;
+    if (apu < APU_BASE)
+        return NULL;
+    AcquireSRWLockShared(&lock);
+    if (heap && apu - APU_BASE < heap_size)
+        va = heap + (apu - APU_BASE);
     for (unsigned i = 0; i < mapped_count && !va; i++)
         if (apu >= mapped[i].apu && apu - mapped[i].apu < mapped[i].size)
             va = mapped[i].va + (apu - mapped[i].apu);
-    ReleaseSRWLockExclusive(&lock);
+    ReleaseSRWLockShared(&lock);
     return va;
 }
 

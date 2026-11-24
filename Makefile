@@ -64,6 +64,13 @@ CFLAGS_xapu := -DHAVE_FFMPEG_OPUS -I$(FFMPEG_XMA2)/include
 LIBS_xapu := -L$(FFMPEG_XMA2)/lib -lavcodec -lswresample -lavutil -lbcrypt
 endif
 
+# acphal decodes the title's XMA contexts with the same FFmpeg build; without it, silence of the
+# same length.
+ifneq ($(FFMPEG_XMA2),)
+CFLAGS_acphal := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
+LIBS_acphal := -L$(FFMPEG_XMA2)/lib -lavcodec -lswresample -lavutil -lbcrypt
+endif
+
 # The DirectStorage shim talks to the BCPack helper over a localhost socket.
 LIBS_xcrdapi := -lws2_32
 
