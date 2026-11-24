@@ -23,6 +23,7 @@ EXPORTS
     ReboxWritePhysicalPages
     ReboxPhysicalAdopted
     ReboxPhysicalDescribe
+    ReboxMapPhysicalAlias
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister

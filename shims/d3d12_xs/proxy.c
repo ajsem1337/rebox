@@ -3129,6 +3129,68 @@ static HRESULT STDMETHODCALLTYPE queue_Slot25(struct proxy *p, ID3D12Fence *fenc
     return E_NOTIMPL;
 }
 
+/* Queue slot 29 (31 on the newer layout): CopyPageMappingsBatchX(count, batches, pool, pool pages,
+ * flags). Maps pages of a pool, memory the title mapped physical pages into, at each batch's
+ * destination: a title streams data into pool pages and has the GPU map them into its tiled heap
+ * this way. A batch is {destination, range count, ranges}; a range {kind, start, count} in pool
+ * pages of 64 KiB: kind 0 maps pages start.. in order, 1 maps page start count times, 2 unmaps,
+ * 3 leaves the destination as it is (facts from VIctory, GPL-3.0). Done at once, through xmem;
+ * textures placed at the destinations are uploaded again. */
+struct page_range { UINT32 kind, start, count; };
+struct page_batch { UINT64 destination; UINT32 count; const struct page_range *ranges; };
+
+static HRESULT STDMETHODCALLTYPE queue_CopyPageMappingsBatchX(struct proxy *p, UINT count,
+        const struct page_batch *batches, UINT64 pool, UINT pool_pages, UINT flags)
+{
+    static BOOL (WINAPI *alias)(ULONGLONG, ULONGLONG, ULONGLONG);
+    static LONG calls, failed;
+    const UINT64 page = 64u << 10;
+    BOOL ok = TRUE;
+
+    if (!alias)
+    {
+        HMODULE xmem = GetModuleHandleA("xmem.dll");
+        alias = xmem ? (void *)GetProcAddress(xmem, "ReboxMapPhysicalAlias") : NULL;
+    }
+    if (InterlockedIncrement(&calls) <= 4)
+        rebox_log("d3d12_xs: CopyPageMappingsBatchX(%u batches, pool %#llx, %u pages, flags %#x)", count,
+                  (unsigned long long)pool, pool_pages, flags);
+    if (!alias || (!batches && count))
+        return E_INVALIDARG;
+    for (UINT b = 0; b < count; b++)
+    {
+        UINT64 at = batches[b].destination;
+        for (UINT r = 0; batches[b].ranges && r < batches[b].count; r++)
+        {
+            const struct page_range *range = &batches[b].ranges[r];
+            UINT64 len = (UINT64)range->count * page, source = pool + (UINT64)range->start * page;
+            switch (range->kind)
+            {
+            case 0:
+                ok &= (UINT64)range->start + range->count <= pool_pages && alias(at, source, len);
+                break;
+            case 1:
+                for (UINT k = 0; k < range->count; k++)
+                    ok &= range->start < pool_pages && alias(at + k * page, source, page);
+                break;
+            case 2:
+                alias(at, 0, len);
+                break;
+            case 3:
+                break;
+            default:
+                ok = FALSE;
+            }
+            if (range->kind <= 2 && len)
+                ReboxTitleMemoryWritten(at, len);
+            at += len;
+        }
+    }
+    if (!ok && InterlockedIncrement(&failed) <= 4)
+        rebox_log("d3d12_xs: CopyPageMappingsBatchX: a page mapping failed (pool %#llx)", (unsigned long long)pool);
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE queue_Slot32(struct proxy *p, UINT planes, const void *plane_params, const void *params)
 {
     if (newer_layouts)
@@ -4308,6 +4370,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(18, queue_Slot18),
         FN(25, queue_Slot25),
         FN(32, queue_Slot32),
+        FN(29, queue_CopyPageMappingsBatchX),
         FN(23, queue_SignalX),
         FN(26, queue_GetDesc),
         FN(30, queue_PresentX),
@@ -4325,6 +4388,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(25, queue_SignalX), /* inferred: 23 + 2, as PresentX 30 + 2 */
         FN(28, queue_GetDesc), /* inferred: 26 + 2 */
         FN(32, queue_PresentX),
+        FN(31, queue_CopyPageMappingsBatchX), /* 29 + 2 (VIctory) */
     };
     /* Graphics list: PC through ResourceBarrier (26), then PC + 4 for PC
      * slots 28-58 (both sources agree at 32-48, 50-52 and 60-62). */

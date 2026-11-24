@@ -1338,6 +1338,44 @@ void xmem_describe_address(const char *name, ULONG_PTR address)
               (unsigned long long)address, mbi.BaseAddress, (unsigned long long)mbi.RegionSize, mbi.AllocationBase,
               mbi.State, mbi.Type, mbi.Protect, in_adopted(address) ? ", GPU memory in place" : "", page, data);
 }
+
+/* Maps the physical pages mapped at [from, from + len) at [to, to + len) as well, in place of
+ * what is there; from 0 unmaps. The console queue's CopyPageMappingsBatchX (d3d12_xs): a title
+ * streams data into the pages of a pool, then has the GPU map them into its tiled heap (facts from
+ * VIctory, GPL-3.0). FALSE if a source page isn't mapped physical memory. */
+BOOL WINAPI ReboxMapPhysicalAlias(ULONGLONG to, ULONGLONG from, ULONGLONG len)
+{
+    ULONG_PTR n = 0, *us;
+    BOOL ok = TRUE;
+
+    if (!to || !len || (to | from | len) & (PAGE_UNIT - 1) || !mapped_at
+            || !(us = malloc((len / PAGE_UNIT) * sizeof(*us))))
+        return FALSE;
+    AcquireSRWLockExclusive(&physical_lock);
+    for (ULONG_PTR at = (ULONG_PTR)from; from && at < from + len;)
+    {
+        SIZE_T slot = slot_at(at);
+        if (slot == (SIZE_T)-1)
+        {
+            ok = FALSE;
+            break;
+        }
+        us[n++] = mapped_at[slot].unit;
+        at += (SIZE_T)units[mapped_at[slot].unit].size_units * PAGE_UNIT;
+    }
+    unmap_range((ULONG_PTR)to, (ULONG_PTR)(to + len));
+    if (from && ok)
+        ok = map_units((ULONG_PTR)to, us, n);
+    ReleaseSRWLockExclusive(&physical_lock);
+    free(us);
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("xmem: pages at %#llx+%#llx %s %#llx%s", (unsigned long long)from, (unsigned long long)len,
+                      from ? "mapped at" : "(none) unmap", (unsigned long long)to, ok ? "" : ": a source page isn't mapped");
+    }
+    return ok;
+}
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)

@@ -497,6 +497,22 @@ static void test_xmem(void)
                     CHECK(kept, "unmapping a copy of a physical page keeps what was written through its view");
                     if (plain) VirtualFree(plain, 0, MEM_RELEASE);
                 }
+                /* CopyPageMappingsBatchX's mapping (ReboxMapPhysicalAlias): the pages at a pool
+                 * address mapped at another as well, the same memory at both. */
+                {
+                    BOOL (WINAPI *alias)(ULONGLONG, ULONGLONG, ULONGLONG) =
+                            (void *)GetProcAddress(m, "ReboxMapPhysicalAlias");
+                    BYTE *heap = valloc(NULL, 2 << 16, MEM_RESERVE | 0x400000 /* MEM_PHYSICAL */, 0x3, PAGE_READWRITE);
+                    BOOL aliased = alias && heap && r3 && pmap(r3, 4, NULL) && pmap(r3, 2, pages + 10)
+                            && alias((ULONG_PTR)heap, (ULONG_PTR)r3, 2 << 16);
+                    if (aliased)
+                    {
+                        r3[(1 << 16) + 3] = 0x5e;
+                        aliased = heap[(1 << 16) + 3] == 0x5e && alias((ULONG_PTR)heap, 0, 2 << 16);
+                    }
+                    CHECK(aliased, "ReboxMapPhysicalAlias maps a pool's pages at another address, then unmaps them");
+                    if (heap && vfree) vfree(heap, 0, MEM_RELEASE);
+                }
                 CHECK(r3 && pmap(r3, 4, NULL) && vfree && vfree(r3, 0, MEM_RELEASE),
                       "a range reserved for physical pages unmaps and releases");
             }
