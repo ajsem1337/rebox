@@ -1236,6 +1236,47 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
     rebox_log("xmem: %#llx+%#llx is GPU memory in place now: %u physical pages mapped there are copies",
               (unsigned long long)address, (unsigned long long)size, converted);
 }
+
+/* Logs what is mapped at each 64 KiB page of [address, address + size): its page number, view or
+ * copy, and every other address the same page is mapped at (xcrdapi's REBOX_PHYSICAL_TRACE: what a
+ * request's virtual destination really is). */
+void WINAPI ReboxPhysicalDescribe(ULONGLONG address, ULONGLONG size)
+{
+    UINT logged = 0, empty = 0;
+
+    AcquireSRWLockShared(&physical_lock);
+    for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); mapped_at && at < address + size;
+         at += PAGE_UNIT)
+    {
+        SIZE_T slot = slot_at(at);
+        char others[200];
+        int len = 0;
+        UINT count = 0;
+        if (slot == (SIZE_T)-1)
+        {
+            empty++;
+            if (logged++ < 160)
+                rebox_log("xmem: describe: %#llx: no physical page mapped", (unsigned long long)at);
+            continue;
+        }
+        for (SIZE_T k = 0; k < MAPPED_SLOTS; k++)
+            if (k != slot && mapped_at[k].address > 1 && mapped_at[k].unit == mapped_at[slot].unit)
+            {
+                count++;
+                if (len < 160)
+                    len += snprintf(others + len, sizeof(others) - len, " %#llx", (unsigned long long)mapped_at[k].address);
+            }
+        others[min(len, (int)sizeof(others) - 1)] = 0;
+        if (logged++ < 160)
+            rebox_log("xmem: describe: %#llx: page %#llx (%s), also at %u:%s", (unsigned long long)at,
+                      (unsigned long long)((mapped_at[slot].unit + 1) << 4), mapped_at[slot].copy ? "copy" : "view",
+                      count, others);
+    }
+    ReleaseSRWLockShared(&physical_lock);
+    if (empty)
+        rebox_log("xmem: describe: %u of the pages at %#llx+%#llx have no physical page", empty,
+                  (unsigned long long)address, (unsigned long long)size);
+}
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)

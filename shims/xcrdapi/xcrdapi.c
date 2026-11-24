@@ -268,6 +268,7 @@ struct entry
     HANDLE event;               /* ENTRY_EVENT: duplicated, closed once set */
     ULONG_PTR *pages;           /* a physical-page destination's page numbers, as at enqueue */
     UINT32 page_count;
+    BOOL traced;                /* its destination covers REBOX_PHYSICAL_TRACE */
 };
 
 struct queue
@@ -477,6 +478,16 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     BOOL bcpack = !!(r->options & OPT_BCPACK);
     BOOL to_pages = !!(r->options & OPT_DEST_PHYSICAL);
     DSTORAGE_REQUEST paged;
+
+    if (e->traced)
+    {
+        /* What its destination is as it runs (xmem). */
+        HMODULE xmem = GetModuleHandleA("xmem.dll");
+        void (WINAPI *describe)(ULONGLONG, ULONGLONG) = xmem ? (void *)GetProcAddress(xmem, "ReboxPhysicalDescribe") : NULL;
+        rebox_log("xcrdapi: trace: the request into %p+%#x runs now", r->destination, r->destination_size);
+        if (describe)
+            describe((ULONGLONG)(ULONG_PTR)r->destination, r->destination_size);
+    }
 
     /* A destination in physical pages: decoded into a buffer here, then written through the pages
      * (xmem). */
@@ -704,10 +715,13 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
         }
         if (trace && !(request->options & OPT_DEST_PHYSICAL)
                 && trace - (UINT64)(ULONG_PTR)request->destination < request->destination_size)
+        {
+            e.traced = TRUE;
             rebox_log("xcrdapi: trace: a request (options %#llx, file offset %llu, %u -> %u bytes) writes %p+%#x, "
                       "covering %#llx (thread %#lx)", (unsigned long long)request->options,
                       (unsigned long long)request->file_offset, request->source_size, request->destination_size,
                       request->destination, request->destination_size, (unsigned long long)trace, GetCurrentThreadId());
+        }
     }
     {
         /* Each kind of request once (its options), with an example: what a title asks for. */
