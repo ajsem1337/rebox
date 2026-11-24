@@ -984,7 +984,7 @@ static void program_set(UINT64 key, enum program_state state)
 /* Variants of a graphics program compiled before: by the program and the draw's user SGPRs. A new one
  * compiled in the title's thread took AnyPS5 up to seconds (a translation, or a large one from the
  * disk cache), and a scene bringing in hundreds stalled its frames until the title's GPU watchdog
- * fired. A new variant goes to a worker, ahead of the queue, and the caller waits a few
+ * fired. A new variant goes to a variant worker (newest first), and the caller waits a few
  * milliseconds for it (a variant already in AnyPS5's memory is that quick); if it isn't done the
  * draw is skipped this time. Overwritten on collision: the worst is compiling one again. */
 #define VARIANTS 65536
@@ -1020,20 +1020,29 @@ struct compile_job
 {
     struct compile_job *next;
     UINT64 key;
-    BOOL variant; /* a variant of a program compiled before: variant_set, and ahead of the queue */
+    BOOL variant; /* a variant of a program compiled before: variant_set, and the variant queue */
+    ULONGLONG queued; /* GetTickCount64 */
     struct rebox_compile_in in;
     UINT32 user_sgprs[64];
     BYTE shader[];
 };
-static struct compile_job *jobs_head, *jobs_tail;
-static SRWLOCK jobs_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE jobs_ready = CONDITION_VARIABLE_INIT;
+/* Two queues: programs' first compiles, and variants (their own workers, so a variant already in
+ * AnyPS5's memory is done while its draw waits, not queued behind translations taking seconds). */
+static struct compile_queue
+{
+    struct compile_job *head, *tail;
+    SRWLOCK lock;
+    CONDITION_VARIABLE ready;
+} program_queue = { NULL, NULL, SRWLOCK_INIT, CONDITION_VARIABLE_INIT },
+  variant_queue = { NULL, NULL, SRWLOCK_INIT, CONDITION_VARIABLE_INIT };
 static LONG jobs_queued, jobs_done;
 
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background);
 
-static DWORD WINAPI compile_worker(void *unused)
+static DWORD WINAPI compile_worker(void *param)
 {
+    struct compile_queue *q = param;
+
     for (;;)
     {
         struct compile_job *job;
@@ -1041,14 +1050,22 @@ static DWORD WINAPI compile_worker(void *unused)
         HRESULT hr;
         LONG done;
 
-        AcquireSRWLockExclusive(&jobs_lock);
-        while (!jobs_head)
-            SleepConditionVariableSRW(&jobs_ready, &jobs_lock, INFINITE, 0);
-        job = jobs_head;
-        if (!(jobs_head = job->next))
-            jobs_tail = NULL;
-        ReleaseSRWLockExclusive(&jobs_lock);
+        AcquireSRWLockExclusive(&q->lock);
+        while (!q->head)
+            SleepConditionVariableSRW(&q->ready, &q->lock, INFINITE, 0);
+        job = q->head;
+        if (!(q->head = job->next))
+            q->tail = NULL;
+        ReleaseSRWLockExclusive(&q->lock);
 
+        /* A variant no draw has waited for in a second is dropped: per-frame user SGPRs make new
+         * ones every frame, and the queue would only grow. A draw asking again queues it again. */
+        if (job->variant && GetTickCount64() - job->queued > 1000)
+        {
+            variant_set(job->key, PROGRAM_COLD);
+            free(job);
+            continue;
+        }
         memset(&out, 0, sizeof(out));
         hr = compile_now(&job->in, &out, TRUE);
         if (job->variant)
@@ -1063,9 +1080,12 @@ static DWORD WINAPI compile_worker(void *unused)
     return 0;
 }
 
+#define VARIANT_WORKERS 4
+
 static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL variant)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
+    struct compile_queue *q;
     BOOL pending;
     struct compile_job *job = malloc(sizeof(*job) + in->shader_size);
 
@@ -1080,6 +1100,7 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL va
     memset(job, 0, sizeof(*job));
     job->key = key;
     job->variant = variant;
+    job->queued = GetTickCount64();
     job->in = *in;
     memcpy(job->shader, in->shader, in->shader_size);
     job->in.shader = job->shader;
@@ -1099,32 +1120,40 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL va
         workers = n && n < sizeof(v) && atoi(v) > 0 ? (UINT)atoi(v) : min(max(si.dwNumberOfProcessors / 2, 1u), 8u);
         for (UINT w = 0; w < workers; w++)
         {
-            HANDLE t = CreateThread(NULL, 0, compile_worker, NULL, 0, NULL);
+            HANDLE t = CreateThread(NULL, 0, compile_worker, &program_queue, 0, NULL);
             if (t)
                 CloseHandle(t);
         }
-        rebox_log("d3d12_xs: console shaders compile in the background on %u threads", workers);
+        for (UINT w = 0; w < VARIANT_WORKERS; w++)
+        {
+            HANDLE t = CreateThread(NULL, 0, compile_worker, &variant_queue, 0, NULL);
+            if (t)
+                CloseHandle(t);
+        }
+        rebox_log("d3d12_xs: console shaders compile in the background on %u threads, and their variants on %u",
+                  workers, VARIANT_WORKERS);
         InitOnceComplete(&started, 0, NULL);
     }
     InterlockedIncrement(&jobs_queued);
-    AcquireSRWLockExclusive(&jobs_lock);
+    q = variant ? &variant_queue : &program_queue;
+    AcquireSRWLockExclusive(&q->lock);
     if (variant)
     {
-        /* Ahead of the programs: a draw is waiting for it. */
-        if (!(job->next = jobs_head))
-            jobs_tail = job;
-        jobs_head = job;
+        /* Newest first: its draw is waiting for it now. */
+        if (!(job->next = q->head))
+            q->tail = job;
+        q->head = job;
     }
     else
     {
-        if (jobs_tail)
-            jobs_tail->next = job;
+        if (q->tail)
+            q->tail->next = job;
         else
-            jobs_head = job;
-        jobs_tail = job;
+            q->head = job;
+        q->tail = job;
     }
-    ReleaseSRWLockExclusive(&jobs_lock);
-    WakeConditionVariable(&jobs_ready);
+    ReleaseSRWLockExclusive(&q->lock);
+    WakeConditionVariable(&q->ready);
 }
 
 /* Which console stages draw into the display-sized targets (proxy.c brackets those draws): each
