@@ -388,8 +388,55 @@ static LONG CALLBACK skip_assert(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/* REBOX_SKIP_FAULT=RVA:LENGTH[,...] (bring-up, hex): an access violation at that RVA of the exe
+ * skips the faulting instruction (LENGTH bytes) and goes on, logged. For a title's deliberate
+ * crash, such as a watchdog writing its signature to address 0, to see what it would do next. */
+static struct { ULONG_PTR rva, length; } skip_faults[8];
+static UINT skip_fault_count;
+
+static LONG CALLBACK skip_fault(EXCEPTION_POINTERS *ep)
+{
+    static LONG skipped;
+    EXCEPTION_RECORD *rec = ep->ExceptionRecord;
+    CONTEXT *c = ep->ContextRecord;
+    ULONG_PTR exe = (ULONG_PTR)GetModuleHandleA(NULL);
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    for (UINT i = 0; i < skip_fault_count; i++)
+        if (c->Rip == exe + skip_faults[i].rva)
+        {
+            if (InterlockedIncrement(&skipped) <= 32)
+                rebox_log("xmem: the fault at exe+%#llx skipped (thread %#lx; REBOX_SKIP_FAULT)",
+                          (unsigned long long)skip_faults[i].rva, GetCurrentThreadId());
+            c->Rip += skip_faults[i].length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
 {
+    {
+        char list[256];
+        DWORD len = GetEnvironmentVariableA("REBOX_SKIP_FAULT", list, sizeof(list));
+        const char *at = list;
+        unsigned long long rva, length;
+        int used;
+        while (len && len < sizeof(list) && skip_fault_count < ARRAYSIZE(skip_faults)
+                && sscanf(at, "%llx:%llx%n", &rva, &length, &used) == 2 && length)
+        {
+            skip_faults[skip_fault_count].rva = (ULONG_PTR)rva;
+            skip_faults[skip_fault_count++].length = (ULONG_PTR)length;
+            rebox_log("xmem: a fault at exe+%#llx is skipped (%llu bytes; REBOX_SKIP_FAULT)", rva, length);
+            at += used;
+            if (*at != ',')
+                break;
+            at++;
+        }
+        if (skip_fault_count)
+            AddVectoredExceptionHandler(1, skip_fault);
+    }
     char hang[16];
     DWORD hang_len = GetEnvironmentVariableA("REBOX_HANG_DUMP", hang, sizeof(hang));
     int hang_seconds = hang_len && hang_len < sizeof(hang) ? atoi(hang) : 60;
