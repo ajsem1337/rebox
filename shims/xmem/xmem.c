@@ -988,17 +988,38 @@ static void clear_slot(SIZE_T slot)
  * physical_lock. */
 static struct { ULONG plain, split, coalesced, failed, copies; } placed;
 
+/* One step of place_view, timed: a step of 20 ms or more is logged (the first 64), with which it
+ * was; a map or a split usually takes tens of microseconds. */
+static BOOL timed_step(BOOL ok, ULONGLONG start, const char *step, ULONG_PTR address, SIZE_T size)
+{
+    ULONGLONG took = GetTickCount64() - start;
+    if (took >= 20)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 64)
+            rebox_log("xmem: %s of %lu KiB at %#llx took %llu ms (%s)", step, (unsigned long)(size >> 10),
+                      (unsigned long long)address, took, ok ? "done" : "failed");
+    }
+    return ok;
+}
+
 static BOOL place_view(ULONG_PTR address, SIZE_T size, struct page_section *s, UINT64 offset)
 {
     void *p = (void *)address;
+    ULONGLONG t;
     if (!map_view3 || in_adopted(address))
         return FALSE;
-    if (map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
+    t = GetTickCount64();
+    if (timed_step(!!map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                               NULL, 0), t, "a view into a placeholder", address, size))
         return ++placed.plain, TRUE;
-    if (VirtualFree(p, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+    t = GetTickCount64();
+    if (timed_step(VirtualFree(p, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), t, "a placeholder split", address, size)
             && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
         return ++placed.split, TRUE;
-    if (VirtualFree(p, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)
+    t = GetTickCount64();
+    if (timed_step(VirtualFree(p, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS), t, "a placeholder coalesce", address,
+                   size)
             && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
         return ++placed.coalesced, TRUE;
     placed.failed++;
@@ -1221,6 +1242,13 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
     timing = GetTickCount64();
     memset(&placed, 0, sizeof(placed));
     unmap_range(start, end);
+    if (GetTickCount64() - timing >= 20)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 64)
+            rebox_log("xmem: XMemMapPhysicalPages(%p, %lu pages): unmapping what was there took %llu ms", address,
+                      (unsigned long)count, GetTickCount64() - timing);
+    }
     /* Then the pages, a stretch of non-empty entries at a time. */
     if (pages && (us = malloc(count * sizeof(*us))))
     {
@@ -1266,7 +1294,7 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
             }
     }
     timing = GetTickCount64() - timing;
-    if (timing >= 100)
+    if (timing >= 20)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 64)
