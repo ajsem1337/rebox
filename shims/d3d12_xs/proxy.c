@@ -2528,6 +2528,13 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
         else
             first = FALSE;
         ReleaseSRWLockExclusive(&kind_lock);
+        /* Screen-sized ones (video planes) each, the first 64. */
+        {
+            static LONG large;
+            if (!first && cpu != address && desc->Width >= 1920 && desc->Height >= 1080
+                    && InterlockedIncrement(&large) <= 64)
+                first = TRUE;
+        }
         if (first)
             rebox_log("d3d12_xs: placed at %#llx in a GPU view of title memory, over %#llx: dimension %u, %llux%u, "
                       "format %u, flags %#x", (unsigned long long)address, (unsigned long long)cpu, desc->Dimension,

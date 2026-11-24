@@ -65,6 +65,7 @@ static UINT submissions;
 #define WATCH_BUDGET 512                   /* textures fingerprinted per submission */
 #define FULL_HASH_MAX (4u << 20)           /* textures this size or smaller are hashed whole */
 #define FULL_HASH_BUDGET (8u << 20)        /* bytes hashed whole per submission */
+#define HOT_BUDGET (32u << 20)             /* bytes of hot textures checked every submission */
 
 static BOOL full_hash(const struct title_texture *t)
 {
@@ -172,6 +173,19 @@ static void watch(void)
             changed++;
         }
     watch_cursor = t ? watch_cursor + checked : 0;
+    /* Hot textures, ones the CPU has rewritten since they were made (a glyph atlas gains letters
+     * as text is laid out, and the frame draws them at once), are checked every submission: the
+     * round robin over hundreds of textures came back to them only after the text had been
+     * drawn without its letters. */
+    hashed = 0;
+    for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
+        if (t->uploads >= 2 && full_hash(t) && !t->dirty && !t->gpu_written && !t->unreadable
+                && still_readable(t) && (hashed += t->size, fingerprint(t) != t->fingerprint))
+        {
+            t->dirty = TRUE;
+            InterlockedIncrement(&dirty_count);
+            changed++;
+        }
     if (changed)
     {
         static LONG logged;
