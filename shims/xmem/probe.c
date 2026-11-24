@@ -141,6 +141,20 @@ static LONG CALLBACK on_probe(EXCEPTION_POINTERS *ep)
             BOOL known = FALSE;
             for (LONG i = 0; i < min(seen_count, 64); i++)
                 known |= seen[i] == rip;
+            /* A range of 64 bytes or less: every write (the first 256), with what was there, to see
+             * a field written again later by the same code. */
+            if (known && w->length <= 64)
+            {
+                static LONG every;
+                char where[MAX_PATH + 32];
+                if (InterlockedIncrement(&every) <= 256)
+                {
+                    describe(rip, where, sizeof(where));
+                    rebox_log("write watch: %s writes %#llx again (thread %#lx; was %#llx)", where,
+                              (unsigned long long)at, GetCurrentThreadId(),
+                              (unsigned long long)*(const UINT64 *)(at & ~(ULONG_PTR)7));
+                }
+            }
             if (!known)
             {
                 LONG n = InterlockedIncrement(&seen_count);
