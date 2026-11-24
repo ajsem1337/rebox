@@ -2893,13 +2893,27 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
     ReleaseSRWLockShared(&memory_view_lock);
     if (res)
         return res;
-    AcquireSRWLockExclusive(&memory_view_lock);
-    if (!(res = memory_view_find(address, desc, hash))
-            && SUCCEEDED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
-                                                      &IID_ID3D12Resource, (void **)&res)) && res)
-        memory_view_add(address, desc, res, hash);
-    ReleaseSRWLockExclusive(&memory_view_lock);
-    return res;
+    /* Made outside the lock: the threads recording a frame's lists all make views at addresses,
+     * and a world streaming in makes thousands of new ones, each a placed resource (slow in
+     * vkd3d-proton); made under the lock, the threads waited for each other's, seconds a frame. Two
+     * threads making the same one keep the first. */
+    {
+        ID3D12Resource *made = NULL, *found;
+        if (FAILED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                &IID_ID3D12Resource, (void **)&made)))
+            made = NULL;
+        AcquireSRWLockExclusive(&memory_view_lock);
+        if (!(found = memory_view_find(address, desc, hash)) && made)
+            memory_view_add(address, desc, made, hash);
+        ReleaseSRWLockExclusive(&memory_view_lock);
+        if (found)
+        {
+            if (made)
+                ID3D12Resource_Release(made);
+            return found;
+        }
+        return made;
+    }
 }
 
 /* Slot 70: a shader resource view of memory, without a resource object: (resource desc, { the PC's
