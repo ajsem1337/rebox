@@ -3119,6 +3119,55 @@ static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12Com
     ReleaseSRWLockExclusive(&value_fence_lock);
 }
 
+/* GPU waits whose value may come another way: written by the title's CPU or a shader, not a list's
+ * Write*BitValue. A thread watches the memory of each pending one and signals its fence from the CPU
+ * once the value is there, or after 2 s (as a CPU-side wait gave up), so no queue waits for ever. */
+struct pending_value_wait { struct memory_wait wait; struct value_fence *fence; UINT64 target; LONGLONG since; };
+static struct pending_value_wait pending_value_waits[256];
+static UINT pending_value_wait_count;
+static BOOL wait_satisfied(const struct memory_wait *w);
+
+/* Under value_fence_lock, exclusive. */
+static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLONG timeout)
+{
+    if (ID3D12Fence_GetCompletedValue(pw->fence->fence) >= pw->target)
+        return TRUE;
+    if (!wait_satisfied(&pw->wait) && now - pw->since < timeout)
+        return FALSE;
+    if (now - pw->since >= timeout)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx at %#llx timed out after 2 s; signalled from the CPU",
+                      (unsigned long long)pw->wait.address, (unsigned long long)pw->target,
+                      (unsigned long long)pw->wait.address);
+    }
+    ID3D12Fence_Signal(pw->fence->fence, pw->target);
+    if (pw->target > pw->fence->signalled)
+        pw->fence->signalled = pw->target;
+    return TRUE;
+}
+
+static DWORD WINAPI value_wait_watcher(void *arg)
+{
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    for (;;)
+    {
+        LARGE_INTEGER now;
+        Sleep(1);
+        QueryPerformanceCounter(&now);
+        AcquireSRWLockExclusive(&value_fence_lock);
+        for (UINT i = 0; i < pending_value_wait_count;)
+            if (value_wait_done(&pending_value_waits[i], now.QuadPart, 2 * freq.QuadPart))
+                pending_value_waits[i] = pending_value_waits[--pending_value_wait_count];
+            else
+                i++;
+        ReleaseSRWLockExclusive(&value_fence_lock);
+    }
+    return 0;
+}
+
 /* A counter wait not met in memory now: queue waits on the GPU for the address's fence. FALSE for
  * a wait this can't express (another comparison, a partial mask), which stays on the CPU. */
 static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wait *w)
@@ -3131,8 +3180,19 @@ static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wa
         return FALSE;
     target = w->comparison == D3D12_COMPARISON_FUNC_GREATER ? w->value + 1 : w->value;
     AcquireSRWLockExclusive(&value_fence_lock);
-    if ((f = value_fence(w->address)))
+    /* Watched until it's met (value_wait_watcher); with no room to watch it, on the CPU instead. */
+    if ((f = value_fence(w->address)) && pending_value_wait_count < ARRAYSIZE(pending_value_waits))
+    {
+        static LONG started;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        pending_value_waits[pending_value_wait_count++] = (struct pending_value_wait){ *w, f, target, now.QuadPart };
+        if (!InterlockedExchange(&started, 1))
+            CloseHandle(CreateThread(NULL, 0, value_wait_watcher, NULL, 0, NULL));
         ID3D12CommandQueue_Wait(queue, f->fence, target);
+    }
+    else
+        f = NULL;
     ReleaseSRWLockExclusive(&value_fence_lock);
     return f != NULL;
 }
