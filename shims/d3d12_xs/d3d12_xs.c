@@ -324,7 +324,9 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
 
     if ((env && *env == '0') || !pso)
         return;
-    if (!desc->VS.BytecodeLength || !desc->PS.BytecodeLength || desc->HS.BytecodeLength
+    /* No pixel shader: a depth-only pass (a depth prepass, shadow maps); only the first stage is
+     * deferred and the pipeline keeps no fragment stage (patch 0014). */
+    if (!desc->VS.BytecodeLength || desc->HS.BytecodeLength
             || desc->DS.BytecodeLength || desc->GS.BytecodeLength || desc->InputLayout.NumElements > ARRAYSIZE(g->elements))
     {
         LONG n = InterlockedIncrement(&refused_other);
@@ -338,7 +340,8 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
         return;
     }
     if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, first, &vs_size))
-            || !(ps = console_fssm_graphics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, 0x10, &ps_size))
+            || (desc->PS.BytecodeLength
+                && !(ps = console_fssm_graphics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, 0x10, &ps_size)))
             || !(g = calloc(1, sizeof(*g) + vs_size + ps_size)))
     {
         LONG n = InterlockedIncrement(vs ? &refused_ps : &refused_vs);
@@ -429,10 +432,12 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
                       e ? e->SemanticName : "?", e ? e->SemanticIndex : 0, g->elements[r].dxgi_format, g->elements[r].slot,
                       g->elements[r].offset, g->elements[r].per_instance ? ", per instance" : "");
         }
-    link_interpolants(desc, vs, ps, console_stage_watched(console_stage_id(vs, vs_size))
-                      || console_stage_watched(console_stage_id(ps, ps_size)));
+    if (ps)
+        link_interpolants(desc, vs, ps, console_stage_watched(console_stage_id(vs, vs_size))
+                          || console_stage_watched(console_stage_id(ps, ps_size)));
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
-    memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
+    if (ps)
+        memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
     if (SUCCEEDED(ID3D12PipelineState_SetPrivateData((ID3D12PipelineState *)pso, &REBOX_GRAPHICS_GUID, g->size, g))
             && !(InterlockedIncrement(&attached) & (attached - 1)))
         rebox_log("d3d12_xs: graphics PSOs deferred to draw time: %ld", attached);
@@ -440,7 +445,7 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
         rebox_log("d3d12_xs: graphics PSO: console %s shader (%u inputs) and pixel shader (%u interpolants) "
                      "deferred to draw time, %u input elements", first_name,
                      ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)vs + 1))->input_count,
-                     ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)ps + 1))->interpolator_count,
+                     ps ? ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)ps + 1))->interpolator_count : 0,
                      g->element_count);
     free(g);
     free(vs);

@@ -1,0 +1,28 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 06d22a2..c3dff3f 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8449,7 +8449,8 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_comman
+     in.shader_size = g->ps_size;
+     in.push_offset = 128;
+     memset(&ps, 0, sizeof(ps));
+-    if (FAILED(hr = compile(&in, &ps)))
++    /* rebox (patch 0014): no pixel stage in a depth-only pipeline (a depth prepass, shadow maps). */
++    if (g->ps_size && FAILED(hr = compile(&in, &ps)))
+         return VK_NULL_HANDLE;
+     VKD3D_BREADCRUMB_TAG("rebox console graphics [vs key0, ps key0]");
+     VKD3D_BREADCRUMB_AUX64(vs.key[0]);
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index ceb4de0..1f4d4fd 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3660,7 +3660,8 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+         return VK_NULL_HANDLE;
+     module_info.codeSize = ps->spirv_words * sizeof(uint32_t);
+     module_info.pCode = ps->spirv;
+-    if (VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.ps)) < 0)
++    /* rebox (patch 0014): a depth-only pipeline has no pixel stage, and no fragment module. */
++    if (ps->spirv_words && VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &override.ps)) < 0)
+     {
+         VK_CALL(vkDestroyShaderModule(device->vk_device, override.vs, NULL));
+         return VK_NULL_HANDLE;
