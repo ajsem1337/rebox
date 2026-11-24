@@ -259,7 +259,10 @@ compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the d
 included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
 and finalize with no guest memory (`ms PLAN`, as d3d12_xs compiles them); 619 more need the
 descriptors a draw's memory gives (the SRT walk), and 526 use `v_mad_legacy_f32` with clamp,
-which AnyPS5's decoder refuses ("VOP3 source modifiers are not implemented").
+which AnyPS5's decoder accepts from patch 0010. Of 497 of those (the other 29 run past 30
+minutes each; one with its clamp bits cleared runs as long without the patch), 177 now compile,
+validate and finalize, 303 need the draw's descriptors, and 17 fail later (8 bindings at finalize, 8 Phi
+dominance, 1 sampler pairs).
 
 ## AnyPS5 patches
 
@@ -336,8 +339,7 @@ Titles that ship a PS09 PSO cache carry the console driver's register state for 
   replace the root-order layout.
 - **Speculated descriptors** are checked through the fault buffer, which is logged; recompiling
   on a mismatch isn't done.
-- **Mesh shaders** compile but haven't drawn on a GPU yet. Still open: `v_mad_legacy_f32` with
-  clamp in AnyPS5's decoder (8% of the title's mesh shaders); per-primitive outputs (none in the
+- **Mesh shaders** compile but haven't drawn on a GPU yet. Still open: per-primitive outputs (none in the
   title; such a stage is refused); amplification shaders (no task stage in AnyPS5); the Y and Z
   group counts of indirect mesh dispatches, and what the console's 16-byte records hold beyond
   three group counts; root arguments an `ExecuteIndirect` changes per record, which never reach

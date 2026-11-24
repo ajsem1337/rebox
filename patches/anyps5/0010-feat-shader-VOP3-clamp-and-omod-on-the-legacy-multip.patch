@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 13:42:27 +0000
+Subject: [PATCH] feat(shader): VOP3 clamp and omod on the legacy
+ multiply-adds, and op_sel[3] on permlanes
+
+v_mad_legacy_f32 and v_mac_legacy_f32 were refused in VOP3 with clamp or
+omod ("VOP3 source modifiers are not implemented"); their source abs and
+neg were already decoded and read. Their translation already writes the
+result through the shared f32 result path, so they now take the same
+result modifiers as v_mad_f32 and v_mul_legacy_f32: omod, then the clamp.
+Compilers emit v_mad_legacy_f32 with clamp for saturate(a * b + c), often
+with a negated factor: of one title's Xbox Series shaders, 526 of 6,685
+mesh, 880 of 2,680 compute, 3,067 of 8,523 pixel and 1 of 339 vertex
+shaders were refused for it.
+
+v_permlane16_b32 and v_permlanex16_b32 use op_sel bits 0 and 1 as fi and
+bound_ctrl; bit 3, the destination half select of 16-bit operations, has
+no meaning for their 32-bit result (LLVM's gfx1030 disassembler drops
+it) and is now accepted and ignored. Xbox Series compute shaders set it
+with fi in wave reductions (45 of the title's 2,680). Bit 2 still throws.
+
+Neither is measured on hardware (docs/dev/debt fragment).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tests/Vop2EncodingDecode.cpp              | 28 +++++++++++++++++++
+ .../RdnaDecoder/src/RdnaVectorOpDecoder.cpp   |  4 ++-
+ .../changes/feat-shader-vop3-modifiers.md     |  6 ++++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+ create mode 100644 docs/dev/debt/changes/feat-shader-vop3-modifiers.md
+
+diff --git a/core/libs/prx/libSceAgcDriver/tests/Vop2EncodingDecode.cpp b/core/libs/prx/libSceAgcDriver/tests/Vop2EncodingDecode.cpp
+index 456d19e687..7f026ee83e 100644
+--- a/core/libs/prx/libSceAgcDriver/tests/Vop2EncodingDecode.cpp
++++ b/core/libs/prx/libSceAgcDriver/tests/Vop2EncodingDecode.cpp
+@@ -36,6 +36,9 @@ int main() {
+         {{0xd51f0002u, 0x60020300u}, RdnaOpcode::VMacF32, "VOP3 v_mac_f32 with negated sources"},
+         {{0xd5368302u, 0x68020300u}, RdnaOpcode::VFmacF16, "VOP3 v_fmac_f16 with source modifiers, clamp and mul:2"},
+         {{0xd5360402u, 0x80020300u}, RdnaOpcode::VFmacF16, "VOP3 v_fmac_f16 with accumulator modifiers"},
++        {{0xd5408102u, 0x48020300u}, RdnaOpcode::VMadLegacyF32, "VOP3 v_mad_legacy_f32 with abs, neg, clamp and mul:2"},
++        {{0xd5068002u, 0x38020300u}, RdnaOpcode::VMacLegacyF32, "VOP3 v_mac_legacy_f32 with a negated source, clamp and div:2"},
++        {{0xd7784803u, 0x03058302u}, RdnaOpcode::VPermlanex16B32, "VOP3 v_permlanex16_b32 with fi and the destination op_sel bit"},
+     };
+     const std::vector<Refused> refused{
+         {{0x2a040300u}, "VOP2 opcode is not implemented", "VOP2 opcode 0x15"},
+@@ -56,6 +59,7 @@ int main() {
+         {{0xd51f0002u, 0x80020300u}, "VOP3 source modifiers are not implemented", "VOP3 v_mac_f32 with a negated accumulator"},
+         {{0xd5060402u, 0x00020300u}, "VOP3 source modifiers are not implemented", "VOP3 opcode 0x106 with an absolute accumulator"},
+         {{0xd5360802u, 0x00020300u}, "VOP3 source modifiers are not implemented", "VOP3 v_fmac_f16 with op_sel"},
++        {{0xd7786003u, 0x03058302u}, "VOP3 perm-lane op_sel bits are not implemented", "VOP3 v_permlanex16_b32 with the src2 op_sel bit"},
+     };
+     int failures = 0;
+     for (const auto& test : accepted) {
+@@ -98,5 +102,29 @@ int main() {
+         std::fprintf(stderr, "VOP3 v_fmac_f32 with accumulator modifiers was refused: %s\n", error.what());
+         ++failures;
+     }
++    try {
++        const std::vector<std::uint32_t> code{0xd5408102u, 0x48020300u, 0xbf810000u};
++        const auto decoded = RdnaInstructionDecoder{}.Decode(code);
++        const RdnaInstruction& mad = decoded.instructions.at(0);
++        if (!mad.destination.clamp || mad.destination.omod != 1u || !mad.source0.absolute || mad.source0.negate || mad.source1.absolute || !mad.source1.negate || mad.source2.absolute || mad.source2.negate) {
++            std::fprintf(stderr, "VOP3 v_mad_legacy_f32 does not carry its abs, neg, clamp and omod\n");
++            ++failures;
++        }
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "VOP3 v_mad_legacy_f32 with modifiers was refused: %s\n", error.what());
++        ++failures;
++    }
++    try {
++        const std::vector<std::uint32_t> code{0xd7784803u, 0x03058302u, 0xbf810000u};
++        const auto decoded = RdnaInstructionDecoder{}.Decode(code);
++        const RdnaInstruction& permlane = decoded.instructions.at(0);
++        if (!permlane.destination.opSel || permlane.destination.opSelHi) {
++            std::fprintf(stderr, "VOP3 v_permlanex16_b32 does not carry fi without bound_ctrl\n");
++            ++failures;
++        }
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "VOP3 v_permlanex16_b32 with fi and the destination op_sel bit was refused: %s\n", error.what());
++        ++failures;
++    }
+     return failures == 0 ? 0 : 1;
+ }
+diff --git a/core/shader/recompiler/RdnaDecoder/src/RdnaVectorOpDecoder.cpp b/core/shader/recompiler/RdnaDecoder/src/RdnaVectorOpDecoder.cpp
+index 1030da1282..6bfd3d4f2d 100644
+--- a/core/shader/recompiler/RdnaDecoder/src/RdnaVectorOpDecoder.cpp
++++ b/core/shader/recompiler/RdnaDecoder/src/RdnaVectorOpDecoder.cpp
+@@ -1972,6 +1972,8 @@ bool supportsNativeVop3ResultModifiers(RdnaOpcode opcode) {
+         case RdnaOpcode::VSubrevF32:
+         case RdnaOpcode::VMulF32:
+         case RdnaOpcode::VMulLegacyF32:
++        case RdnaOpcode::VMadLegacyF32:
++        case RdnaOpcode::VMacLegacyF32:
+         case RdnaOpcode::VMinF32:
+         case RdnaOpcode::VMaxF32:
+         case RdnaOpcode::VMacF32:
+@@ -2028,7 +2030,7 @@ bool readsVop2Accumulator(RdnaOpcode opcode) {
+ 
+ void checkNativeVop3Modifiers(RdnaOpcode opcode, std::uint32_t encodedOpcode, bool permlane, bool carryInOut, bool scalarDst, std::uint32_t abs, std::uint32_t opSel, std::uint32_t clamp, std::uint32_t omod, std::uint32_t neg) {
+     if (permlane) {
+-        if (abs != 0u || (opSel & ~0x3u) != 0u || clamp != 0u || omod != 0u || neg != 0u) {
++        if (abs != 0u || (opSel & ~0xbu) != 0u || clamp != 0u || omod != 0u || neg != 0u) {
+             throw std::invalid_argument("VOP3 perm-lane op_sel bits are not implemented");
+         }
+         return;
+diff --git a/docs/dev/debt/changes/feat-shader-vop3-modifiers.md b/docs/dev/debt/changes/feat-shader-vop3-modifiers.md
+new file mode 100644
+index 0000000000..304041b502
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-vop3-modifiers.md
+@@ -0,0 +1,6 @@
++# shader
++
++## add Functional
++
++- [Clamp and omod of `v_mad_legacy_f32` and `v_mac_legacy_f32`](../../../core/shader/recompiler/Translation/src/FloatInstructions.cpp) (VOP3 0x140 and 0x106) apply to the result as for `v_mad_f32`: the result is scaled, then clamped to [0, 1], a NaN becoming 0 with `DX10_CLAMP`. Not measured on hardware; the RDNA2 ISA gives no exception for the legacy forms.
++- [`op_sel[3]` of `v_permlane16_b32` and `v_permlanex16_b32`](../../../core/shader/recompiler/RdnaDecoder/src/RdnaVectorOpDecoder.cpp) is accepted and ignored: the RDNA2 ISA defines `op_sel` as half selects for 16-bit operands, the permlanes use bits 0 and 1 as fi and bound_ctrl, and their 32-bit result has no half to select; LLVM's gfx1030 disassembler drops the bit. Not measured on hardware. Xbox Series compute shaders set it with fi in wave reductions (`v_permlanex16_b32 v3, v2, -1, -1` with exec 0xffff0000, then `v_readlane_b32` of lane 31). `op_sel[2]` still throws.
+-- 
+2.55.0
+
