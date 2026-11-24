@@ -920,7 +920,7 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
 /* Ranges d3d12_xs made GPU memory in place (ReboxPhysicalAdopted): their pages were replaced by a
  * GPU heap holding a copy, so pages mapped there are copies from then on, and the memory is never
  * decommitted or split here. */
-static struct { ULONG_PTR start, end; } adopted[32];
+static struct { ULONG_PTR start, end; } adopted[4096];
 static UINT adopted_count;
 
 static BOOL in_adopted(ULONG_PTR address)
