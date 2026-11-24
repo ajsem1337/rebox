@@ -671,8 +671,8 @@ static void log_large(void)
         if ((t->surface.width < 1920 || t->surface.height < 1080) && t->surface.format != DXGI_FORMAT_A8_UNORM)
             continue;
         if (!t->unreadable && t->cpu && still_readable(t))
-            for (UINT64 at = 0; at < t->size; at += 4093, sampled++)
-                nonzero += t->cpu[at] != 0;
+            for (UINT64 at = 0, step = t->size <= (4u << 20) ? 1 : 4093; at < t->size; at += step, sampled++)
+                nonzero += t->cpu[at] != 0; /* up to 4 MiB (a glyph atlas) every byte */
         rebox_log("d3d12_xs: large title texture at %#llx: %ux%u format %u, mode %u, %u uploads%s%s%s, "
                   "%llu of %llu sampled bytes nonzero", (unsigned long long)t->address, t->surface.width,
                   t->surface.height, t->surface.format, t->surface.mode, t->uploads, t->dirty ? ", dirty" : "",
