@@ -2044,6 +2044,28 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                         }
                     }
                 counted:
+                    /* REBOX_WATCH_TARGET: a stage binding the texture at that title address, and as what. */
+                    {
+                        static UINT64 target = ~0ull;
+                        static LONG target_shown;
+                        if (target == ~0ull)
+                        {
+                            const char *v = getenv("REBOX_WATCH_TARGET");
+                            target = v ? _strtoui64(v, NULL, 16) : 0;
+                        }
+                        if (target)
+                        {
+                            ID3D12Resource *res = console_texture_of(w);
+                            UINT64 at = 0;
+                            UINT up = 0;
+                            if (res && title_texture_info(res, &at, &up) && at == target
+                                    && InterlockedIncrement(&target_shown) <= 64)
+                                rebox_log("d3d12_xs: console %s shader %016llx binds the watched target %#llx as "
+                                          "binding %u.%u (kind %u, role %u)", stage_name(h->stage),
+                                          (unsigned long long)stage_id, (unsigned long long)target, i, e,
+                                          (UINT)b.kind, (UINT)b.role);
+                        }
+                    }
                     if ((console_stage_watched(stage_id) && InterlockedIncrement(&watched_shown) <= 24)
                             || (stage_first && InterlockedIncrement(&shown) <= 512))
                     {
