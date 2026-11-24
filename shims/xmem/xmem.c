@@ -984,18 +984,25 @@ static void clear_slot(SIZE_T slot)
 /* A view of size bytes of section s at offset, at address: in the placeholder there, split off a
  * larger one, or made of adjacent ones coalesced. Each step is a wineserver call under Wine, so
  * the plain map is tried first. */
+/* Counts for XMemMapPhysicalPages's timing log: views placed by each step, and copies. Under
+ * physical_lock. */
+static struct { ULONG plain, split, coalesced, failed, copies; } placed;
+
 static BOOL place_view(ULONG_PTR address, SIZE_T size, struct page_section *s, UINT64 offset)
 {
     void *p = (void *)address;
     if (!map_view3 || in_adopted(address))
         return FALSE;
     if (map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
-        return TRUE;
+        return ++placed.plain, TRUE;
     if (VirtualFree(p, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
             && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
-        return TRUE;
-    return VirtualFree(p, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)
-            && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
+        return ++placed.split, TRUE;
+    if (VirtualFree(p, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)
+            && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
+        return ++placed.coalesced, TRUE;
+    placed.failed++;
+    return FALSE;
 }
 
 /* Page unit u at address as ordinary memory with a copy of its contents: where there's no
@@ -1014,6 +1021,7 @@ static BOOL place_copy(ULONG_PTR address, ULONG_PTR u)
         return FALSE;
     }
     memcpy((void *)address, unit_home(u), size);
+    placed.copies++;
     if (InterlockedIncrement(&copies) <= 8)
         rebox_log("xmem: physical page %#llx at %#llx is a copy: no placeholder there",
                   (unsigned long long)((u + 1) << 4), (unsigned long long)address);
@@ -1176,6 +1184,7 @@ static ULONG_PTR list_end(ULONG_PTR at, ULONG_PTR count, const ULONG_PTR *pages)
 BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *pages)
 {
     ULONG_PTR start = (ULONG_PTR)address, end, *us;
+    ULONGLONG timing;
     BOOL ok = TRUE;
 
     if (!address || !count)
@@ -1209,6 +1218,8 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
                   (unsigned long long)trace_address(), (unsigned long long)(pages && i < count ? pages[i] : 0),
                   GetCurrentThreadId(), __builtin_return_address(0));
     }
+    timing = GetTickCount64();
+    memset(&placed, 0, sizeof(placed));
     unmap_range(start, end);
     /* Then the pages, a stretch of non-empty entries at a time. */
     if (pages && (us = malloc(count * sizeof(*us))))
@@ -1253,6 +1264,16 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
                           (unsigned long long)mapped_at[k].address);
                 probe_watch_add(mapped_at[k].address + off, 8);
             }
+    }
+    timing = GetTickCount64() - timing;
+    if (timing >= 100)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 64)
+            rebox_log("xmem: XMemMapPhysicalPages(%p, %lu pages) took %llu ms: views %lu placed, %lu split off a "
+                      "placeholder, %lu coalesced, %lu failed; %lu copies", address, (unsigned long)count,
+                      (unsigned long long)timing, placed.plain, placed.split, placed.coalesced, placed.failed,
+                      placed.copies);
     }
     ReleaseSRWLockExclusive(&physical_lock);
     return ok;
