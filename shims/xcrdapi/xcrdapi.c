@@ -695,6 +695,21 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
     }
     e.request = *request;
     {
+        /* REBOX_PHYSICAL_TRACE=<address> (xmem's): a request whose virtual destination covers it. */
+        static UINT64 trace = ~0ull;
+        if (trace == ~0ull)
+        {
+            const char *v = getenv("REBOX_PHYSICAL_TRACE");
+            trace = v ? _strtoui64(v, NULL, 16) : 0;
+        }
+        if (trace && !(request->options & OPT_DEST_PHYSICAL)
+                && trace - (UINT64)(ULONG_PTR)request->destination < request->destination_size)
+            rebox_log("xcrdapi: trace: a request (options %#llx, file offset %llu, %u -> %u bytes) writes %p+%#x, "
+                      "covering %#llx (thread %#lx)", (unsigned long long)request->options,
+                      (unsigned long long)request->file_offset, request->source_size, request->destination_size,
+                      request->destination, request->destination_size, (unsigned long long)trace, GetCurrentThreadId());
+    }
+    {
         /* Each kind of request once (its options), with an example: what a title asks for. */
         static UINT64 kinds[32];
         static LONG kind_count;
