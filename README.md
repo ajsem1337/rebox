@@ -141,6 +141,7 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_STATE_OBJECTS=DIR` | Write each distinct serialized ray tracing state object a title loads (`DeserializeStateObjectX`, Xbox device slot 115) to `DIR\<fnv1a64>.bin`. They get a placeholder that traces nothing: console ray tracing code isn't translated yet |
 | `REBOX_CONSOLE_MODE` | `ConsoleMode` value `rebox-run` puts in the registry for `XSystemGetDeviceType` (default `0x64`, Series X; `0x50` is Xbox One X) |
 | `REBOX_KEYBOARD_PAD=0` | Don't drive the gamepad from the keyboard when no controller is connected (`shims/gameinput`: WASD/arrows sticks, Space A, Left Ctrl B, R X, F Y, Q/E shoulders, Z/C triggers, Enter menu, Tab view, IJKL D-pad) |
+| `REBOX_PAD_SCRIPT=<seconds>:<button>,...` | Press gamepad buttons by themselves, for unattended runs: each held for 200 ms that many seconds after `gameinput.dll` loads; buttons `a`, `b`, `x`, `y`, `menu`, `view`, `up`, `down`, `left`, `right` |
 | `REBOX_FFX_STUB=0` | Run the package's own FidelityFX loader instead of the stub |
 | `REBOX_TEXTURE_ARRAYS=slice-major` | Read placed 2D array textures a slice (its whole mip chain) at a time, addrlib's order, instead of a mip (all its slices) at a time as console texture pools store them |
 | `REBOX_CONSOLE_DLLS` | Console system DLLs taken from the dump's system partition (`EmbeddedXvd/Windows/System32`, next to or inside the game directory) instead of being stubbed; default `xg_xs.dll` (the texture-layout library, pure computation). Empty uses none |

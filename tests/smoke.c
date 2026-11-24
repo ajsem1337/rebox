@@ -3597,6 +3597,9 @@ static void test_gameinput(void)
         memset(&state, 0xcc, sizeof(state));
         CHECK(XSLOT(reading, 22, BOOL, void *)(reading, &state) && state.lx >= -1.0f && state.lx <= 1.0f,
               "the reading has a gamepad state (buttons %#x)", state.buttons);
+        /* run-smoke.sh sets REBOX_PAD_SCRIPT=0:x: X is held for the first 200 ms after the DLL loads. */
+        if (getenv("REBOX_PAD_SCRIPT"))
+            CHECK(state.buttons & 0x10, "REBOX_PAD_SCRIPT=0:x holds X just after load (buttons %#x)", state.buttons);
         {
             void *next = (void *)1, *again = NULL, *nav = NULL;
             UINT32 buttons = 0xffffffff;

@@ -9,6 +9,10 @@
  *   WASD left stick, arrows right stick, Space A, Left Ctrl B, R X, F Y,
  *   Q/E shoulders, Z/C triggers, Enter menu, Tab view, I/K/J/L D-pad, Shift/V stick clicks.
  *
+ * REBOX_PAD_SCRIPT=<seconds>:<button>[,...] presses buttons by itself, for runs nobody watches: each
+ * is held for 200 ms that many seconds after this DLL loaded; buttons a, b, x, y, menu, view, up,
+ * down, left, right (REBOX_PAD_SCRIPT=25:a,35:a presses A twice).
+ *
  * The gamepad is also a UI navigation device (menus written against GameInputKindUiNavigation).
  * Each GetCurrentReading is a new reading; those whose state changed are also kept, so a title
  * that steps through readings with GetNextReading sees every press.
@@ -180,6 +184,57 @@ static void log_state(const GameInputGamepadState *s, const XINPUT_STATE *x)
                      s->rightThumbstickY);
 }
 
+static ULONGLONG loaded_at;
+static struct { ULONGLONG at; uint32_t button; } presses[64];
+static unsigned press_count;
+
+/* Load time, and REBOX_PAD_SCRIPT parsed. */
+__attribute__((constructor)) static void pad_script_init(void)
+{
+    static const struct { const char *name; uint32_t button; } names[] = {
+        { "menu", 0x1 }, { "view", 0x2 }, { "a", 0x4 }, { "b", 0x8 }, { "x", 0x10 }, { "y", 0x20 },
+        { "up", 0x40 }, { "down", 0x80 }, { "left", 0x100 }, { "right", 0x200 },
+    };
+    const char *env = getenv("REBOX_PAD_SCRIPT");
+
+    loaded_at = GetTickCount64();
+    while (env && *env && press_count < ARRAYSIZE(presses))
+    {
+        char *end;
+        double seconds = strtod(env, &end);
+        const char *name = *end == ':' ? end + 1 : NULL;
+        size_t len = name ? strcspn(name, ",") : 0;
+        if (!name)
+            break;
+        for (unsigned i = 0; i < ARRAYSIZE(names); i++)
+            if (strlen(names[i].name) == len && !_strnicmp(name, names[i].name, len))
+            {
+                presses[press_count].at = (ULONGLONG)(seconds * 1000);
+                presses[press_count++].button = names[i].button;
+            }
+        env = name + len;
+        while (*env == ',' || *env == ' ')
+            env++;
+    }
+}
+
+/* REBOX_PAD_SCRIPT's buttons held now. */
+static uint32_t scripted_buttons(void)
+{
+    static LONG logged[ARRAYSIZE(presses)];
+    ULONGLONG now = GetTickCount64() - loaded_at;
+    uint32_t held = 0;
+
+    for (unsigned i = 0; i < press_count; i++)
+        if (now >= presses[i].at && now < presses[i].at + 200)
+        {
+            held |= presses[i].button;
+            if (!InterlockedExchange(&logged[i], 1))
+                rebox_log("gameinput: REBOX_PAD_SCRIPT presses %#x at %.1f s", presses[i].button, now / 1000.0);
+        }
+    return held;
+}
+
 static void read_gamepad(GameInputGamepadState *s)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -210,6 +265,7 @@ static void read_gamepad(GameInputGamepadState *s)
     }
     else
         read_keyboard(s);
+    s->buttons |= scripted_buttons();
     log_state(s, pad ? &x : NULL);
 }
 
