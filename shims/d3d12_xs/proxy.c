@@ -95,6 +95,8 @@ struct proxy
     UINT wait_count, wait_capacity;
     ID3D12Fence *cpu_fence;        /* queues: signalled after submissions that carry CPU writes */
     UINT64 cpu_fence_value;
+    ID3D12Fence *timing_fence;     /* queues: signalled after every submission (gpu_latency_note) */
+    UINT64 timing_value;
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
@@ -3198,6 +3200,89 @@ static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wa
     return f != NULL;
 }
 
+/* How long the GPU takes to finish each submission: the queue signals its own fence after it, and
+ * a thread notes when the fence gets there. Every 10 s: submissions finished, their average and
+ * longest time, and the oldest still running. */
+struct gpu_latency_entry { ID3D12Fence *fence; UINT64 value; LONG64 at; void *queue; };
+static struct gpu_latency_entry gpu_latency[4096];
+static UINT gpu_latency_head, gpu_latency_tail;
+static SRWLOCK gpu_latency_lock = SRWLOCK_INIT;
+
+static DWORD WINAPI gpu_latency_thread(void *arg)
+{
+    LARGE_INTEGER f, now;
+    LONG64 last_log, total = 0, longest = 0, finished = 0;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    last_log = now.QuadPart;
+    for (;;)
+    {
+        Sleep(20);
+        QueryPerformanceCounter(&now);
+        AcquireSRWLockExclusive(&gpu_latency_lock);
+        /* In submission order per queue; entries of several queues interleave, so a finished one
+         * behind an unfinished one of another queue waits for it (an upper bound). */
+        while (gpu_latency_tail != gpu_latency_head)
+        {
+            struct gpu_latency_entry *e = &gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)];
+            if (ID3D12Fence_GetCompletedValue(e->fence) < e->value)
+                break;
+            total += now.QuadPart - e->at;
+            longest = max(longest, now.QuadPart - e->at);
+            finished++;
+            ID3D12Fence_Release(e->fence);
+            gpu_latency_tail++;
+        }
+        if (now.QuadPart - last_log >= 10 * f.QuadPart)
+        {
+            double ms = 1000.0 / (double)f.QuadPart;
+            LONG64 oldest = gpu_latency_tail != gpu_latency_head
+                    ? now.QuadPart - gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].at : 0;
+            if (finished || oldest)
+                rebox_log("d3d12_xs: GPU: %lld submissions finished in the last 10 s, %.1f ms on average, longest "
+                          "%.1f ms; %u still running, the oldest for %.1f ms (queue %p)", finished,
+                          finished ? total * ms / finished : 0.0, longest * ms, gpu_latency_head - gpu_latency_tail,
+                          oldest * ms, gpu_latency_tail != gpu_latency_head
+                          ? gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].queue : NULL);
+            total = longest = finished = 0;
+            last_log = now.QuadPart;
+        }
+        ReleaseSRWLockExclusive(&gpu_latency_lock);
+    }
+    return 0;
+}
+
+static void gpu_latency_note(struct proxy *queue)
+{
+    static LONG started;
+    LARGE_INTEGER now;
+
+    if (!queue->timing_fence)
+    {
+        ID3D12Device *device = NULL;
+        if (SUCCEEDED(ID3D12CommandQueue_GetDevice(INNER(queue, ID3D12CommandQueue), &IID_ID3D12Device, (void **)&device)))
+        {
+            ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&queue->timing_fence);
+            ID3D12Device_Release(device);
+        }
+        if (!queue->timing_fence)
+            return;
+    }
+    if (!InterlockedExchange(&started, 1))
+        CloseHandle(CreateThread(NULL, 0, gpu_latency_thread, NULL, 0, NULL));
+    ID3D12CommandQueue_Signal(INNER(queue, ID3D12CommandQueue), queue->timing_fence, ++queue->timing_value);
+    QueryPerformanceCounter(&now);
+    AcquireSRWLockExclusive(&gpu_latency_lock);
+    if (gpu_latency_head - gpu_latency_tail < ARRAYSIZE(gpu_latency))
+    {
+        ID3D12Fence_AddRef(queue->timing_fence);
+        gpu_latency[gpu_latency_head++ % ARRAYSIZE(gpu_latency)] =
+                (struct gpu_latency_entry){ queue->timing_fence, queue->timing_value, now.QuadPart, queue };
+    }
+    ReleaseSRWLockExclusive(&gpu_latency_lock);
+}
+
 /* Time each part of a submission takes, logged at powers of two: memory waits, texture uploads,
  * the rest before it, vkd3d-proton's ExecuteCommandLists, and what follows it. */
 static volatile LONG64 submit_ticks[5];
@@ -3275,6 +3360,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     }
     submit_mark(&mark, 2);
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
+    gpu_latency_note(p);
     submit_mark(&mark, 3);
     /* Waits elsewhere for the values these lists write (signal_value_fences). */
     signal_value_fences(INNER(p, ID3D12CommandQueue), count, lists);
