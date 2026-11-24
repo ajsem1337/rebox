@@ -118,7 +118,9 @@ echo "ok   ray tracing list slots are handled by d3d12_xs on both layouts"
 grep -Eq "first-chance access violation \(0xc0000005\) at smoke.exe\+0x" <<<"$out" \
     && grep -Eq "  reading 0x10\s*$" <<<"$out" && grep -q "reading 0x20ff00000040 (inside the GPU window" <<<"$out" \
     && grep -Eq "  #1  smoke.exe\+0x" <<<"$out" || { echo "FAIL fault report missing or incomplete"; exit 1; }
-grep -q "xmem: stack sample 1 " <<<"$out" && grep -A3 "xmem: stack sample 1 " <<<"$out" | grep -q "xmem: thread " \
+# The sampling thread's own lines: other threads log in between.
+sampler=$(grep -m1 -o "^\[rebox [0-9a-f]*\] xmem: stack sample 1 " <<<"$out" | grep -o "^\[rebox [0-9a-f]*\]")
+[ -n "$sampler" ] && grep -F -A3 "$sampler xmem: stack sample 1 " <<<"$(grep -F "$sampler" <<<"$out")" | grep -q "xmem: thread " \
     || { echo "FAIL REBOX_STACK_SAMPLE logged no thread stacks"; exit 1; }
 echo "ok   REBOX_STACK_SAMPLE logs every thread's stack from a copy, without faulting"
 grep -q "write watch: smoke.exe+0x[0-9a-f]* writes 0x7e0000008" <<<"$out" || { echo "FAIL REBOX_WRITE_WATCH logged no writer"; exit 1; }

@@ -334,6 +334,22 @@ static BOOL push(struct entry **list, UINT32 *count, UINT32 *size, const struct 
     return TRUE;
 }
 
+/* Whether [p, p + size) is all committed, writable memory. */
+static BOOL writable_range(const void *p, SIZE_T size)
+{
+    const BYTE *at = p, *end = (const BYTE *)p + size;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    while (at < end)
+    {
+        if (!VirtualQuery(at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)
+                || !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return FALSE;
+        at = (const BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return TRUE;
+}
+
 static HRESULT inflate_into(BYTE *dst, UINT32 dst_size, const BYTE *src, UINT32 src_size)
 {
     unsigned long out = dst_size, in;
@@ -625,6 +641,17 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         else if (read != r->source_size)
             hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
         ReleaseSRWLockShared(&e->file->lock);
+    }
+    /* A destination the title unmapped meanwhile (pages in a tile pool come and go): the request
+     * fails, as a read into it does, instead of decoding into it and faulting. */
+    if (SUCCEEDED(hr) && (bcpack || (r->options & OPT_ZLIB) || from_memory)
+            && !writable_range(r->destination, r->destination_size))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 16)
+            rebox_log("xcrdapi: a request's destination %p+%#x isn't all committed and writable: it fails",
+                      r->destination, r->destination_size);
+        hr = HRESULT_FROM_WIN32(ERROR_NOACCESS);
     }
     if (SUCCEEDED(hr) && bcpack)
     {
