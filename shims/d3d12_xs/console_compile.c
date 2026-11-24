@@ -1577,9 +1577,31 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
             solid = strstr(debug + 8, id) != NULL;
         }
+        /* REBOX_DEBUG_PS_LZ=<stage id>,...: those pixel stages' own code with every image_sample made
+         * image_sample_lz (level 0, no derivatives): whether implicit-LOD sampling is what fails. */
+        static UINT32 lz_code[4096];
+        const char *lz = getenv("REBOX_DEBUG_PS_LZ");
+        const UINT32 *own = req.code;
+        if (!solid && lz && req.code_dwords <= ARRAYSIZE(lz_code))
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            if (strstr(lz, id))
+            {
+                UINT changed = 0;
+                memcpy(lz_code, req.code, req.code_dwords * 4);
+                /* A dword that reads as image_sample (MIMG, opcode 0x20, gfx10 encoding 0xf080....);
+                 * no length decoding, so a literal that looks like one is changed too: debugging only. */
+                for (UINT k = 0; k + 1 < req.code_dwords; k++)
+                    if ((lz_code[k] & 0xfdfc0000u) == 0xf0800000u)
+                        lz_code[k] = (lz_code[k] & ~(0x7fu << 18)) | 0x27u << 18, changed++;
+                own = lz_code;
+                rebox_log("d3d12_xs: REBOX_DEBUG_PS_LZ: stage %s, %u image_sample made image_sample_lz", id, changed);
+            }
+        }
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
-        preq.code = solid ? replacement : req.code;
+        preq.code = solid ? replacement : own;
         preq.code_dwords = solid ? replacement_dwords : req.code_dwords;
         preq.code_address = req.code_address;
         preq.wave = req.wave;
