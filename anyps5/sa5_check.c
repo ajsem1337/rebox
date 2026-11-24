@@ -716,7 +716,7 @@ static int vertex_sweep(const char *plan, int first, int count)
 /* Mesh shaders: compiled with d3d12_xs's settings (wave and limits from the FSSM, 32 user SGPRs,
  * push data 0-95), then finalized with a draw block at byte 96: the guest buffer table pushed, the
  * other host buffers baked. Returns 0 and a "ok ..." detail, or -1 and the error. */
-static int mesh_compile(const struct sa5_mesh_request *req, char *detail, size_t size)
+static int mesh_compile(const struct sa5_mesh_request *req, const char *name, char *detail, size_t size)
 {
     struct sa5_result *result = NULL;
     struct sa5_host_buffer hosts[8];
@@ -753,6 +753,17 @@ static int mesh_compile(const struct sa5_mesh_request *req, char *detail, size_t
     }
     snprintf(detail, size, "ok %u words, wave%u, %u bindings, subgroup %u; finalized %u words", words, req->wave,
              sa5_result_binding_count(result), sa5_result_subgroup_size(result), out_count);
+    if (name && getenv("SA5_DUMP_SPIRV"))
+    {
+        char path[1200];
+        FILE *dump;
+        snprintf(path, sizeof(path), "%s\\%s.spv", getenv("SA5_DUMP_SPIRV"), name);
+        if ((dump = fopen(path, "wb")))
+        {
+            fwrite(out, 4, out_count, dump);
+            fclose(dump);
+        }
+    }
     sa5_free_words(out);
     sa5_result_free(result);
     return 0;
@@ -798,7 +809,7 @@ static int mesh_builtin(void)
     req.primitive_vertices = 3;
     req.push_size = 96;
     req.use_cache = 1;
-    failed = mesh_compile(&req, detail, sizeof(detail));
+    failed = mesh_compile(&req, "mesh", detail, sizeof(detail));
     printf("%s mesh: %s\n", failed ? "FAIL" : "ok  ", detail);
     return failed;
 }
@@ -855,7 +866,7 @@ static int mesh_sweep(const char *plan, int first, int count)
         req.clip_cntl = clip;
         req.push_size = 96;
         req.use_cache = 1;
-        if (mesh_compile(&req, detail, sizeof(detail)))
+        if (mesh_compile(&req, name, detail, sizeof(detail)))
             failed++;
         else
             ok++;

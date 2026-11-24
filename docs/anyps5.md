@@ -256,7 +256,10 @@ and images). `REBOX_DUMP_SPIRV=DIR` writes each finalized module.
 its code; `tools/ps09.py` reads the PS09 PSO cache. `sa5_check.exe` compiles shaders through the
 DLL outside a title: a built-in one, a dumped one (`CODE.bin SKIP RSRC1 RSRC2 X,Y,Z`), or the
 vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a built-in mesh
-program (`mesh`). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
+program (`mesh`). `tools/ms-plan.py DUMP_DIR OUT_DIR` writes a mesh plan from the `*.ms.bin` containers
+`REBOX_DUMP_SHADERS` dumps (each FSSM to `OUT_DIR`, its `FLAT_SCRATCH` setup made `s_nop`s as
+`console_compile.c` does), and `SA5_DUMP_SPIRV=DIR` writes each mesh module `ms` finalizes, as it does
+for `cs`. `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
 shaders compiled and validated on that many threads at once. Compute shaders, `ps` and `bench`
 compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the disk cache
 included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
