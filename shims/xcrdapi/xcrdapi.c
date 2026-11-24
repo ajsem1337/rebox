@@ -493,9 +493,20 @@ static HRESULT write_pages(const struct entry *e, const BYTE *data, UINT32 size)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 8)
-            rebox_log("xcrdapi: writing %u bytes to %u physical pages (first %#llx, offset %llu) failed", size,
-                      e->page_count, e->page_count ? (unsigned long long)e->pages[0] : 0ull,
-                      (unsigned long long)e->request.destination_page_offset);
+        {
+            /* Which entries are still 0, and what the array's memory is (xmem). */
+            HMODULE xmem = GetModuleHandleA("xmem.dll");
+            void (WINAPI *describe)(ULONGLONG, ULONGLONG) =
+                    xmem ? (void *)GetProcAddress(xmem, "ReboxPhysicalDescribe") : NULL;
+            UINT32 zero = 0;
+            for (UINT32 i = 0; i < e->page_count; i++)
+                zero += !e->pages[i];
+            rebox_log("xcrdapi: writing %u bytes to %u physical pages (first %#llx, offset %llu) failed; %u of them "
+                      "0, array at %p", size, e->page_count, e->page_count ? (unsigned long long)e->pages[0] : 0ull,
+                      (unsigned long long)e->request.destination_page_offset, zero, array);
+            if (describe)
+                describe((ULONGLONG)(ULONG_PTR)array, e->page_count * sizeof(*array));
+        }
         return E_INVALIDARG;
     }
     return S_OK;
