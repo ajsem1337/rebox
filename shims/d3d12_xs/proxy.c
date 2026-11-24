@@ -4234,9 +4234,25 @@ static UINT64 write_span(const struct cpu_write *w)
     return w->size ? w->size : 4ull * w->count;
 }
 
+/* REBOX_MEMORY_WAITS=0: Wait32/64BitValueX are ignored, the lists ordered only by the title's
+ * fences (VIctory does so: a value another queue or the CPU writes first can't be waited for when
+ * lists run to completion one after another). */
+static BOOL memory_waits_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *v = getenv("REBOX_MEMORY_WAITS");
+        enabled = !(v && *v == '0');
+        if (!enabled)
+            rebox_log("d3d12_xs: Wait32/64BitValueX are ignored (REBOX_MEMORY_WAITS=0)");
+    }
+    return enabled;
+}
+
 static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value, UINT64 mask, UINT width)
 {
-    if (!address || comparison == D3D12_COMPARISON_FUNC_ALWAYS)
+    if (!address || comparison == D3D12_COMPARISON_FUNC_ALWAYS || !memory_waits_enabled())
         return;
     /* A write earlier in this list satisfies it once the GPU is there; waiting before the
      * submission would wait for ever. */
