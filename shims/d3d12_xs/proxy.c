@@ -1330,6 +1330,20 @@ static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T
             && InterlockedIncrement(&logged) <= 24)
         rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#llx", what, (void *)resource,
                   (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, (unsigned long long)cpu);
+    /* A view on a texture at a title address where another texture is registered too: on the
+     * console both are the same memory; here each texture placed in title memory has its own, so
+     * what is drawn through one isn't seen through the other. */
+    {
+        static LONG aliased;
+        UINT64 at = 0;
+        UINT uploads = 0;
+        ID3D12Resource *other;
+        if (title_texture_info(resource, &at, &uploads) && at && (other = title_texture_at(at)) && other != resource
+                && InterlockedIncrement(&aliased) <= 32)
+            rebox_log("d3d12_xs: %s of %p (%llux%u, format %u) at title address %#llx, where texture %p is "
+                      "registered too: they don't share memory here", what, (void *)resource,
+                      (unsigned long long)d.Width, d.Height, d.Format, (unsigned long long)at, (void *)other);
+    }
 }
 
 static D3D12_RESOURCE_DESC resource_desc(ID3D12Resource *resource)
