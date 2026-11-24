@@ -548,7 +548,6 @@ static UINT64 gpu_view_to_cpu(UINT64 address)
 {
     static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
     static volatile LONG resolved;
-    static LONG logged;
     UINT64 cpu;
 
     if (!resolved) /* a race only looks the export up twice */
@@ -557,9 +556,6 @@ static UINT64 gpu_view_to_cpu(UINT64 address)
         resolved = 1;
     }
     cpu = to_cpu ? to_cpu(address) : address;
-    if (cpu != address && InterlockedIncrement(&logged) <= 4)
-        rebox_log("d3d12_xs: %#llx is in a GPU view of title memory: placed over %#llx",
-                  (unsigned long long)address, (unsigned long long)cpu);
     return cpu;
 }
 
@@ -2515,7 +2511,15 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
 
     if (!d || !out)
         return E_INVALIDARG;
-    address = gpu_view_to_cpu(address);
+    {
+        UINT64 cpu = gpu_view_to_cpu(address);
+        static LONG logged;
+        if (cpu != address && InterlockedIncrement(&logged) <= 64)
+            rebox_log("d3d12_xs: placed at %#llx in a GPU view of title memory, over %#llx: dimension %u, %llux%u, "
+                      "format %u, flags %#x", (unsigned long long)address, (unsigned long long)cpu, desc->Dimension,
+                      (unsigned long long)desc->Width, desc->Height, desc->Format, desc->Flags);
+        address = cpu;
+    }
     if (d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         why = 0;
     /* A buffer over the title's own memory: that memory is made GPU memory where it is. */
