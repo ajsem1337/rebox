@@ -231,11 +231,24 @@ static struct gpuva_mailbox *mailbox;
 
 /* A write into title memory the layer is making GPU memory (layers/gpuva_mailbox.h) waits until the
  * new pages are mapped there, then is retried in them. */
+/* Physical pages being mapped again around a part of a view that is unmapped (unmap_range): for a
+ * moment nothing is mapped there, so an access there (any, read or write) waits until they are back,
+ * then is retried. One window at a time: it is set under physical_lock. */
+static volatile UINT64 remap_start, remap_size;
+
 static LONG CALLBACK hold_busy_writes(EXCEPTION_POINTERS *ep)
 {
     const EXCEPTION_RECORD *r = ep->ExceptionRecord;
     UINT64 address, start;
 
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 && remap_size
+            && r->ExceptionInformation[1] - remap_start < remap_size)
+    {
+        start = remap_start;
+        while (remap_size && remap_start == start)
+            Sleep(0);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1
             || !mailbox || !mailbox->busy_size)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -804,6 +817,11 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
     UINT64 bytes;
     BOOL ok = TRUE;
 
+    static LONG handler_installed;
+    /* Accesses during a remap wait in hold_busy_writes, installed with the GPU window if there is
+     * one, else here. */
+    if (!mailbox && !InterlockedExchange(&handler_installed, 1))
+        AddVectoredExceptionHandler(1, hold_busy_writes);
     if (!count || !pages)
     {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1103,6 +1121,13 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
             }
             clear_slot(s);
         }
+        /* Pages of the view that stay are briefly unmapped: accesses to them wait (hold_busy_writes). */
+        if (keep)
+        {
+            remap_start = view;
+            remap_size = view_bytes;
+            MemoryBarrier();
+        }
         if (!unmap_view2 || !unmap_view2(GetCurrentProcess(), (void *)view, MEM_PRESERVE_PLACEHOLDER))
         {
             static LONG logged;
@@ -1122,6 +1147,8 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
             if (keep_count[1])
                 map_units(keep_at[1], keep + (start - view) / PAGE_UNIT, keep_count[1]);
             free(keep);
+            MemoryBarrier();
+            remap_size = 0;
         }
     }
 }
