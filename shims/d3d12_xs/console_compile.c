@@ -182,6 +182,12 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
 struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
 static struct late_texture late[4096];
 static UINT late_count;
+/* V#s the same: a guest buffer table entry ({address, length in dwords}) whose V# was empty when the
+ * stage was set up (a video shader's constants, written with its T#s), filled at submission from
+ * the V# at its address then. Until then it reads as an empty buffer (zeros). */
+struct late_buffer { UINT32 *entry; UINT64 source; UINT tries; UINT64 stage; };
+static struct late_buffer late_buffers[1024];
+static UINT late_buffer_count;
 static SRWLOCK late_lock = SRWLOCK_INIT;
 
 void console_resolve_late(void)
@@ -190,9 +196,35 @@ void console_resolve_late(void)
     UINT kept = 0, resolved = 0;
     static LONG logged;
 
-    if (!late_count)
+    if (!late_count && !late_buffer_count)
         return;
     AcquireSRWLockExclusive(&late_lock);
+    {
+        UINT kept_buffers = 0;
+        for (UINT i = 0; i < late_buffer_count; i++)
+        {
+            struct late_buffer *t = &late_buffers[i];
+            UINT32 w[4] = { 0 };
+            if (ReboxShadowRead(t->source, w, sizeof(w)) && (w[0] || w[1]))
+            {
+                UINT64 base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
+                UINT32 stride = (w[1] >> 16) & 0x3fff;
+                UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
+                static LONG shown;
+                t->entry[0] = (UINT32)base;
+                t->entry[1] = (UINT32)(base >> 32);
+                t->entry[2] = (UINT32)min(bytes / 4, 0xffffffffull);
+                if ((console_stage_watched(t->stage) && InterlockedIncrement(&shown) <= 16)
+                        || InterlockedIncrement(&shown) <= 4)
+                    rebox_log("d3d12_xs: late V# %08x %08x %08x %08x of stage %016llx: buffer at %#llx, %llu bytes",
+                              w[0], w[1], w[2], w[3], (unsigned long long)t->stage, (unsigned long long)base,
+                              (unsigned long long)bytes);
+            }
+            else if (++t->tries < 8)
+                late_buffers[kept_buffers++] = *t;
+        }
+        late_buffer_count = kept_buffers;
+    }
     for (UINT i = 0; i < late_count; i++)
     {
         struct late_texture *t = &late[i];
@@ -723,7 +755,22 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
 /* The address of the n-th T# a graphics stage loads from its descriptor tables, or 0. The code is scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode
  * 3) from an SGPR pair whose low register is a table pointer (user SGPRs 8-15, the console's
  * graphics layout, used as {sN, 0}): the address is that SGPR plus the load's offset. */
+static UINT64 late_load_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n,
+                               UINT32 opcode);
+
 static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
+{
+    return late_load_source(h, in, n, 3 /* s_load_dwordx8: a T# */);
+}
+
+/* The same for the n-th V# the code loads (s_load_dwordx4). */
+static UINT64 late_buffer_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
+{
+    return late_load_source(h, in, n, 2);
+}
+
+static UINT64 late_load_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n,
+                               UINT32 opcode)
 {
     BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
     const UINT32 *code = (const UINT32 *)((const BYTE *)h + h->code_offset);
@@ -738,7 +785,7 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
         op = (w0 >> 18) & 0xff;
         sbase = (w0 & 0x3f) * 2;
         i++; /* SMEM is two dwords */
-        if (op != 3 || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
+        if (op != opcode || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
             continue;
         address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
         /* In a shadow heap, whatever it holds now: AnyPS5 may have read it empty a moment before. */
@@ -1092,7 +1139,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
     static UINT32 indices[MAX_ELEMENTS]; /* under compile_lock */
     static struct { UINT position; UINT64 source; SIZE_T heap; } pending[64]; /* late T#s of this stage */
-    UINT pending_count = 0, zero_textures = 0;
+    UINT pending_count = 0, zero_textures = 0, zero_buffers = 0;
     BYTE *block_cpu = NULL;
     static SRWLOCK compile_lock = SRWLOCK_INIT;
     struct sa5_compute_request req;
@@ -1718,6 +1765,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
              * descriptors in vkd3d-proton) can be read as storage buffers. */
             UINT32 *table, per = b.count ? b.word_count / b.count : 0;
             UINT64 va;
+            BYTE *table_cpu = NULL;
+            UINT64 empty_sources[16];
+            UINT empty_entries[16], empty_count = 0;
             if (host_count == ARRAYSIZE(hosts) || per != 4 || !(table = calloc(b.count ? b.count : 1, 16)))
             {
                 log_failure(h, "no room for the guest buffer table", NULL);
@@ -1740,6 +1790,19 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 table[e * 4] = (UINT32)base;
                 table[e * 4 + 1] = (UINT32)(base >> 32);
                 table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
+                /* An empty V# of a graphics stage: maybe one the title writes before it submits. */
+                if (graphics && !(w[0] | w[1] | w[2] | w[3]) && empty_count < ARRAYSIZE(empty_sources))
+                {
+                    UINT64 source = late_buffer_source(h, in, zero_buffers++);
+                    if (source)
+                    {
+                        empty_sources[empty_count] = source;
+                        empty_entries[empty_count++] = e;
+                        if (console_stage_watched(stage_id))
+                            rebox_log("d3d12_xs: console shader %016llx: empty V#, noted at %#llx",
+                                      (unsigned long long)stage_id, (unsigned long long)source);
+                    }
+                }
                 if (graphics)
                 {
                     /* The first graphics stages' buffers and their first values (where guest
@@ -1767,7 +1830,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             }
             {
                 LONG64 t = ticks_now();
-                va = draw_buffer(table, (b.count ? b.count : 1) * 16, NULL);
+                va = draw_buffer(table, (b.count ? b.count : 1) * 16, &table_cpu);
                 InterlockedAdd64(&part_ticks[3], ticks_now() - t);
             }
             free(table);
@@ -1775,6 +1838,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 log_failure(h, "no GPU memory for the guest buffer table", NULL);
                 goto done;
+            }
+            if (empty_count && table_cpu)
+            {
+                AcquireSRWLockExclusive(&late_lock);
+                for (UINT k = 0; k < empty_count && late_buffer_count < ARRAYSIZE(late_buffers); k++)
+                    late_buffers[late_buffer_count++] = (struct late_buffer){
+                            (UINT32 *)(table_cpu + empty_entries[k] * 16), empty_sources[k], 0, stage_id };
+                ReleaseSRWLockExclusive(&late_lock);
             }
             host_va[host_count] = va;
             /* Per-draw contents: pushed (graphics: after the stage's push data). */
