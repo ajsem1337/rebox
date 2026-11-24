@@ -1314,12 +1314,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
 }
 
-/* A background compile lets go of compile_lock while AnyPS5 runs (its caches have their own locks),
- * so several workers compile at once and a draw's compile isn't skipped for one that holds the lock.
- * What the request points at is the caller's or per-thread; the rest of compile_now holds the lock. */
+/* Every compile lets go of compile_lock while AnyPS5 runs (its caches have their own locks), so
+ * several threads compile at once. What the request points at is the caller's or per-thread; the
+ * rest of compile_now holds the lock. */
 #define unlocked_compile(background, call) \
-    ((background) ? (ReleaseSRWLockExclusive(&compile_lock), compile_result = (call), \
-                     AcquireSRWLockExclusive(&compile_lock), compile_result) : (call))
+    ((void)(background), ReleaseSRWLockExclusive(&compile_lock), compile_result = (call), \
+     AcquireSRWLockExclusive(&compile_lock), compile_result)
 static __thread int compile_result;
 
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
@@ -1605,17 +1605,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     req.region_count = n;
     req.use_cache = 1;
 
-    /* One compile at a time: AnyPS5's caches are thread-safe, but this keeps the static index
-     * table simple and compiles are rare once warm. The render thread never waits for a background
-     * compile (see ReboxConsoleCompile): if one holds the lock, this call is skipped. */
-    if (background || !async_compiles())
-        AcquireSRWLockExclusive(&compile_lock);
-    else if (!TryAcquireSRWLockExclusive(&compile_lock))
-    {
-        free(code);
-        set_last(E_PENDING, "a background compile holds the compiler", NULL);
-        return E_PENDING;
-    }
+    /* The lock keeps the static index table simple; AnyPS5 itself runs outside it (its caches have
+     * their own locks), so a caller waits only for another's bookkeeping. It used to be skipped
+     * when another thread held the lock: with a title's several recording threads compiling a
+     * scene's draws, most of them were dropped. */
+    AcquireSRWLockExclusive(&compile_lock);
     phase_end(&mark, 0 + (graphics ? 0 : 4));
     if (graphics && h->stage == 0x80)
     {
