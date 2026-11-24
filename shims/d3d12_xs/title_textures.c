@@ -654,6 +654,31 @@ static int batches_reclaim(ID3D12CommandQueue *queue)
     return free_slot;
 }
 
+/* Screen-sized textures kept in step (a video's planes), every 600 submissions, eight times: how
+ * they are laid out, how often uploaded, and whether their memory holds anything. Called with the
+ * lock held. */
+static void log_large(void)
+{
+    static UINT rounds;
+    if (submissions % 600 || rounds >= 8)
+        return;
+    rounds++;
+    for (struct title_texture *t = textures; t; t = t->next)
+    {
+        UINT64 nonzero = 0, sampled = 0;
+        if (t->surface.width < 1920 || t->surface.height < 1080)
+            continue;
+        if (!t->unreadable && t->cpu && still_readable(t))
+            for (UINT64 at = 0; at < t->size; at += 4093, sampled++)
+                nonzero += t->cpu[at] != 0;
+        rebox_log("d3d12_xs: large title texture at %#llx: %ux%u format %u, mode %u, %u uploads%s%s%s, "
+                  "%llu of %llu sampled bytes nonzero", (unsigned long long)t->address, t->surface.width,
+                  t->surface.height, t->surface.format, t->surface.mode, t->uploads, t->dirty ? ", dirty" : "",
+                  t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "",
+                  (unsigned long long)nonzero, (unsigned long long)sampled);
+    }
+}
+
 void title_textures_upload(ID3D12CommandQueue *queue)
 {
     struct title_texture *t;
@@ -668,6 +693,7 @@ void title_textures_upload(ID3D12CommandQueue *queue)
     AcquireSRWLockExclusive(&lock);
     submissions++;
     watch();
+    log_large();
     ReleaseSRWLockExclusive(&lock);
     if (!dirty_count || slot < 0)
         return;
