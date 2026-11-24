@@ -1275,6 +1275,16 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
                       (unsigned long long)timing, placed.plain, placed.split, placed.coalesced, placed.failed,
                       placed.copies);
     }
+    /* Totals, every 4096 calls: a title that maps one page per call makes thousands. */
+    {
+        static ULONGLONG calls, pages_total, ms_total, split_total, plain_total, copy_total;
+        calls++, pages_total += count, ms_total += timing;
+        split_total += placed.split + placed.coalesced, plain_total += placed.plain, copy_total += placed.copies;
+        if (!(calls & 4095))
+            rebox_log("xmem: XMemMapPhysicalPages: %llu calls, %llu pages, %llu ms in all; views %llu placed, %llu "
+                      "split or coalesced; %llu copies", calls, pages_total, ms_total, plain_total, split_total,
+                      copy_total);
+    }
     ReleaseSRWLockExclusive(&physical_lock);
     return ok;
 }
