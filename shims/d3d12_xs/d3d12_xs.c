@@ -636,6 +636,13 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
             console.InputLayout = *(const D3D12_INPUT_LAYOUT_DESC *)(stream + offset + subobj_layouts[type].offset);
         offset += subobj_layouts[type].size;
     }
+    if (blend)
+        console.BlendState = *blend;
+    if (rt_formats)
+    {
+        console.NumRenderTargets = rt_formats->NumRenderTargets;
+        memcpy(console.RTVFormats, rt_formats->RTFormats, sizeof(console.RTVFormats));
+    }
     shader_cache_census("stream", census_names, census_bc, stage_count,
                         cached_pso ? (const D3D12_CACHED_PIPELINE_STATE *)(stream + cached_pso) : NULL);
 
