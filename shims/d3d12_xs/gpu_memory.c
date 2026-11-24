@@ -433,8 +433,32 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     }
     if (!device || !size || !get_mailbox || !(box = get_mailbox()) || box->magic != GPUVA_MAILBOX_MAGIC)
         return FALSE;
-    if (!committed_run(address, &run_start, &run_end) || end > run_end)
-        return FALSE;
+    /* Already GPU memory, the usual case (every root view bound asks): before committed_run, whose
+     * VirtualQuery calls made a frame's bindings take seconds once a world streams in. */
+    AcquireSRWLockShared(&lock);
+    for (c = chunks; c && !(address >= c->gpu && end <= c->gpu + c->size); c = c->next)
+        ;
+    ReleaseSRWLockShared(&lock);
+    if (c)
+        return TRUE;
+    /* A range that couldn't be adopted isn't tried again for a second: committed_run walks every
+     * region of the allocation, thousands in title memory full of physical-page views. */
+    {
+        static struct { UINT64 address, end; ULONGLONG at; } failed[64];
+        static LONG next;
+        ULONGLONG now = GetTickCount64();
+        for (UINT i = 0; i < ARRAYSIZE(failed); i++)
+            if (failed[i].address <= address && end <= failed[i].end && now - failed[i].at < 1000)
+                return FALSE;
+        if (!committed_run(address, &run_start, &run_end) || end > run_end)
+        {
+            UINT i = (UINT)InterlockedIncrement(&next) % ARRAYSIZE(failed);
+            failed[i].address = address & ~0xffffull;
+            failed[i].end = (end + 0xffff) & ~0xffffull;
+            failed[i].at = now;
+            return FALSE;
+        }
+    }
     /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
     base = address & ~(ADOPT_GRANULE - 1);
     limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
