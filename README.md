@@ -188,6 +188,7 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 | `REBOX_DUMP_FRAMES_EVERY=N` | Also dump a frame every N seconds (the first frame, then the first one N seconds after the last dump) |
 | `REBOX_DUMP_TITLE_TEXTURE=<address>` | With `REBOX_DUMP_FRAMES`, write the title memory of the placed texture at that hex address as `DIR/texture_<address>_<n>.bin` each time the texture state log runs (every 600 submissions, eight times) |
+| `REBOX_DSTORAGE_IGNORE_FAILURES=1` | A DirectStorage request that fails (logged and counted as before) no longer makes the next status entry report the failure: whether a title gives up on a whole batch for one failed request (a BCPack block the decoder refuses) |
 
 The shader cache ([docs/shaders.md](docs/shaders.md)) is keyed by the 64-bit FNV-1a hash of the
 bytecode exactly as the title passes it to `Create*PipelineState`.

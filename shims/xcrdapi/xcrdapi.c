@@ -635,7 +635,15 @@ static DWORD WINAPI queue_worker(void *param)
             if (FAILED(hr))
             {
                 static LONG logged;
-                if (SUCCEEDED(q->first_failure))
+                /* REBOX_DSTORAGE_IGNORE_FAILURES=1: the status entries read as success anyway, to
+                 * see whether a title gives up on a whole batch for one failed request. */
+                static int ignore = -1;
+                if (ignore < 0)
+                {
+                    const char *v = getenv("REBOX_DSTORAGE_IGNORE_FAILURES");
+                    ignore = v && *v == '1';
+                }
+                if (SUCCEEDED(q->first_failure) && !ignore)
                     q->first_failure = hr;
                 if (InterlockedIncrement(&logged) <= 16)
                     rebox_log("xcrdapi: request failed %#lx (options %#llx, offset %llu, %u -> %u bytes)", hr,
