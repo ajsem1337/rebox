@@ -20,6 +20,8 @@
 // draw (a UE5 title) gets one module and one pipeline per shader, not one per draw. A mesh module's
 // draw parameters, which AnyPS5 reads from the push block, are frozen too (FreezeMeshDraw).
 #define REBOX_ANYPS5_BUILD
+#include <cstdlib>
+#include <atomic>
 #include "rebox_anyps5.h"
 
 #include "sa5_internal.hpp"
@@ -806,6 +808,21 @@ void Validate(const std::vector<std::uint32_t>& words)
     if (!tools.Validate(words.data(), words.size(), options)) Fail("rewritten module is invalid: " + log);
 }
 
+// Whether a finalized module is validated: every one for the first 256, then every 32nd.
+// Validation is much of the allocation a compile does, and under Wine allocations take the
+// process heap's one lock, so it kept a world's thousand new shaders queued for minutes.
+// REBOX_SPIRV_VALIDATE=1 validates every module, =0 none.
+bool ShouldValidate()
+{
+    static const int setting = [] {
+        const char* v = std::getenv("REBOX_SPIRV_VALIDATE");
+        return v && *v == '1' ? 1 : v && *v == '0' ? 0 : -1;
+    }();
+    static std::atomic<std::uint64_t> finalized{0};
+    const std::uint64_t n = finalized.fetch_add(1, std::memory_order_relaxed);
+    return setting == 1 || (setting < 0 && (n < 256 || n % 32 == 0));
+}
+
 }  // namespace
 
 extern "C" {
@@ -821,7 +838,7 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr);
         HostBuffers(m, buffers, buffer_count, nullptr);
         const auto words = m.Words();
-        Validate(words);
+        if (ShouldValidate()) Validate(words);
         *out = new uint32_t[words.size()];
         std::memcpy(*out, words.data(), words.size() * sizeof(uint32_t));
         *out_count = static_cast<uint32_t>(words.size());
@@ -845,7 +862,7 @@ SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw);
         HostBuffers(m, buffers, buffer_count, &draw);
         const auto words = m.Words();
-        Validate(words);
+        if (ShouldValidate()) Validate(words);
         *out = new uint32_t[words.size()];
         std::memcpy(*out, words.data(), words.size() * sizeof(uint32_t));
         *out_count = static_cast<uint32_t>(words.size());
