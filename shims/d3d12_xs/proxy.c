@@ -3191,6 +3191,29 @@ static HRESULT STDMETHODCALLTYPE queue_CopyPageMappingsBatchX(struct proxy *p, U
     return S_OK;
 }
 
+/* Slot 29 of a queue made on the older table: CopyPageMappingsBatchX on the older layout; on the
+ * newer one it is another of the page-mapping methods (27 + 2), not known here. */
+static HRESULT STDMETHODCALLTYPE queue_Slot29(struct proxy *p, UINT count, const struct page_batch *batches,
+        UINT64 pool, UINT pool_pages, UINT flags)
+{
+    static LONG logged;
+    if (!newer_layouts)
+        return queue_CopyPageMappingsBatchX(p, count, batches, pool, pool_pages, flags);
+    if (InterlockedIncrement(&logged) <= 4)
+        rebox_log("d3d12_xs: queue slot 29 on the newer layout (a page-mapping method, not known): ignored");
+    return S_OK;
+}
+
+/* Slot 31 of a queue made on the older table: CopyPageMappingsBatchX once the newer layout is known
+ * (29 + 2), else the older layout's SetHDRToneMapperX, which has nothing to do here. */
+static HRESULT STDMETHODCALLTYPE queue_Slot31(struct proxy *p, UINT count, const struct page_batch *batches,
+        UINT64 pool, UINT pool_pages, UINT flags)
+{
+    if (newer_layouts)
+        return queue_CopyPageMappingsBatchX(p, count, batches, pool, pool_pages, flags);
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE queue_Slot32(struct proxy *p, UINT planes, const void *plane_params, const void *params)
 {
     if (newer_layouts)
@@ -4370,7 +4393,8 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(18, queue_Slot18),
         FN(25, queue_Slot25),
         FN(32, queue_Slot32),
-        FN(29, queue_CopyPageMappingsBatchX),
+        FN(29, queue_Slot29),
+        FN(31, queue_Slot31),
         FN(23, queue_SignalX),
         FN(26, queue_GetDesc),
         FN(30, queue_PresentX),
