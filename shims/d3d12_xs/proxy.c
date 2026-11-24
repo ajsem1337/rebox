@@ -2798,11 +2798,11 @@ static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D1
     }
     if (!info.SizeInBytes || info.SizeInBytes == ~0ull)
         return E_FAIL;
-    /* The title's memory under one the GPU writes is made GPU memory too: the texture has a heap
-     * of its own, but a title also reads that memory by address (a buffer over a render target),
-     * and those reads went to memory the GPU couldn't see: a fault that lost the device. */
-    if (gpu)
-        gpu_memory_adopt(address, info.SizeInBytes);
+    /* The title's memory under a texture is made GPU memory too, as all of it is on the console:
+     * the texture has memory of its own, but a title also reads that memory by address (a buffer
+     * over a render target, or over the texture beside one), and those reads went to memory the
+     * GPU couldn't see: a fault that lost the device. */
+    gpu_memory_adopt(address, info.SizeInBytes);
     AcquireSRWLockExclusive(&alias_lock);
     {
         SIZE_T start = (SIZE_T)((address >> 16) * 0x9e3779b97f4a7c15ull >> 52) % ARRAYSIZE(alias_heaps);
