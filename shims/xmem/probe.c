@@ -375,10 +375,88 @@ void probe_watch_add(ULONG_PTR start, ULONG_PTR length)
     }
     ReleaseSRWLockExclusive(&lock);
 }
+/* REBOX_PAGE_CHECK=ADDRESS:LENGTH (hex, up to 1 MiB): a thread compares the range with a copy about
+ * every millisecond and logs each change (the first 64): how many bytes, the first changed qwords
+ * old -> new, and the memory there then (region type, protection, allocation base), to see when
+ * and how data at an address changes, writes the watches don't see included. */
+static ULONG_PTR check_start, check_length;
+
+static DWORD WINAPI page_check(void *param)
+{
+    BYTE *copy = malloc(check_length);
+    BOOL had = FALSE;
+    UINT changes = 0;
+    MEMORY_BASIC_INFORMATION last = { 0 };
+
+    if (!copy)
+        return 0;
+    for (;;)
+    {
+        const BYTE *now = (const BYTE *)check_start;
+        MEMORY_BASIC_INFORMATION mbi = { 0 };
+        BOOL readable = VirtualQuery(now, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT
+                && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && !IsBadReadPtr(now, check_length);
+
+        if (!readable)
+        {
+            if (had)
+                rebox_log("page check: %#llx+%#llx not readable now (state %#lx, type %#lx, protect %#lx)",
+                          (unsigned long long)check_start, (unsigned long long)check_length, mbi.State, mbi.Type,
+                          mbi.Protect);
+            had = FALSE;
+        }
+        else if (!had)
+        {
+            memcpy(copy, now, check_length);
+            had = TRUE;
+            last = mbi;
+            rebox_log("page check: %#llx+%#llx readable (type %#lx, protect %#lx, allocation %p), copy taken",
+                      (unsigned long long)check_start, (unsigned long long)check_length, mbi.Type, mbi.Protect,
+                      mbi.AllocationBase);
+        }
+        else if (memcmp(copy, now, check_length))
+        {
+            char line[400];
+            int at = 0;
+            UINT64 changed = 0, shown = 0;
+            for (ULONG_PTR off = 0; off + 8 <= check_length; off += 8)
+            {
+                UINT64 was = *(const UINT64 *)(copy + off), is = *(const UINT64 *)(now + off);
+                if (was == is)
+                    continue;
+                changed += 8;
+                if (shown++ < 4 && at < 340)
+                    at += snprintf(line + at, sizeof(line) - at, " +%#llx %#llx->%#llx", (unsigned long long)off,
+                                   (unsigned long long)was, (unsigned long long)is);
+            }
+            line[min(at, (int)sizeof(line) - 1)] = 0;
+            if (++changes <= 64)
+                rebox_log("page check: %#llx+%#llx changed, %llu bytes:%s (type %#lx, protect %#lx, allocation %p%s)",
+                          (unsigned long long)check_start, (unsigned long long)check_length,
+                          (unsigned long long)changed, line, mbi.Type, mbi.Protect, mbi.AllocationBase,
+                          mbi.AllocationBase != last.AllocationBase || mbi.Type != last.Type ? ", a different mapping" : "");
+            memcpy(copy, now, check_length);
+            last = mbi;
+        }
+        Sleep(1);
+    }
+}
+
 void probe_install(void)
 {
     char *spec = rebox_getenv("REBOX_PROBE"), *max = rebox_getenv("REBOX_PROBE_MAX"), *tok, *save = NULL;
     char *watch = rebox_getenv("REBOX_WRITE_WATCH");
+    {
+        char *check = rebox_getenv("REBOX_PAGE_CHECK"), *colon;
+        if (check && (colon = strchr(check, ':')))
+        {
+            check_start = strtoull(check, NULL, 16);
+            check_length = min(strtoull(colon + 1, NULL, 16), 1u << 20) & ~7ull;
+            if (check_start && check_length)
+                CloseHandle(CreateThread(NULL, 0, page_check, NULL, 0, NULL));
+        }
+        free(check);
+    }
 
     for (char *t = watch ? strtok_s(watch, ",", &save) : NULL; t && watch_count < ARRAYSIZE(watches);
          t = strtok_s(NULL, ",", &save))
