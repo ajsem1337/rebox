@@ -12,10 +12,17 @@
  *   sa5_check mesh                             a built-in console mesh program (one triangle),
  *                                              compiled and finalized as d3d12_xs does
  *   sa5_check ms PLAN [FIRST [COUNT]]          the mesh shaders in PLAN (format: mesh_sweep), the
- *                                              same way, no guest memory */
+ *                                              same way, no guest memory
+ *   sa5_check bench THREADS PLAN [FIRST [COUNT]]  compile throughput: the pixel shaders in PLAN (format:
+ *                                              pixel_sweep), compiled and validated on THREADS
+ *                                              threads at once
+ * Compute shaders (built-in or dumped), ps and bench compile with no cache unless SA5_USE_CACHE is set:
+ * then through AnyPS5's caches, its disk cache included (ANYPS5_SHADER_CACHE_DIR), as d3d12_xs
+ * compiles. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 #include "rebox_anyps5.h"
 
 static int compile(const uint32_t *code, uint32_t dwords, uint32_t rsrc1, uint32_t rsrc2, const uint32_t threads[3])
@@ -33,6 +40,7 @@ static int compile(const uint32_t *code, uint32_t dwords, uint32_t rsrc1, uint32
     memcpy(req.threads, threads, sizeof(req.threads));
     req.rsrc1 = rsrc1;
     req.rsrc2 = rsrc2;
+    req.use_cache = getenv("SA5_USE_CACHE") != NULL;
     wave = 32;
     req.wave = wave;
     if (sa5_compile_compute(&req, &result, error, sizeof(error)))
@@ -75,12 +83,64 @@ static uint8_t *read_all(const char *path, long *size)
     return data;
 }
 
+/* A pixel plan line: NAME CODE SKIP RSRC1 RSRC2 ENA NINTERP COL DEPTH CNTL. Returns 1 with the request
+ * filled in (the code in *data, for the caller to free), 0 for a line that isn't one, -1 if the code
+ * can't be read. */
+static int pixel_parse(const char *line, char name[64], struct sa5_pixel_request *req, uint32_t *user_data,
+                       uint8_t **data)
+{
+    char path[1024], winpath[1100], cntl[1024], ignored[64];
+    unsigned skip, rsrc1, rsrc2, ena, ninterp, col, depth;
+    static struct sa5_slot slots[1];
+    struct sa5_layout layout;
+    long size;
+
+    *data = NULL;
+    if (line[0] == '#' || sscanf(line, "%63s %1023s %u %x %x %x %u %x %u %1023s", name, path, &skip, &rsrc1, &rsrc2,
+                                 &ena, &ninterp, &col, &depth, cntl) != 10)
+        return 0;
+    snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+    for (char *p = winpath; *p; p++)
+        if (*p == '/') *p = '\\';
+    if (!(*data = read_all(winpath, &size)) || size <= (long)skip)
+    {
+        free(*data);
+        *data = NULL;
+        return -1;
+    }
+    memset(req, 0, sizeof(*req));
+    req->code = (const uint32_t *)(*data + skip);
+    req->code_dwords = (uint32_t)((size - skip) / 4);
+    req->code_address = 0x10000000;
+    req->user_data = user_data;
+    req->user_data_count = (rsrc2 >> 1) & 0x1f;
+    req->rsrc1 = rsrc1;
+    req->rsrc2 = rsrc2;
+    req->input_ena = ena;
+    req->interpolator_count = ninterp;
+    /* SPI_PS_INPUT_CNTL_n from the PSO, comma-separated hex ("-" for none). */
+    {
+        char *p = cntl;
+        for (unsigned i = 0; i < 32 && *p && *p != '-'; i++)
+        {
+            req->interpolator_settings[i] = (uint32_t)strtoul(p, &p, 16);
+            if (*p == ',')
+                p++;
+        }
+    }
+    req->col_format = col;
+    req->depth_export = depth;
+    req->use_cache = getenv("SA5_USE_CACHE") != NULL;
+    req->wave = !sa5_analyse(req->code, req->code_dwords, req->user_data_count, &layout, slots, 0, ignored,
+                             sizeof(ignored)) ? layout.wave : 64;
+    return 1;
+}
+
 static int pixel_sweep(const char *plan, int first, int count)
 {
     FILE *f = fopen(plan, "r");
     char line[4096];
     int index = 0, ok = 0, failed = 0, unreadable = 0, valid_count = 0;
-    static struct sa5_slot slots[1];
 
     if (!f)
     {
@@ -89,55 +149,27 @@ static int pixel_sweep(const char *plan, int first, int count)
     }
     while (fgets(line, sizeof(line), f) && (count <= 0 || ok + failed + unreadable < count))
     {
-        char name[64], path[1024], winpath[1100];
-        unsigned skip, rsrc1, rsrc2, ena, ninterp, col, depth;
-        char cntl[1024];
-        struct sa5_pixel_request req = { 0 };
+        char name[64];
+        struct sa5_pixel_request req;
         struct sa5_result *result = NULL;
-        struct sa5_layout layout;
         uint32_t user_data[32] = { 0 }, words = 0;
-        char error[600], ignored[64];
+        char error[600];
         uint8_t *data;
-        long size;
+        int parsed;
 
-        if (line[0] == '#' || sscanf(line, "%63s %1023s %u %x %x %x %u %x %u %1023s", name, path, &skip, &rsrc1, &rsrc2,
-                                     &ena, &ninterp, &col, &depth, cntl) != 10)
+        if (!(parsed = pixel_parse(line, name, &req, user_data, &data)))
             continue;
         if (index++ < first)
-            continue;
-        snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
-        for (char *p = winpath; *p; p++)
-            if (*p == '/') *p = '\\';
-        if (!(data = read_all(winpath, &size)) || size <= (long)skip)
         {
-            printf("ps %s FAIL unreadable\n", name);
-            unreadable++;
             free(data);
             continue;
         }
-        req.code = (const uint32_t *)(data + skip);
-        req.code_dwords = (uint32_t)((size - skip) / 4);
-        req.code_address = 0x10000000;
-        req.user_data = user_data;
-        req.user_data_count = (rsrc2 >> 1) & 0x1f;
-        req.rsrc1 = rsrc1;
-        req.rsrc2 = rsrc2;
-        req.input_ena = ena;
-        req.interpolator_count = ninterp;
-        /* SPI_PS_INPUT_CNTL_n from the PSO, comma-separated hex ("-" for none). */
+        if (parsed < 0)
         {
-            char *p = cntl;
-            for (unsigned i = 0; i < 32 && *p && *p != '-'; i++)
-            {
-                req.interpolator_settings[i] = (uint32_t)strtoul(p, &p, 16);
-                if (*p == ',')
-                    p++;
-            }
+            printf("ps %s FAIL unreadable\n", name);
+            unreadable++;
+            continue;
         }
-        req.col_format = col;
-        req.depth_export = depth;
-        req.wave = !sa5_analyse(req.code, req.code_dwords, req.user_data_count, &layout, slots, 0, ignored,
-                                sizeof(ignored)) ? layout.wave : 64;
         if (sa5_compile_pixel(&req, &result, error, sizeof(error)))
         {
             for (char *p = error; *p; p++)
@@ -164,6 +196,74 @@ static int pixel_sweep(const char *plan, int first, int count)
     printf("%s ps-check: %d of %d pixel shaders compile with their PSO register state, %d of those pass spirv-val "
            "(%d unreadable)\n", failed || unreadable ? "info" : "ok  ", ok, ok + failed + unreadable, valid_count,
            unreadable);
+    return 0;
+}
+
+/* Compile throughput: the pixel shaders of a plan, read first, then compiled and validated by
+ * THREADS threads at once (each takes the next shader), as d3d12_xs's compile workers do. */
+static struct bench_shader
+{
+    struct sa5_pixel_request req;
+    uint32_t user_data[32];
+    uint8_t *data;
+} *bench_shaders;
+static LONG bench_count, bench_next, bench_ok;
+
+static DWORD WINAPI bench_thread(void *unused)
+{
+    LONG i;
+
+    (void)unused;
+    while ((i = InterlockedIncrement(&bench_next) - 1) < bench_count)
+    {
+        struct sa5_result *result = NULL;
+        const uint32_t *spirv;
+        uint32_t words = 0;
+        char error[600];
+
+        if (sa5_compile_pixel(&bench_shaders[i].req, &result, error, sizeof(error)))
+            continue;
+        spirv = sa5_result_spirv(result, &words);
+        if (!sa5_validate(spirv, words, error, sizeof(error)))
+            InterlockedIncrement(&bench_ok);
+        sa5_result_free(result);
+    }
+    return 0;
+}
+
+static int bench(int threads, const char *plan, int first, int count)
+{
+    FILE *f = fopen(plan, "r");
+    char line[4096], name[64];
+    HANDLE handles[64];
+    LARGE_INTEGER frequency, start, end;
+    int index = 0, limit = count > 0 ? count : 65536;
+
+    if (!f || threads < 1 || threads > 64)
+    {
+        printf("FAIL bench: open %s, 1-64 threads\n", plan);
+        return 1;
+    }
+    bench_shaders = calloc(limit, sizeof(*bench_shaders));
+    while (fgets(line, sizeof(line), f) && bench_count < limit)
+    {
+        struct bench_shader *s = &bench_shaders[bench_count];
+        int parsed = pixel_parse(line, name, &s->req, s->user_data, &s->data);
+
+        if (parsed && index++ >= first && parsed > 0)
+            bench_count++;
+        else
+            free(s->data);
+    }
+    fclose(f);
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    for (int t = 0; t < threads; t++)
+        handles[t] = CreateThread(NULL, 0, bench_thread, NULL, 0, NULL);
+    WaitForMultipleObjects(threads, handles, TRUE, INFINITE);
+    QueryPerformanceCounter(&end);
+    printf("bench: %ld pixel shaders on %d threads in %.0f ms (%ld compile and validate)\n", bench_count, threads,
+           (end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart, bench_ok);
     return 0;
 }
 
@@ -495,6 +595,8 @@ int main(int argc, char **argv)
         return mesh_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
     if (argc > 2 && !strcmp(argv[1], "ps"))
         return pixel_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
+    if (argc > 3 && !strcmp(argv[1], "bench"))
+        return bench(atoi(argv[2]), argv[3], argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 0);
     if (argc > 2 && !strcmp(argv[1], "vs"))
         return vertex_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
 

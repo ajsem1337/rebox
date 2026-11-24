@@ -203,6 +203,7 @@
           for p in ${./patches/anyps5}/*.patch; do git -C $out apply --include='core/shader/*' "$p"; done
         '';
 
+        # With mimalloc (MIT) linked in for the DLL's new and delete (anyps5/allocator.cpp).
         rebox-anyps5 = pkgs.stdenvNoCC.mkDerivation {
           name = "rebox-anyps5";
           src = lib.fileset.toSource { root = ./.; fileset = ./anyps5; };
@@ -211,7 +212,7 @@
           buildPhase = ''
             cmake -S anyps5 -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
               -DANYPS5_SOURCE=${anyps5-src} -DCMAKE_TOOLCHAIN_FILE=$PWD/anyps5/mingw-w64.cmake \
-              -DMINGW_PTHREADS=${pkgs.pkgsCross.mingwW64.windows.pthreads}
+              -DMINGW_PTHREADS=${pkgs.pkgsCross.mingwW64.windows.pthreads} -DMIMALLOC_SOURCE=${pkgs.mimalloc.src}
             cmake --build build --target rebox_anyps5 sa5_check -j$NIX_BUILD_CORES
           '';
           installPhase = "mkdir -p $out && cp build/rebox_anyps5.dll build/sa5_check.exe $out/";

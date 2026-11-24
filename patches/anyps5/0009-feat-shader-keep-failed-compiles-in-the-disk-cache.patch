@@ -1,0 +1,494 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 12:24:04 +0000
+Subject: [PATCH] feat(shader): keep failed compiles in the disk cache
+
+A resource plan build or variant emission that throws was remembered
+only in memory, so every run compiled each failing stage again before
+failing (a title with a few hundred such stages paid for all of them at
+every start, and its plan misses stayed far above its plan writes).
+The failure is now written under the entry's own key, with the same
+format, source version, key and hash checks as a compiled entry, as its
+error text and the code address it failed at; a later run rethrows it
+at that address without compiling. APS5_NO_FAILURE_MEMO=1 neither stores
+nor reads them. The cache counts their hits and writes apart from the
+compiled entries'.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libSceAgcDriver/tests/ShaderDiskCache.cpp |  35 +++++-
+ core/shader/recompiler/Recompiler.cpp         |  24 +++-
+ core/shader/recompiler/ShaderDiskCache.cpp    | 107 +++++++++++++++---
+ core/shader/recompiler/ShaderDiskCache.hpp    |  15 ++-
+ docs/dev/ARCHITECTURE.md                      |   2 +-
+ 5 files changed, 155 insertions(+), 28 deletions(-)
+
+diff --git a/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp b/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
+index eed66b34f6..f750ba15c8 100644
+--- a/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
++++ b/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
+@@ -556,6 +556,19 @@ void verifyEntryRoundTrip() {
+     incompatible.artifact.runtimeAbiVersion = RuntimeAbi::Version + 1u;
+     const auto incompatibleFile = ShaderDiskCache::EncodeEntry(key, incompatible);
+     require(ShaderDiskCache::DecodeEntry(incompatibleFile, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with an incompatible runtime ABI loads");
++
++    const auto failure = ShaderDiskCache::EncodeFailureEntry(key, 0x30000u, "reads the shader clock");
++    std::string message;
++    require(ShaderDiskCache::DecodeFailureEntry(failure, key, 0x30000u, message) == ShaderDiskCache::LoadStatus::Failed && message == "reads the shader clock", "a recorded failure does not decode");
++    require(ShaderDiskCache::DecodeFailureEntry(failure, key, 0x31000u, message) == ShaderDiskCache::LoadStatus::KeyMismatch, "a failure recorded for another code address loads");
++    require(ShaderDiskCache::DecodeFailureEntry(failure, otherKey, 0x30000u, message) == ShaderDiskCache::LoadStatus::KeyMismatch, "a failure recorded for another key loads");
++    require(ShaderDiskCache::DecodeFailureEntry(file, key, 0x30000u, message) == ShaderDiskCache::LoadStatus::Absent, "a compiled entry decodes as a failure");
++    require(ShaderDiskCache::DecodeEntry(failure, key, decoded) == ShaderDiskCache::LoadStatus::Failed, "a recorded failure decodes as a compiled entry");
++    for (std::size_t offset = 0; offset < failure.size(); ++offset) {
++        auto damaged = failure;
++        damaged[offset] ^= std::byte{0x10};
++        require(ShaderDiskCache::DecodeFailureEntry(damaged, key, 0x30000u, message) != ShaderDiskCache::LoadStatus::Failed, "a recorded failure with byte " + std::to_string(offset) + " damaged loads");
++    }
+ }
+ 
+ std::vector<std::byte> packBytes(const std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>>& entries) {
+@@ -1427,7 +1440,7 @@ std::uint64_t diskMisses() {
+     return ShaderDiskCache::Totals().misses;
+ }
+ 
+-void verifyEmissionFailureMemo() {
++void verifyEmissionFailureMemo(const char* self) {
+     const auto before = ShaderDiskCache::Totals();
+     ClockRequest clock;
+     const auto first = emissionFailure(clock.request);
+@@ -1458,7 +1471,22 @@ void verifyEmissionFailureMemo() {
+     require(diskMisses() == before.misses + 4, "concurrent requests emitted the program " + std::to_string(diskMisses() - before.misses - 3) + " times");
+ 
+     ShaderDiskCache::Flush();
+-    require(ShaderDiskCache::Totals().writes == before.writes, "an emission failure was stored in the disk cache");
++    const auto after = ShaderDiskCache::Totals();
++    require(after.writes == before.writes, "an emission failure was stored as a compiled variant");
++    require(after.failureWrites == before.failureWrites + 4, "the emission failures were not recorded in the disk cache");
++    const std::string command = "\"" + std::string(self) + "\" --load-failure";
++    require(std::system(command.c_str()) == 0, "the process loading the recorded failure failed");
++}
++
++int runFailureLoadingProcess() {
++    ClockRequest layout;
++    layout.request.layout = {0, 0, 16, 112};
++    const auto before = ShaderDiskCache::Totals();
++    static_cast<void>(emissionFailure(layout.request));
++    const auto after = ShaderDiskCache::Totals();
++    require(after.misses == before.misses && after.failureHits == before.failureHits + 1, "the recorded emission failure was not loaded from the disk cache");
++    std::cout << "loaded the recorded emission failure without compiling\n";
++    return 0;
+ }
+ 
+ int runWithoutFailureMemo() {
+@@ -3018,6 +3046,7 @@ int main(int argc, char** argv) {
+         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
+         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
++        if (argc == 2 && std::string_view(argv[1]) == "--load-failure") return runFailureLoadingProcess();
+         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
+         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
+         std::filesystem::remove_all(directory);
+@@ -3043,7 +3072,7 @@ int main(int argc, char** argv) {
+         verifyAcrossProcesses(argv[0]);
+         verifyPrebuiltAcrossProcesses(argv[0], directory);
+         verifyPlanAcrossProcesses(argv[0]);
+-        verifyEmissionFailureMemo();
++        verifyEmissionFailureMemo(argv[0]);
+         verifyFailureMemoSwitch(argv[0]);
+         verifyInvocationIsolation();
+         verifyBufferAlignmentSpecialization();
+diff --git a/core/shader/recompiler/Recompiler.cpp b/core/shader/recompiler/Recompiler.cpp
+index 41fadc1343..45e4f32701 100644
+--- a/core/shader/recompiler/Recompiler.cpp
++++ b/core/shader/recompiler/Recompiler.cpp
+@@ -60,6 +60,7 @@
+ #include "Translation/include/Translation/InstructionTranslator.hpp"
+ #include "Translation/include/Translation/ShaderInputInfoBuilder.hpp"
+ #include <exception>
++#include <optional>
+ #include <stdexcept>
+ #include <string>
+ #include <string_view>
+@@ -756,7 +757,12 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
+                 if (reload) planKey = source->planKey;
+                 else ShaderDiskCache::BuildPlanKey(request, HostSubgroupSize(request), planKey);
+                 const auto shaderHash = reload ? source->planShaderHash : request.shader.codeAddress;
+-                source->plan = ShaderDiskCache::LoadSharedPlan(planKey, shaderHash);
++                std::optional<std::string> recorded;
++                source->plan = ShaderDiskCache::LoadSharedPlan(planKey, shaderHash, FailureMemo() && !reload ? &recorded : nullptr);
++                if (recorded) {
++                    source->planFailure = std::make_exception_ptr(std::runtime_error(*recorded));
++                    std::rethrow_exception(source->planFailure);
++                }
+                 if (source->plan != nullptr && reload) resourcePlans().reloads.fetch_add(1, std::memory_order_relaxed);
+                 if (source->plan != nullptr && !reload) {
+                     source->planKey = planKey;
+@@ -772,7 +778,10 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
+                         source->program = std::move(resource.program);
+                     }
+                 } catch (...) {
+-                    if (FailureMemo()) source->planFailure = std::current_exception();
++                    if (FailureMemo()) {
++                        source->planFailure = std::current_exception();
++                        if (disk && !reload) ShaderDiskCache::StoreFailure(std::move(planKey), request.shader.codeAddress, source->planFailure);
++                    }
+                     throw;
+                 }
+                 if (disk) {
+@@ -1777,13 +1786,17 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
+     if (disk) {
+         ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), diskKey);
+         CompiledVariant loaded;
+-        if (ShaderDiskCache::Load(diskKey, loaded)) {
++        std::optional<std::string> recorded;
++        if (ShaderDiskCache::Load(diskKey, loaded, request.shader.codeAddress, FailureMemo() ? &recorded : nullptr)) {
+             loaded.layout = request.layout;
+             loaded.artifact.variantId = nextVariantId();
+             attachSubstitutes(loaded);
+             ShaderDiskCache::ReleaseMapped(loaded.artifact.spirv);
+             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
+             NoteShader(2);
++        } else if (recorded) {
++            source.emissionFailures.push_back({request.shader.codeAddress, request.layout, std::make_exception_ptr(std::runtime_error(*recorded))});
++            std::rethrow_exception(source.emissionFailures.back().failure);
+         }
+     }
+     if (variant == nullptr) {
+@@ -1799,7 +1812,10 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
+             attachSubstitutes(compiled);
+             variant = std::make_shared<const CompiledVariant>(std::move(compiled));
+         } catch (...) {
+-            if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
++            if (emissionFailure != nullptr && FailureMemo()) {
++                source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
++                if (disk) ShaderDiskCache::StoreFailure(std::move(diskKey), request.shader.codeAddress, emissionFailure);
++            }
+             throw;
+         }
+         if (disk) {
+diff --git a/core/shader/recompiler/ShaderDiskCache.cpp b/core/shader/recompiler/ShaderDiskCache.cpp
+index 4e38cd266e..be758a9d11 100644
+--- a/core/shader/recompiler/ShaderDiskCache.cpp
++++ b/core/shader/recompiler/ShaderDiskCache.cpp
+@@ -33,9 +33,11 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <exception>
+ #include <fstream>
+ #include <limits>
+ #include <mutex>
++#include <new>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -162,6 +164,7 @@ static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the p
+ static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
+ 
+ constexpr std::uint32_t FileMagic = 0x43535041u;
++constexpr std::uint32_t FailureMagic = 0x46535041u;
+ 
+ struct FileHeader {
+     std::uint32_t magic;
+@@ -1461,8 +1464,8 @@ std::string hex(std::uint64_t value) {
+     return text;
+ }
+ 
+-std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const std::byte> payload) {
+-    const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
++std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const std::byte> payload, std::uint32_t magic = FileMagic) {
++    const FileHeader header{magic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
+     const auto payloadOffset = PayloadOffset(key.size());
+     std::vector<std::byte> file(payloadOffset + payload.size());
+     std::memcpy(file.data(), &header, sizeof(header));
+@@ -1475,7 +1478,7 @@ LoadStatus unwrapEntry(std::span<const std::byte> file, std::span<const std::byt
+     if (file.size() < sizeof(FileHeader)) return LoadStatus::Rejected;
+     FileHeader header;
+     std::memcpy(&header, file.data(), sizeof(header));
+-    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return LoadStatus::Rejected;
++    if ((header.magic != FileMagic && header.magic != FailureMagic) || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return LoadStatus::Rejected;
+     const auto body = file.size() - sizeof(header);
+     if (header.keyBytes > body) return LoadStatus::Rejected;
+     const auto payloadOffset = PayloadOffset(static_cast<std::size_t>(header.keyBytes));
+@@ -1487,7 +1490,27 @@ LoadStatus unwrapEntry(std::span<const std::byte> file, std::span<const std::byt
+     if (HashBytes(storedKey) != header.keyHash) return LoadStatus::Rejected;
+     if (storedKey.size() != key.size() || !std::equal(storedKey.begin(), storedKey.end(), key.begin())) return LoadStatus::KeyMismatch;
+     if (HashBytes(payload) != header.payloadHash) return LoadStatus::Rejected;
+-    return LoadStatus::Loaded;
++    return header.magic == FailureMagic ? LoadStatus::Failed : LoadStatus::Loaded;
++}
++
++std::optional<std::string> failureMessage(std::exception_ptr failure) {
++    try {
++        std::rethrow_exception(failure);
++    } catch (const std::bad_alloc&) {
++        return std::nullopt;
++    } catch (const std::exception& error) {
++        return error.what();
++    } catch (...) {
++        return std::nullopt;
++    }
++}
++
++LoadStatus recordedFailure(std::span<const std::byte> file, std::span<const std::byte> key, std::uint64_t codeAddress, std::optional<std::string>* failure) {
++    if (failure == nullptr) return LoadStatus::Absent;
++    std::string message;
++    const auto status = DecodeFailureEntry(file, key, codeAddress, message);
++    if (status == LoadStatus::Failed) *failure = std::move(message);
++    return status;
+ }
+ 
+ std::atomic<unsigned> runningWriters{0};
+@@ -1509,20 +1532,27 @@ public:
+     [[nodiscard]] bool Enabled() const { return !directory.empty(); }
+     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
+ 
+-    bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
++    bool Load(std::span<const std::byte> key, CompiledVariant& variant, std::uint64_t codeAddress, std::optional<std::string>* failure) {
+         if (loadPrebuilt(key, variant)) return true;
+-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
++        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) {
++            const auto status = DecodeEntry(file, key, variant, owner);
++            return status == LoadStatus::Failed ? recordedFailure(file, key, codeAddress, failure) : status;
++        }, hits, misses, loadFailures);
+     }
+ 
+     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
++        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
++            const auto status = DecodePlanEntry(file, key, plan);
++            return status == LoadStatus::Failed ? LoadStatus::Absent : status;
++        }, planHits, planMisses, planLoadFailures);
+     }
+ 
+-    std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
++    std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash, std::optional<std::string>* failure) {
+         std::shared_ptr<const IrResourcePlan> plan;
+         load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
+             std::span<const std::byte> payload;
+             const auto status = unwrapEntry(file, key, payload);
++            if (status == LoadStatus::Failed) return recordedFailure(file, key, shaderHash, failure);
+             if (status != LoadStatus::Loaded) return status;
+             plan = sharedPlans().Get(payload, shaderHash);
+             return plan != nullptr ? LoadStatus::Loaded : LoadStatus::Rejected;
+@@ -1538,6 +1568,10 @@ public:
+         enqueue({std::move(key), nullptr, std::move(plan)});
+     }
+ 
++    void StoreFailure(std::vector<std::byte> key, std::uint64_t codeAddress, std::string message) {
++        enqueue({std::move(key), nullptr, nullptr, codeAddress, std::move(message)});
++    }
++
+     std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
+         const auto path = directory / EntryName(key);
+         const auto file = EncodeEntry(key, variant);
+@@ -1587,6 +1621,8 @@ public:
+         counters.planMisses = planMisses.load(std::memory_order_relaxed);
+         counters.planWrites = planWrites.load(std::memory_order_relaxed);
+         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
++        counters.failureHits = failureHits.load(std::memory_order_relaxed);
++        counters.failureWrites = failureWrites.load(std::memory_order_relaxed);
+         counters.prebuiltHits = prebuiltHits.load(std::memory_order_relaxed);
+         counters.prebuiltMisses = prebuiltMisses.load(std::memory_order_relaxed);
+         counters.prebuiltRejected = prebuiltRejected.load(std::memory_order_relaxed);
+@@ -1653,6 +1689,8 @@ private:
+         std::vector<std::byte> key;
+         std::shared_ptr<const CompiledVariant> variant;
+         std::shared_ptr<const IrResourcePlan> plan;
++        std::uint64_t codeAddress = 0;
++        std::optional<std::string> failure;
+     };
+ 
+     bool loadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
+@@ -1728,6 +1766,10 @@ private:
+                     bytesRead.fetch_add(bytes.size(), std::memory_order_relaxed);
+                     loaded = true;
+                     break;
++                case LoadStatus::Failed:
++                    failureHits.fetch_add(1, std::memory_order_relaxed);
++                    bytesRead.fetch_add(bytes.size(), std::memory_order_relaxed);
++                    break;
+                 case LoadStatus::Absent:
+                 case LoadStatus::KeyMismatch:
+                     missCount.fetch_add(1, std::memory_order_relaxed);
+@@ -1784,9 +1826,9 @@ private:
+     }
+ 
+     void write(const Job& job) {
+-        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
++        const auto file = job.failure ? EncodeFailureEntry(job.key, job.codeAddress, *job.failure) : job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
+         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
+-            (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
++            (job.failure ? failureWrites : job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
+             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+         } else {
+             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+@@ -1868,13 +1910,14 @@ private:
+         const auto totals = Totals();
+         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
+         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
+-        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures;
++        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.failureHits != reported.failureHits || totals.failureWrites != reported.failureWrites;
+         const auto prebuiltChanged = totals.prebuiltHits != reported.prebuiltHits || totals.prebuiltMisses != reported.prebuiltMisses || totals.prebuiltRejected != reported.prebuiltRejected;
+         if (!baseChanged && !prebuiltChanged) return;
+-        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
++        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; recorded compile failures: %llu hits, %llu writes; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
+                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
+                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
++                     delta(totals.failureHits, reported.failureHits), delta(totals.failureWrites, reported.failureWrites),
+                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
+                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
+         if (prebuiltChanged && (!packs.empty() || !looseDirectories.empty())) std::fprintf(stderr, "[shader-prebuilt] interval: %llu hits, %llu misses, %llu rejected; lookup %.3f ms, file read %.3f ms, decode %.3f ms; total load %.3f ms, max %.3f ms (lifetime hits %llu)\n",
+@@ -1897,7 +1940,7 @@ private:
+     bool stopping = false;
+     std::thread writer;
+     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
+-    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
++    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, failureHits{0}, failureWrites{0};
+     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
+     std::atomic<std::int64_t> lastReport{0};
+     std::mutex reportMutex;
+@@ -2046,6 +2089,30 @@ LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std:
+     return DecodePlan(payload, plan) ? LoadStatus::Loaded : LoadStatus::Rejected;
+ }
+ 
++std::vector<std::byte> EncodeFailureEntry(std::span<const std::byte> key, std::uint64_t codeAddress, std::string_view message) {
++    std::vector<std::byte> payload;
++    Writer writer(payload);
++    writer.Value(codeAddress);
++    writer.Text(std::string(message));
++    return wrapEntry(key, payload, FailureMagic);
++}
++
++LoadStatus DecodeFailureEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::uint64_t codeAddress, std::string& message) {
++    std::span<const std::byte> payload;
++    const auto status = unwrapEntry(file, key, payload);
++    if (status == LoadStatus::Loaded) return LoadStatus::Absent;
++    if (status != LoadStatus::Failed) return status;
++    Reader reader(payload);
++    std::uint64_t recordedAddress = 0;
++    std::string recordedMessage;
++    reader.Value(recordedAddress);
++    reader.Text(recordedMessage);
++    if (!reader.Done()) return LoadStatus::Rejected;
++    if (recordedAddress != codeAddress) return LoadStatus::KeyMismatch;
++    message = std::move(recordedMessage);
++    return LoadStatus::Failed;
++}
++
+ bool Enabled() {
+     return store().Enabled();
+ }
+@@ -2054,9 +2121,9 @@ std::filesystem::path EntryDirectory() {
+     return store().Directory();
+ }
+ 
+-bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
++bool Load(std::span<const std::byte> key, CompiledVariant& variant, std::uint64_t codeAddress, std::optional<std::string>* failure) {
+     auto& instance = store();
+-    return instance.Enabled() && instance.Load(key, variant);
++    return instance.Enabled() && instance.Load(key, variant, codeAddress, failure);
+ }
+ 
+ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
+@@ -2064,14 +2131,20 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
+     if (instance.Enabled()) instance.Store(std::move(key), std::move(variant));
+ }
+ 
++void StoreFailure(std::vector<std::byte> key, std::uint64_t codeAddress, std::exception_ptr failure) {
++    auto& instance = store();
++    if (!instance.Enabled() || failure == nullptr) return;
++    if (auto message = failureMessage(failure)) instance.StoreFailure(std::move(key), codeAddress, std::move(*message));
++}
++
+ bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+     auto& instance = store();
+     return instance.Enabled() && instance.LoadPlan(key, plan);
+ }
+ 
+-std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
++std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash, std::optional<std::string>* failure) {
+     auto& instance = store();
+-    return instance.Enabled() ? instance.LoadSharedPlan(key, shaderHash) : nullptr;
++    return instance.Enabled() ? instance.LoadSharedPlan(key, shaderHash, failure) : nullptr;
+ }
+ 
+ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
+diff --git a/core/shader/recompiler/ShaderDiskCache.hpp b/core/shader/recompiler/ShaderDiskCache.hpp
+index 9831aaeee8..9339c1c6c6 100644
+--- a/core/shader/recompiler/ShaderDiskCache.hpp
++++ b/core/shader/recompiler/ShaderDiskCache.hpp
+@@ -5,21 +5,25 @@
+ #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
+ #include <cstddef>
+ #include <cstdint>
++#include <exception>
+ #include <filesystem>
+ #include <memory>
++#include <optional>
+ #include <span>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace ShaderRecompiler::ShaderDiskCache {
+ 
+-inline constexpr std::uint32_t FormatVersion = 95;
++inline constexpr std::uint32_t FormatVersion = 96;
+ 
+ enum class LoadStatus {
+     Loaded,
+     Absent,
+     KeyMismatch,
+     Rejected,
++    Failed,
+ };
+ 
+ struct Counters {
+@@ -34,6 +38,8 @@ struct Counters {
+     std::uint64_t planMisses = 0;
+     std::uint64_t planWrites = 0;
+     std::uint64_t planLoadFailures = 0;
++    std::uint64_t failureHits = 0;
++    std::uint64_t failureWrites = 0;
+     std::uint64_t prebuiltHits = 0;
+     std::uint64_t prebuiltMisses = 0;
+     std::uint64_t prebuiltRejected = 0;
+@@ -63,15 +69,18 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
+ [[nodiscard]] bool DecodePlan(std::span<const std::byte> bytes, IrResourcePlan& plan);
+ [[nodiscard]] std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan);
+ [[nodiscard]] LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan);
++[[nodiscard]] std::vector<std::byte> EncodeFailureEntry(std::span<const std::byte> key, std::uint64_t codeAddress, std::string_view message);
++[[nodiscard]] LoadStatus DecodeFailureEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::uint64_t codeAddress, std::string& message);
+ 
+ [[nodiscard]] bool Enabled();
+ [[nodiscard]] std::filesystem::path EntryDirectory();
+ 
+-[[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
++[[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant, std::uint64_t codeAddress = 0, std::optional<std::string>* failure = nullptr);
+ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
++void StoreFailure(std::vector<std::byte> key, std::uint64_t codeAddress, std::exception_ptr failure);
+ [[nodiscard]] std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant);
+ [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
+-[[nodiscard]] std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash);
++[[nodiscard]] std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash, std::optional<std::string>* failure = nullptr);
+ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
+ void Flush();
+ void ReleaseMapped(const SharedSpirv& spirv) noexcept;
+diff --git a/docs/dev/ARCHITECTURE.md b/docs/dev/ARCHITECTURE.md
+index c72f9728d9..d95abeba2a 100644
+--- a/docs/dev/ARCHITECTURE.md
++++ b/docs/dev/ARCHITECTURE.md
+@@ -140,7 +140,7 @@ flowchart LR
+ ```
+ 
+ - [`Recompiler.cpp`](../../core/shader/recompiler/Recompiler.cpp) runs the stages in this order. With `ANYPS5_ENABLE_SPIRV_TOOLS`, the SPIR-V is also validated and optimized with SPIRV-Tools.
+-- `ShaderRecompiler::Recompile` keeps compiled variants in memory, and `ShaderDiskCache` stores them on disk so later runs reuse them. Before the writable cache, a miss is also looked up in read-only prebuilt packs and loose entry folders under `shader_cache/prebuilt`; pack entries are ordinary encoded cache entries behind a sorted key-hash index, validated by magic, compiler source version and index checksum when mapped, and a miss or rejected entry falls through to the writable cache and the compiler. The cache format (`ShaderDiskCache::FormatVersion`) stores, among other things, the finite stencil-reference set, its replay-safety proof and reserved push-data word in the artifact and binding layouts. An entry of any other format, or written by another compiler source version, is rejected.
++- `ShaderRecompiler::Recompile` keeps compiled variants in memory, and `ShaderDiskCache` stores them on disk so later runs reuse them. Before the writable cache, a miss is also looked up in read-only prebuilt packs and loose entry folders under `shader_cache/prebuilt`; pack entries are ordinary encoded cache entries behind a sorted key-hash index, validated by magic, compiler source version and index checksum when mapped, and a miss or rejected entry falls through to the writable cache and the compiler. The cache format (`ShaderDiskCache::FormatVersion`) stores, among other things, the finite stencil-reference set, its replay-safety proof and reserved push-data word in the artifact and binding layouts. An entry of any other format, or written by another compiler source version, is rejected. A resource plan build or variant emission that throws (the failures `Recompile` remembers in memory) is stored as well, under the same key, as its error text and the code address it failed at; a later run rethrows it at that address without compiling. `APS5_NO_FAILURE_MEMO=1` neither stores nor reads them.
+ - The Vulkan pipelines are journaled as well ([`PipelineJournal.cpp`](../../core/libs/prx/libSceAgcDriver/Graphics/src/PipelineJournal.cpp)): a graphics pipeline the store builds (`CachedPipeline`) or a compute pipeline a dispatch builds is appended to `pipelines.journal` next to the shader cache entries, as the materialized result of each stage (the specialized SPIR-V, bindings and push constants, through `ShaderDiskCache::EncodeResult`) plus the recipe the pipeline was built from (`GraphicsPipelineRecipe`: the stages' identities, vertex input layout, descriptor set layout keys and the state fields the `Pipeline` constructor reads, `CanonicalPipelineState`). When a `VulkanDevice` is created, the journal is loaded and its pipelines are built on a pool of `hardware_concurrency() / 2` threads (`APS5_PIPELINE_JOURNAL_THREADS`) while the title loads. The load parses the file a record at a time and keeps it open, and a replay thread reads an entry's modules from it when it builds that entry (a record that no longer reads back as loaded rejects the entry), so the replay holds the modules of the entries being built rather than the file, so the first draw or dispatch of a configuration seen on an earlier run finds its pipeline resident. The pipeline stores key on `RecompileResult::Identity`, a hash of the module words, specialization constants, subgroup width and bindings that is the same on every run (`SharedSpirv::ContentHash`, computed once per shared module), rather than on the process-lifetime variant ids; compute pipelines and their journal modules key on `DescribedPipelineIdentity` instead, the same hash with the element count of image, storage image and sampler table bindings left out, since `DescribeSetLayouts` gives those tables a fixed capacity and two results that differ only in a table's size build the same pipeline. A graphics pipeline is built outside the store's mutex, so the replay threads and the queue workers build in parallel. A draw that arrives before its replayed entry builds the pipeline itself; the first inserted wins. A replayed entry enters the store at its least recently used end and a full store takes none, so the title's own pipelines are never evicted for a replayed one, and the optimized relink of a replayed pipeline (`OptimizedPipeline::Schedule`) waits for the first draw that binds it, so the relink thread serves the title's pipelines first. A device created without a window starts its replay at its first draw or dispatch rather than at creation, since `Driver::AttachWindow` usually replaces it before the title draws. The journal records a pipeline once (modules and recipes are deduplicated by content), keeps at most `APS5_PIPELINE_JOURNAL_MAX_MIB` (1024), replays the last `APS5_PIPELINE_JOURNAL_ENTRIES` recorded (4096, the pipeline store's largest bound: a replayed pipeline that finds the store full grows its bound from 1024 instead of being dropped), and is disabled with `APS5_NO_PIPELINE_JOURNAL=1` or without a shader cache directory. The file header names the device (`PipelineJournalDeviceFingerprint`, the properties the driver's pipeline cache file is named by), so a journal written for another GPU or driver is started over rather than replayed; appends and reads hold `pipelines.journal.lock` against another process sharing the directory, and a device cancels its replay before it is replaced (`PrepareForReplacement`) or destroyed, so a replaced headless device never inserts entries the window's device then sweeps. `APS5_PROFILE_DRAW=1` prints a `[pipeline-journal]` summary when the replay finishes and at teardown.
+ - A compute shader whose LDS plus its lock dword exceeds the host's `maxComputeSharedMemorySize` is not given a `Workgroup` array. `Recompile` sets `ShaderInfo::sharedMemoryBytes` for it and the SPIR-V backend addresses the LDS in a coherent storage buffer at descriptor set 1 (`WorkgroupMemoryDescriptorSet`), with a slice of `RecompileResult::workgroupMemoryDwords` per workgroup, indexed by `WorkgroupID` and `NumWorkGroups`. `VulkanDevice` keeps one such buffer, sized from the dispatch dimensions, and binds it after the resource set; programs that fit keep using shared memory.
+ - `Driver::RegisterShader` splits shader preparation in two. `PlanRegistered` runs on the registering guest thread: it validates the registers and entry point, decodes the code and builds the recompile request, so invalid registrations still fail there. The RDNA to IR translation and resource plan (`PrepareShader`) run on a background pool of `hardware_concurrency() / 2` threads (at least 2, 64 MiB stacks), which `Driver::stop` joins when it closes the pool.
+-- 
+2.55.0
+
