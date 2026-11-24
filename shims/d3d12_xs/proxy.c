@@ -3052,6 +3052,8 @@ volatile UINT64 rebox_value_watch; /* console_compile.c (REBOX_WATCH_STAGE): 4 f
 BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
 
 static void lists_wait(UINT count, ID3D12CommandList *const *lists);
+static volatile LONG timed_out_count;
+static BOOL after_timed_out_wait(UINT64 address, UINT bytes);
 static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists);
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
@@ -3060,6 +3062,23 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
 
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(lists[i]);
+    /* Lists that write where a wait timed out: on which queue, and when. */
+    if (timed_out_count)
+        for (UINT i = 0; i < count; i++)
+        {
+            struct proxy *l = (struct proxy *)lists[i];
+            static LONG logged;
+            if (!is_proxy(l))
+                continue;
+            for (UINT k = 0; k < l->gpu_write_count; k++)
+                if (after_timed_out_wait(l->gpu_writes[k].address, 4) && InterlockedIncrement(&logged) <= 32)
+                    rebox_log("d3d12_xs: list %p writing %#llx (where a wait timed out) submitted on queue %p (thread %#lx)",
+                              l, (unsigned long long)l->gpu_writes[k].address, p, GetCurrentThreadId());
+            for (UINT k = 0; k < l->cpu_write_count; k++)
+                if (after_timed_out_wait(l->cpu_writes[k].address, 4) && InterlockedIncrement(&logged) <= 32)
+                    rebox_log("d3d12_xs: list %p writing %#llx by the CPU (where a wait timed out) submitted on queue %p "
+                              "(thread %#lx)", l, (unsigned long long)l->cpu_writes[k].address, p, GetCurrentThreadId());
+        }
     /* Memory waits the lists start with, on the CPU (lists_wait). */
     lists_wait(count, lists);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
@@ -3738,6 +3757,19 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
     console_display_draw_end();
 }
 
+/* Addresses whose CPU-side wait timed out (lists_wait): writes to their pages recorded or submitted
+ * later are logged, to see which list and queue a waiting title expects to write them. */
+static volatile UINT64 timed_out_waits[16];
+static volatile LONG timed_out_count;
+
+static BOOL after_timed_out_wait(UINT64 address, UINT bytes)
+{
+    for (LONG i = 0; i < min(timed_out_count, 16); i++)
+        if ((timed_out_waits[i] & ~0xfffull) == (address & ~0xfffull))
+            return TRUE;
+    return FALSE;
+}
+
 /* Console memory writes and waits (xcl, ivall/xcl, GPL-2.0-only, list_x.rs and cpu_writes.rs; older
  * layout 69-72 and 88-90, newer two later): a value written to a GPU address at the bottom or top of
  * the pipe, or a wait on one. A write to our GPU memory (identity-mapped) is WriteBufferImmediate.
@@ -3754,6 +3786,13 @@ static void list_write_values(struct proxy *p, UINT64 address, const UINT32 *val
 
     if (!address)
         return;
+    if (after_timed_out_wait(address, 4 * count))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 32)
+            rebox_log("d3d12_xs: %s %#llx = %#x recorded in list %p (thread %#lx), an address a wait timed out on",
+                      what, (unsigned long long)address, values[0], p, GetCurrentThreadId());
+    }
     if (gpu_memory_heap_at(address, &heap, &offset))
     {
         D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2];
@@ -3877,6 +3916,9 @@ static void lists_wait(UINT count, ID3D12CommandList *const *lists)
             if (!ok)
             {
                 static LONG logged;
+                LONG slot = InterlockedIncrement(&timed_out_count) - 1;
+                if (slot < 16)
+                    timed_out_waits[slot] = w->address;
                 if (InterlockedIncrement(&logged) <= 4)
                     rebox_log("d3d12_xs: Wait%uBitValueX at %#llx (comparison %u, %#llx, mask %#llx) timed out after 2 s",
                               w->width * 8, (unsigned long long)w->address, w->comparison,
