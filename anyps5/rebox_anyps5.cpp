@@ -247,6 +247,96 @@ SA5_API int sa5_compile_vertex(const sa5_vertex_request* request, sa5_result** o
     }
 }
 
+// A console mesh shader through AnyPS5's mesh path (rebox_anyps5.h): its primitive shader over a
+// non-indexed point list, one point per lane, group_stride points per workgroup, so that lane n of
+// workgroup g gets v5 = g * group_stride + n as from the console's fast launch. AnyPS5's own driver
+// builds the same MeshConfiguration from VGT_SHADER_STAGES_EN and the GE registers for a geometry
+// program (Graphics/src/State.cpp); a console mesh program has none of those, only its group size
+// and output limits.
+SA5_API int sa5_compile_mesh(const sa5_mesh_request* request, sa5_result** out, char* error, std::size_t error_size)
+{
+    if (!request || !out || !request->code || !request->code_dwords || !request->user_data
+            || request->user_data_count < 8 || request->user_data_count > 64 || !request->threads
+            || !request->max_vertices || !request->max_primitives || request->max_vertices > 256
+            || request->max_primitives > 256 || request->primitive_vertices < 1 || request->primitive_vertices > 3) {
+        SetError(error, error_size, "bad request");
+        return -1;
+    }
+    *out = nullptr;
+    try {
+        std::vector<MemoryRegion> regions;
+        for (std::uint32_t i = 0; i < request->region_count; i++)
+            regions.push_back({request->regions[i].address,
+                               std::span<const std::byte>(static_cast<const std::byte*>(request->regions[i].data),
+                                                          request->regions[i].size)});
+        const std::uint32_t wave = request->wave ? request->wave : 64u;
+        const std::uint32_t stride = request->group_stride ? request->group_stride
+                : std::max({request->threads, request->max_vertices, request->max_primitives});
+        const std::uint32_t lanes = std::max(request->threads, stride);
+        // s[4:7]: the index buffer V# AnyPS5's mesh path loads through, never read here (no draw is
+        // indexed): a null buffer that isn't all zeros, so no host takes it for a descriptor the
+        // title has yet to write.
+        std::vector<std::uint32_t> user(request->user_data, request->user_data + request->user_data_count);
+        user[4] = user[5] = user[6] = 0;
+        user[7] = (77u << 12) | 0xfacu;  // 32_32_32_32_FLOAT, identity swizzle
+
+        ShaderVertexStageInfo vs{};
+        vs.paClVsOutCntl = request->clip_cntl;
+        ShaderFloatMode floatMode;
+        floatMode.floatMode = (request->rsrc1 >> 12u) & 0xffu;
+        floatMode.dx10Clamp = ((request->rsrc1 >> 21u) & 1u) != 0u;
+        floatMode.ieeeMode = ((request->rsrc1 >> 23u) & 1u) != 0u;
+
+        // The points: stride per group, each its own primitive; ESGS items don't exist (no vertex
+        // half), but AnyPS5 wants a size for the input offsets it hands out in v0-v1.
+        MeshConfiguration mesh{};
+        mesh.inputPrimitive = 1;  // DI_PT_POINTLIST
+        mesh.primitivesPerGroup = stride;
+        mesh.verticesPerGroup = stride;
+        mesh.maxVertices = request->max_vertices;
+        mesh.maxPrimitives = request->max_primitives;
+        mesh.threadsPerGroup = (lanes + wave - 1u) / wave * wave;
+        mesh.ldsSizeDwords = (request->lds_bytes + 3u) / 4u;
+        mesh.provokingVertex = 0;
+        mesh.esgsItemSize = 1;
+        mesh.outputPrimitiveSize = request->primitive_vertices;
+
+        const std::uint32_t pushSize = request->push_size ? request->push_size : MeshDrawPushOffsetBytes - request->push_offset;
+        if (request->push_offset + pushSize > MeshDrawPushOffsetBytes)
+            throw std::runtime_error("a mesh stage's push data must end before its draw parameters (byte 104)");
+
+        RecompileRequest compile{};
+        compile.shader = {ShaderStage::Mesh, request->code_address,
+                          std::span<const std::uint32_t>(request->code, request->code_dwords), 0, {}};
+        compile.context.waveSize = wave;
+        compile.context.userDataBaseRegister = 0;
+        compile.context.userData = std::span<const std::uint32_t>(user);
+        compile.context.vertex = vs;
+        compile.context.memory = MemoryRegionView(std::span<const MemoryRegion>(regions));
+        compile.context.floatMode = floatMode;
+        compile.target = DefaultTarget(wave);
+        // VK_EXT_mesh_shader's guaranteed limits (RADV gives more); AnyPS5 reads them only for
+        // emulated barycentrics, which aren't asked for.
+        compile.target.mesh = MeshTargetLimits{{128, 128, 128}, 128, 28672, 256, 256, 128, 32768, 1, 1};
+        compile.layout = {0, 0, request->push_offset, pushSize};
+        GraphicsCompileContext graphics{};
+        graphics.firstUserSgpr = 0;
+        graphics.mesh = mesh;
+        graphics.draw = {0, 0, 0, 1};
+        compile.graphics = graphics;
+        compile.useCache = request->use_cache != 0;
+
+        *out = new sa5_result(RecompileMemoized(compile, regions));
+        return 0;
+    } catch (const std::exception& e) {
+        SetError(error, error_size, e.what());
+        return -1;
+    } catch (...) {
+        SetError(error, error_size, "unknown exception");
+        return -1;
+    }
+}
+
 SA5_API std::uint32_t sa5_result_vertex_input_count(const sa5_result* result)
 {
     return result ? static_cast<std::uint32_t>(result->result.vertexInputs.size()) : 0u;

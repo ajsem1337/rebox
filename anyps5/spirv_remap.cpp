@@ -17,7 +17,8 @@
 // With a draw block (sa5_finalize_draw), the heap indices of 2. and the pushed addresses of 3. are
 // read from a per-draw buffer whose address is in the push block instead: the module has nothing
 // that changes from draw to draw, so a title that copies its descriptors to new heap slots every
-// draw (a UE5 title) gets one module and one pipeline per shader, not one per draw.
+// draw (a UE5 title) gets one module and one pipeline per shader, not one per draw. A mesh module's
+// draw parameters, which AnyPS5 reads from the push block, are frozen too (FreezeMeshDraw).
 #define REBOX_ANYPS5_BUILD
 #include "rebox_anyps5.h"
 
@@ -454,6 +455,47 @@ void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
     }
 }
 
+// ---------------------------------------------------------------- mesh draw parameters
+
+// A mesh module (sa5_compile_mesh) reads AnyPS5's draw parameters from push dwords 26-31
+// (MeshDrawPushOffsetBytes): index count, base vertex, base instance, index word, indirect argument
+// address. Each workgroup here is one console group, never indexed or indirect: they become
+// constants (no index limit, the rest 0), so the stage's push data may end at the draw block's
+// address (PushBlock cuts AnyPS5's dword array there) and the bytes aren't pushed per draw.
+void FreezeMeshDraw(Module& m)
+{
+    constexpr std::uint32_t ExecutionModelMeshEXT = 5365, First = 104 / 4, Count = 6;
+    if (std::none_of(m.insts.begin(), m.insts.end(),
+                     [](const Inst& inst) { return Op(inst) == OpEntryPoint && inst[1] == ExecutionModelMeshEXT; }))
+        return;
+    const std::uint32_t all = m.Constant(0xffffffffu), zero = m.Constant(0);
+    std::set<std::uint32_t> pushVars;
+    std::map<std::uint32_t, std::uint32_t> constants, chains;  // id -> value; access chain -> dword
+    for (const auto& inst : m.insts) {
+        if (Op(inst) == OpVariable && inst[3] == StorageClassPushConstant) pushVars.insert(inst[2]);
+        if (Op(inst) == OpConstant && inst.size() == 4) constants[inst[2]] = inst[3];
+    }
+    std::vector<Inst> out;
+    for (auto& inst : m.insts) {
+        const auto op = Op(inst);
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && inst.size() == 6 && pushVars.count(inst[3])
+                && constants.count(inst[4]) && constants.count(inst[5]) && !constants[inst[4]]
+                && constants[inst[5]] >= First && constants[inst[5]] < First + Count) {
+            chains[inst[2]] = constants[inst[5]] - First;
+            continue;
+        }
+        if (op == OpLoad && chains.count(inst[3])) {
+            out.push_back(Make(OpCopyObject, {inst[1], inst[2], chains[inst[3]] ? zero : all}));
+            continue;
+        }
+        out.push_back(std::move(inst));
+    }
+    m.insts = std::move(out);
+    for (const auto& inst : m.insts)
+        for (const auto w : PointerWords(inst))
+            if (chains.count(inst[w])) Fail("a mesh draw parameter is used other than loaded");
+}
+
 // ---------------------------------------------------------------- 3. host buffers through BDA
 
 // The push block, with room for the host buffer addresses at byte 128: returns the variable and
@@ -775,6 +817,7 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
         Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
+        FreezeMeshDraw(m);
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr);
         HostBuffers(m, buffers, buffer_count, nullptr);
         const auto words = m.Words();
@@ -797,6 +840,7 @@ SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_
         if (!result || !out || !out_count) Fail("bad arguments");
         if (draw_block_base % 8u) Fail("the draw block's address must be 8-byte aligned in the push block");
         Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
+        FreezeMeshDraw(m);
         const DrawBlock draw(m, draw_block_base);
         for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw);
         HostBuffers(m, buffers, buffer_count, &draw);
