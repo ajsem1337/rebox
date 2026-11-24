@@ -245,10 +245,12 @@ down missing translations.
 
 ## Known gaps (ordered roughly by how soon they'll bite)
 
-- **Console shaders are partly covered** ([docs/anyps5.md](docs/anyps5.md)). Compute, vertex and
-  pixel shaders compile through AnyPS5 at their first dispatch or draw. Mesh, tessellation and
-  geometry pipelines get fallback shaders, shaders that need LDS spilling or scratch are skipped,
-  and so are shaders using instructions AnyPS5 doesn't handle yet; each is logged once.
+- **Console shaders are partly covered** ([docs/anyps5.md](docs/anyps5.md)). Compute, vertex,
+  pixel and mesh shaders compile through AnyPS5 at their first dispatch, draw or mesh dispatch
+  (mesh ones haven't drawn on a GPU yet, and need `REBOX_MESH_PIPELINES=1`). Amplification,
+  tessellation and geometry pipelines get fallback shaders, shaders that need LDS spilling or
+  scratch are skipped, and so are shaders using instructions AnyPS5 doesn't handle yet (8% of the
+  target title's mesh shaders use `v_mad_legacy_f32` with clamp); each is logged once.
 - **D3D12.X interfaces** ([docs/d3d12x.md](docs/d3d12x.md)). `D3D12XboxCreateDevice` returns
   proxies with the Xbox layouts. Their slot tables are merged from our disassembly and
   [ScarlettX](https://github.com/Freminet/ScarlettX)'s traces. Slots nobody has identified
