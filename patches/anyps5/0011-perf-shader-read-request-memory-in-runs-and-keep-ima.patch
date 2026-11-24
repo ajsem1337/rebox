@@ -1,0 +1,426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 17:55:46 +0000
+Subject: [PATCH] perf(shader): read request memory in runs, and keep image
+ table capture per record cheap
+
+RequestMemoryView gave the SRT walk one word per call and searched its
+regions for each, and offered no bulk reader, so an image table snapshot
+read every record a word at a time. It now reads runs of words
+(SrtRuntime::readWords, a copy per region) and tries the region, or the
+gap between regions, of its last lookup before searching. A word that
+straddles two regions, or lies outside them, still fails as before.
+
+An address-based table column of 65,536 keys checked page accessibility
+through a hash map for every record and appended a read range per
+record, all sorted and merged at the end; consecutive records share a
+page and touch the last range, so the last page's answer is kept and
+touching ranges are joined as they are taken (the sort and merge give
+the same ranges). Resolving the tables looked up the poison record for
+every poisoned key; runs of keys with one code now reuse the last
+lookup.
+
+The results are the same: one title's 217 compute shaders, each compiled
+20 to 40 times through the result memo with moving descriptor tables,
+give identical SPIR-V, bindings and push data. Its bindless shaders,
+whose 65,536-key tables are captured at every dispatch, went from 2.1,
+3.5 and 6.9 ms a call (fixed tables, 64 table copies, 2,000 copies) to
+1.0, 1.3 and 2.3 ms under Wine; other shaders were already at tens of
+microseconds. tests/RequestMemoryViewTests.cpp checks runs against word
+reads and coverage against the regions' bytes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  18 +++
+ .../Optimization/RequestMemoryView.hpp        |   6 +
+ .../Optimization/src/RequestMemoryView.cpp    |  74 ++++++++----
+ .../Optimization/src/ResourceMaterializer.cpp |  40 +++++--
+ .../tests/RequestMemoryViewTests.cpp          | 109 ++++++++++++++++++
+ 5 files changed, 218 insertions(+), 29 deletions(-)
+ create mode 100644 core/shader/recompiler/tests/RequestMemoryViewTests.cpp
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index e9077f6f32..465c081c3b 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -450,6 +450,24 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND NOT TARGET request_memory_view_tests)
++        add_test_executable(request_memory_view_tests
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/RequestMemoryViewTests.cpp")
++        target_link_libraries(request_memory_view_tests PRIVATE ${target} ${runtimeTarget})
++        target_include_directories(request_memory_view_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(request_memory_view_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(request_memory_view_tests)
++        add_test(NAME request_memory_view COMMAND request_memory_view_tests)
++        set_tests_properties(request_memory_view PROPERTIES TIMEOUT 20)
++        if(MINGW)
++            target_link_libraries(request_memory_view_tests PRIVATE libc)
++            set_tests_properties(request_memory_view PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET spirv_validator_exit_tests)
+         add_test_executable(spirv_validator_exit_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/SpirvValidatorExit.cpp")
+         target_link_libraries(spirv_validator_exit_tests PRIVATE SPIRV-Tools-static)
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/RequestMemoryView.hpp b/core/shader/recompiler/Optimization/include/Optimization/RequestMemoryView.hpp
+index 321474d501..9a71ab0753 100644
+--- a/core/shader/recompiler/Optimization/include/Optimization/RequestMemoryView.hpp
++++ b/core/shader/recompiler/Optimization/include/Optimization/RequestMemoryView.hpp
+@@ -3,6 +3,8 @@
+ 
+ #include "Optimization/SrtWalker.hpp"
+ #include "Recompiler.hpp"
++#include <atomic>
++#include <cstddef>
+ #include <cstdint>
+ #include <span>
+ #include <vector>
+@@ -16,9 +18,13 @@ public:
+ 
+ private:
+     static bool ReadGuestMemory(void* userContext, std::uint64_t address, std::uint32_t* value);
++    static bool ReadGuestWords(void* userContext, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
+     static bool Covered(void* userContext, std::uint64_t address, std::uint64_t bytes);
++    const MemoryRegion* Find(std::uint64_t address) const;
+ 
+     std::vector<MemoryRegion> regions;
++    mutable std::atomic<std::size_t> last{0};
++    mutable std::atomic<std::size_t> lastGap{~std::size_t{0}};
+ };
+ 
+ }
+diff --git a/core/shader/recompiler/Optimization/src/RequestMemoryView.cpp b/core/shader/recompiler/Optimization/src/RequestMemoryView.cpp
+index 58981be3a0..79d46c10b6 100644
+--- a/core/shader/recompiler/Optimization/src/RequestMemoryView.cpp
++++ b/core/shader/recompiler/Optimization/src/RequestMemoryView.cpp
+@@ -37,6 +37,28 @@ RequestMemoryView::RequestMemoryView(std::span<const MemoryRegion> memoryRegions
+     }
+ }
+ 
++const MemoryRegion* RequestMemoryView::Find(std::uint64_t address) const {
++    if (regions.empty()) return nullptr;
++    const auto hint = last.load(std::memory_order_relaxed);
++    if (hint < regions.size() && address >= regions[hint].guestAddress && address - regions[hint].guestAddress < regions[hint].bytes.size()) return &regions[hint];
++    const auto gap = lastGap.load(std::memory_order_relaxed);
++    if (gap <= regions.size()) {
++        const std::uint64_t low = gap == 0u ? 0u : regions[gap - 1u].guestAddress + regions[gap - 1u].bytes.size();
++        const std::uint64_t high = gap == regions.size() ? std::numeric_limits<std::uint64_t>::max() : regions[gap].guestAddress;
++        if (address >= low && address < high) return nullptr;
++    }
++    const auto it = std::upper_bound(regions.begin(), regions.end(), address, [](std::uint64_t addressValue, const MemoryRegion& region) {
++        return addressValue < region.guestAddress;
++    });
++    if (it == regions.begin() || address - std::prev(it)->guestAddress >= std::prev(it)->bytes.size()) {
++        lastGap.store(static_cast<std::size_t>(it - regions.begin()), std::memory_order_relaxed);
++        return nullptr;
++    }
++    const auto found = std::prev(it);
++    last.store(static_cast<std::size_t>(found - regions.begin()), std::memory_order_relaxed);
++    return &*found;
++}
++
+ bool RequestMemoryView::ReadGuestMemory(void* userContext, std::uint64_t address, std::uint32_t* value) {
+     const auto* self = static_cast<const RequestMemoryView*>(userContext);
+     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+@@ -44,26 +66,42 @@ bool RequestMemoryView::ReadGuestMemory(void* userContext, std::uint64_t address
+         if (debug) std::fprintf(stderr, "[srt] guest read 0x%llx is outside the request memory\n", static_cast<unsigned long long>(address));
+         return false;
+     };
+-    const auto it = std::upper_bound(self->regions.begin(), self->regions.end(), address, [](std::uint64_t addressValue, const MemoryRegion& region) {
+-        return addressValue < region.guestAddress;
+-    });
+-    if (it == self->regions.begin()) {
+-        return miss();
+-    }
+-    const MemoryRegion& region = *std::prev(it);
+-    if (address < region.guestAddress) {
++    const MemoryRegion* region = self->Find(address);
++    if (region == nullptr) {
+         return miss();
+     }
+-    const std::uint64_t offset = address - region.guestAddress;
+-    if (offset > region.bytes.size() || region.bytes.size() - offset < sizeof(std::uint32_t)) {
++    const std::uint64_t offset = address - region->guestAddress;
++    if (region->bytes.size() - offset < sizeof(std::uint32_t)) {
+         return miss();
+     }
+     std::uint32_t word = 0;
+-    std::memcpy(&word, region.bytes.data() + offset, sizeof(word));
++    std::memcpy(&word, region->bytes.data() + offset, sizeof(word));
+     *value = word;
+     return true;
+ }
+ 
++bool RequestMemoryView::ReadGuestWords(void* userContext, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
++    const auto* self = static_cast<const RequestMemoryView*>(userContext);
++    while (count != 0u) {
++        const MemoryRegion* region = self->Find(address);
++        if (region == nullptr) return ReadGuestMemory(userContext, address, values);
++        const std::uint64_t offset = address - region->guestAddress;
++        const std::uint64_t whole = std::min<std::uint64_t>(count, (region->bytes.size() - offset) / sizeof(std::uint32_t));
++        if (whole == 0u) {
++            if (!ReadGuestMemory(userContext, address, values)) return false;
++            address += sizeof(std::uint32_t);
++            ++values;
++            --count;
++            continue;
++        }
++        std::memcpy(values, region->bytes.data() + offset, static_cast<std::size_t>(whole) * sizeof(std::uint32_t));
++        address += whole * sizeof(std::uint32_t);
++        values += whole;
++        count -= whole;
++    }
++    return true;
++}
++
+ bool RequestMemoryView::Covered(void* userContext, std::uint64_t address, std::uint64_t bytes) {
+     const auto* self = static_cast<const RequestMemoryView*>(userContext);
+     if (bytes > std::numeric_limits<std::uint64_t>::max() - address) {
+@@ -71,18 +109,11 @@ bool RequestMemoryView::Covered(void* userContext, std::uint64_t address, std::u
+     }
+     const std::uint64_t end = address + bytes;
+     while (address < end) {
+-        const auto it = std::upper_bound(self->regions.begin(), self->regions.end(), address, [](std::uint64_t addressValue, const MemoryRegion& region) {
+-            return addressValue < region.guestAddress;
+-        });
+-        if (it == self->regions.begin()) {
+-            return false;
+-        }
+-        const MemoryRegion& region = *std::prev(it);
+-        const std::uint64_t regionEnd = region.guestAddress + region.bytes.size();
+-        if (address >= regionEnd) {
++        const MemoryRegion* region = self->Find(address);
++        if (region == nullptr) {
+             return false;
+         }
+-        address = regionEnd;
++        address = region->guestAddress + region->bytes.size();
+     }
+     return true;
+ }
+@@ -94,6 +125,7 @@ SrtRuntime RequestMemoryView::MakeRuntime(std::span<const std::uint32_t> userDat
+     runtime.userContext = this;
+     runtime.readMemory = &ReadGuestMemory;
+     runtime.readSpecializationMemory = &ReadGuestMemory;
++    runtime.readWords = &ReadGuestWords;
+     runtime.accessible = &Covered;
+     return runtime;
+ }
+diff --git a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+index 63085044b8..6977c0fcb4 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+@@ -809,6 +809,7 @@ public:
+                 columns.clear();
+                 pages.clear();
+                 wholePages.clear();
++                lastWholePage = std::numeric_limits<std::uint64_t>::max();
+                 tables = {};
+             }
+             tables.shader = plan.shaderHash;
+@@ -868,9 +869,11 @@ private:
+ 
+     bool AddressAccessible(std::uint64_t address) {
+         const auto page = address & ~(PageBytes - 1u);
+-        const auto [found, inserted] = wholePages.try_emplace(page, false);
+-        if (inserted) found->second = Accessible(page, PageBytes);
+-        const bool accessible = found->second || Accessible(address, sizeof(std::uint32_t));
++        if (page != lastWholePage) {
++            lastWholePage = page;
++            lastWholePageAccessible = WholePageAccessible(page);
++        }
++        const bool accessible = lastWholePageAccessible || Accessible(address, sizeof(std::uint32_t));
+         if (accessible) {
+             ++accessibleChecks;
+         } else {
+@@ -1242,11 +1245,16 @@ private:
+             }
+             return checkedAccessible;
+         };
++        std::uint64_t wholePage = std::numeric_limits<std::uint64_t>::max();
++        bool wholePageAccessible = false;
+         const auto wholeAccessible = [&](std::uint64_t address) {
+             if (!column.address) return accessible(address);
+-            const auto [found, inserted] = wholePages.try_emplace(address & ~(PageBytes - 1u), false);
+-            if (inserted) found->second = Accessible(address & ~(PageBytes - 1u), PageBytes);
+-            return found->second;
++            const auto page = address & ~(PageBytes - 1u);
++            if (page != wholePage) {
++                wholePage = page;
++                wholePageAccessible = WholePageAccessible(page);
++            }
++            return wholePageAccessible;
+         };
+         const auto locate = [&](std::uint32_t offset, std::uint32_t immediate) -> std::optional<std::uint64_t> {
+             if (column.address) return ImageTableAbi::ScalarAddressDword(records.base, offset, immediate);
+@@ -1259,7 +1267,15 @@ private:
+             } else {
+                 runs.emplace_back(address, words);
+             }
+-            if (column.address) records.readRanges.emplace_back(address, static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
++            if (column.address) {
++                const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
++                auto& ranges = records.readRanges;
++                if (!ranges.empty() && address >= ranges.back().first && address - ranges.back().first <= ranges.back().second) {
++                    ranges.back().second = std::max(ranges.back().second, address - ranges.back().first + bytes);
++                } else {
++                    ranges.emplace_back(address, bytes);
++                }
++            }
+             low = std::min(low, address);
+             high = std::max(high, address + static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
+             total += words;
+@@ -1561,6 +1577,8 @@ private:
+     HashScratchIndex wordsIndex{threadScratch<HashSlot, WordsIndexTag>()};
+     std::unordered_map<std::uint64_t, bool> pages;
+     std::unordered_map<std::uint64_t, bool> wholePages;
++    std::uint64_t lastWholePage = std::numeric_limits<std::uint64_t>::max();
++    bool lastWholePageAccessible = false;
+     SrtWriteStamp stamp;
+     std::vector<std::pair<std::uint64_t, std::uint32_t>> comparedRuns;
+     std::vector<std::uint32_t> comparedWords;
+@@ -2175,13 +2193,19 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
+         std::map<std::uint64_t, std::uint32_t> pointers;
+         if (column.nested) nestedRecords.Clear();
+         else records.Clear();
++        std::uint32_t poisonedCode = 0u;
++        std::uint32_t poisonedMapped = Abi::NullCode;
+         for (std::uint32_t key = 0; key < column.keys; key++) {
+             const auto code = column.codes[key];
+             if (column.nested && column.pointers[key] == Abi::UncapturedPointer) continue;
+             std::uint32_t mapped = Abi::NullCode;
+             if ((code & Abi::PoisonFlag) != 0u) {
+                 const auto reason = static_cast<PoisonReason>(code & ~Abi::PoisonFlag);
+-                mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
++                if (code != poisonedCode) {
++                    poisonedCode = code;
++                    poisonedMapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
++                }
++                mapped = poisonedMapped;
+             } else if (column.nested && out.map[header + Abi::TableFault] == 0u) {
+                 if (const auto known = nestedRecords.Find(code)) {
+                     mapped = *known;
+diff --git a/core/shader/recompiler/tests/RequestMemoryViewTests.cpp b/core/shader/recompiler/tests/RequestMemoryViewTests.cpp
+new file mode 100644
+index 0000000000..8cae2cc061
+--- /dev/null
++++ b/core/shader/recompiler/tests/RequestMemoryViewTests.cpp
+@@ -0,0 +1,109 @@
++#include "Optimization/RequestMemoryView.hpp"
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <span>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++std::vector<std::byte> Bytes(std::size_t count, std::uint8_t first) {
++    std::vector<std::byte> bytes(count);
++    for (std::size_t index = 0; index < count; ++index) bytes[index] = static_cast<std::byte>(first + index);
++    return bytes;
++}
++
++bool ReadEach(const SrtRuntime& runtime, std::uint64_t address, std::uint64_t count, std::vector<std::uint32_t>& out) {
++    out.assign(count, 0u);
++    for (std::uint64_t word = 0; word < count; ++word) {
++        if (!runtime.readMemory(runtime.userContext, address + word * 4u, &out[word])) return false;
++    }
++    return true;
++}
++
++bool Inside(const std::vector<MemoryRegion>& regions, std::uint64_t address, std::uint64_t bytes) {
++    for (std::uint64_t at = address; at < address + bytes; ++at) {
++        bool found = false;
++        for (const auto& region : regions) found = found || (at >= region.guestAddress && at < region.guestAddress + region.bytes.size());
++        if (!found) return false;
++    }
++    return true;
++}
++
++void ReadsMatchWordByWord() {
++    const auto first = Bytes(16, 0x10);
++    const auto second = Bytes(18, 0x40);
++    const auto third = Bytes(8, 0x80);
++    const std::vector<MemoryRegion> regions{
++        {0x2000, std::span<const std::byte>(third)},
++        {0x1000, std::span<const std::byte>(first)},
++        {0x1010, std::span<const std::byte>(second)},
++    };
++    RequestMemoryView view{std::span<const MemoryRegion>(regions)};
++    const auto runtime = view.MakeRuntime({}, 0);
++    Require(runtime.readWords != nullptr, "the view reads runs of words");
++    const std::array<std::uint64_t, 12> starts{0x0ffc, 0x1000, 0x1004, 0x100c, 0x1010, 0x101c, 0x101e, 0x1020, 0x1ffc, 0x2000, 0x2004, 0x2008};
++    for (int pass = 0; pass < 2; ++pass) {
++        for (const auto start : starts) {
++            for (std::uint64_t count = 0; count <= 12u; ++count) {
++                std::vector<std::uint32_t> each;
++                const bool eachOk = ReadEach(runtime, start, count, each);
++                std::vector<std::uint32_t> run(count, 0u);
++                const bool runOk = runtime.readWords(runtime.userContext, start, run.data(), count);
++                Require(eachOk == runOk, "a run of words reads exactly when each word does");
++                if (eachOk) Require(each == run, "a run of words holds what each word does");
++            }
++        }
++    }
++    std::uint32_t word = 0;
++    Require(runtime.readMemory(runtime.userContext, 0x100c, &word), "the last word of a region reads");
++    std::uint32_t expected = 0;
++    std::memcpy(&expected, first.data() + 12, sizeof(expected));
++    Require(word == expected, "the last word of a region holds its bytes");
++    Require(!runtime.readMemory(runtime.userContext, 0x1020, &word), "a word straddling the end of a region fails");
++    Require(!runtime.readMemory(runtime.userContext, 0x1800, &word), "a word between regions fails");
++    Require(runtime.readMemory(runtime.userContext, 0x2004, &word), "a word after a gap reads");
++    Require(!runtime.readMemory(runtime.userContext, 0x1804, &word), "a gap read again fails");
++    Require(!runtime.readMemory(runtime.userContext, 0x0, &word), "a word before every region fails");
++    Require(!runtime.readMemory(runtime.userContext, 0x3000, &word), "a word after every region fails");
++}
++
++void CoverageMatchesBytes() {
++    const auto first = Bytes(16, 0x10);
++    const auto second = Bytes(16, 0x40);
++    const auto third = Bytes(8, 0x80);
++    const std::vector<MemoryRegion> regions{
++        {0x1000, std::span<const std::byte>(first)},
++        {0x1010, std::span<const std::byte>(second)},
++        {0x2000, std::span<const std::byte>(third)},
++    };
++    RequestMemoryView view{std::span<const MemoryRegion>(regions)};
++    const auto runtime = view.MakeRuntime({}, 0);
++    for (int pass = 0; pass < 2; ++pass) {
++        for (std::uint64_t address = 0x0ff8; address < 0x2010; address += address < 0x1028 || address >= 0x1ff0 ? 4u : 0x100u) {
++            for (std::uint64_t bytes = 1; bytes <= 40u; bytes += 3u) {
++                Require(runtime.accessible(runtime.userContext, address, bytes) == Inside(regions, address, bytes), "coverage matches the regions' bytes");
++            }
++        }
++    }
++}
++
++}
++
++int main() {
++    ReadsMatchWordByWord();
++    CoverageMatchesBytes();
++    std::puts("request memory view tests passed");
++    return 0;
++}
+-- 
+2.55.0
+

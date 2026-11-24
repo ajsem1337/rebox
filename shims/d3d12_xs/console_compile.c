@@ -178,6 +178,22 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
     return h;
 }
 
+/* As hash_bytes, eight bytes a step: for keys that stay in the process (not the stage ids the log
+ * and REBOX_WATCH_STAGE name), over whole shaders at every draw and dispatch. */
+static UINT64 hash_words(UINT64 h, const void *data, SIZE_T size)
+{
+    const BYTE *p = data;
+    SIZE_T i = 0;
+    for (; i + 8 <= size; i += 8)
+    {
+        UINT64 w;
+        memcpy(&w, p + i, sizeof(w));
+        h = (h ^ w) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    return hash_bytes(h, p + i, size - i);
+}
+
 /* ------------------------------------------------------------ late T#s */
 
 /* T#s a title writes after recording the draw that reads them (the target title fills a per-draw
@@ -395,26 +411,36 @@ static int compare_ranges(const void *a, const void *b)
 static UINT64 page_table(UINT32 *bytes)
 {
     static SRWLOCK table_lock = SRWLOCK_INIT;
-    static UINT64 table_va, table_key;
+    static UINT64 table_va;
+    static LONG table_key[3];
     static BYTE *table_cpu;
     struct shadow_region regions[MAX_REGIONS];
     struct gpu_memory_region chunks[MAX_REGIONS];
     UINT64 (*buffers)[2];
-    UINT n = shadow_regions(regions, MAX_REGIONS), nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
-    UINT nbuffers, count = 0, merged = 0;
-    UINT64 key = hash_bytes(hash_bytes(0xcbf29ce484222325ull, regions, n * sizeof(*regions)), chunks,
-                            nchunks * sizeof(*chunks)) ^ (UINT64)shadow_buffer_ranges_generation() * 0x9e3779b97f4a7c15ull;
+    UINT n, nchunks, nbuffers, count = 0, merged = 0;
+    /* What it maps changes only with these (read before what they cover). */
+    const LONG key[3] = { shadow_regions_generation(), gpu_memory_generation(), shadow_buffer_ranges_generation() };
     struct page_range *ranges;
     UINT64 va = 0;
 
     *bytes = 16 + PAGE_TABLE_CAPACITY * sizeof(struct page_range);
+    AcquireSRWLockShared(&table_lock);
+    if (table_va && !memcmp(key, table_key, sizeof(key)))
+    {
+        va = table_va;
+        ReleaseSRWLockShared(&table_lock);
+        return va;
+    }
+    ReleaseSRWLockShared(&table_lock);
     AcquireSRWLockExclusive(&table_lock);
-    if (table_va && key == table_key)
+    if (table_va && !memcmp(key, table_key, sizeof(key)))
     {
         va = table_va;
         ReleaseSRWLockExclusive(&table_lock);
         return va;
     }
+    n = shadow_regions(regions, MAX_REGIONS);
+    nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
     if (!table_cpu && FAILED(ReboxGpuAlloc(*bytes, 256, (void **)&table_cpu, &table_va)))
     {
         table_cpu = NULL;
@@ -482,7 +508,7 @@ static UINT64 page_table(UINT32 *bytes)
         for (UINT i = count; i < PAGE_TABLE_CAPACITY; i++) /* empty, sorted after every real range */
             out[i] = (struct page_range){ ~0ull, ~0ull, 0, 0, 0 };
     }
-    table_key = key;
+    memcpy(table_key, key, sizeof(key));
     va = table_va;
     ReleaseSRWLockExclusive(&table_lock);
     free(ranges);
@@ -734,11 +760,20 @@ static void log_failure(const struct rebox_deferred_shader *h, const char *what,
 static UINT64 failed_stages[256];
 static LONG failed_stage_count;
 
-static volatile LONG graphics_calls;
-static volatile LONG64 graphics_ticks, phase_ticks[8]; /* regions, AnyPS5, bindings, module; then compute's */
-static volatile LONG64 compute_ticks;
-static volatile LONG compute_calls;
-static volatile LONG64 part_ticks[8];                  /* within bindings: identity, lookups, page table, host buffers; then compute's */
+/* Compile timings for the log, by kind (graphics stages, compute) and by who asked: a title thread
+ * at its draw or dispatch, which waits for it, or a background worker (a program's first compile, a
+ * graphics variant), whose time the title doesn't wait for. Phases: memory regions, waiting for the
+ * compiler lock, AnyPS5, bindings (parts: identity, heap lookups, page table, host buffers),
+ * finalizing a module. */
+enum { PHASE_REGIONS, PHASE_LOCK, PHASE_ANYPS5, PHASE_BINDINGS, PHASE_MODULE, PHASES };
+enum { PART_IDENTITY, PART_LOOKUPS, PART_PAGE_TABLE, PART_HOST_BUFFERS, PARTS };
+static struct compile_stats
+{
+    volatile LONG calls, memo_skips;
+    volatile LONG64 ticks, phase[PHASES], part[PARTS];
+} compile_stats[2][2]; /* [compute][background] */
+static __thread struct compile_stats *stats;
+static __thread LONG64 relock_ticks; /* a background compile's wait to take the lock back */
 
 static LONG64 ticks_now(void)
 {
@@ -751,9 +786,15 @@ static void phase_end(LARGE_INTEGER *mark, UINT phase)
 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (mark->QuadPart)
-        InterlockedAdd64(&phase_ticks[phase], now.QuadPart - mark->QuadPart);
+    if (mark->QuadPart && stats)
+        InterlockedAdd64(&stats->phase[phase], now.QuadPart - mark->QuadPart);
     *mark = now;
+}
+
+static void part_add(UINT part, LONG64 ticks)
+{
+    if (stats)
+        InterlockedAdd64(&stats->part[part], ticks);
 }
 
 static double qpc_frequency(void)
@@ -761,6 +802,44 @@ static double qpc_frequency(void)
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     return (double)f.QuadPart;
+}
+
+/* Shaders whose bindings couldn't be made for a reason their next draw or dispatch meets again
+ * (more descriptor elements or host buffers than there is room for, a binding of a kind not
+ * handled, a module that can't be fitted): AnyPS5 isn't asked again at each one, only at every
+ * BINDING_RETRY-th, in case what it captures has changed. A title's bindless compute shaders
+ * captured tables of 24,000 descriptors at every dispatch, all refused. */
+#define BINDING_RETRY 64
+static struct { volatile UINT64 id; volatile LONG calls; } binding_failures[512];
+static volatile LONG binding_failure_count;
+
+/* Whether to skip this call of shader id (its bindings failed before, and it isn't time to retry). */
+static BOOL binding_failure_skips(UINT64 id)
+{
+    LONG n = min(binding_failure_count, (LONG)ARRAYSIZE(binding_failures));
+    for (LONG i = 0; i < n; i++)
+        if (binding_failures[i].id == id)
+            return InterlockedIncrement(&binding_failures[i].calls) % BINDING_RETRY != 0;
+    return FALSE;
+}
+
+static void binding_failure_note(UINT64 id)
+{
+    LONG n = min(binding_failure_count, (LONG)ARRAYSIZE(binding_failures)), slot;
+    for (LONG i = 0; i < n; i++)
+        if (binding_failures[i].id == id)
+            return;
+    if ((slot = InterlockedIncrement(&binding_failure_count) - 1) < (LONG)ARRAYSIZE(binding_failures))
+        binding_failures[slot].id = id;
+}
+
+/* A retry that worked: the shader is asked for at every call again. */
+static void binding_failure_clear(UINT64 id)
+{
+    LONG n = min(binding_failure_count, (LONG)ARRAYSIZE(binding_failures));
+    for (LONG i = 0; i < n; i++)
+        if (binding_failures[i].id == id)
+            binding_failures[i].id = 0;
 }
 
 static BOOL stage_failed(UINT64 id)
@@ -1224,7 +1303,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
     if (!async_compiles() || !in || !in->shader || !in->shader_size || !out)
         return compile_now(in, out, FALSE);
-    key = hash_bytes(0xcbf29ce484222325ull, in->shader, in->shader_size);
+    key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
     switch (program_claim(key, TRUE))
     {
     case PROGRAM_COLD: /* claimed: compile it in the background */
@@ -1242,6 +1321,59 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
 }
 
+/* Guest memory for AnyPS5: the shadow heaps at their title addresses, then the GPU memory chunks
+ * (xmem's allocations, at their GPU VAs) that don't overlap them, so the SRT walk can follow
+ * user-data pointers into constant data. Title-created resources aren't included. Made again only
+ * when the heaps or chunks change: walking the heaps' pages for GPU memory at every draw and
+ * dispatch took a share of each. Returns the count, at most MAX_REGIONS. */
+static UINT guest_regions(struct sa5_region *regions)
+{
+    static SRWLOCK cache_lock = SRWLOCK_INIT;
+    static struct sa5_region cached[MAX_REGIONS];
+    static UINT cached_count;
+    static LONG cached_key[2];
+    static BOOL cached_valid;
+    const LONG key[2] = { shadow_regions_generation(), gpu_memory_generation() };
+    struct shadow_region shadows[MAX_REGIONS];
+    struct gpu_memory_region chunks[MAX_REGIONS];
+    UINT n, count, shadow_count;
+
+    AcquireSRWLockShared(&cache_lock);
+    if (cached_valid && !memcmp(key, cached_key, sizeof(key)))
+    {
+        n = cached_count;
+        memcpy(regions, cached, n * sizeof(*regions));
+        ReleaseSRWLockShared(&cache_lock);
+        return n;
+    }
+    ReleaseSRWLockShared(&cache_lock);
+
+    n = shadow_regions(shadows, MAX_REGIONS);
+    for (UINT i = 0; i < n; i++)
+        regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
+    count = gpu_memory_regions(chunks, MAX_REGIONS - n);
+    shadow_count = n;
+    for (UINT i = 0; i < count; i++)
+    {
+        BOOL overlaps = FALSE;
+        for (UINT j = 0; j < shadow_count && !overlaps; j++)
+            overlaps = chunks[i].gpu < regions[j].address + regions[j].size
+                    && regions[j].address < chunks[i].gpu + chunks[i].size;
+        if (!overlaps && chunks[i].size)
+            regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
+    }
+
+    /* Kept under the generations read before it was made: a change since makes the next call
+     * make it again. */
+    AcquireSRWLockExclusive(&cache_lock);
+    memcpy(cached, regions, n * sizeof(*regions));
+    cached_count = n;
+    memcpy(cached_key, key, sizeof(key));
+    cached_valid = TRUE;
+    ReleaseSRWLockExclusive(&cache_lock);
+    return n;
+}
+
 /* Compiles run on any number of threads at once: AnyPS5's caches have their own locks, and so do
  * the module table, the per-draw ring, host buffers, the page table and the late lists here; what
  * compile_now keeps between calls is per thread. A lock around it used to make a title's recording
@@ -1252,7 +1384,6 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
     struct sa5_region regions[MAX_REGIONS];
-    struct shadow_region shadows[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
     UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX];
@@ -1273,7 +1404,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
 
     const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
     BOOL graphics;
-    UINT64 stage_id;
+    UINT64 stage_id, failure_id;
     LARGE_INTEGER started = { 0 }, mark = { 0 };
 
     if (!h || !out || in->shader_size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC
@@ -1290,43 +1421,48 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     stage_push = graphics && h->stage == 0x80 ? MESH_PUSH_DATA : GRAPHICS_PUSH_DATA;
     stage_id = graphics ? hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
                                      (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
-    if (graphics)
+    /* Counts for the log, at powers of two of each kind's compiles: what they took, for title threads
+     * (the draw or dispatch waits) and background workers apart, and graphics stages AnyPS5 refused. */
     {
-        /* Counts for the log, at powers of two: stage compiles asked for, the time they took (the
-         * draw waits for them), and stages AnyPS5 refused. */
-        LONG n = InterlockedIncrement(&graphics_calls);
+        struct compile_stats *kind = compile_stats[!graphics];
+        LONG n;
+        stats = &kind[background != 0];
+        relock_ticks = 0;
+        n = InterlockedIncrement(&stats->calls);
         if (!(n & (n - 1)))
         {
-            double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
-            rebox_log("d3d12_xs: console graphics: %ld stage compiles asked for, %.2f ms each on average (memory "
-                         "regions %.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers %.2f], "
-                         "module %.2f); "
-                         "%ld distinct stages refused so far", n,
-                         graphics_ticks * ms, phase_ticks[0] * ms, phase_ticks[1] * ms, phase_ticks[2] * ms,
-                         part_ticks[0] * ms, part_ticks[1] * ms, part_ticks[2] * ms, part_ticks[3] * ms,
-                         phase_ticks[3] * ms, min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
-        }
-        QueryPerformanceCounter(&started);
-        mark = started;
-    }
-    if (!graphics)
-    {
-        /* Compute compiles, timed the same way (at dispatch, the list's recording waits for them). */
-        LONG n = InterlockedIncrement(&compute_calls);
-        if (!(n & (n - 1)))
-        {
-            double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
-            rebox_log("d3d12_xs: console compute: %ld compiles asked for, %.2f ms each on average (memory regions "
-                      "%.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers "
-                      "%.2f], module %.2f)", n, compute_ticks * ms, phase_ticks[4] * ms, phase_ticks[5] * ms,
-                      phase_ticks[6] * ms, part_ticks[4] * ms, part_ticks[5] * ms, part_ticks[6] * ms,
-                      part_ticks[7] * ms, phase_ticks[7] * ms);
+            char rows[2][400];
+            for (UINT b = 0; b < 2; b++)
+            {
+                const struct compile_stats *st = &kind[b];
+                double ms = 1000.0 / qpc_frequency() / max(st->calls - (st == stats), 1);
+                snprintf(rows[b], sizeof(rows[b]), "%ld, %.2f ms each (memory regions %.2f, lock %.2f, AnyPS5 %.2f, "
+                         "bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers %.2f], module "
+                         "%.2f), %ld skipped as failing", st->calls - (st == stats), st->ticks * ms,
+                         st->phase[PHASE_REGIONS] * ms, st->phase[PHASE_LOCK] * ms, st->phase[PHASE_ANYPS5] * ms,
+                         st->phase[PHASE_BINDINGS] * ms, st->part[PART_IDENTITY] * ms, st->part[PART_LOOKUPS] * ms,
+                         st->part[PART_PAGE_TABLE] * ms, st->part[PART_HOST_BUFFERS] * ms,
+                         st->phase[PHASE_MODULE] * ms, st->memo_skips);
+            }
+            char refused[64] = "";
+            if (graphics)
+                snprintf(refused, sizeof(refused), "; %ld distinct stages refused so far",
+                         min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
+            rebox_log("d3d12_xs: console %s: compiles at title threads %s; at background workers %s%s",
+                      graphics ? "graphics" : "compute", rows[0], rows[1], refused);
         }
         QueryPerformanceCounter(&started);
         mark = started;
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
+    failure_id = graphics ? stage_id : hash_words(0x636f6d70757465ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+    if (binding_failure_skips(failure_id))
+    {
+        InterlockedIncrement(&stats->memo_skips);
+        set_last(E_FAIL, "its bindings failed before (retried at every 64th call)", NULL);
+        return E_FAIL;
+    }
     /* REBOX_WATCH_STAGE=<id>[:<offset>]: at that stage's draws, the 16 bytes at the offset (hex,
      * default 0x20) of the buffer its s8 table's first V# names: the first 16 draws, then every 100th. */
     if (graphics && getenv("REBOX_WATCH_STAGE"))
@@ -1477,25 +1613,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                          (int)in->bindless[6][0], in->bindless[6][1]);
     }
 
-    /* Guest memory: the shadow heaps at their title addresses, then the GPU memory chunks
-     * (xmem's allocations, at their GPU VAs) that don't overlap them, so the SRT walk can follow
-     * user-data pointers into constant data. Title-created resources aren't included. */
-    n = shadow_regions(shadows, MAX_REGIONS);
-    for (UINT i = 0; i < n; i++)
-        regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
-    {
-        struct gpu_memory_region chunks[MAX_REGIONS];
-        UINT count = gpu_memory_regions(chunks, MAX_REGIONS - n), shadow_count = n;
-        for (UINT i = 0; i < count; i++)
-        {
-            BOOL overlaps = FALSE;
-            for (UINT j = 0; j < shadow_count && !overlaps; j++)
-                overlaps = chunks[i].gpu < regions[j].address + regions[j].size
-                        && regions[j].address < chunks[i].gpu + chunks[i].size;
-            if (!overlaps && chunks[i].size)
-                regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
-        }
-    }
+    n = guest_regions(regions);
     if (!(code = malloc(h->code_dwords * 4u)))
         return E_OUTOFMEMORY;
     memcpy(code, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
@@ -1530,7 +1648,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     req.region_count = n;
     req.use_cache = 1;
 
-    phase_end(&mark, 0 + (graphics ? 0 : 4));
+    phase_end(&mark, PHASE_REGIONS);
+    phase_end(&mark, PHASE_LOCK); /* no lock now: kept so the phases line up */
     if (graphics && h->stage == 0x80)
     {
         /* A mesh stage (console_fssm.c): AnyPS5's mesh path with the group's size and limits, user
@@ -1917,11 +2036,18 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         goto done;
     }
 
-    phase_end(&mark, 1 + (graphics ? 0 : 4));
+    phase_end(&mark, PHASE_ANYPS5);
+    if (relock_ticks)
+    {
+        /* Taking the lock back after a background compile is waiting, not AnyPS5. */
+        InterlockedAdd64(&stats->phase[PHASE_ANYPS5], -relock_ticks);
+        InterlockedAdd64(&stats->phase[PHASE_LOCK], relock_ticks);
+        relock_ticks = 0;
+    }
     {
         LONG64 t = ticks_now();
         sa5.identity(result, key);
-        InterlockedAdd64(&part_ticks[graphics ? 0 : 4], ticks_now() - t);
+        part_add(PART_IDENTITY, ticks_now() - t);
     }
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
     if (graphics)
@@ -2025,7 +2151,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = draw_buffer(table, (b.count ? b.count : 1) * 16, &table_cpu);
-                InterlockedAdd64(&part_ticks[graphics ? 3 : 7], ticks_now() - t);
+                part_add(PART_HOST_BUFFERS, ticks_now() - t);
             }
             free(table);
             if (!va)
@@ -2046,6 +2172,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             if (graphics && pushed_count == GRAPHICS_PUSHED_MAX)
             {
                 log_failure(h, "more per-draw host buffers than a graphics stage has push room for", NULL);
+                binding_failure_note(failure_id);
                 goto done;
             }
             hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, graphics ? pushed_count : host_count, 0, 1,
@@ -2066,7 +2193,16 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             BOOL sampler = b.kind == 6;
             UINT32 per = b.count ? b.word_count / b.count : 0;
             if (remap_count == MAX_BINDINGS || index_count + b.count > MAX_ELEMENTS || b.kind > 6
-                    || in->bindless[b.kind][0] == ~0u || !in->heap_cpu[sampler] || (per != 4 && per != 8))
+                    || (per != 4 && per != 8))
+            {
+                char detail[128];
+                snprintf(detail, sizeof(detail), "role %u kind %u binding %u: %u elements of %u words (room for %u "
+                         "elements in %u bindings)", b.role, b.kind, b.binding, b.count, per, MAX_ELEMENTS, MAX_BINDINGS);
+                log_failure(h, "a guest binding is larger than d3d12_xs binds", detail);
+                binding_failure_note(failure_id);
+                goto done;
+            }
+            if (in->bindless[b.kind][0] == ~0u || !in->heap_cpu[sampler])
             {
                 char detail[128];
                 snprintf(detail, sizeof(detail), "role %u kind %u binding %u: %u elements of %u words", b.role,
@@ -2160,7 +2296,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
                 BOOL null_view = FALSE;
-                InterlockedAdd64(&part_ticks[graphics ? 1 : 5], ticks_now() - lookup_start);
+                part_add(PART_LOOKUPS, ticks_now() - lookup_start);
                 /* A texture descriptor the title wrote outside our heaps, or an empty slot, reads
                  * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
                  * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
@@ -2304,6 +2440,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             if (host_count == ARRAYSIZE(hosts))
             {
                 log_failure(h, "more than 8 host buffers", NULL);
+                binding_failure_note(failure_id);
                 goto done;
             }
             switch (b.role)
@@ -2314,7 +2451,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = b.word_count ? draw_buffer(b.words, bytes, NULL) : zero_buffer(bytes = 16);
-                InterlockedAdd64(&part_ticks[graphics ? 3 : 7], ticks_now() - t);
+                part_add(PART_HOST_BUFFERS, ticks_now() - t);
                 break;
             }
             case ROLE_FAULT_BUFFER:
@@ -2336,7 +2473,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = page_table(&bytes);
-                InterlockedAdd64(&part_ticks[graphics ? 2 : 6], ticks_now() - t);
+                part_add(PART_PAGE_TABLE, ticks_now() - t);
                 break;
             }
             default:
@@ -2344,6 +2481,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 char role[32];
                 snprintf(role, sizeof(role), "role %u", b.role);
                 log_failure(h, "unsupported host binding", role);
+                binding_failure_note(failure_id);
                 goto done;
             }
             }
@@ -2361,6 +2499,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 if (pushed_count == GRAPHICS_PUSHED_MAX)
                 {
                     log_failure(h, "more per-draw host buffers than a graphics stage has push room for", NULL);
+                    binding_failure_note(failure_id);
                     goto done;
                 }
                 hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, pushed_count, bytes / 4, 0,
@@ -2379,7 +2518,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         }
     }
 
-    phase_end(&mark, 2 + (graphics ? 0 : 4));
+    phase_end(&mark, PHASE_BINDINGS);
     if (!(module = find_module(key)))
     {
         if (graphics ? sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
@@ -2388,6 +2527,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                     sizeof(error)))
         {
             log_failure(h, "fitting it to vkd3d-proton's bindings failed", error);
+            binding_failure_note(failure_id);
             goto done;
         }
         module = add_module(key, words, word_count);
@@ -2411,7 +2551,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                      req.code_dwords * 4u), module->count, remap_count, host_count, (unsigned long long)key[0]);
     }
 
-    phase_end(&mark, 3 + (graphics ? 0 : 4));
+    phase_end(&mark, PHASE_MODULE);
     memset(out, 0, sizeof(*out));
     out->spirv = module->words;
     out->spirv_words = module->count;
@@ -2465,6 +2605,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         }
     }
     hr = S_OK;
+    binding_failure_clear(failure_id);
     {
         char detail[96];
         snprintf(detail, sizeof(detail), "%u SPIR-V words, %u guest bindings, %u host buffers", module->count,
@@ -2473,11 +2614,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
 
 done:
-    if (started.QuadPart)
+    if (started.QuadPart && stats)
     {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        InterlockedAdd64(graphics ? &graphics_ticks : &compute_ticks, now.QuadPart - started.QuadPart);
+        InterlockedAdd64(&stats->ticks, now.QuadPart - started.QuadPart);
     }
     if (words)
     {

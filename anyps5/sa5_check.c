@@ -16,9 +16,14 @@
  *   sa5_check bench THREADS PLAN [FIRST [COUNT]]  compile throughput: the pixel shaders in PLAN (format:
  *                                              pixel_sweep), compiled and validated on THREADS
  *                                              threads at once
+ *   sa5_check memo PLAN NAME [ITERATIONS]      the memoized path as at every dispatch: compute shader
+ *                                              NAME of PLAN (format: NAME CODE SKIP RSRC1 RSRC2 X,Y,Z
+ *                                              [WAVE]) with new descriptor tables and buffers at each
+ *                                              call, timed by phase (d3d12_xs's)
  * Compute shaders (built-in or dumped), ps and bench compile with no cache unless SA5_USE_CACHE is set:
  * then through AnyPS5's caches, its disk cache included (ANYPS5_SHADER_CACHE_DIR), as d3d12_xs
  * compiles. */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -264,6 +269,282 @@ static int bench(int threads, const char *plan, int first, int count)
     QueryPerformanceCounter(&end);
     printf("bench: %ld pixel shaders on %d threads in %.0f ms (%ld compile and validate)\n", bench_count, threads,
            (end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart, bench_ok);
+    return 0;
+}
+
+/* The memoized path at every dispatch, as d3d12_xs drives it (console_compile.c's compile_now): one
+ * compute shader of a plan (format as cs plans: NAME CODE SKIP RSRC1 RSRC2 X,Y,Z [WAVE]) compiled
+ * ITERATIONS times through AnyPS5's caches, its descriptor tables (laid out from sa5_analyse) at a
+ * new address each time and its buffers' V#s naming new memory, as a title's per-draw data does;
+ * then its identity, its bindings and, once per module key, sa5_finalize. Prints the first call's
+ * time and the average of the rest, phase by phase. SA5_BENCH_SLOTS=1 gives every dispatch a new
+ * module key (new heap slots, as when a title copies its descriptors around); SA5_BENCH_IMAGES=N
+ * cycles the textures through N sets; SA5_BENCH_FIXED_TABLES=1 keeps the tables in one place (only
+ * the buffers they name change), and SA5_BENCH_COPIES=N moves them through N places (64), after
+ * which calls repeat earlier ones. */
+static uint64_t bench_hash(uint64_t h, const void *data, size_t size)
+{
+    for (size_t i = 0; i < size; i++)
+        h = (h ^ ((const uint8_t *)data)[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static int memo_bench(const char *plan, const char *wanted, int iterations)
+{
+    enum { TABLE_BASE = 0x20000000, BUFFER_BASE = 0x30000000, IMAGE_BASE = 0x40000000 };
+    FILE *f = fopen(plan, "r");
+    char line[4096], name[64] = "", path[1024], winpath[1100], error[1024];
+    unsigned skip, rsrc1, rsrc2, x, y, z, wave = 0;
+    long size = 0;
+    uint8_t *data = NULL, *tables, *buffers, *images;
+    struct sa5_layout layout;
+    static struct sa5_slot slots[256];
+    struct sa5_region regions[40];
+    uint32_t user[32] = { 0 }, table_bytes = 0, region_count = 0;
+    struct sa5_compute_request req = { 0 };
+    LARGE_INTEGER frequency, t0, t1, t2, t3, t4, t4b, t5;
+    uint64_t digest = 0xcbf29ce484222325ull;
+    double first[5] = { 0 }, rest[5] = { 0 };
+    uint64_t keys[64];
+    int key_count = 0, finalized = 0;
+    int new_slots = getenv("SA5_BENCH_SLOTS") && *getenv("SA5_BENCH_SLOTS") == '1';
+    int image_sets = getenv("SA5_BENCH_IMAGES") ? atoi(getenv("SA5_BENCH_IMAGES")) : 0;
+    int fixed_tables = getenv("SA5_BENCH_FIXED_TABLES") && *getenv("SA5_BENCH_FIXED_TABLES") == '1';
+    uint32_t table_copies = getenv("SA5_BENCH_COPIES") ? (uint32_t)atoi(getenv("SA5_BENCH_COPIES")) : 64;
+
+    while (f && fgets(line, sizeof(line), f))
+    {
+        wave = 0;
+        if (line[0] != '#' && sscanf(line, "%63s %1023s %u %x %x %u,%u,%u %u", name, path, &skip, &rsrc1, &rsrc2, &x,
+                                     &y, &z, &wave) >= 8 && !strcmp(name, wanted))
+            break;
+        name[0] = 0;
+    }
+    if (f)
+        fclose(f);
+    if (!name[0])
+    {
+        printf("FAIL memo: %s not in %s\n", wanted, plan);
+        return 1;
+    }
+    snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+    for (char *p = winpath; *p; p++)
+        if (*p == '/') *p = '\\';
+    if (!(data = read_all(winpath, &size)) || size <= (long)skip)
+    {
+        printf("FAIL memo: can't read %s\n", path);
+        return 1;
+    }
+    req.code = (const uint32_t *)(data + skip);
+    req.code_dwords = (uint32_t)((size - skip) / 4);
+    req.code_address = 0x10000000;
+    req.user_data = user;
+    req.user_data_count = (rsrc2 >> 1) & 0x1f;
+    req.threads[0] = x;
+    req.threads[1] = y;
+    req.threads[2] = z;
+    req.rsrc1 = rsrc1;
+    req.rsrc2 = rsrc2;
+    req.wave = wave ? wave : 32;
+    req.use_cache = 1;
+    memset(&layout, 0, sizeof(layout));
+    if (sa5_analyse(req.code, req.code_dwords, req.user_data_count, &layout, slots, 256, error, sizeof(error)))
+    {
+        printf("FAIL memo: analyse: %s\n", error);
+        return 1;
+    }
+    for (uint32_t i = 0; i < layout.slot_count && i < 256; i++)
+        if ((slots[i].dword + slots[i].size) * 4 > table_bytes)
+            table_bytes = (slots[i].dword + slots[i].size) * 4;
+    table_bytes = (table_bytes + 255) & ~255u;
+    if (!table_bytes)
+        table_bytes = 256;
+    printf("memo %s: %u code dwords, wave%u, %u tables, %u slots, %u-byte tables\n", name, req.code_dwords, req.wave,
+           layout.table_count, layout.slot_count, table_bytes);
+
+    /* Guest memory: copies of every table (16 tables per copy) to move them through, what they
+     * point at, and more regions as a title has (other heaps and GPU memory chunks). */
+    if (table_copies < 1 || (uint64_t)table_copies * 16 * table_bytes > BUFFER_BASE - TABLE_BASE)
+        table_copies = (BUFFER_BASE - TABLE_BASE) / 16 / table_bytes;
+    tables = calloc(table_copies * 16, table_bytes);
+    buffers = calloc(1, 1 << 20);
+    images = calloc(1, 1 << 20);
+    regions[region_count++] = (struct sa5_region){ TABLE_BASE, tables, (size_t)table_copies * 16 * table_bytes };
+    regions[region_count++] = (struct sa5_region){ BUFFER_BASE, buffers, 1 << 20 };
+    regions[region_count++] = (struct sa5_region){ IMAGE_BASE, images, 1 << 20 };
+    while (region_count < 40)
+    {
+        regions[region_count] = (struct sa5_region){ 0x100000000ull + region_count * 0x1000000ull, buffers, 1 << 20 };
+        region_count++;
+    }
+    req.regions = regions;
+    req.region_count = region_count;
+
+    QueryPerformanceFrequency(&frequency);
+    for (int it = 0; it < iterations; it++)
+    {
+        struct sa5_result *result = NULL;
+        uint64_t identity[2], key;
+        uint32_t copy = fixed_tables ? 0 : it % table_copies, count;
+        double phase[5];
+
+        /* This dispatch's tables: the same textures and samplers, buffers somewhere new. */
+        for (uint32_t t = 0; t < layout.table_count && t < 16; t++)
+        {
+            uint8_t *table = tables + (size_t)(copy * 16 + t) * table_bytes;
+            if (layout.table_sgprs[t] < 32)
+                user[layout.table_sgprs[t]] = TABLE_BASE + (copy * 16 + t) * table_bytes;
+            for (uint32_t i = 0; i < layout.slot_count && i < 256; i++)
+            {
+                const struct sa5_slot *s = &slots[i];
+                uint32_t *w = (uint32_t *)(table + s->dword * 4);
+                if (s->table != t)
+                    continue;
+                if (s->kind == SA5_SLOT_TEXTURE || s->kind == SA5_SLOT_STORAGE)
+                {
+                    static const uint32_t types[] = { 9, 8, 9, 10, 11, 12, 13, 14, 15 };
+                    uint64_t address = IMAGE_BASE + (((image_sets ? it % image_sets : 0) * 16 + i) % 4096) * 0x100;
+                    memset(w, 0, s->size * 4);
+                    w[0] = (uint32_t)(address >> 8);
+                    w[1] = (56u << 20) | (3u << 30);   /* 8_8_8_8_UNORM, width 64 */
+                    w[2] = 15u | (63u << 14);           /* width 64, height 64 */
+                    w[3] = 0xfacu | (types[s->dim < 9 ? s->dim : 0] << 28);
+                }
+                else if (s->kind == SA5_SLOT_SAMPLER)
+                {
+                    w[0] = 0;
+                    w[1] = 0xfff000u;
+                    w[2] = 0x5000000u;
+                    w[3] = 0;
+                }
+                else
+                {
+                    uint64_t address = BUFFER_BASE + ((it * 7 + i) % 4096) * 0x100;
+                    w[0] = (uint32_t)address;
+                    w[1] = (uint32_t)(address >> 32) & 0xffff;
+                    w[2] = 0x1000;
+                    w[3] = 0xfacu | (77u << 12);
+                }
+            }
+        }
+
+        QueryPerformanceCounter(&t0);
+        if (sa5_compile_compute(&req, &result, error, sizeof(error)))
+        {
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("FAIL memo: compile %d: %.600s\n", it, error);
+            return 1;
+        }
+        QueryPerformanceCounter(&t1);
+        sa5_result_identity(result, identity);
+        QueryPerformanceCounter(&t2);
+        /* d3d12_xs's binding pass: every binding's words, and a module key from their shape. */
+        key = identity[0] ^ identity[1];
+        count = sa5_result_binding_count(result);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            struct sa5_binding b;
+            sa5_result_binding(result, i, &b);
+            key = bench_hash(key, &b.binding, sizeof(b.binding));
+            key = bench_hash(key, &b.count, sizeof(b.count));
+            if (b.role != 0 || b.kind != 1)
+                key = bench_hash(key, &b.role, sizeof(b.role));
+        }
+        if (new_slots)
+            key = bench_hash(key, &it, sizeof(it));
+        QueryPerformanceCounter(&t3);
+        {
+            int known = 0;
+            for (int k = 0; k < key_count && !known; k++)
+                known = keys[k] == key;
+            if (!known)
+            {
+                /* A new module: guest buffers and host data become pushed pointers, every other
+                 * binding moves to a set of its own (d3d12_xs's bindless sets, without a heap). */
+                struct sa5_host_buffer hosts[8];
+                struct sa5_remap remaps[64];
+                static uint32_t indices[4096];
+                uint32_t host_count = 0, remap_count = 0, index_count = 0, *words = NULL, word_count = 0;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    struct sa5_binding b;
+                    sa5_result_binding(result, i, &b);
+                    if (b.role > 2 || (b.role == 0 && b.kind == 1))
+                    {
+                        if (host_count < 8)
+                        {
+                            hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count,
+                                    b.word_count ? b.word_count : 4, b.role == 0, 0, 0 };
+                            host_count++;
+                        }
+                    }
+                    else if (remap_count < 64 && index_count + b.count <= 4096)
+                    {
+                        for (uint32_t e = 0; e < b.count; e++)
+                            indices[index_count + e] = e + (new_slots ? it : 0);
+                        remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, 1 + b.kind, 0, b.count,
+                                &indices[index_count], 0 };
+                        index_count += b.count;
+                    }
+                }
+                if (sa5_finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error,
+                                 sizeof(error)))
+                {
+                    for (char *p = error; *p; p++)
+                        if (*p == '\n') *p = ' ';
+                    printf("     finalize failed: %.300s\n", error);
+                }
+                else
+                    sa5_free_words(words);
+                if (key_count < 64)
+                    keys[key_count++] = key;
+                finalized++;
+            }
+        }
+        QueryPerformanceCounter(&t4);
+        /* What the call gave (untimed): its module, bindings and push data, for comparing builds. */
+        {
+            uint32_t words = 0, push_size = 0;
+            const uint32_t *spirv = sa5_result_spirv(result, &words);
+            const void *push = sa5_result_push_constants(result, &push_size);
+            digest = bench_hash(digest, spirv, words * 4);
+            digest = bench_hash(digest, push, push_size);
+            for (uint32_t i = 0; i < count; i++)
+            {
+                struct sa5_binding b;
+                sa5_result_binding(result, i, &b);
+                digest = bench_hash(digest, &b, offsetof(struct sa5_binding, word_count) + sizeof(b.word_count));
+                digest = bench_hash(digest, b.words, b.word_count * 4);
+                digest = bench_hash(digest, &b.image_shape, sizeof(b.image_shape) + sizeof(b.role));
+            }
+        }
+        QueryPerformanceCounter(&t4b);
+        sa5_result_free(result);
+        QueryPerformanceCounter(&t5);
+        phase[0] = (t1.QuadPart - t0.QuadPart) * 1000.0 / frequency.QuadPart;
+        phase[1] = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
+        phase[2] = (t3.QuadPart - t2.QuadPart) * 1000.0 / frequency.QuadPart;
+        phase[3] = (t4.QuadPart - t3.QuadPart) * 1000.0 / frequency.QuadPart;
+        phase[4] = (t5.QuadPart - t4b.QuadPart) * 1000.0 / frequency.QuadPart;
+        for (int p = 0; p < 5; p++)
+        {
+            if (!it)
+                first[p] = phase[p];
+            else
+                rest[p] += phase[p] / (iterations > 1 ? iterations - 1 : 1);
+        }
+    }
+    printf("memo %s: first call %.3f ms (compile %.3f, identity %.3f, bindings %.3f, module %.3f, free %.3f)\n", name,
+           first[0] + first[1] + first[2] + first[3] + first[4], first[0], first[1], first[2], first[3], first[4]);
+    printf("memo %s: %d more calls, %.3f ms each (compile %.3f, identity %.3f, bindings %.3f, module %.3f, free %.3f); "
+           "%d modules\n", name, iterations - 1, rest[0] + rest[1] + rest[2] + rest[3] + rest[4], rest[0], rest[1],
+           rest[2], rest[3], rest[4], finalized);
+    printf("memo %s: results digest %016llx\n", name, (unsigned long long)digest);
+    free(data);
+    free(tables);
+    free(buffers);
+    free(images);
     return 0;
 }
 
@@ -597,6 +878,8 @@ int main(int argc, char **argv)
         return pixel_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
     if (argc > 3 && !strcmp(argv[1], "bench"))
         return bench(atoi(argv[2]), argv[3], argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 0);
+    if (argc > 3 && !strcmp(argv[1], "memo"))
+        return memo_bench(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 200);
     if (argc > 2 && !strcmp(argv[1], "vs"))
         return vertex_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
 

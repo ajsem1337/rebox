@@ -25,6 +25,9 @@ UINT64 WINAPI ReboxGpuBytesInUse(void);
  * (console_compile.c). Returns the count, at most max. */
 struct gpu_memory_region { UINT64 gpu; const void *cpu; SIZE_T size; };
 UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max);
+/* Changes whenever a chunk is made or freed (what gpu_memory_regions and
+ * gpu_memory_identity_extent see). */
+LONG gpu_memory_generation(void);
 /* The chunk heap holding a GPU address, and the address's offset in it (the heap gets a
  * reference); FALSE if the address isn't in GPU memory from ReboxGpuAlloc. */
 BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset);

@@ -264,6 +264,29 @@ minutes each; one with its clamp bits cleared runs as long without the patch), 1
 validate and finalize, 303 need the draw's descriptors, and 17 fail later (8 bindings at finalize, 8 Phi
 dominance, 1 sampler pairs).
 
+`memo PLAN NAME [ITERATIONS]` times the path every draw and dispatch takes once a shader is
+compiled: compute shader `NAME` of a compute plan (`NAME CODE SKIP RSRC1 RSRC2 X,Y,Z [WAVE]`),
+compiled again and again through AnyPS5's caches with its descriptor tables (laid out by
+`sa5_analyse`) at a new address and its buffers' V#s naming new memory each time, then its identity,
+its bindings and, once per module key, `sa5_finalize`, phase by phase as `d3d12_xs` times them.
+`SA5_BENCH_FIXED_TABLES=1` keeps the tables in place, `SA5_BENCH_COPIES=N` moves them through N
+places, `SA5_BENCH_IMAGES=N` cycles the textures through N sets and `SA5_BENCH_SLOTS=1` makes
+every call a new module. It prints a digest of each call's SPIR-V, bindings and push data, to
+compare builds. Under Wine, the target title's compute shaders take 10-200 us a call there, except
+its bindless ones, whose 65,536-key image tables are captured at every call (1-2.3 ms with patch
+0011, 2-7 ms before).
+
+**Per call in `d3d12_xs`.** Its compile timings (logged at powers of two of each kind's compiles)
+are kept apart for title threads, whose draw or dispatch waits, and background workers, whose first
+compiles of programs take seconds and once dominated the averages; waiting for the compiler lock
+is a phase of its own. The guest memory regions and the BDA page table are made again only when
+the shadow heaps or GPU memory chunks change (generation counters in `shadow.c` and
+`gpu_memory.c`), not at every call. A shader whose bindings can't be made for a reason its next
+call meets again (more descriptor elements or host buffers than `d3d12_xs` binds, a binding kind it
+doesn't handle, a module it can't fit) is skipped without asking AnyPS5, except at every 64th call;
+the target title's bindless compute shaders reach 24,000 table elements, and each of their
+dispatches captured them all before being refused.
+
 ## AnyPS5 patches
 
 Patch 0004's speculation of descriptors and table pointers it can't evaluate is on by default:

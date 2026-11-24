@@ -230,8 +230,17 @@ static void index_slot(struct shadow_heap *h, UINT index)
     }
 }
 
+/* Bumped under the lock after each change to the heap list or a heap's placement. */
+static volatile LONG regions_generation;
+
+LONG shadow_regions_generation(void)
+{
+    return regions_generation;
+}
+
 static void heap_free(struct shadow_heap *h)
 {
+    InterlockedIncrement(&regions_generation);
     for (UINT i = 0; i < h->count; i++)
         unindex(h, i);
     if (h->mirror)
@@ -334,6 +343,7 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
     }
     heap->next = heaps;
     heaps = heap;
+    InterlockedIncrement(&regions_generation);
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -456,6 +466,7 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
                     h->gpu_memory = TRUE;
                     h->gpu_va = (UINT64)(ULONG_PTR)memory;
                 }
+                InterlockedIncrement(&regions_generation);
                 if (InterlockedIncrement(&logged) <= 8)
                     rebox_log("d3d12_xs: the %u-descriptor heap's console descriptors are its memory at %p%s", count,
                               memory, !h->shader_visible ? "" : adopted ? " (GPU memory there)"
