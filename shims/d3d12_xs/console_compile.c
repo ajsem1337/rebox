@@ -1042,11 +1042,23 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
     if (in->user_sgprs)
         memcpy(job->user_sgprs, in->user_sgprs, job->in.user_sgpr_count * 4u);
     job->in.user_sgprs = job->user_sgprs;
+    /* REBOX_CONSOLE_COMPILE_THREADS workers (default half the CPUs, at most 8): a world brings
+     * a thousand new shaders at once, and one worker left its draws skipped for minutes. */
     if (InitOnceBeginInitialize(&started, 0, &pending, NULL) && pending)
     {
-        HANDLE t = CreateThread(NULL, 0, compile_worker, NULL, 0, NULL);
-        if (t)
-            CloseHandle(t);
+        SYSTEM_INFO si;
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("REBOX_CONSOLE_COMPILE_THREADS", v, sizeof(v));
+        UINT workers;
+        GetSystemInfo(&si);
+        workers = n && n < sizeof(v) && atoi(v) > 0 ? (UINT)atoi(v) : min(max(si.dwNumberOfProcessors / 2, 1u), 8u);
+        for (UINT w = 0; w < workers; w++)
+        {
+            HANDLE t = CreateThread(NULL, 0, compile_worker, NULL, 0, NULL);
+            if (t)
+                CloseHandle(t);
+        }
+        rebox_log("d3d12_xs: console shaders compile in the background on %u threads", workers);
         InitOnceComplete(&started, 0, NULL);
     }
     InterlockedIncrement(&jobs_queued);
@@ -1176,6 +1188,14 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         return compile_now(in, out, FALSE);
     }
 }
+
+/* A background compile lets go of compile_lock while AnyPS5 runs (its caches have their own locks),
+ * so several workers compile at once and a draw's compile isn't skipped for one that holds the lock.
+ * What the request points at is the caller's or per-thread; the rest of compile_now holds the lock. */
+#define unlocked_compile(background, call) \
+    ((background) ? (ReleaseSRWLockExclusive(&compile_lock), compile_result = (call), \
+                     AcquireSRWLockExclusive(&compile_lock), compile_result) : (call))
+static __thread int compile_result;
 
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
 {
@@ -1497,7 +1517,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         mreq.regions = regions;
         mreq.region_count = n;
         mreq.use_cache = 1;
-        if (sa5.compile_mesh(&mreq, &result, error, sizeof(error)))
+        if (unlocked_compile(background, sa5.compile_mesh(&mreq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (mesh)", error);
             {
@@ -1568,7 +1588,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
          * vertex colour it passes through is what blackens a draw. */
         /* REBOX_DEBUG_VS_UV=<stage id>,...: the same with param1 made (0.5, 0.5, 0.5, 0.5) (texture
          * coordinates at the centre). */
-        static UINT32 whitened[4096];
+        static __thread UINT32 whitened[4096];
         const char *white = getenv("REBOX_DEBUG_VS_WHITE"), *uv = getenv("REBOX_DEBUG_VS_UV");
         char stage_text[24];
         snprintf(stage_text, sizeof(stage_text), "%016llx", (unsigned long long)stage_id);
@@ -1614,7 +1634,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         vreq.regions = regions;
         vreq.region_count = n;
         vreq.use_cache = 1;
-        if (sa5.compile_vertex(&vreq, &result, error, sizeof(error)))
+        if (unlocked_compile(background, sa5.compile_vertex(&vreq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (vertex)", error);
             {
@@ -1638,7 +1658,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         };
         /* attr<N>:<stage id>,...: those pixel stages export their interpolant N's xyz instead (a
          * vertex colour, texture coordinates), alpha 1. */
-        static UINT32 attr0[] = {
+        static __thread UINT32 attr0[] = {
             0xbefc0309,                         /* s_mov_b32 m0, s9 (the primitive mask; set below) */
             0xc8080000, 0xc8090001,             /* v_interp_p1/p2_f32 v2, attr0.x */
             0xc80c0100, 0xc80d0101,             /* v3, attr0.y */
@@ -1651,7 +1671,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         /* texture<hex>:<stage id>,...: those pixel stages export, as grey, the first channel of the
          * texture whose T# is at that offset of their s8 table, sampled (level 0) at interpolant
          * 1's xy: whether a texture they read holds anything. */
-        static UINT32 texture[] = {
+        static __thread UINT32 texture[] = {
             0xbefc0309, 0xbe890380,             /* s_mov_b32 m0, s9; s_mov_b32 s9, 0 */
             0xf40c0504, 0xfa000040,             /* s_load_dwordx8 s[20:27], s[8:9], <offset> */
             0xc8080400, 0xc8090401,             /* v_interp_p1/p2_f32 v2, attr1.x */
@@ -1723,7 +1743,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         }
         /* REBOX_DEBUG_PS_LZ=<stage id>,...: those pixel stages' own code with every image_sample made
          * image_sample_lz (level 0, no derivatives): whether implicit-LOD sampling is what fails. */
-        static UINT32 lz_code[4096];
+        static __thread UINT32 lz_code[4096];
         /* REBOX_DEBUG_PS_NOWQM=<stage id>,...: the same with the whole-quad-mode prologue (s_mov_b64
          * s[N:N+1], exec; s_wqm_b64 exec, exec; s_and_b64 exec, exec, s[N:N+1]) made s_nop: whether
          * the exec mask it leaves is what keeps the stage from writing. */
@@ -1763,7 +1783,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
          * to the offset (an instruction boundary), then a wait for its loads and an export of VGPRs
          * r, g, b (alpha 1): what the code has computed by then, cut down run by run to find an
          * instruction translated wrongly. */
-        static UINT32 cut_code[4096];
+        static __thread UINT32 cut_code[4096];
         const char *cut = getenv("REBOX_DEBUG_PS_CUT");
         UINT cut_dwords = 0;
         if (!solid && cut && !strncmp(cut, lz_id, 16) && cut[16] == ':')
@@ -1820,7 +1840,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         preq.regions = regions;
         preq.region_count = n;
         preq.use_cache = 1;
-        if (sa5.compile_pixel(&preq, &result, error, sizeof(error)))
+        if (unlocked_compile(background, sa5.compile_pixel(&preq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (pixel)", error);
             {
@@ -1831,7 +1851,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             goto done;
         }
     }
-    else if (sa5.compile(&req, &result, error, sizeof(error)))
+    else if (unlocked_compile(background, sa5.compile(&req, &result, error, sizeof(error))))
     {
         log_failure(h, "AnyPS5 failed", error);
         goto done;

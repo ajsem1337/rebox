@@ -153,6 +153,7 @@ method the title asked for that isn't implemented.
 | `REBOX_CONSOLE_COMPUTE=0` | Don't defer console compute shaders to AnyPS5: they're looked up in the shader cache, then get fallback shaders ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_CONSOLE_COMPUTE_BISECT=VALUE/BITS` | Run only the console compute programs whose code address hashes to VALUE in its low BITS bits (the rest are skipped), logging each one run: halve the set run by run to find a program that faults the GPU |
 | `REBOX_CONSOLE_ASYNC=0` | Compile console shaders in the title's thread at their first dispatch or draw. By default a program's first compile runs on a worker thread while that dispatch is skipped or the draw uses its fallback: large shaders take hundreds of milliseconds each, and a title's game thread can give up waiting for its render thread |
+| `REBOX_CONSOLE_COMPILE_THREADS=N` | Background workers compiling console shaders (default half the CPUs, at most 8); AnyPS5 runs outside the compile lock, so they compile at once |
 | `REBOX_ANYPS5_SPECULATE=0` | Turns off AnyPS5's speculation of descriptors and table pointers it can't evaluate (patches/anyps5/0004; on by default, [docs/anyps5.md](docs/anyps5.md)) |
 | `ANYPS5_SHADER_CACHE_DIR`, `ANYPS5_NO_SHADER_CACHE` | Where AnyPS5 keeps compiled shaders on disk (default `%LOCALAPPDATA%\rebox\anyps5-cache`), or not at all |
 | `REBOX_DUMP_SPIRV=DIR` | Writes each console shader's finalized SPIR-V to DIR |
