@@ -63,7 +63,8 @@ struct embedded
     struct embedded *next;
 };
 
-struct cpu_write { UINT64 address; UINT32 values[2]; UINT count; };
+/* A write of count dwords, or (size set) a copy of size bytes from source. */
+struct cpu_write { UINT64 address; UINT32 values[2]; UINT count; UINT64 source, size; };
 struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; };
 
 struct proxy
@@ -3973,6 +3974,11 @@ static void list_write_values(struct proxy *p, UINT64 address, const UINT32 *val
     }
 }
 
+static UINT64 write_span(const struct cpu_write *w)
+{
+    return w->size ? w->size : 4ull * w->count;
+}
+
 static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64 value, UINT64 mask, UINT width)
 {
     if (!address || comparison == D3D12_COMPARISON_FUNC_ALWAYS)
@@ -3980,7 +3986,7 @@ static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64
     /* A write earlier in this list satisfies it once the GPU is there; waiting before the
      * submission would wait for ever. */
     for (UINT i = 0; i < p->cpu_write_count; i++)
-        if (p->cpu_writes[i].address <= address && address < p->cpu_writes[i].address + 4 * p->cpu_writes[i].count)
+        if (p->cpu_writes[i].address <= address && address < p->cpu_writes[i].address + write_span(&p->cpu_writes[i]))
             return;
     for (UINT i = 0; i < p->gpu_write_count; i++)
         if (p->gpu_writes[i].address <= address && address < p->gpu_writes[i].address + 4 * p->gpu_writes[i].count)
@@ -4100,7 +4106,13 @@ static DWORD WINAPI cpu_write_worker(void *arg)
         for (UINT i = 0; i < job->count; i++)
         {
             const struct cpu_write *w = &job->writes[i];
-            if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, 4 * w->count))
+            if (w->size)
+            {
+                if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, (UINT_PTR)w->size)
+                        && !IsBadReadPtr((const void *)(ULONG_PTR)w->source, (UINT_PTR)w->size))
+                    memmove((void *)(ULONG_PTR)w->address, (const void *)(ULONG_PTR)w->source, (size_t)w->size);
+            }
+            else if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, 4 * w->count))
             {
                 volatile UINT32 *to = (volatile UINT32 *)(ULONG_PTR)w->address;
                 for (UINT k = 0; k < w->count; k++)
@@ -4190,6 +4202,39 @@ static void STDMETHODCALLTYPE list_Write64BitValueTopOfPipeX(struct proxy *p, UI
 {
     UINT32 v[2] = { (UINT32)value, (UINT32)(value >> 32) };
     list_write_values(p, address, v, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write64BitValueTopOfPipeX");
+}
+
+/* CopyMemoryToMemoryX(destination, source, size, flags), slot 62 (60 on the older layout): GPU
+ * addresses, which are title memory here. Copied by the CPU once the GPU has run the list's work,
+ * as the list's other writes outside GPU memory (the method's shape: VIctory, GPL-3.0, facts). */
+static void STDMETHODCALLTYPE list_CopyMemoryToMemoryX(struct proxy *p, UINT64 destination, UINT64 source,
+        UINT64 size, UINT flags)
+{
+    static LONG logged;
+
+    if (!destination || !source || !size)
+        return;
+    if (after_timed_out_wait(destination, (UINT)min(size, 0xffffffffull)) && InterlockedIncrement(&logged) <= 32)
+        rebox_log("d3d12_xs: CopyMemoryToMemoryX %#llx <- %#llx (%llu bytes) recorded in list %p, where a wait "
+                  "timed out", (unsigned long long)destination, (unsigned long long)source,
+                  (unsigned long long)size, p);
+    if (p->cpu_write_count == p->cpu_write_capacity)
+    {
+        UINT capacity = p->cpu_write_capacity ? p->cpu_write_capacity * 2 : 16;
+        struct cpu_write *grown = realloc(p->cpu_writes, capacity * sizeof(*grown));
+        if (!grown)
+            return;
+        p->cpu_writes = grown;
+        p->cpu_write_capacity = capacity;
+    }
+    p->cpu_writes[p->cpu_write_count++] = (struct cpu_write){ destination, { 0, 0 }, 0, source, size };
+}
+
+/* Pipeline syncs at the top and bottom of the pipe (flags, control, address, size): vkd3d-proton
+ * orders a list's work itself (VIctory, GPL-3.0, facts). */
+static void STDMETHODCALLTYPE list_PipelineSyncX(struct proxy *p, UINT flags, UINT control, UINT64 address,
+        UINT64 size)
+{
 }
 
 
@@ -4730,6 +4775,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(88, list_Write32BitValueTopOfPipeX),
         FN(89, list_Write64BitValueTopOfPipeX),
         FN(90, list_Write32BitValueBottomOfPipeX),    /* Write32BitValueBottomOfShaderX */
+        FN(60, list_CopyMemoryToMemoryX),
+        FWD(78, 14),                                  /* DispatchX: Dispatch plus flags */
+        FN(129, list_PipelineSyncX), FN(130, list_PipelineSyncX),
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
         FN(41, list_SetComputeRootConstantBufferView), FN(42, list_SetGraphicsRootConstantBufferView), /* PC 37-42 */
@@ -4769,6 +4817,10 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(90, list_Write32BitValueTopOfPipeX),
         FN(91, list_Write64BitValueTopOfPipeX),
         FN(92, list_Write32BitValueBottomOfPipeX),
+        FN(62, list_CopyMemoryToMemoryX),             /* the older 60, 78, 84 and 129-130, two later */
+        FWD(80, 14),                                  /* DispatchX: Dispatch plus flags */
+        FN(86, list_CopyResourceX),
+        FN(131, list_PipelineSyncX), FN(132, list_PipelineSyncX),
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
         FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
