@@ -257,6 +257,17 @@ static BOOL still_readable(struct title_texture *t)
     return FALSE;
 }
 
+/* Rewritten by the CPU since it was made, or likely to be: uploaded twice, or once if it has one
+ * mip and an uncompressed format. A video's planes (a Bink decoder's R8 luma and chroma, rewritten
+ * every frame and never reported) look like that; the round robin over a world's tens of thousands
+ * of textures came back to them so rarely that a cutscene showed its first, empty frame. */
+static BOOL hot(const struct title_texture *t)
+{
+    UINT block = 0;
+    return t->uploads >= 2
+            || (t->uploads == 1 && t->surface.mips == 1 && detile_element(t->surface.format, &block) && block == 1);
+}
+
 /* Called with the lock held. */
 static void watch(void)
 {
@@ -289,7 +300,7 @@ static void watch(void)
      * overwrote what the GPU drew into them (menu text got worse). */
     hashed = 0;
     for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (t->uploads >= 2 && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
+        if (hot(t) && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
                 && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, fingerprint(t) != t->fingerprint))
         {
             t->dirty = TRUE;
