@@ -179,7 +179,7 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
  * graphics stage's heap slots are in its draw block, which the GPU reads: such a texture's slot
  * is written at submission instead (console_resolve_late), from the descriptor at its address
  * then. Until resolved, it holds the dummy texture. */
-struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; };
+struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
 static struct late_texture late[4096];
 static UINT late_count;
 static SRWLOCK late_lock = SRWLOCK_INIT;
@@ -209,9 +209,10 @@ void console_resolve_late(void)
                 if (shadow_slot_view(t->heap, index) == SHADOW_VIEW_UAV_TEXTURE)
                     shadow_reserve_srv_for_uav(t->heap, index, &index);
                 {
-                    static LONG shown;
+                    static LONG shown, watched_shown;
                     ID3D12Resource *r = console_texture_of(w);
-                    if (InterlockedIncrement(&shown) <= 8)
+                    if ((console_stage_watched(t->stage) && InterlockedIncrement(&watched_shown) <= 32)
+                            || InterlockedIncrement(&shown) <= 8)
                     {
                         D3D12_RESOURCE_DESC rd = { 0 };
                         UINT64 at = 0;
@@ -233,7 +234,7 @@ void console_resolve_late(void)
         if (!done)
         {
             static LONG unresolved;
-            if (t->tries == 0 && InterlockedIncrement(&unresolved) <= 4)
+            if (t->tries == 0 && (console_stage_watched(t->stage) || InterlockedIncrement(&unresolved) <= 4))
                 rebox_log("d3d12_xs: late T# at %#llx: %08x %08x %08x %08x %08x %08x %08x %08x, no view for it yet",
                           (unsigned long long)t->source, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         }
@@ -1799,7 +1800,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 {
                     UINT64 source = late_source(h, in, zero_textures++);
                     static LONG noted;
-                    if (InterlockedIncrement(&noted) <= 4)
+                    if (console_stage_watched(stage_id) || InterlockedIncrement(&noted) <= 4)
                         rebox_log("d3d12_xs: console shader %016llx: empty T# (%08x %08x %08x %08x), noted at %#llx",
                                   (unsigned long long)stage_id, w[4], w[5], w[6], w[7], (unsigned long long)source);
                     if (source)
@@ -2047,7 +2048,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             for (UINT i = 0; i < pending_count && late_count < ARRAYSIZE(late); i++)
                 late[late_count++] = (struct late_texture){
                         (UINT32 *)(block_cpu + (2 * SA5_DRAW_ADDRESSES + pending[i].position) * sizeof(UINT32)),
-                        pending[i].source, pending[i].heap, 0 };
+                        pending[i].source, pending[i].heap, 0, stage_id };
             ReleaseSRWLockExclusive(&late_lock);
         }
     }
