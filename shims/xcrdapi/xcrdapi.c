@@ -115,6 +115,30 @@ static struct
 
 static const char *const stat_names[ST_KINDS] = { "requests", "status entries", "fence signals", "events" };
 
+/* Failed requests by result and options, for the stats line. */
+static struct { volatile LONG hr; volatile LONG64 options; volatile LONG64 count; } failures[8];
+
+static void count_failure(HRESULT hr, UINT64 options)
+{
+    for (int i = 0; i < (int)(sizeof(failures) / sizeof(*failures)); i++)
+    {
+        if (!failures[i].count && InterlockedCompareExchange64(&failures[i].count, -1, 0) == 0)
+        {
+            failures[i].hr = hr;
+            failures[i].options = (LONG64)options;
+            InterlockedExchange64(&failures[i].count, 1);
+            return;
+        }
+        while (failures[i].count < 0)
+            YieldProcessor();
+        if (failures[i].hr == hr && failures[i].options == (LONG64)options)
+        {
+            InterlockedIncrement64(&failures[i].count);
+            return;
+        }
+    }
+}
+
 static DWORD WINAPI stats_thread(void *param)
 {
     DWORD seconds = (DWORD)(ULONG_PTR)param;
@@ -143,6 +167,15 @@ static DWORD WINAPI stats_thread(void *param)
                      (long long)(stats.enqueued[0] + stats.enqueued[1] + stats.enqueued[2] + stats.enqueued[3]
                                  - stats.submitted),
                      (long long)stats.polls, (long long)stats.polls_pending);
+        if (stats.failed)
+        {
+            at = 0;
+            for (int i = 0; i < (int)(sizeof(failures) / sizeof(*failures)) && failures[i].count > 0; i++)
+                at += snprintf(line + at, sizeof(line) - at, "%s%#lx/options %#llx: %lld", i ? ", " : "",
+                               failures[i].hr, (unsigned long long)failures[i].options,
+                               (long long)failures[i].count);
+            rebox_log("xcrdapi: failed by result and options: %s", line);
+        }
     }
     return 0;
 }
@@ -670,7 +703,10 @@ static DWORD WINAPI queue_worker(void *param)
         {
             HRESULT hr = run_request(q, &e);
             if (FAILED(hr))
+            {
                 InterlockedIncrement64(&stats.failed);
+                count_failure(hr, e.request.options);
+            }
             if (SUCCEEDED(hr) && !(e.request.options & OPT_DEST_PHYSICAL)) /* pages: xmem reports */
                 report_written(e.request.destination, e.request.destination_size);
             if (FAILED(hr))
