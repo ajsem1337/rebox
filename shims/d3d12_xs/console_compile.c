@@ -981,10 +981,46 @@ static void program_set(UINT64 key, enum program_state state)
     ReleaseSRWLockExclusive(&programs_lock);
 }
 
+/* Variants of a program compiled before: by the program and the draw's user SGPRs. A new one
+ * compiled in the title's thread took AnyPS5 up to seconds (a translation, or a large one from the
+ * disk cache), and a scene bringing in hundreds stalled its frames until the title's GPU watchdog
+ * fired. A new variant goes to a worker, ahead of the queue, and the caller waits a few
+ * milliseconds for it (a variant already in AnyPS5's memory is that quick); if it isn't done the
+ * draw is skipped this time. Overwritten on collision: the worst is compiling one again. */
+#define VARIANTS 65536
+static struct { UINT64 key; LONG state; } variants[VARIANTS];
+
+static enum program_state variant_state(UINT64 key, BOOL claim)
+{
+    UINT slot = (UINT)(key % VARIANTS);
+    enum program_state state = PROGRAM_COLD;
+
+    AcquireSRWLockExclusive(&programs_lock);
+    if (variants[slot].key == key && variants[slot].state != PROGRAM_COLD)
+        state = variants[slot].state;
+    else if (claim)
+    {
+        variants[slot].key = key;
+        variants[slot].state = PROGRAM_PENDING;
+    }
+    ReleaseSRWLockExclusive(&programs_lock);
+    return state;
+}
+
+static void variant_set(UINT64 key, enum program_state state)
+{
+    UINT slot = (UINT)(key % VARIANTS);
+    AcquireSRWLockExclusive(&programs_lock);
+    if (variants[slot].key == key)
+        variants[slot].state = state;
+    ReleaseSRWLockExclusive(&programs_lock);
+}
+
 struct compile_job
 {
     struct compile_job *next;
     UINT64 key;
+    BOOL variant; /* a variant of a program compiled before: variant_set, and ahead of the queue */
     struct rebox_compile_in in;
     UINT32 user_sgprs[64];
     BYTE shader[];
@@ -1015,7 +1051,10 @@ static DWORD WINAPI compile_worker(void *unused)
 
         memset(&out, 0, sizeof(out));
         hr = compile_now(&job->in, &out, TRUE);
-        program_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        if (job->variant)
+            variant_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        else
+            program_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
         done = InterlockedIncrement(&jobs_done);
         if (!(done & (done - 1)))
             rebox_log("d3d12_xs: console shaders: %ld background compiles done of %ld queued", done, jobs_queued);
@@ -1024,7 +1063,7 @@ static DWORD WINAPI compile_worker(void *unused)
     return 0;
 }
 
-static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
+static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL variant)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     BOOL pending;
@@ -1032,11 +1071,15 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
 
     if (!job)
     {
-        program_set(key, PROGRAM_COLD);
+        if (variant)
+            variant_set(key, PROGRAM_COLD);
+        else
+            program_set(key, PROGRAM_COLD);
         return;
     }
     memset(job, 0, sizeof(*job));
     job->key = key;
+    job->variant = variant;
     job->in = *in;
     memcpy(job->shader, in->shader, in->shader_size);
     job->in.shader = job->shader;
@@ -1065,11 +1108,21 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
     }
     InterlockedIncrement(&jobs_queued);
     AcquireSRWLockExclusive(&jobs_lock);
-    if (jobs_tail)
-        jobs_tail->next = job;
-    else
+    if (variant)
+    {
+        /* Ahead of the programs: a draw is waiting for it. */
+        if (!(job->next = jobs_head))
+            jobs_tail = job;
         jobs_head = job;
-    jobs_tail = job;
+    }
+    else
+    {
+        if (jobs_tail)
+            jobs_tail->next = job;
+        else
+            jobs_head = job;
+        jobs_tail = job;
+    }
     ReleaseSRWLockExclusive(&jobs_lock);
     WakeConditionVariable(&jobs_ready);
 }
@@ -1152,6 +1205,42 @@ UINT64 console_last_draw_vs(void)
     return current_draw.vs;
 }
 
+/* A compiled program's variant for this draw (see variants): compiled here once a worker has. */
+static HRESULT compile_variant(UINT64 program, const struct rebox_compile_in *in, struct rebox_compile_out *out)
+{
+    static LONG skipped;
+    UINT64 key = hash_bytes(program ^ 0x5641524955u, in->user_sgprs,
+                            in->user_sgprs ? min(in->user_sgpr_count, 64u) * 4u : 0);
+    enum program_state state = variant_state(key, TRUE);
+    LARGE_INTEGER now, until, frequency;
+
+    if (state == PROGRAM_WARM)
+        return compile_now(in, out, FALSE);
+    if (state == PROGRAM_FAILED)
+    {
+        set_last(E_FAIL, "its background compile failed", NULL);
+        return E_FAIL;
+    }
+    if (state == PROGRAM_COLD) /* claimed */
+    {
+        queue_compile(key, in, TRUE);
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&until);
+        until.QuadPart += frequency.QuadPart / 250; /* 4 ms */
+        do
+        {
+            SwitchToThread();
+            if ((state = variant_state(key, FALSE)) == PROGRAM_WARM)
+                return compile_now(in, out, FALSE);
+            QueryPerformanceCounter(&now);
+        } while (state == PROGRAM_PENDING && now.QuadPart < until.QuadPart);
+    }
+    if (!(InterlockedIncrement(&skipped) & 1023))
+        rebox_log("d3d12_xs: console shaders: %ld draws or dispatches skipped while a new variant compiled", skipped);
+    set_last(E_PENDING, "a new variant is compiling in the background", NULL);
+    return E_PENDING;
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     UINT64 key;
@@ -1177,7 +1266,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     switch (program_claim(key, TRUE))
     {
     case PROGRAM_COLD: /* claimed: compile it in the background */
-        queue_compile(key, in);
+        queue_compile(key, in, FALSE);
         set_last(E_PENDING, "compiling in the background", NULL);
         return E_PENDING;
     case PROGRAM_PENDING:
@@ -1187,7 +1276,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         set_last(E_FAIL, "its background compile failed", NULL);
         return E_FAIL;
     default:
-        return compile_now(in, out, FALSE);
+        return compile_variant(key, in, out);
     }
 }
 
