@@ -634,10 +634,26 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* Whether [va, va + size) can go in the BDA page table as identity-mapped memory: a title address
+ * (4 GiB to 2^46, outside the GPU window, as proxy.c's ia_adopt) only if it is GPU memory or can be
+ * made so; anything else is vkd3d-proton's own. A constant buffer in title memory that isn't GPU
+ * memory (pages of a render-target pool) was mapped anyway, and shaders reading through the table
+ * faulted the GPU. */
+static BOOL buffer_range_mappable(UINT64 va, UINT64 size)
+{
+    UINT64 end;
+    if (va < 0x100000000ull || va + size > 0x400000000000ull
+            || (va + size > 0x200000000000ull && va < 0x210000000000ull))
+        return TRUE;
+    if (gpu_memory_identity_extent(va, &end) && end >= va + size)
+        return TRUE;
+    return gpu_memory_adopt(va, size);
+}
+
 void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
 {
     UINT32 w[8];
-    if (desc)
+    if (desc && desc->BufferLocation && buffer_range_mappable(desc->BufferLocation, desc->SizeInBytes))
         note_buffer_range(desc->BufferLocation, desc->SizeInBytes);
     console_encode_cbv(desc, w);
     write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE);
