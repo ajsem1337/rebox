@@ -482,6 +482,21 @@ static void test_xmem(void)
                     }
                     CHECK(shared, "unmapping the middle of four pages mapped together keeps the outer two");
                 }
+                /* A page mapped as a copy (ordinary memory) and as a view at once: what is written
+                 * through the view survives unmapping the copy, which gives back only its own writes. */
+                if (r3)
+                {
+                    BYTE *plain = VirtualAlloc(NULL, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
+                    BOOL kept = plain && pmap(r3, 4, NULL) && pmap(plain, 1, pages + 8) && pmap(r3, 1, pages + 8);
+                    if (kept)
+                    {
+                        r3[100] = 0x77;   /* through the view */
+                        plain[200] = 0x88; /* through the copy */
+                        kept = pmap(plain, 1, NULL) && r3[100] == 0x77 && r3[200] == 0x88;
+                    }
+                    CHECK(kept, "unmapping a copy of a physical page keeps what was written through its view");
+                    if (plain) VirtualFree(plain, 0, MEM_RELEASE);
+                }
                 CHECK(r3 && pmap(r3, 4, NULL) && vfree && vfree(r3, 0, MEM_RELEASE),
                       "a range reserved for physical pages unmaps and releases");
             }

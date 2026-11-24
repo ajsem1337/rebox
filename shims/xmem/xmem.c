@@ -754,7 +754,7 @@ static ULONG_PTR unit_count, unit_capacity;
 /* Address -> the page mapped there: open addressing on 64 KiB-aligned addresses. A page mapped as
  * part of a run shares that run's view (view, view_bytes); a copy is its own. */
 #define MAPPED_SLOTS (1u << 20)
-static struct { ULONG_PTR address, unit, view; SIZE_T view_bytes; BOOL copy; } *mapped_at;
+static struct { ULONG_PTR address, unit, view; SIZE_T view_bytes; BOOL copy; BYTE *snapshot; } *mapped_at;
 
 static SIZE_T mapped_slot(ULONG_PTR address, BOOL insert)
 {
@@ -941,6 +941,10 @@ static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view
     mapped_at[slot].view = view;
     mapped_at[slot].view_bytes = view_bytes;
     mapped_at[slot].copy = copy;
+    /* A copy keeps what it was given, so unmapping it writes back only what changed through it. */
+    mapped_at[slot].snapshot = NULL;
+    if (copy && units[u].section && (mapped_at[slot].snapshot = malloc((SIZE_T)units[u].size_units * PAGE_UNIT)))
+        memcpy(mapped_at[slot].snapshot, unit_home(u), (SIZE_T)units[u].size_units * PAGE_UNIT);
 }
 
 static void clear_slot(SIZE_T slot)
@@ -950,6 +954,8 @@ static void clear_slot(SIZE_T slot)
         units[u].mapped = 0;
     if (units[u].copy_at == mapped_at[slot].address)
         units[u].copy_at = 0;
+    free(mapped_at[slot].snapshot);
+    mapped_at[slot].snapshot = NULL;
     mapped_at[slot].address = 1; /* a tombstone */
 }
 
@@ -1048,8 +1054,26 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
         if (mapped_at[slot].copy)
         {
             SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
-            if (units[u].section && !IsBadReadPtr((void *)at, size))
-                memcpy(unit_home(u), (void *)at, size);
+            const UINT64 *snapshot = (const UINT64 *)mapped_at[slot].snapshot;
+            /* Only what changed through the copy goes back: the page may have been written
+             * elsewhere since it was copied (DirectStorage, another mapping), and a whole copy
+             * written back wiped a loaded asset with the zeros it was copied with. */
+            if (units[u].section && snapshot && !IsBadReadPtr((void *)at, size))
+            {
+                const UINT64 *copy = (const UINT64 *)at;
+                UINT64 *home = (UINT64 *)unit_home(u), changed = 0;
+                for (SIZE_T q = 0; q < size / 8; q++)
+                    if (copy[q] != snapshot[q])
+                        home[q] = copy[q], changed++;
+                if (changed)
+                {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 16)
+                        rebox_log("xmem: a copy of physical page %#llx at %#llx unmapped: %llu qwords written through "
+                                  "it go back", (unsigned long long)((u + 1) << 4), (unsigned long long)at,
+                                  (unsigned long long)changed);
+                }
+            }
             if (!in_adopted(at))
                 VirtualFree((void *)at, size, MEM_DECOMMIT);
             clear_slot(slot);
@@ -1229,6 +1253,9 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
         mapped_at[slot].view = at;
         mapped_at[slot].view_bytes = (SIZE_T)units[u].size_units * PAGE_UNIT;
         units[u].copy_at = at;
+        if (!mapped_at[slot].snapshot && units[u].section
+                && (mapped_at[slot].snapshot = malloc((SIZE_T)units[u].size_units * PAGE_UNIT)))
+            memcpy(mapped_at[slot].snapshot, unit_home(u), (SIZE_T)units[u].size_units * PAGE_UNIT);
         if (units[u].mapped == at)
             units[u].copy = TRUE;
         converted++;
@@ -1437,7 +1464,12 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
                       (unsigned long long)units[u].mapped, GetCurrentThreadId());
         memcpy(unit_home(u) + offset, from, n);
         if (units[u].copy_at)
+        {
+            SIZE_T slot = slot_at(units[u].copy_at);
             memcpy((BYTE *)units[u].copy_at + offset, from, n);
+            if (slot != (SIZE_T)-1 && mapped_at[slot].snapshot) /* not a write through the copy */
+                memcpy(mapped_at[slot].snapshot + offset, from, n);
+        }
         if (units[u].mapped && written)
             written((UINT64)(units[u].mapped + offset), n);
         if (units[u].copy_at && units[u].copy_at != units[u].mapped && written)
