@@ -1053,11 +1053,15 @@ static void fence_refresh(void)
     ReleaseSRWLockShared(&fence_cells_lock);
 }
 
+/* Keeps the completed values in memory: each fence's value read about every millisecond (and at
+ * once when fence_event is set). Not SetEventOnCompletion from the title's Signal: inside
+ * vkd3d-proton that call waited, and the title's render thread with it, for seconds a frame once
+ * the target title reached its world. */
 static DWORD WINAPI fence_thread(void *arg)
 {
     for (;;)
     {
-        WaitForSingleObject(fence_event, INFINITE);
+        WaitForSingleObject(fence_event, 1);
         fence_refresh();
     }
     return 0;
@@ -1085,15 +1089,12 @@ static void fence_note_signal(void *fence, UINT64 value)
     while ((old = f->fence_signalled) < (LONG64)value
             && InterlockedCompareExchange64(&f->fence_signalled, value, old) != old)
         ;
-    if (f->fence_cell)
-        ID3D12Fence_SetEventOnCompletion(INNER(f, ID3D12Fence), value, fence_event);
 }
 
 static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     struct fence_cell *cell;
-    BOOL armed = FALSE;
 
     InitOnceExecuteOnce(&once, fence_thread_init, NULL, NULL);
     AcquireSRWLockExclusive(&fence_cells_lock);
@@ -1104,7 +1105,6 @@ static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
         InterlockedIncrement(&p->refs);
         fence_cells[fence_cell_count++] = p;
         p->fence_cell = cell;
-        armed = TRUE;
         if (fence_cell_count == 1)
             rebox_log("d3d12_xs: fence slot 12: completed values in memory, kept by a thread");
         if (fence_cell_count <= 32)
@@ -1118,8 +1118,6 @@ static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
         overflow.value = ID3D12Fence_GetCompletedValue(INNER(p, ID3D12Fence));
         return (UINT64 *)&overflow.value;
     }
-    if (armed && p->fence_signalled && fence_event)
-        ID3D12Fence_SetEventOnCompletion(INNER(p, ID3D12Fence), p->fence_signalled, fence_event);
     fence_refresh();
     return (UINT64 *)&cell->value;
 }
