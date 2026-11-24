@@ -98,6 +98,8 @@ struct proxy
     ID3D12Fence *timing_fence;     /* queues: signalled after every submission (gpu_latency_note) */
     struct proxy *signal_queue;    /* fences: the queue that last signalled it */
     UINT64 timing_value;
+    ID3D12Fence *arrival_fence;    /* queues: signalled just before each GPU memory wait (gpu_wait_for_value) */
+    UINT64 arrival_value;
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
 };
@@ -3464,12 +3466,66 @@ static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12Com
 }
 
 /* GPU waits whose value may come another way: written by the title's CPU or a shader, not a list's
- * Write*BitValue. A thread watches the memory of each pending one and signals its fence from the CPU
- * once the value is there, or after 2 s (as a CPU-side wait gave up), so no queue waits for ever. */
-struct pending_value_wait { struct memory_wait wait; struct value_fence *fence; UINT64 target; LONGLONG since; void *queue; };
-static struct pending_value_wait pending_value_waits[256];
+ * Write*BitValue, or never (a cycle). A thread watches each pending one and signals its fence from
+ * the CPU once the value is in memory, or once the queue has stood at the wait for the timeout, so
+ * no queue waits for ever.
+ *
+ * The timeout runs from when the queue gets to the wait (it signals its arrival fence just before
+ * the wait), not from the submission: a queue some seconds behind had each wait it was yet to reach
+ * time out and its value signalled before the writer ran, at every frame, once the title's world
+ * was slow (runs 0419 and 0421: a writer submitted before the wait, with the right value, still
+ * "timed out" behind its own queue's work). At a present, a wait the queue stands at whose value no
+ * queue has been told to signal is released too (REBOX_MEMORY_WAIT_FORCE=0 turns that off): what
+ * a console runtime holding lists does at a present. */
+struct pending_value_wait
+{
+    struct memory_wait wait;
+    struct value_fence *fence;
+    UINT64 target;
+    LONGLONG since;          /* submitted */
+    LONGLONG arrived;        /* the queue got to it (0: not yet) */
+    LONG present_at_arrival; /* value_wait_presents when it arrived */
+    void *queue;
+    ID3D12Fence *arrival;    /* the queue's arrival fence and the value signalled just before the wait */
+    UINT64 arrival_value;
+};
+static struct pending_value_wait pending_value_waits[1024];
 static UINT pending_value_wait_count;
 static BOOL wait_satisfied(const struct memory_wait *w);
+static volatile LONG value_wait_presents; /* presents so far (queue_PresentX) */
+static volatile UINT64 timed_out_waits[16];
+
+/* Counts for the summary every 10 s (under value_fence_lock). */
+static struct
+{
+    UINT made, by_writer, in_memory, timed_out, forced, after_loss;
+    LONGLONG behind, behind_max, standing, standing_max; /* submission to arrival; arrival to met */
+} value_wait_stats;
+
+static LONGLONG value_wait_timeout(LONGLONG freq)
+{
+    static LONG ms = -1;
+    if (ms < 0)
+    {
+        const char *v = getenv("REBOX_MEMORY_WAIT_TIMEOUT_MS");
+        LONG n = v && *v ? atol(v) : 2000;
+        ms = n > 0 ? n : 2000;
+        if (v && *v)
+            rebox_log("d3d12_xs: GPU memory waits time out %ld ms after their queue gets to them", ms);
+    }
+    return freq * ms / 1000;
+}
+
+static BOOL value_wait_force(void)
+{
+    static int force = -1;
+    if (force < 0)
+    {
+        const char *v = getenv("REBOX_MEMORY_WAIT_FORCE");
+        force = !(v && *v == '0');
+    }
+    return force;
+}
 
 /* Whether to log another line about this address: up to 4 each, for 64 addresses (under
  * value_fence_lock). */
@@ -3490,76 +3546,165 @@ static BOOL log_address(UINT64 address)
     return FALSE;
 }
 
-/* Under value_fence_lock, exclusive. */
-static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLONG timeout)
+static BOOL device_lost(void)
 {
-    if (ID3D12Fence_GetCompletedValue(pw->fence->fence) >= pw->target)
+    static LONG lost;
+    ID3D12Device *device;
+    if (lost)
         return TRUE;
-    if (!wait_satisfied(&pw->wait) && now - pw->since < timeout)
-        return FALSE;
-    if (now - pw->since < timeout)
+    if ((device = rebox_shared_device()) && FAILED(ID3D12Device_GetDeviceRemovedReason(device)))
     {
-        static LONG logged;
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        if ((now - pw->since) * 10 >= f.QuadPart && log_address(pw->wait.address) && InterlockedIncrement(&logged) <= 256)
-            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p met in memory after %.0f ms; signalled "
-                      "from the CPU", (unsigned long long)pw->wait.address, (unsigned long long)pw->target, pw->queue,
-                      (now - pw->since) * 1000.0 / (double)f.QuadPart);
+        InterlockedExchange(&lost, 1);
+        rebox_log("d3d12_xs: the device is lost: GPU memory waits still pending are signalled from the CPU, "
+                  "not logged");
     }
-    if (now - pw->since >= timeout)
+    return lost;
+}
+
+/* Under value_fence_lock, exclusive. */
+static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLONG freq)
+{
+    double ms = 1000.0 / (double)freq;
+    BOOL in_memory, forced = FALSE;
+
+    if (!pw->arrived && ID3D12Fence_GetCompletedValue(pw->arrival) >= pw->arrival_value)
+    {
+        pw->arrived = now;
+        pw->present_at_arrival = value_wait_presents;
+        value_wait_stats.behind += now - pw->since;
+        value_wait_stats.behind_max = max(value_wait_stats.behind_max, now - pw->since);
+    }
+    if (ID3D12Fence_GetCompletedValue(pw->fence->fence) >= pw->target)
+    {
+        LONGLONG standing = pw->arrived ? now - pw->arrived : 0;
+        value_wait_stats.by_writer++;
+        value_wait_stats.standing += standing;
+        value_wait_stats.standing_max = max(value_wait_stats.standing_max, standing);
+        goto done;
+    }
+    if (!(in_memory = wait_satisfied(&pw->wait)))
+    {
+        if (!pw->arrived && !device_lost())
+            return FALSE;
+        forced = value_wait_force() && value_wait_presents != pw->present_at_arrival
+                && pw->fence->signalled < pw->target;
+        if (!forced && now - pw->arrived < value_wait_timeout(freq))
+            return FALSE;
+    }
+    if (device_lost())
+        value_wait_stats.after_loss++;
+    else if (in_memory)
     {
         static LONG logged;
+        value_wait_stats.in_memory++;
+        if (pw->arrived && (now - pw->arrived) * 10 >= freq && log_address(pw->wait.address)
+                && InterlockedIncrement(&logged) <= 256)
+            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p met in memory %.0f ms after the queue got "
+                      "there (%.0f ms after its submission); signalled from the CPU", (unsigned long long)pw->wait.address,
+                      (unsigned long long)pw->target, pw->queue, (now - pw->arrived) * ms, (now - pw->since) * ms);
+    }
+    else
+    {
+        static LONG logged;
+        LONG slot;
+        if (forced)
+            value_wait_stats.forced++;
+        else
+            value_wait_stats.timed_out++;
         InterlockedIncrement(&value_timeouts);
+        if ((slot = InterlockedIncrement(&timed_out_count) - 1) < 16)
+            timed_out_waits[slot] = pw->wait.address;
         if (log_address(pw->wait.address) && InterlockedIncrement(&logged) <= 256)
-        {
-            LARGE_INTEGER f;
-            QueryPerformanceFrequency(&f);
-            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p (its list wrote %u values before it) timed "
-                      "out after 2 s; signalled from the CPU. A list writing it was last submitted %s%p, value %#llx, "
-                      "%.0f ms before the wait", (unsigned long long)pw->wait.address, (unsigned long long)pw->target,
-                      pw->queue, pw->wait.writes_before, pw->fence->last_queue == pw->queue ? "on the same queue " : "on ",
+            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx (%u-bit) on queue %p (its list wrote %u values before it) "
+                      "%s; signalled from the CPU. The queue got there %.0f ms after the submission and stood %.0f ms; "
+                      "memory holds %#llx. %s %p, value %#llx, %.0f ms before the wait",
+                      (unsigned long long)pw->wait.address, (unsigned long long)pw->target, pw->wait.width * 8,
+                      pw->queue, pw->wait.writes_before, forced ? "released at a present" : "timed out",
+                      (pw->arrived - pw->since) * ms, (now - pw->arrived) * ms,
+                      IsBadReadPtr((void *)(ULONG_PTR)pw->wait.address, pw->wait.width) ? 0ull
+                      : pw->wait.width == 8 ? *(volatile UINT64 *)(ULONG_PTR)pw->wait.address
+                      : *(volatile UINT32 *)(ULONG_PTR)pw->wait.address,
+                      pw->fence->signalled >= pw->target
+                      ? "A signal reaching it is queued (not yet run); the last list writing it was submitted on"
+                      : "No queue has been told to signal it; the last list writing it was submitted on",
                       pw->fence->last_queue, (unsigned long long)pw->fence->last_value,
-                      pw->fence->last_at ? (pw->since - pw->fence->last_at) * 1000.0 / (double)f.QuadPart : 0.0);
-        }
+                      pw->fence->last_at ? (pw->since - pw->fence->last_at) * ms : 0.0);
     }
     ID3D12Fence_Signal(pw->fence->fence, pw->target);
     if (pw->target > pw->fence->signalled)
         pw->fence->signalled = pw->target;
+done:
+    ID3D12Fence_Release(pw->arrival);
     return TRUE;
 }
 
 static DWORD WINAPI value_wait_watcher(void *arg)
 {
-    LARGE_INTEGER freq;
+    LARGE_INTEGER freq, now;
+    LONGLONG last_log;
+
     QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    last_log = now.QuadPart;
     for (;;)
     {
-        LARGE_INTEGER now;
         Sleep(1);
         QueryPerformanceCounter(&now);
         AcquireSRWLockExclusive(&value_fence_lock);
         for (UINT i = 0; i < pending_value_wait_count;)
-            if (value_wait_done(&pending_value_waits[i], now.QuadPart, 2 * freq.QuadPart))
+            if (value_wait_done(&pending_value_waits[i], now.QuadPart, freq.QuadPart))
                 pending_value_waits[i] = pending_value_waits[--pending_value_wait_count];
             else
                 i++;
+        if (now.QuadPart - last_log >= 10 * freq.QuadPart)
+        {
+            double ms = 1000.0 / (double)freq.QuadPart;
+            UINT standing = 0, arrived = value_wait_stats.by_writer + value_wait_stats.in_memory
+                    + value_wait_stats.timed_out + value_wait_stats.forced;
+            for (UINT i = 0; i < pending_value_wait_count; i++)
+                standing += pending_value_waits[i].arrived != 0;
+            if (value_wait_stats.made || pending_value_wait_count)
+                rebox_log("d3d12_xs: GPU memory waits in the last 10 s: %u made; %u met by their writer (stood %.1f ms "
+                          "on average, longest %.1f), %u in memory, %u timed out, %u released at a present, %u after the "
+                          "device was lost; queues got to them %.1f ms after submission on average (longest %.1f); %u "
+                          "pending, %u of them with the queue standing at it", value_wait_stats.made,
+                          value_wait_stats.by_writer, value_wait_stats.by_writer
+                          ? value_wait_stats.standing * ms / value_wait_stats.by_writer : 0.0,
+                          value_wait_stats.standing_max * ms, value_wait_stats.in_memory, value_wait_stats.timed_out,
+                          value_wait_stats.forced, value_wait_stats.after_loss,
+                          arrived ? value_wait_stats.behind * ms / arrived : 0.0, value_wait_stats.behind_max * ms,
+                          pending_value_wait_count, standing);
+            memset(&value_wait_stats, 0, sizeof(value_wait_stats));
+            last_log = now.QuadPart;
+        }
         ReleaseSRWLockExclusive(&value_fence_lock);
     }
     return 0;
 }
 
-/* A counter wait not met in memory now: queue waits on the GPU for the address's fence. FALSE for
- * a wait this can't express (another comparison, a partial mask), which stays on the CPU. */
-static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wait *w)
+/* A counter wait not met in memory now: queue waits on the GPU for the address's fence, after
+ * signalling its arrival fence. FALSE for a wait this can't express (another comparison, a partial
+ * mask), which stays on the CPU. */
+static BOOL gpu_wait_for_value(struct proxy *p, const struct memory_wait *w)
 {
+    ID3D12CommandQueue *queue = INNER(p, ID3D12CommandQueue);
     UINT64 all = w->width == 8 ? ~0ull : 0xffffffffull, target;
     struct value_fence *f;
 
     if ((w->comparison != D3D12_COMPARISON_FUNC_GREATER && w->comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL)
-            || (w->mask & all) != all)
+            || (w->mask & all) != all || (w->comparison == D3D12_COMPARISON_FUNC_GREATER && w->value == all))
         return FALSE;
     target = w->comparison == D3D12_COMPARISON_FUNC_GREATER ? w->value + 1 : w->value;
+    if (!p->arrival_fence)
+    {
+        ID3D12Device *device = rebox_shared_device();
+        if (!device || FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+                (void **)&p->arrival_fence)))
+        {
+            p->arrival_fence = NULL;
+            return FALSE;
+        }
+    }
     AcquireSRWLockExclusive(&value_fence_lock);
     /* Watched until it's met (value_wait_watcher); with no room to watch it, on the CPU instead. */
     if ((f = value_fence(w->address)) && pending_value_wait_count < ARRAYSIZE(pending_value_waits))
@@ -3567,13 +3712,23 @@ static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wa
         static LONG started;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        pending_value_waits[pending_value_wait_count++] = (struct pending_value_wait){ *w, f, target, now.QuadPart, queue };
+        ID3D12CommandQueue_Signal(queue, p->arrival_fence, ++p->arrival_value);
+        ID3D12Fence_AddRef(p->arrival_fence);
+        pending_value_waits[pending_value_wait_count++] = (struct pending_value_wait){ *w, f, target, now.QuadPart, 0, 0,
+                p, p->arrival_fence, p->arrival_value };
+        value_wait_stats.made++;
         if (!InterlockedExchange(&started, 1))
             CloseHandle(CreateThread(NULL, 0, value_wait_watcher, NULL, 0, NULL));
         ID3D12CommandQueue_Wait(queue, f->fence, target);
     }
     else
+    {
+        static LONG logged;
+        if (f && !InterlockedExchange(&logged, 1))
+            rebox_log("d3d12_xs: %u GPU memory waits pending, no room for more: further waits on the CPU",
+                      pending_value_wait_count);
         f = NULL;
+    }
     ReleaseSRWLockExclusive(&value_fence_lock);
     return f != NULL;
 }
@@ -4099,6 +4254,7 @@ static HRESULT STDMETHODCALLTYPE queue_PresentX(struct proxy *p, UINT planes, co
     UINT64 token = planes && plane_params ? *(const UINT64 *)plane_params : 0;
     LONGLONG call = pacing_now();
     HRESULT hr = present_x(INNER(p, ID3D12CommandQueue), &p->present, planes, plane_params, params);
+    InterlockedIncrement(&value_wait_presents);
 
     pacing_presented(token, call, pacing_now());
     return hr;
@@ -4515,9 +4671,9 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
     console_display_draw_end();
 }
 
-/* Addresses whose CPU-side wait timed out (lists_wait): writes to their pages recorded or submitted
- * later are logged, to see which list and queue a waiting title expects to write them. */
-static volatile UINT64 timed_out_waits[16];
+/* Addresses whose wait timed out (lists_wait on the CPU, value_wait_done on the GPU): writes to their
+ * pages recorded or submitted later are logged, to see which list and queue a waiting title expects
+ * to write them. timed_out_waits is declared with the GPU waits. */
 static volatile LONG timed_out_count;
 
 static BOOL after_timed_out_wait(UINT64 address, UINT bytes)
@@ -4704,8 +4860,6 @@ static void writes_before_wait(struct proxy *queue, struct proxy *l, const struc
 
 static void lists_wait(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
-    ID3D12CommandQueue *queue = INNER(p, ID3D12CommandQueue);
-
     for (UINT i = 0; i < count; i++)
     {
         struct proxy *l = (struct proxy *)lists[i];
@@ -4720,7 +4874,7 @@ static void lists_wait(struct proxy *p, UINT count, ID3D12CommandList *const *li
             if (wait_satisfied(w))
                 continue;
             writes_before_wait(p, l, w, &cpu_done, &gpu_done);
-            if (gpu_wait_for_value(queue, w))
+            if (gpu_wait_for_value(p, w))
                 continue;
             QueryPerformanceCounter(&start);
             QueryPerformanceFrequency(&freq);

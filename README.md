@@ -202,6 +202,8 @@ method the title asked for that isn't implemented.
 | `REBOX_DSTORAGE_IGNORE_FAILURES=1` | A DirectStorage request that fails (logged and counted as before) no longer makes the next status entry report the failure: whether a title gives up on a whole batch for one failed request (a BCPack block the decoder refuses) |
 | `REBOX_DISPATCHX=1` | Console DispatchX calls (list slot 80, 78 on older lists) run as Dispatch; by default they are dropped, since the title's ray tracing builder dispatches this way and run, they faulted the GPU |
 | `REBOX_MEMORY_WAITS=0` | Console memory waits in lists (Wait32/64BitValueX) are ignored; lists are ordered only by the title's fences: whether the waits are what stalls a title's queues |
+| `REBOX_MEMORY_WAIT_TIMEOUT_MS=<ms>` | How long a queue stands at a GPU memory wait (a counter wait made a fence wait) before its value is signalled from the CPU and the wait logged; default 2000. The time runs from when the queue gets to the wait, not from the submission |
+| `REBOX_MEMORY_WAIT_FORCE=0` | A GPU memory wait the queue stands at, whose value no queue has been told to signal, is no longer released at the next present |
 
 The shader cache ([docs/shaders.md](docs/shaders.md)) is keyed by the 64-bit FNV-1a hash of the
 bytecode exactly as the title passes it to `Create*PipelineState`.
