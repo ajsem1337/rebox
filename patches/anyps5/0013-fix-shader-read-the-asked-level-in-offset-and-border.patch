@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 21:59:40 +0000
+Subject: [PATCH 13/14] fix(shader): read the asked level in offset and
+ border-clamped LOD gathers
+
+OpImageGather has no LOD operand, and outside fragment shaders it reads
+level 0. image_gather4_l already fetched its four texels at the level
+the sampler picks, but only without a texel offset and only when neither
+axis used CLAMP_HALF_BORDER or CLAMP_BORDER; image_gather4_l_o, and
+every gather through a border-clamped sampler, read level 0.
+
+A depth pyramid's occlusion culling gathers exactly so: image_gather4_l
+and three image_gather4_l_o through a literal CLAMP_BORDER sampler with a
+transparent black border. Every test there compared against the finest
+level of the pyramid instead of the coarser level it picked.
+
+The emulation now adds the offset to the footprint, gives the border
+colour (transparent black, opaque black, opaque white, from the S#'s
+BORDER_COLOR_TYPE in a new specialization constant per sampler) to
+texels outside the image under the two border modes, and keeps a
+half-border footprint within one texel of the edge. A palette border
+colour still gathers level 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  16 ++
+ .../src/DescriptorBindingBuilder.cpp          |   4 +-
+ .../recompiler/PipelineSpecialization.hpp     |   2 +
+ .../SpirvBackend/src/SpirvImageEmitter.cpp    |  52 ++++-
+ .../recompiler/tests/GatherLodTests.cpp       | 186 ++++++++++++++++++
+ .../fix-shader-gather-lod-offset-border.md    |   5 +
+ 6 files changed, 255 insertions(+), 10 deletions(-)
+ create mode 100644 core/shader/recompiler/tests/GatherLodTests.cpp
+ create mode 100644 docs/dev/debt/changes/fix-shader-gather-lod-offset-border.md
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index 6281a642f4..8589bfa627 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -468,6 +468,22 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET gather_lod_tests)
++        add_test_executable(gather_lod_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/GatherLodTests.cpp")
++        target_link_libraries(gather_lod_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-opt SPIRV-Tools-static)
++        target_include_directories(gather_lod_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(gather_lod_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(gather_lod_tests)
++        add_test(NAME gather_lod COMMAND gather_lod_tests)
++        set_tests_properties(gather_lod PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(gather_lod_tests PRIVATE libc)
++            set_tests_properties(gather_lod PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET loop_guard_tests)
+         add_test_executable(loop_guard_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardTests.cpp")
+         target_link_libraries(loop_guard_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-static)
+diff --git a/core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp b/core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp
+index 528a554de3..88f3c78ed8 100644
+--- a/core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp
++++ b/core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp
+@@ -33,7 +33,8 @@ static_assert(PipelineSpecialization::GatherLodBiasBase + ShaderInfo::MaxSampler
+ static_assert(PipelineSpecialization::GatherImageMinLodBase + ShaderInfo::MaxImages <= PipelineSpecialization::FmaskFormatBase);
+ static_assert(PipelineSpecialization::FmaskFormatBase + ShaderInfo::MaxImages <= PipelineSpecialization::VolumeGatherBase);
+ static_assert(PipelineSpecialization::VolumeGatherBase + ShaderInfo::MaxImages <= PipelineSpecialization::GatherImageShapeBase);
+-static_assert(PipelineSpecialization::GatherImageShapeBase + ShaderInfo::MaxImages <= PipelineSpecialization::ImageComponentBase);
++static_assert(PipelineSpecialization::GatherImageShapeBase + ShaderInfo::MaxImages <= PipelineSpecialization::GatherBorderBase);
++static_assert(PipelineSpecialization::GatherBorderBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::ImageComponentBase);
+ static_assert(PipelineSpecialization::ImageComponentBase + ShaderInfo::MaxImages <= PipelineSpecialization::NormalizedImageBase);
+ 
+ namespace {
+@@ -466,6 +467,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
+             const auto bias = static_cast<float>(static_cast<std::int32_t>(((words[2] & 0x3fffu) ^ 0x2000u) - 0x2000u)) / 256.0f;
+             plan.specialization.push_back({PipelineSpecialization::GatherLodBase + index, state});
+             plan.specialization.push_back({PipelineSpecialization::GatherLodBiasBase + index, std::bit_cast<std::uint32_t>(bias)});
++            plan.specialization.push_back({PipelineSpecialization::GatherBorderBase + index, (words[3] >> 30u) & 3u});
+         }
+     }
+     for (const auto& pair : info.sampledPairs) {
+diff --git a/core/shader/recompiler/PipelineSpecialization.hpp b/core/shader/recompiler/PipelineSpecialization.hpp
+index 3ad5aa68d2..e8524cae82 100644
+--- a/core/shader/recompiler/PipelineSpecialization.hpp
++++ b/core/shader/recompiler/PipelineSpecialization.hpp
+@@ -61,6 +61,8 @@ inline constexpr std::uint32_t GatherImageMinLodBase = 57920u;
+ inline constexpr std::uint32_t FmaskFormatBase = 58048u;
+ inline constexpr std::uint32_t VolumeGatherBase = 58176u;
+ inline constexpr std::uint32_t GatherImageShapeBase = 58432u;
++inline constexpr std::uint32_t GatherBorderBase = 58560u;
++inline constexpr std::uint32_t GatherBorderUnknown = 3u;
+ 
+ inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
+     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
+diff --git a/core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp b/core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp
+index f18b9c0beb..64d7b6d739 100644
+--- a/core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp
++++ b/core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp
+@@ -1040,17 +1040,27 @@ std::uint32_t FloatClamp(SpirvEmitterState& state, std::uint32_t value, std::uin
+     return clamped;
+ }
+ 
++std::uint32_t GatherBorderType(SpirvEmitterState& state, std::uint32_t sampler) {
++    return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::GatherBorderBase + sampler, PipelineSpecialization::GatherBorderUnknown);
++}
++
++std::uint32_t GatherBorderMode(SpirvEmitterState& state, std::uint32_t mode) {
++    const auto boolean = TypeBool(state);
++    return Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpIEqual, boolean, mode, ConstantU32(state, 4u)), Binary(state, spv::OpIEqual, boolean, mode, ConstantU32(state, 6u)));
++}
++
+ std::uint32_t GatherLodSupported(SpirvEmitterState& state, std::uint32_t sampler) {
+     const auto samplerState = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::GatherLodBase + sampler, 4u << 24u);
+     const auto boolean = TypeBool(state);
++    const auto borderKnown = Binary(state, spv::OpINotEqual, boolean, GatherBorderType(state, sampler), ConstantU32(state, PipelineSpecialization::GatherBorderUnknown));
+     const auto supported = [&](std::uint32_t shift) {
+         const auto mode = EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), samplerState, ConstantU32(state, shift)), 7u);
+-        return Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, mode, ConstantU32(state, 4u)), Binary(state, spv::OpINotEqual, boolean, mode, ConstantU32(state, 6u)));
++        return Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, GatherBorderMode(state, mode)), borderKnown);
+     };
+     return Binary(state, spv::OpLogicalAnd, boolean, supported(24u), supported(27u));
+ }
+ 
+-std::uint32_t EmitTwoDimensionalGatherLod(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {
++std::uint32_t EmitTwoDimensionalGatherLod(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup, std::uint32_t offset) {
+     auto& state = ctx.state;
+     state.module.EmitCapability(spv::CapabilityImageQuery);
+     const auto u32 = TypeU32(state);
+@@ -1104,21 +1114,45 @@ std::uint32_t EmitTwoDimensionalGatherLod(SpirvValueEmitContext& ctx, const Imag
+         const auto floored = state.module.AllocateId();
+         state.module.AddFunction(spv::OpExtInst, f32, floored, GlslStd450(state), GLSLstd450Floor, scaled);
+         first[axis] = Unary(state, spv::OpConvertFToS, i32, FloatClamp(state, floored, ConstantF32(state, 0xcb800000u), ConstantF32(state, 0x4b800000u)));
++        if (offset != 0u) {
++            const auto moved = state.module.AllocateId();
++            state.module.AddFunction(spv::OpCompositeExtract, i32, moved, offset, axis);
++            first[axis] = Binary(state, spv::OpIAdd, i32, first[axis], moved);
++        }
++        const auto halfBorder = Binary(state, spv::OpIEqual, boolean, field(axis == 0u ? 24u : 27u, 7u), ConstantU32(state, 4u));
++        const auto held = state.module.AllocateId();
++        state.module.AddFunction(spv::OpExtInst, i32, held, GlslStd450(state), GLSLstd450SClamp, first[axis], ConstantI32(state, -1), extent[axis]);
++        first[axis] = Select(state, i32, halfBorder, held, first[axis]);
+     }
++    const auto borderType = GatherBorderType(state, access.mem.sampler);
+     const auto vectorType = ImageVectorType(state, setup.numericClass, 4);
+     const auto scalarType = ImageScalarType(state, setup.numericClass);
+     const auto component = ImageConversionFormat(access.image).format == IrBufferFormat::Invalid ? ImageGatherComponent(EffectiveDmask(access.mem)) : 0u;
++    const auto one = setup.numericClass == IrTextureNumericClass::Float ? ConstantF32(state, 0x3f800000u) : setup.numericClass == IrTextureNumericClass::Sint ? ConstantI32(state, 1) : ConstantU32(state, 1u);
++    const auto zero = SampledComponentZero(state, setup.numericClass);
++    const auto white = Binary(state, spv::OpIEqual, boolean, borderType, ConstantU32(state, 2u));
++    const auto borderOne = component == 3u ? Binary(state, spv::OpLogicalOr, boolean, white, Binary(state, spv::OpIEqual, boolean, borderType, ConstantU32(state, 1u))) : white;
++    const auto border = Select(state, scalarType, borderOne, one, zero);
+     const std::int32_t corners[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+     std::uint32_t values[4] = {};
+     for (std::uint32_t index = 0; index < 4u; index++) {
+-        const auto x = GatherAddress(state, field(24u, 7u), Binary(state, spv::OpIAdd, i32, first[0], ConstantI32(state, corners[index][0])), extent[0]);
+-        const auto y = GatherAddress(state, field(27u, 7u), Binary(state, spv::OpIAdd, i32, first[1], ConstantI32(state, corners[index][1])), extent[1]);
++        std::uint32_t outside = 0u;
++        std::uint32_t texelAxis[2] = {};
++        for (std::uint32_t axis = 0; axis < 2u; axis++) {
++            const auto mode = field(axis == 0u ? 24u : 27u, 7u);
++            const auto texelIndex = Binary(state, spv::OpIAdd, i32, first[axis], ConstantI32(state, corners[index][axis]));
++            texelAxis[axis] = GatherAddress(state, mode, texelIndex, extent[axis]);
++            const auto beyond = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpSLessThan, boolean, texelIndex, ConstantI32(state, 0)), Binary(state, spv::OpSGreaterThanEqual, boolean, texelIndex, extent[axis]));
++            const auto axisOutside = Binary(state, spv::OpLogicalAnd, boolean, GatherBorderMode(state, mode), beyond);
++            outside = outside == 0u ? axisOutside : Binary(state, spv::OpLogicalOr, boolean, outside, axisOutside);
++        }
+         const auto texelCoord = state.module.AllocateId();
+-        state.module.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(state, 2), texelCoord, x, y);
++        state.module.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(state, 2), texelCoord, texelAxis[0], texelAxis[1]);
+         const auto texel = state.module.AllocateId();
+         state.module.AddFunction(spv::OpImageFetch, vectorType, texel, image, texelCoord, spv::ImageOperandsLodMask, level);
+-        values[index] = state.module.AllocateId();
+-        state.module.AddFunction(spv::OpCompositeExtract, scalarType, values[index], texel, component);
++        const auto fetched = state.module.AllocateId();
++        state.module.AddFunction(spv::OpCompositeExtract, scalarType, fetched, texel, component);
++        values[index] = Select(state, scalarType, outside, border, fetched);
+     }
+     const auto result = state.module.AllocateId();
+     state.module.AddFunction(spv::OpCompositeConstruct, vectorType, result, values[0], values[1], values[2], values[3]);
+@@ -1835,8 +1869,8 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
+         gathered = state.module.AllocateId();
+         state.module.AddFunction(spv::OpCompositeConstruct, ImageVectorType(state, resultNumericClass, 4), gathered, component, component, component, component);
+     }
+-    if (HasFlag(mem, RdnaImageSampleFlagLod) && setup.layout.lod != NoImageComponent && !setup.dref && dimension == RdnaImageDimension::Dim2D && !access.image.cube && !access.image.remappedDepth1D && setup.layout.offset == NoImageComponent && !HasFlag(mem, RdnaImageSampleFlagGatherHorizontal) && state.program.Info().images.at(mem.resource).table == NoTable && state.program.Info().samplers.at(mem.sampler).table == NoTable) {
+-        const auto fetched = EmitTwoDimensionalGatherLod(ctx, access, setup);
++    if (HasFlag(mem, RdnaImageSampleFlagLod) && setup.layout.lod != NoImageComponent && !setup.dref && dimension == RdnaImageDimension::Dim2D && !access.image.cube && !access.image.remappedDepth1D && !HasFlag(mem, RdnaImageSampleFlagGatherHorizontal) && state.program.Info().images.at(mem.resource).table == NoTable && state.program.Info().samplers.at(mem.sampler).table == NoTable) {
++        const auto fetched = EmitTwoDimensionalGatherLod(ctx, access, setup, setup.layout.offset != NoImageComponent ? PackedOffset(ctx, access, setup.layout) : 0u);
+         const auto supported = GatherLodSupported(state, mem.sampler);
+         const auto scalarType = ImageScalarType(state, resultNumericClass);
+         std::uint32_t lanes[4] = {};
+diff --git a/core/shader/recompiler/tests/GatherLodTests.cpp b/core/shader/recompiler/tests/GatherLodTests.cpp
+new file mode 100644
+index 0000000000..18a838b056
+--- /dev/null
++++ b/core/shader/recompiler/tests/GatherLodTests.cpp
+@@ -0,0 +1,186 @@
++#include "BdaAbi.hpp"
++#include "PipelineSpecialization.hpp"
++#include "Recompiler.hpp"
++#include <spirv-tools/libspirv.hpp>
++#include <spirv-tools/optimizer.hpp>
++#include <spirv/unified1/spirv.hpp>
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <span>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++constexpr std::uint64_t TableAddress = 0x20000000u;
++
++std::vector<std::uint32_t> GatherShader(bool offset) {
++    std::vector<std::uint32_t> code{
++        0xf40c0200u, 0xfa000000u,   // s_load_dwordx8 s[8:15], s[0:1], 0x0
++        0xf4080400u, 0xfa000020u,   // s_load_dwordx4 s[16:19], s[0:1], 0x20
++        0xf4080500u, 0xfa000030u,   // s_load_dwordx4 s[20:23], s[0:1], 0x30
++        0xbf8cc07fu,                // s_waitcnt lgkmcnt(0)
++    };
++    if (offset) {
++        code.insert(code.end(), {0x7e0002ffu, 0x00000202u}); // v_mov_b32 v0, 0x202
++        code.insert(code.end(), {0x7e0202f0u, 0x7e0402f0u, 0x7e0602f4u}); // v1 = v2 = 0.5, v3 = 2.0
++        code.insert(code.end(), {0xf1500108u, 0x00820400u}); // image_gather4_l_o v[4:7], v[0:3], s[8:15], s[16:19] dmask 0x1
++    } else {
++        code.insert(code.end(), {0x7e0202f0u, 0x7e0402f0u, 0x7e0602f4u}); // v1 = v2 = 0.5, v3 = 2.0
++        code.insert(code.end(), {0xf1100108u, 0x00820401u}); // image_gather4_l v[4:7], v[1:3], s[8:15], s[16:19] dmask 0x1
++    }
++    code.insert(code.end(), {
++        0xbf8c3f70u,                // s_waitcnt vmcnt(0)
++        0xe0700000u, 0x80050400u,   // buffer_store_dword v4, off, s[20:23], 0
++        0xbf810000u,                // s_endpgm
++    });
++    return code;
++}
++
++std::array<std::uint32_t, 16> Table(std::uint32_t clamp, std::uint32_t borderType) {
++    std::array<std::uint32_t, 16> table{};
++    table[0] = 0x40000000u >> 8u;
++    table[1] = (56u << 20u) | (3u << 30u);          // 8_8_8_8_UNORM, WIDTH-1 low bits
++    table[2] = 15u | (63u << 14u);                  // 64x64
++    table[3] = 0xfacu | (6u << 16u) | (9u << 28u);  // XYZW, levels 0-6, 2D
++    table[5] = 6u << 4u;                            // MAX_MIP
++    table[8] = clamp | (clamp << 3u) | (clamp << 6u);
++    table[9] = 0xfff000u;                           // MAX_LOD
++    table[10] = 0x5000000u;                         // filters
++    table[11] = borderType << 30u;
++    table[12] = 0x30000000u;                        // V#: the output
++    table[14] = 16u;
++    table[15] = 0xfacu | (77u << 12u);
++    return table;
++}
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 6> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityImageQuery,
++                                                               spv::CapabilityImageGatherExtended, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++RecompileResult Compile(const std::vector<std::uint32_t>& code, const std::array<std::uint32_t, 16>& table) {
++    static const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(TableAddress), 0u};
++    static std::array<std::byte, 64u * 1024u> buffer{};
++    std::array<std::byte, sizeof(table)> bytes{};
++    std::memcpy(bytes.data(), table.data(), sizeof(table));
++    const std::vector<MemoryRegion> regions{{TableAddress, std::span<const std::byte>(bytes)}, {0x30000000u, std::span<const std::byte>(buffer)}};
++    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, std::span<const std::uint32_t>(code), 0, {}},
++        {32u, 0, std::span<const std::uint32_t>(userData), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    return Recompile(request);
++}
++
++struct Counts {
++    std::size_t gathers = 0;
++    std::size_t lodFetches = 0;
++};
++
++Counts Specialized(const RecompileResult& result) {
++    const auto view = result.spirv.Words();
++    std::vector<std::uint32_t> words(view.begin(), view.end());
++    std::string log;
++    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
++    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* message) { log += message; });
++    spvtools::ValidatorOptions options;
++    options.SetScalarBlockLayout(true);
++    if (!tools.Validate(words.data(), words.size(), options)) std::fprintf(stderr, "%s\n", log.c_str());
++    Require(tools.Validate(words.data(), words.size(), options), "the gather module validates");
++    if (const char* dump = std::getenv("GATHER_LOD_DUMP")) {
++        static int serial = 0;
++        const std::string path = std::string(dump) + std::to_string(serial++) + ".spv";
++        if (FILE* file = std::fopen(path.c_str(), "wb")) {
++            std::fwrite(words.data(), 4, words.size(), file);
++            std::fclose(file);
++        }
++    }
++
++    std::unordered_map<std::uint32_t, std::string> defaults;
++    for (const auto& constant : result.specialization) defaults[constant.id] = std::to_string(constant.value);
++    spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_2);
++    optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char*) {});
++    optimizer.RegisterPass(spvtools::CreateSetSpecConstantDefaultValuePass(defaults));
++    optimizer.RegisterPass(spvtools::CreateFreezeSpecConstantValuePass());
++    optimizer.RegisterPerformancePasses();
++    std::vector<std::uint32_t> optimized;
++    spvtools::OptimizerOptions optimizerOptions;
++    optimizerOptions.set_run_validator(false);
++    Require(optimizer.Run(words.data(), words.size(), &optimized, optimizerOptions), "the specialized module optimizes");
++
++    std::vector<std::pair<std::uint32_t, bool>> reads;
++    std::vector<std::uint32_t> operands;
++    for (std::size_t index = 5; index < optimized.size();) {
++        const auto count = optimized[index] >> 16u;
++        Require(count != 0u && index + count <= optimized.size(), "the optimized module's instructions are well formed");
++        const auto op = optimized[index] & 0xffffu;
++        const bool fetch = op == spv::OpImageFetch && count > 5u && (optimized[index + 5] & spv::ImageOperandsLodMask) != 0u;
++        if (op == spv::OpImageGather || fetch) reads.push_back({optimized[index + 2], op == spv::OpImageGather});
++        for (std::size_t word = (op == spv::OpImageGather || op == spv::OpImageFetch) ? 3u : 1u; word < count; word++) operands.push_back(optimized[index + word]);
++        index += count;
++    }
++    Counts counts;
++    for (const auto& [id, gather] : reads) {
++        if (std::ranges::find(operands, id) == operands.end()) continue;
++        if (gather) counts.gathers++;
++        else counts.lodFetches++;
++    }
++    return counts;
++}
++
++void TestBorderGather(bool offset) {
++    const auto result = Compile(GatherShader(offset), Table(6u, 0u));
++    const auto counts = Specialized(result);
++    Require(counts.gathers == 0u, offset ? "an offset gather at an explicit level through a border sampler still reads level 0" : "a gather at an explicit level through a border sampler still reads level 0");
++    Require(counts.lodFetches == 4u, "the four texels are fetched at a level");
++}
++
++void TestPaletteBorderKeepsGather() {
++    const auto counts = Specialized(Compile(GatherShader(true), Table(6u, 3u)));
++    Require(counts.gathers == 1u, "a gather through a palette border sampler is not emulated");
++}
++
++void TestWrapGather() {
++    const auto counts = Specialized(Compile(GatherShader(true), Table(0u, 0u)));
++    Require(counts.gathers == 0u && counts.lodFetches == 4u, "an offset gather at an explicit level through a wrapping sampler still reads level 0");
++}
++
++}
++
++int main() {
++    try {
++        TestBorderGather(false);
++        TestBorderGather(true);
++        TestPaletteBorderKeepsGather();
++        TestWrapGather();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++    std::puts("gather LOD tests passed");
++    return 0;
++}
+diff --git a/docs/dev/debt/changes/fix-shader-gather-lod-offset-border.md b/docs/dev/debt/changes/fix-shader-gather-lod-offset-border.md
+new file mode 100644
+index 0000000000..bf0cf50592
+--- /dev/null
++++ b/docs/dev/debt/changes/fix-shader-gather-lod-offset-border.md
+@@ -0,0 +1,5 @@
++# shader
++
++## add Functional
++
++- [Explicit-level 2D gathers](../../../core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp) (`image_gather4_l`, `image_gather4_l_o`) fetch their four texels at the level the S# and T# pick (bias, MIN_LOD/MAX_LOD, nearest level, MIP_FILTER none), since `OpImageGather` has no LOD operand and reads level 0 outside fragment shaders. The offset moves the footprint by whole texels. CLAMP_BORDER reads the border colour for footprint texels outside the image, and CLAMP_HALF_BORDER first keeps the footprint within one texel of it; MIRROR_ONCE_HALF_BORDER and MIRROR_ONCE_BORDER fetch as mirror once to edge. A border colour from the palette (BORDER_COLOR_TYPE 3), a depth comparison, a cube, a horizontal gather, or a T# or S# from an image table still gathers level 0. Not measured on hardware: the level rounding and the half-border footprint follow the 2D sample path's rules.
+-- 
+2.55.0
+

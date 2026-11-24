@@ -9,6 +9,9 @@
  *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (format: pixel_sweep) with
  *                                              their PSO register state, compile only, no guest
  *                                              memory; one "ps NAME ok|FAIL ..." line each
+ *   sa5_check cs PLAN [FIRST [COUNT]]          the compute shaders in PLAN (format: compute_sweep),
+ *                                              compile only, no guest memory, validated, loops
+ *                                              counted
  *   sa5_check mesh                             a built-in console mesh program (one triangle),
  *                                              compiled and finalized as d3d12_xs does
  *   sa5_check ms PLAN [FIRST [COUNT]]          the mesh shaders in PLAN (format: mesh_sweep), the
@@ -713,7 +716,7 @@ static int vertex_sweep(const char *plan, int first, int count)
 /* Mesh shaders: compiled with d3d12_xs's settings (wave and limits from the FSSM, 32 user SGPRs,
  * push data 0-95), then finalized with a draw block at byte 96: the guest buffer table pushed, the
  * other host buffers baked. Returns 0 and a "ok ..." detail, or -1 and the error. */
-static int mesh_compile(const struct sa5_mesh_request *req, char *detail, size_t size)
+static int mesh_compile(const struct sa5_mesh_request *req, const char *name, char *detail, size_t size)
 {
     struct sa5_result *result = NULL;
     struct sa5_host_buffer hosts[8];
@@ -750,6 +753,17 @@ static int mesh_compile(const struct sa5_mesh_request *req, char *detail, size_t
     }
     snprintf(detail, size, "ok %u words, wave%u, %u bindings, subgroup %u; finalized %u words", words, req->wave,
              sa5_result_binding_count(result), sa5_result_subgroup_size(result), out_count);
+    if (name && getenv("SA5_DUMP_SPIRV"))
+    {
+        char path[1200];
+        FILE *dump;
+        snprintf(path, sizeof(path), "%s\\%s.spv", getenv("SA5_DUMP_SPIRV"), name);
+        if ((dump = fopen(path, "wb")))
+        {
+            fwrite(out, 4, out_count, dump);
+            fclose(dump);
+        }
+    }
     sa5_free_words(out);
     sa5_result_free(result);
     return 0;
@@ -795,7 +809,7 @@ static int mesh_builtin(void)
     req.primitive_vertices = 3;
     req.push_size = 96;
     req.use_cache = 1;
-    failed = mesh_compile(&req, detail, sizeof(detail));
+    failed = mesh_compile(&req, "mesh", detail, sizeof(detail));
     printf("%s mesh: %s\n", failed ? "FAIL" : "ok  ", detail);
     return failed;
 }
@@ -852,7 +866,7 @@ static int mesh_sweep(const char *plan, int first, int count)
         req.clip_cntl = clip;
         req.push_size = 96;
         req.use_cache = 1;
-        if (mesh_compile(&req, detail, sizeof(detail)))
+        if (mesh_compile(&req, name, detail, sizeof(detail)))
             failed++;
         else
             ok++;
@@ -865,6 +879,142 @@ static int mesh_sweep(const char *plan, int first, int count)
     fclose(f);
     printf("%s ms-check: %d of %d mesh shaders compile, validate and finalize\n", failed ? "info" : "ok  ", ok,
            ok + failed);
+    return 0;
+}
+
+/* Loops in a module's entry point (the guest program; AnyPS5's helper functions have bounded loops
+ * of their own): each OpLoopMerge, and whether some OpBranchConditional can leave it (to its merge
+ * block; AnyPS5's loop guard, APS5_LOOP_GUARD, forces those exits). */
+static void count_loops(const uint32_t *spirv, uint32_t words, int *loops, int *no_exit)
+{
+    enum { MAX_LOOPS = 512 };
+    static uint32_t merge[MAX_LOOPS], conditional_targets[1 << 17];
+    uint32_t n = 0, targets = 0, entry = 0, function = 0;
+
+    *loops = *no_exit = 0;
+    for (uint32_t i = 5; i < words;)
+    {
+        uint32_t op = spirv[i] & 0xffff, len = spirv[i] >> 16;
+        if (!len || i + len > words)
+            break;
+        if (op == 15 /* OpEntryPoint */ && !entry)
+            entry = spirv[i + 2];
+        else if (op == 54 /* OpFunction */)
+            function = spirv[i + 2];
+        else if (op == 246 /* OpLoopMerge */ && n < MAX_LOOPS && function == entry)
+            merge[n++] = spirv[i + 1];
+        else if (op == 250 /* OpBranchConditional */ && targets + 2 <= ARRAYSIZE(conditional_targets))
+        {
+            conditional_targets[targets++] = spirv[i + 2];
+            conditional_targets[targets++] = spirv[i + 3];
+        }
+        i += len;
+    }
+    for (uint32_t l = 0; l < n; l++)
+    {
+        int exits = 0;
+        for (uint32_t t = 0; t < targets && !exits; t++)
+            exits = conditional_targets[t] == merge[l];
+        *no_exit += !exits;
+    }
+    *loops = (int)n;
+}
+
+/* Compute shaders: plan lines NAME CODE SKIP RSRC1 RSRC2 X,Y,Z [WAVE] (as for memo), compiled with
+ * no guest memory and validated; with their loops counted (count_loops) and a hash of the SPIR-V.
+ * SA5_DUMP_SPIRV=DIR writes each module to DIR\NAME.spv. */
+static int compute_sweep(const char *plan, int first, int count)
+{
+    FILE *f = fopen(plan, "r");
+    char line[4096];
+    int index = 0, ok = 0, failed = 0, valid_count = 0, all_loops = 0, all_no_exit = 0;
+
+    if (!f)
+    {
+        printf("FAIL open %s\n", plan);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), f) && (count <= 0 || ok + failed < count))
+    {
+        char name[64], path[1024], winpath[1100], error[600], ignored[64];
+        unsigned skip, rsrc1, rsrc2, wave = 0;
+        uint32_t user[32] = { 0 }, words = 0;
+        struct sa5_compute_request req = { 0 };
+        struct sa5_result *result = NULL;
+        struct sa5_layout layout;
+        static struct sa5_slot slots[256];
+        uint8_t *data;
+        long size;
+
+        if (line[0] == '#' || sscanf(line, "%63s %1023s %u %x %x %u,%u,%u %u", name, path, &skip, &rsrc1, &rsrc2,
+                                     &req.threads[0], &req.threads[1], &req.threads[2], &wave) < 8)
+            continue;
+        if (index++ < first)
+            continue;
+        snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
+        for (char *p = winpath; *p; p++)
+            if (*p == '/') *p = '\\';
+        if (!(data = read_all(winpath, &size)) || size <= (long)skip)
+        {
+            printf("cs %s FAIL unreadable\n", name);
+            free(data);
+            failed++;
+            continue;
+        }
+        req.code = (const uint32_t *)(data + skip);
+        req.code_dwords = (uint32_t)((size - skip) / 4);
+        req.code_address = 0x10000000;
+        req.user_data = user;
+        req.user_data_count = (rsrc2 >> 1) & 0x1f;
+        req.rsrc1 = rsrc1;
+        req.rsrc2 = rsrc2;
+        req.use_cache = getenv("SA5_USE_CACHE") != NULL;
+        req.wave = wave ? wave
+                        : !sa5_analyse(req.code, req.code_dwords, req.user_data_count, &layout, slots, 0, ignored,
+                                       sizeof(ignored)) ? layout.wave : 32;
+        if (sa5_compile_compute(&req, &result, error, sizeof(error)))
+        {
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            printf("cs %s FAIL %.300s\n", name, error);
+            failed++;
+        }
+        else
+        {
+            const uint32_t *spirv = sa5_result_spirv(result, &words);
+            int valid = !sa5_validate(spirv, words, error, sizeof(error)), loops, no_exit;
+            uint64_t hash = 0xcbf29ce484222325ull;
+            for (uint32_t i = 0; i < words; i++)
+                hash = (hash ^ spirv[i]) * 0x100000001b3ull;
+            for (char *p = error; *p; p++)
+                if (*p == '\n') *p = ' ';
+            count_loops(spirv, words, &loops, &no_exit);
+            if (getenv("SA5_DUMP_SPIRV"))
+            {
+                char out[1200];
+                FILE *dump;
+                snprintf(out, sizeof(out), "%s\\%s.spv", getenv("SA5_DUMP_SPIRV"), name);
+                if ((dump = fopen(out, "wb")))
+                {
+                    fwrite(spirv, 4, words, dump);
+                    fclose(dump);
+                }
+            }
+            printf("cs %s ok %u words, hash %016llx, %d loops (%d without a conditional exit), %u bindings, %s%.300s\n",
+                   name, words, (unsigned long long)hash, loops, no_exit, sa5_result_binding_count(result),
+                   valid ? "valid" : "INVALID: ", valid ? "" : error);
+            valid_count += valid;
+            all_loops += loops;
+            all_no_exit += no_exit;
+            sa5_result_free(result);
+            ok++;
+        }
+        fflush(stdout);
+        free(data);
+    }
+    fclose(f);
+    printf("%s cs-check: %d of %d compute shaders compile, %d of those pass spirv-val; %d loops, %d without a "
+           "conditional exit\n", failed ? "info" : "ok  ", ok, ok + failed, valid_count, all_loops, all_no_exit);
     return 0;
 }
 
@@ -882,6 +1032,8 @@ int main(int argc, char **argv)
         return memo_bench(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 200);
     if (argc > 2 && !strcmp(argv[1], "vs"))
         return vertex_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
+    if (argc > 2 && !strcmp(argv[1], "cs"))
+        return compute_sweep(argv[2], argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? atoi(argv[4]) : 0);
 
     static const uint32_t endpgm[] = { 0xbf810000u };
     uint32_t threads[3] = { 1, 1, 1 };
