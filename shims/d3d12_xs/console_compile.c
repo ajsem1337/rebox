@@ -1441,9 +1441,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             0xf800180f, 0x00000100, /* exp mrt0 v0, v1, v0, v0 done vm */
             0xbf810000,             /* s_endpgm */
         };
-        /* attr0:<stage id>,...: those pixel stages export their interpolant 0's xyz instead (a
-         * vertex colour), alpha 1. */
-        static const UINT32 attr0[] = {
+        /* attr<N>:<stage id>,...: those pixel stages export their interpolant N's xyz instead (a
+         * vertex colour, texture coordinates), alpha 1. */
+        static UINT32 attr0[] = {
             0xbefc0309,                         /* s_mov_b32 m0, s9 (the primitive mask) */
             0xc8080000, 0xc8090001,             /* v_interp_p1/p2_f32 v2, attr0.x */
             0xc80c0100, 0xc80d0101,             /* v3, attr0.y */
@@ -1475,7 +1475,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         BOOL solid = debug && (!strcmp(debug, "magenta") || !strcmp(debug, "fullscreen"));
         const UINT32 *replacement = magenta;
         UINT replacement_dwords = ARRAYSIZE(magenta);
-        if (debug && (!strncmp(debug, "attr0:", 6) || !strncmp(debug, "texture", 7)))
+        if (debug && ((!strncmp(debug, "attr", 4) && debug[4] >= '0' && debug[4] <= '9') || !strncmp(debug, "texture", 7)))
         {
             char id[24];
             const char *ids = strchr(debug, ':');
@@ -1484,7 +1484,12 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 solid = TRUE;
                 if (debug[0] == 'a')
+                {
+                    UINT attr = strtoul(debug + 4, NULL, 10) & 31;
+                    for (UINT k = 1; k <= 6; k++) /* the v_interp dwords: the attribute is bits 10-15 */
+                        attr0[k] = (attr0[k] & ~(0x3fu << 10)) | attr << 10;
                     replacement = attr0, replacement_dwords = ARRAYSIZE(attr0);
+                }
                 else
                 {
                     texture[3] = 0xfa000000 | (strtoul(debug + 7, NULL, 16) & 0x1fffff);
