@@ -910,6 +910,19 @@ enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index)
     return view;
 }
 
+/* Whether a heap's reserved tail has room; the first times it doesn't, logged: what would have gone
+ * there binds nothing. Under lock. */
+static BOOL reserve_room(const struct shadow_heap *h)
+{
+    static LONG logged;
+    if (h->reserved_used < h->reserved)
+        return TRUE;
+    if (h->reserved && InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: a shader-visible heap's %u reserved slots are all used: a descriptor the host makes "
+                  "binds nothing", h->reserved);
+    return FALSE;
+}
+
 UINT shadow_reserved(SIZE_T cpu_start)
 {
     UINT reserved = 0;
@@ -997,7 +1010,7 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
                 *index = heap->count + i;
                 found = TRUE;
             }
-        if (!found && device && heap->reserved_used < heap->reserved
+        if (!found && device && reserve_room(heap)
                 && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv;
@@ -1071,7 +1084,7 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
             *index = heap->count + i;
             found = TRUE;
         }
-    if (heap && !found && device && heap->reserved_used < heap->reserved
+    if (heap && !found && device && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
         D3D12_RESOURCE_DESC rd;
@@ -1154,7 +1167,7 @@ BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index)
             *index = heap->count + i;
             found = TRUE;
         }
-    if (heap && !found && device && dummy_texture(device) && heap->reserved_used < heap->reserved
+    if (heap && !found && device && dummy_texture(device) && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
         ID3D12Resource *texture = dummy_texture(device);
@@ -1198,7 +1211,7 @@ BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
             *index = heap->count + i;
             found = TRUE;
         }
-    if (heap && !found && device && heap->reserved_used < heap->reserved
+    if (heap && !found && device && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
         D3D12_SAMPLER_DESC desc;

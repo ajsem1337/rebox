@@ -12,10 +12,12 @@ enum shadow_view
 };
 
 /* Console-format shadow heaps; see shadow.c. */
-/* Shader-visible CBV/SRV/UAV and sampler heaps get SHADOW_RESERVED slots past the title's count in
- * vkd3d-proton's heap (patch 0005 raises its sampler-heap limit to match), for descriptors the host
- * makes itself: samplers that shaders build from literals. */
+/* Shader-visible CBV/SRV/UAV and sampler heaps get slots past the title's count in vkd3d-proton's
+ * heap (patch 0005 raises its sampler-heap limit to match), for descriptors the host makes itself:
+ * samplers that shaders build from literals (SHADOW_RESERVED), views of textures the title wrote T#s
+ * for itself (SHADOW_RESERVED_VIEWS: a world brings thousands, and with 256 the rest bound nothing). */
 #define SHADOW_RESERVED 256
+#define SHADOW_RESERVED_VIEWS 65536
 void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEAP_DESC *desc, UINT increment,
         UINT reserved);
 UINT shadow_reserved(SIZE_T cpu_start);

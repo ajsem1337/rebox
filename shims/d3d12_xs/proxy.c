@@ -1265,7 +1265,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
     d = *desc;
     if ((d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
             && (d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
-        reserved = SHADOW_RESERVED;
+        reserved = d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? SHADOW_RESERVED_VIEWS : SHADOW_RESERVED;
     d.NumDescriptors += reserved;
     hr = ID3D12Device_CreateDescriptorHeap(INNER(p, ID3D12Device), &d, &IID_ID3D12DescriptorHeap, (void **)&heap);
     if (FAILED(hr) && reserved)
