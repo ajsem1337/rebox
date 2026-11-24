@@ -155,7 +155,8 @@ The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
 - **Draw** (patch 0006). At the first draw the PSO's private data is read; its vertex buffers
   join the PSO's mask. At each draw both stages compile through `ReboxConsoleCompile`, with user
   SGPRs in the console's graphics layout (root parameters from s8, one SGPR per descriptor
-  table, two per root descriptor; the fetch shader's address at s[4:5]). The vertex stage goes
+  table, two per root descriptor, then the start of each heap the root signature indexes directly,
+  resource then sampler, one SGPR each (patch 0012); the fetch shader's address at s[4:5]). The vertex stage goes
   through `sa5_compile_vertex`, whose attributes (location r = input layout element r) make the
   vertex input. Push data is the vertex stage's 128 bytes then the pixel stage's: AnyPS5's 112
   bytes, then the address of the stage's **draw block** (`sa5_finalize_draw`): the addresses of

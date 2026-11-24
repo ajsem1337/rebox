@@ -1,0 +1,36 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 1a66b48..8ee48ff 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8198,6 +8198,16 @@ static uint64_t d3d12_command_list_rebox_table_va(struct d3d12_command_list *lis
+     return base + (uint64_t)index * d3d12_device_get_descriptor_handle_increment_size(list->device, type);
+ }
+ 
++/* The bound heap's start as the title sees it (as d3d12_command_list_rebox_table_va finds it). */
++static uint64_t d3d12_command_list_rebox_heap_va(struct d3d12_command_list *list, bool sampler)
++{
++    if (list->rebox.title_base[sampler])
++        return list->rebox.title_base[sampler];
++    if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
++        return 0;
++    return sampler ? list->descriptor_heap.buffers.rebox_sampler_base : list->descriptor_heap.buffers.rebox_resource_base;
++}
++
+ /* Fills data[0..31] with the user SGPRs; returns how many are set. */
+ static unsigned int d3d12_command_list_rebox_sgprs_layout(struct d3d12_command_list *list,
+         const struct vkd3d_pipeline_bindings *bindings, uint32_t *data, bool table_dword)
+@@ -8230,6 +8240,14 @@ static unsigned int d3d12_command_list_rebox_sgprs_layout(struct d3d12_command_l
+         if (n < 32 && !(table_dword && p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE))
+             data[n++] = (uint32_t)(va >> 32);
+     }
++    /* A root signature whose shaders index a heap directly (SM 6.6 ResourceDescriptorHeap,
++     * SamplerDescriptorHeap) gets that heap's start next, one SGPR each: a text pixel shader's root
++     * signature (a table, two constants, flags 0x801) reads its sampler at s11 + 16 * s9. The
++     * resource heap first when both are indexed so is assumed, not seen. */
++    if (table_dword && rs && (rs->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && n < 32)
++        data[n++] = (uint32_t)d3d12_command_list_rebox_heap_va(list, false);
++    if (table_dword && rs && (rs->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && n < 32)
++        data[n++] = (uint32_t)d3d12_command_list_rebox_heap_va(list, true);
+     return n;
+ }
+ 
