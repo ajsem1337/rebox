@@ -548,7 +548,7 @@ static BOOL WINAPI set_thread_ideal_processor_ex(HANDLE thread, PROCESSOR_NUMBER
 static void *real_read_file, *real_read_file_scatter;
 ULONG_PTR WINAPI ReboxPhysicalPageAt(ULONGLONG address);
 
-static void note_read(const char *what, ULONG_PTR buffer, ULONG_PTR size)
+void xmem_note_page_op(const char *what, ULONG_PTR buffer, ULONG_PTR size)
 {
     static ULONG_PTR trace = ~(ULONG_PTR)0;
     static LONG logged;
@@ -565,7 +565,7 @@ static void note_read(const char *what, ULONG_PTR buffer, ULONG_PTR size)
         if (ReboxPhysicalPageAt(at) == traced)
         {
             if (InterlockedIncrement(&logged) <= 64)
-                rebox_log("xmem: trace: %s of %#llx bytes into %#llx writes page %#llx (at %#llx, thread %#lx, from %p)",
+                rebox_log("xmem: trace: %s of %#llx bytes at %#llx touches page %#llx (at %#llx, thread %#lx, from %p)",
                           what, (unsigned long long)size, (unsigned long long)buffer, (unsigned long long)traced,
                           (unsigned long long)at, GetCurrentThreadId(), __builtin_return_address(1));
             return;
@@ -574,7 +574,7 @@ static void note_read(const char *what, ULONG_PTR buffer, ULONG_PTR size)
 
 static BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD size, DWORD *read, OVERLAPPED *overlapped)
 {
-    note_read("ReadFile", (ULONG_PTR)buffer, size);
+    xmem_note_page_op("ReadFile", (ULONG_PTR)buffer, size);
     if (!real_read_file)
         real_read_file = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFile");
     return ((BOOL (WINAPI *)(HANDLE, void *, DWORD, DWORD *, OVERLAPPED *))real_read_file)(file, buffer, size, read,
@@ -585,11 +585,38 @@ static BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT *segments
                                      OVERLAPPED *overlapped)
 {
     for (DWORD i = 0; segments && i < (size + 4095) / 4096; i++)
-        note_read("ReadFileScatter", (ULONG_PTR)segments[i].Buffer, 4096);
+        xmem_note_page_op("ReadFileScatter", (ULONG_PTR)segments[i].Buffer, 4096);
     if (!real_read_file_scatter)
         real_read_file_scatter = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFileScatter");
     return ((BOOL (WINAPI *)(HANDLE, FILE_SEGMENT_ELEMENT *, DWORD, DWORD *, OVERLAPPED *))real_read_file_scatter)(
             file, segments, size, reserved, overlapped);
+}
+
+static void *real_virtual_free, *real_discard_virtual_memory, *real_offer_virtual_memory;
+
+static BOOL WINAPI virtual_free(void *address, SIZE_T size, DWORD type)
+{
+    if (type & MEM_DECOMMIT)
+        xmem_note_page_op("VirtualFree(MEM_DECOMMIT)", (ULONG_PTR)address, size ? size : 1);
+    if (!real_virtual_free)
+        real_virtual_free = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualFree");
+    return ((BOOL (WINAPI *)(void *, SIZE_T, DWORD))real_virtual_free)(address, size, type);
+}
+
+static DWORD WINAPI discard_virtual_memory(void *address, SIZE_T size)
+{
+    xmem_note_page_op("DiscardVirtualMemory", (ULONG_PTR)address, size);
+    if (!real_discard_virtual_memory)
+        real_discard_virtual_memory = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "DiscardVirtualMemory");
+    return ((DWORD (WINAPI *)(void *, SIZE_T))real_discard_virtual_memory)(address, size);
+}
+
+static DWORD WINAPI offer_virtual_memory(void *address, SIZE_T size, DWORD priority)
+{
+    xmem_note_page_op("OfferVirtualMemory", (ULONG_PTR)address, size);
+    if (!real_offer_virtual_memory)
+        real_offer_virtual_memory = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "OfferVirtualMemory");
+    return ((DWORD (WINAPI *)(void *, SIZE_T, DWORD))real_offer_virtual_memory)(address, size, priority);
 }
 
 static struct
@@ -612,6 +639,12 @@ static struct
     /* The title's reservations below 2^46, the console's address width (xmem.c). */
     { "kernelbase.dll", "VirtualAlloc", xmem_low_virtual_alloc },
     { "kernel32.dll", "VirtualAlloc", xmem_low_virtual_alloc },
+    { "kernelbase.dll", "VirtualFree", virtual_free },
+    { "kernel32.dll", "VirtualFree", virtual_free },
+    { "kernelbase.dll", "DiscardVirtualMemory", discard_virtual_memory },
+    { "kernel32.dll", "DiscardVirtualMemory", discard_virtual_memory },
+    { "kernelbase.dll", "OfferVirtualMemory", offer_virtual_memory },
+    { "kernel32.dll", "OfferVirtualMemory", offer_virtual_memory },
     { "kernelbase.dll", "ReadFile", read_file },
     { "kernel32.dll", "ReadFile", read_file },
     { "kernelbase.dll", "ReadFileScatter", read_file_scatter },
@@ -828,6 +861,9 @@ void import_fixup_run(void)
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
         if (replacements[i].ours == (void *)net_connect) real_connect = replacements[i].wine;
+        if (replacements[i].ours == (void *)virtual_free && replacements[i].wine) real_virtual_free = replacements[i].wine;
+        if (replacements[i].ours == (void *)discard_virtual_memory && replacements[i].wine) real_discard_virtual_memory = replacements[i].wine;
+        if (replacements[i].ours == (void *)offer_virtual_memory && replacements[i].wine) real_offer_virtual_memory = replacements[i].wine;
         if (replacements[i].ours == (void *)read_file && replacements[i].wine) real_read_file = replacements[i].wine;
         if (replacements[i].ours == (void *)read_file_scatter && replacements[i].wine) real_read_file_scatter = replacements[i].wine;
         if (replacements[i].ours == (void *)set_thread_priority && replacements[i].wine) real_set_thread_priority = replacements[i].wine;

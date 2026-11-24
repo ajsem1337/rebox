@@ -106,6 +106,8 @@ void *WINAPI xmem_low_virtual_alloc(void *address, SIZE_T size, DWORD type, DWOR
 {
     static NTSTATUS (WINAPI *nt_alloc)(HANDLE, void **, ULONG_PTR, SIZE_T *, ULONG, ULONG);
     NTSTATUS status;
+    if (type & MEM_RESET)
+        xmem_note_page_op("VirtualAlloc(MEM_RESET)", (ULONG_PTR)address, size);
 
     if (!address && (type & MEM_RESERVE))
     {
@@ -703,6 +705,8 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
 
 BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
 {
+    if (type & MEM_DECOMMIT)
+        xmem_note_page_op("XMemVirtualFree(MEM_DECOMMIT)", (ULONG_PTR)address, size ? size : 1);
     if (type & MEM_RELEASE)
         forget_reservation(address);
     if ((type & MEM_RELEASE) && release_physical_range(address))
