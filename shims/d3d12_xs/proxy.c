@@ -5285,6 +5285,7 @@ static void log_slot_stats_at_exit(void)
 
 void proxy_frame_presented(void)
 {
+    console_frame_presented();
     static LONG64 frames;
     int interval = slot_stats_interval();
 

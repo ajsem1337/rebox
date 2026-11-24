@@ -1308,6 +1308,62 @@ UINT64 console_last_draw_vs(void)
     return current_draw.vs;
 }
 
+/* A frame's compile budget. Compiles of known programs run in the title's recording threads (most
+ * take well under a millisecond, AnyPS5's memo and the module cache hitting); a scene that brings
+ * in many new variants made frames take seconds, and the title's GPU watchdog fired. Once the
+ * compiles in the title's threads since the last present have taken REBOX_FRAME_COMPILE_BUDGET_MS
+ * (default 150; 0: no budget), graphics stages are skipped for the rest of the frame, their draws
+ * left out as while a program first compiles; the next frame goes on from there (VIctory, GPL-3.0,
+ * facts: a 500 ms budget a frame for pipelines, after which draws are dropped). Compute dispatches
+ * aren't skipped: what they write can be read back by the title. */
+static volatile LONG compile_frame;
+static volatile LONG64 frame_compile_ticks;
+static volatile LONG budget_frame, budget_skips;
+
+void console_frame_presented(void)
+{
+    InterlockedIncrement(&compile_frame);
+}
+
+static LONG64 frame_budget_ticks(void)
+{
+    static LONG64 budget = -1;
+    if (budget < 0)
+    {
+        char v[16];
+        DWORD n = GetEnvironmentVariableA("REBOX_FRAME_COMPILE_BUDGET_MS", v, sizeof(v));
+        LONG ms = n && n < sizeof(v) ? atol(v) : 150;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        budget = ms > 0 ? f.QuadPart * ms / 1000 : 0;
+    }
+    return budget;
+}
+
+static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct rebox_compile_out *out)
+{
+    const struct rebox_deferred_shader *h = in->shader;
+    BOOL graphics = in->shader_size >= sizeof(*h) && h->version == 2;
+    LONG64 budget = frame_budget_ticks(), started;
+    LONG frame = compile_frame;
+    HRESULT hr;
+
+    if (InterlockedExchange(&budget_frame, frame) != frame)
+        InterlockedExchange64(&frame_compile_ticks, 0);
+    if (graphics && budget && frame_compile_ticks >= budget)
+    {
+        LONG n = InterlockedIncrement(&budget_skips);
+        if (!(n & (n - 1)) && n >= 64)
+            rebox_log("d3d12_xs: console shaders: %ld graphics stages skipped past their frame's compile budget", n);
+        set_last(E_PENDING, "past this frame's compile budget", NULL);
+        return E_PENDING;
+    }
+    started = ticks_now();
+    hr = compile_now(in, out, FALSE);
+    InterlockedAdd64(&frame_compile_ticks, ticks_now() - started);
+    return hr;
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     UINT64 key;
@@ -1343,7 +1399,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         set_last(E_FAIL, "its background compile failed", NULL);
         return E_FAIL;
     default:
-        return compile_now(in, out, FALSE);
+        return compile_within_budget(in, out);
     }
 }
 
