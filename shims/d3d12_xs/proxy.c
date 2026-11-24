@@ -2777,6 +2777,62 @@ static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy
  * composites from such a pair). Each address gets a heap, sized for the largest texture placed
  * there so far, and every such texture is placed at its start, so vkd3d-proton backs them with one
  * memory. A texture larger than the heap gets a new one (aliases made before it no longer share). */
+/* Resources placed in title memory that couldn't be made GPU memory when they were placed: a
+ * title places them before it maps physical pages under them, and the GPU read them there later
+ * (a fault that lost the device). Tried again before submissions, every 100 ms, until they are. */
+static struct { UINT64 address, size; } pending_adopts[1024];
+static UINT pending_adopt_count;
+static SRWLOCK pending_adopt_lock = SRWLOCK_INIT;
+
+static void adopt_or_retry(UINT64 address, UINT64 size)
+{
+    static LONG full;
+    UINT i;
+
+    if (gpu_memory_adopt(address, size))
+        return;
+    AcquireSRWLockExclusive(&pending_adopt_lock);
+    for (i = 0; i < pending_adopt_count; i++)
+        if (pending_adopts[i].address == address && pending_adopts[i].size >= size)
+            break;
+    if (i == pending_adopt_count)
+    {
+        if (pending_adopt_count < ARRAYSIZE(pending_adopts))
+        {
+            pending_adopts[pending_adopt_count].address = address;
+            pending_adopts[pending_adopt_count].size = size;
+            pending_adopt_count++;
+        }
+        else if (!InterlockedExchange(&full, 1))
+            rebox_log("d3d12_xs: no room to retry making title memory at %#llx GPU memory (%u kept)",
+                      (unsigned long long)address, (UINT)ARRAYSIZE(pending_adopts));
+    }
+    ReleaseSRWLockExclusive(&pending_adopt_lock);
+}
+
+static void retry_pending_adopts(void)
+{
+    static ULONGLONG last;
+    static LONG made;
+    ULONGLONG now = GetTickCount64();
+
+    if (!pending_adopt_count || now - last < 100)
+        return;
+    last = now;
+    AcquireSRWLockExclusive(&pending_adopt_lock);
+    for (UINT i = 0; i < pending_adopt_count;)
+        if (gpu_memory_adopt(pending_adopts[i].address, pending_adopts[i].size))
+        {
+            if (InterlockedIncrement(&made) <= 16)
+                rebox_log("d3d12_xs: title memory at %#llx+%#llx under a placed resource is GPU memory now",
+                          (unsigned long long)pending_adopts[i].address, (unsigned long long)pending_adopts[i].size);
+            pending_adopts[i] = pending_adopts[--pending_adopt_count];
+        }
+        else
+            i++;
+    ReleaseSRWLockExclusive(&pending_adopt_lock);
+}
+
 struct alias_heap { UINT64 address, size; ID3D12Heap *heap; };
 static struct alias_heap alias_heaps[4096];
 static SRWLOCK alias_lock = SRWLOCK_INIT;
@@ -2802,7 +2858,7 @@ static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D1
      * the texture has memory of its own, but a title also reads that memory by address (a buffer
      * over a render target, or over the texture beside one), and those reads went to memory the
      * GPU couldn't see: a fault that lost the device. */
-    gpu_memory_adopt(address, info.SizeInBytes);
+    adopt_or_retry(address, info.SizeInBytes);
     AcquireSRWLockExclusive(&alias_lock);
     {
         SIZE_T start = (SIZE_T)((address >> 16) * 0x9e3779b97f4a7c15ull >> 52) % ARRAYSIZE(alias_heaps);
@@ -2911,7 +2967,10 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     /* A buffer over the title's own memory: that memory is made GPU memory where it is. */
     else if (!gpu_memory_heap_at(address, &heap, &offset)
             && !(gpu_memory_adopt(address, d->Width) && gpu_memory_heap_at(address, &heap, &offset)))
+    {
+        adopt_or_retry(address, d->Width);
         why = 1;
+    }
     else
     {
         D3D12_CLEAR_VALUE clear_storage;
@@ -3681,6 +3740,7 @@ static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *
     /* Memory waits the lists start with: on the GPU for counters, else on the CPU (lists_wait). */
     lists_wait(p, count, lists);
     submit_mark(&mark, 0);
+    retry_pending_adopts();
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
     submit_mark(&mark, 1);
