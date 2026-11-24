@@ -4231,7 +4231,9 @@ static void STDMETHODCALLTYPE list_CopyMemoryToMemoryX(struct proxy *p, UINT64 d
 }
 
 /* DispatchX(x, y, z, flags), slot 80 (78 on the older layout): Dispatch with console flags (VIctory,
- * GPL-3.0, facts). REBOX_DISPATCHX=0 drops them, as before they were handled. */
+ * GPL-3.0, facts; the title's ray tracing builder dispatches this way). Dropped unless
+ * REBOX_DISPATCHX=1: ray tracing isn't translated, and run as Dispatch they faulted the GPU within
+ * minutes of reaching the world (two runs). */
 static void STDMETHODCALLTYPE list_DispatchX(struct proxy *p, UINT x, UINT y, UINT z, UINT flags)
 {
     static int enabled = -1;
@@ -4240,11 +4242,11 @@ static void STDMETHODCALLTYPE list_DispatchX(struct proxy *p, UINT x, UINT y, UI
     if (enabled < 0)
     {
         const char *v = getenv("REBOX_DISPATCHX");
-        enabled = !(v && *v == '0');
+        enabled = v && *v == '1';
     }
     if (InterlockedIncrement(&logged) <= 8)
         rebox_log("d3d12_xs: DispatchX(%u, %u, %u, flags %#x) in list %p%s", x, y, z, flags, p,
-                  enabled ? "" : ": dropped (REBOX_DISPATCHX=0)");
+                  enabled ? "" : ": dropped (REBOX_DISPATCHX=1 runs it)");
     if (enabled)
         ID3D12GraphicsCommandList_Dispatch(INNER(p, ID3D12GraphicsCommandList), x, y, z);
 }
