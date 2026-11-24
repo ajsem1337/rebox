@@ -679,8 +679,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, cons
      * concluding the driver can't do lower-half addresses at all. */
     if (adopt)
     {
-        /* Title memory: exactly there, or not at all (the caller sees result 0). */
+        /* Title memory: exactly there, or not at all (the caller sees result 0). And exactly its
+         * size: the placed map covers the whole allocation, so one rounded up to the 2 MiB
+         * alignment above mapped GPU memory over the title's pages past the range too, with
+         * nothing copied there (they read as zeros: a title's streamed assets were wiped). */
         size = info->allocationSize;
+        ai.allocationSize = size;
         oc.opaqueCaptureAddress = adopt;
         vr = d->allocate(device, &ai, alloc, memory);
         if (flags)
