@@ -2512,9 +2512,23 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     if (!d || !out)
         return E_INVALIDARG;
     {
+        /* Each distinct kind (dimension, size, format) once, the first 64 kinds. */
+        static struct { UINT dimension, height, format; UINT64 width; } kinds[64];
+        static LONG kind_count;
+        static SRWLOCK kind_lock = SRWLOCK_INIT;
         UINT64 cpu = gpu_view_to_cpu(address);
-        static LONG logged;
-        if (cpu != address && InterlockedIncrement(&logged) <= 64)
+        BOOL first = cpu != address;
+        AcquireSRWLockExclusive(&kind_lock);
+        for (LONG i = 0; first && i < kind_count; i++)
+            if (kinds[i].dimension == (UINT)desc->Dimension && kinds[i].width == desc->Width
+                    && kinds[i].height == desc->Height && kinds[i].format == (UINT)desc->Format)
+                first = FALSE;
+        if (first && kind_count < ARRAYSIZE(kinds))
+            kinds[kind_count++] = (typeof(kinds[0])){ desc->Dimension, desc->Height, desc->Format, desc->Width };
+        else
+            first = FALSE;
+        ReleaseSRWLockExclusive(&kind_lock);
+        if (first)
             rebox_log("d3d12_xs: placed at %#llx in a GPU view of title memory, over %#llx: dimension %u, %llux%u, "
                       "format %u, flags %#x", (unsigned long long)address, (unsigned long long)cpu, desc->Dimension,
                       (unsigned long long)desc->Width, desc->Height, desc->Format, desc->Flags);
