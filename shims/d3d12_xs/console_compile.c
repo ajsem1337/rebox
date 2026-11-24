@@ -1149,6 +1149,24 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                         rebox_value_watch = base + offset;
                 }
             }
+            /* At its first 4 draws, every buffer V# in its s8 table (16-byte entries whose type
+             * nibble is a buffer's) and the first 8 floats of each: its constants. */
+            if (n <= 4 && in->user_sgprs[8])
+            {
+                UINT32 table[64];
+                if (ReboxShadowRead(in->user_sgprs[8], table, sizeof(table)))
+                    for (UINT e = 0; e < 16; e++)
+                    {
+                        const UINT32 *w = table + e * 4;
+                        UINT64 base = (UINT64)(w[1] & 0xffff) << 32 | w[0];
+                        const float *f = (const float *)(ULONG_PTR)base;
+                        if (!w[0] || (w[3] >> 28) >= 8 || !base || IsBadReadPtr(f, 32))
+                            continue;
+                        rebox_log("d3d12_xs: stage %s draw %ld: table +%#x V# %08x %08x %08x %08x: %g %g %g %g %g %g "
+                                  "%g %g", id, n, e * 16, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3], f[4], f[5],
+                                  f[6], f[7]);
+                    }
+            }
         }
     }
     /* REBOX_DUMP_STAGES=<id>,... (with REBOX_DUMP_SPIRV): those stages' code and the first 256 bytes
