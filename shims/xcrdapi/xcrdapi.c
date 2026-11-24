@@ -694,6 +694,27 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
                          request->destination_size);
     }
     e.request = *request;
+    {
+        /* Each kind of request once (its options), with an example: what a title asks for. */
+        static UINT64 kinds[32];
+        static LONG kind_count;
+        BOOL seen = FALSE;
+        for (LONG k = 0; k < min(kind_count, 32); k++)
+            seen |= kinds[k] == request->options;
+        if (!seen)
+        {
+            LONG k = InterlockedIncrement(&kind_count) - 1;
+            if (k < 32)
+            {
+                kinds[k] = request->options;
+                rebox_log("xcrdapi: a request with options %#llx (%s, %u -> %u bytes, intermediate %u, destination %p "
+                          "+%llu)", (unsigned long long)request->options,
+                          request->options & OPT_SOURCE_MEMORY ? "from memory" : "from a file", request->source_size,
+                          request->destination_size, request->intermediate_size, request->destination,
+                          (unsigned long long)request->destination_page_offset);
+            }
+        }
+    }
     /* A page array is copied now: titles also pass arrays on the stack (xcl). Pages are 64 KiB. */
     if ((request->options & OPT_DEST_PHYSICAL) && request->destination && request->destination_size)
     {
