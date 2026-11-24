@@ -909,6 +909,69 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG
     return ok;
 }
 
+typedef void (WINAPI *title_memory_written_fn)(UINT64, UINT64);
+
+/* Writes size bytes into physical pages, from offset bytes into the first: a DirectStorage request
+ * whose destination is a page array (xcrdapi). Each page's contents are where it is mapped (its
+ * first mapping; others are copies), or kept for when it is. Writes into mapped memory are reported
+ * to d3d12_xs, which uploads textures placed there. FALSE if a page isn't one this process
+ * allocated. */
+BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZE_T offset, const void *data,
+                                    SIZE_T size)
+{
+    static title_memory_written_fn written;
+    static BOOL resolved;
+    const BYTE *from = data;
+    BOOL ok = TRUE;
+
+    if (!resolved)
+    {
+        HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+        written = m ? (title_memory_written_fn)(void *)GetProcAddress(m, "ReboxTitleMemoryWritten") : NULL;
+        resolved = TRUE;
+    }
+    AcquireSRWLockExclusive(&physical_lock);
+    for (ULONG_PTR i = 0; i < count && size; i++)
+    {
+        ULONG_PTR u = page_unit(pages[i]);
+        SIZE_T page_size, n;
+        BYTE *to;
+
+        if (u == (ULONG_PTR)-1)
+        {
+            ok = FALSE;
+            break;
+        }
+        page_size = (SIZE_T)units[u].size_units * PAGE_UNIT;
+        if (offset >= page_size)
+        {
+            offset -= page_size;
+            continue;
+        }
+        n = min(size, page_size - offset);
+        if (units[u].mapped)
+            to = (BYTE *)units[u].mapped;
+        else
+        {
+            if (!units[u].saved && !(units[u].saved = VirtualAlloc(NULL, page_size, MEM_COMMIT | MEM_RESERVE,
+                                                                     PAGE_READWRITE)))
+            {
+                ok = FALSE;
+                break;
+            }
+            to = units[u].saved;
+        }
+        memcpy(to + offset, from, n);
+        if (units[u].mapped && written)
+            written((UINT64)(units[u].mapped + offset), n);
+        from += n;
+        size -= n;
+        offset = 0;
+    }
+    ReleaseSRWLockExclusive(&physical_lock);
+    return ok && !size;
+}
+
 /* Moves memory between the title's and the system's budgets, which aren't kept apart here. */
 BOOL WINAPI XMemTransferMemory(UINT direction, SIZE_T size)
 {

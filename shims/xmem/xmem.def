@@ -20,6 +20,7 @@ EXPORTS
     ReboxHeartbeat
     ReboxGpuvaMailbox
     ReboxGpuViewToCpu
+    ReboxWritePhysicalPages
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister

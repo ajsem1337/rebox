@@ -3520,6 +3520,33 @@ static void test_xcrdapi(void)
                   "DirectStorage runs requests without Submit and sets an event from slot 5 (EnqueueSetEvent)");
             CloseHandle(done);
         }
+
+        /* A zlib read into physical pages (options bit 21): the destination is a page array, the
+         * offset into the first page at +0x10; the data straddles two mapped pages. */
+        {
+            HMODULE xmem = LoadLibraryA("xmem.dll");
+            BOOL (WINAPI *alloc_pages)(ULONGLONG, ULONG_PTR *, ULONG_PTR *) =
+                    xmem ? (void *)GetProcAddress(xmem, "XMemAllocatePhysicalPages") : NULL;
+            BOOL (WINAPI *map_pages)(void *, ULONG_PTR, ULONG_PTR *) =
+                    xmem ? (void *)GetProcAddress(xmem, "XMemMapPhysicalPages") : NULL;
+            ULONG_PTR pages[2], count = 2;
+            BYTE *view = VirtualAlloc(NULL, 2 << 16, MEM_RESERVE, PAGE_READWRITE);
+            HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+            BOOL paged_ok = alloc_pages && map_pages && view && alloc_pages(0, &count, pages) && map_pages(view, 2, pages);
+
+            if (paged_ok)
+            {
+                struct req r5 = { 1 | 1ull << 21, pages, 0x10000 - 100, 280, 0, file, 64, sizeof(zlib_data) };
+                XSLOT(fq, 3, void, const struct req *)(fq, &r5);
+                XSLOT(fq, 5, void, HANDLE, UINT64)(fq, done, 0);
+                XSLOT(fq, 6, void)(fq);
+                paged_ok = WaitForSingleObject(done, 5000) == WAIT_OBJECT_0;
+                for (int i = 0; paged_ok && i < 280; i++)
+                    paged_ok &= view[0x10000 - 100 + i] == (BYTE)unit[i % (sizeof(unit) - 1)];
+            }
+            CHECK(paged_ok, "DirectStorage zlib read into two physical pages");
+            CloseHandle(done);
+        }
     }
     if (file) XSLOT(file, 2, ULONG)(file);
     if (status) XSLOT(status, 2, ULONG)(status);

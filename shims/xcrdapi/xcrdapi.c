@@ -15,8 +15,10 @@
  * Requests run in order on one worker thread per queue, reading from host files or memory.
  * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests go to
  * helpers/bcpack, a separate process running Leonida's GPLv3 decoder (rebox-run starts it and
- * sets REBOX_BCPACK_PORT), over a localhost connection per worker thread. Swizzled
- * destinations and physical-page addresses aren't supported, nor is BCPack without the helper:
+ * sets REBOX_BCPACK_PORT), over a localhost connection per worker thread. A destination in physical
+ * pages (options bit 21: an array of 64 KiB page numbers, the offset into the first at +0x10) is
+ * decoded into a buffer and written through the pages (xmem ReboxWritePhysicalPages). Swizzled
+ * destinations and physical-page sources aren't supported, nor is BCPack without the helper:
  * those requests fail with E_NOTIMPL and are logged, and the next status entry reports it. */
 
 #define COBJMACROS
@@ -264,6 +266,8 @@ struct entry
     ID3D12Fence *fence;
     UINT64 value;
     HANDLE event;               /* ENTRY_EVENT: duplicated, closed once set */
+    ULONG_PTR *pages;           /* a physical-page destination's page numbers, as at enqueue */
+    UINT32 page_count;
 };
 
 struct queue
@@ -427,6 +431,42 @@ static HRESULT bcpack_decode(UINT32 codec, const BYTE *raw, UINT32 raw_size, BYT
     return (HRESULT)reply[0];
 }
 
+typedef BOOL (WINAPI *write_pages_fn)(const ULONG_PTR *, ULONG_PTR, SIZE_T, const void *, SIZE_T);
+
+static BOOL CALLBACK find_write_pages(INIT_ONCE *once, void *param, void **out)
+{
+    HMODULE m = GetModuleHandleA("xmem.dll");
+    *out = m ? (void *)GetProcAddress(m, "ReboxWritePhysicalPages") : NULL;
+    return TRUE;
+}
+
+/* Writes a decoded request into its destination pages. A page number still 0 in the snapshot is
+ * read again from the title's array now: a title can fill an entry after enqueueing the request
+ * (xcl, ivall/xcl, GPL-2.0-only, dstorage.rs: a retail title's streaming requests). */
+static HRESULT write_pages(const struct entry *e, const BYTE *data, UINT32 size)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    const ULONG_PTR *array = e->request.destination;
+    write_pages_fn write;
+
+    InitOnceExecuteOnce(&once, find_write_pages, NULL, (void **)&write);
+    if (!write)
+        return E_NOTIMPL;
+    for (UINT32 i = 0; i < e->page_count; i++)
+        if (!e->pages[i] && !IsBadReadPtr(array + i, sizeof(*array)))
+            e->pages[i] = array[i];
+    if (!write(e->pages, e->page_count, (SIZE_T)e->request.destination_page_offset, data, size))
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("xcrdapi: writing %u bytes to %u physical pages (first %#llx, offset %llu) failed", size,
+                      e->page_count, e->page_count ? (unsigned long long)e->pages[0] : 0ull,
+                      (unsigned long long)e->request.destination_page_offset);
+        return E_INVALIDARG;
+    }
+    return S_OK;
+}
+
 static HRESULT run_request(struct queue *q, const struct entry *e)
 {
     const DSTORAGE_REQUEST *r = &e->request;
@@ -435,8 +475,32 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     HRESULT hr = S_OK;
 
     BOOL bcpack = !!(r->options & OPT_BCPACK);
+    BOOL to_pages = !!(r->options & OPT_DEST_PHYSICAL);
+    DSTORAGE_REQUEST paged;
 
-    if ((r->options & (OPT_SWIZZLE | OPT_DEST_PHYSICAL | OPT_SOURCE_PHYSICAL))
+    /* A destination in physical pages: decoded into a buffer here, then written through the pages
+     * (xmem). */
+    if (to_pages)
+    {
+        HRESULT hr;
+        struct entry inner = *e;
+        BYTE *buffer;
+
+        if (!e->pages || !r->destination_size)
+            return r->destination_size ? E_INVALIDARG : S_OK;
+        if (!(buffer = calloc(1, r->destination_size)))
+            return E_OUTOFMEMORY;
+        paged = *r;
+        paged.options &= ~OPT_DEST_PHYSICAL;
+        paged.destination = buffer;
+        inner.request = paged;
+        inner.pages = NULL;
+        if (SUCCEEDED(hr = run_request(q, &inner)))
+            hr = write_pages(e, buffer, r->destination_size);
+        free(buffer);
+        return hr;
+    }
+    if ((r->options & (OPT_SWIZZLE | OPT_SOURCE_PHYSICAL))
             || (bcpack && !getenv("REBOX_BCPACK_PORT")))
     {
         static LONG logged;
@@ -527,6 +591,7 @@ static void release_entry(const struct entry *e)
         object_Release(&e->status->obj);
     if (e->fence)
         ID3D12Fence_Release(e->fence);
+    free(e->pages);
 }
 
 static DWORD WINAPI queue_worker(void *param)
@@ -565,7 +630,7 @@ static DWORD WINAPI queue_worker(void *param)
             HRESULT hr = run_request(q, &e);
             if (FAILED(hr))
                 InterlockedIncrement64(&stats.failed);
-            if (SUCCEEDED(hr))
+            if (SUCCEEDED(hr) && !(e.request.options & OPT_DEST_PHYSICAL)) /* pages: xmem reports */
                 report_written(e.request.destination, e.request.destination_size);
             if (FAILED(hr))
             {
@@ -621,6 +686,15 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
                          request->destination_size);
     }
     e.request = *request;
+    /* A page array is copied now: titles also pass arrays on the stack (xcl). Pages are 64 KiB. */
+    if ((request->options & OPT_DEST_PHYSICAL) && request->destination && request->destination_size)
+    {
+        UINT64 span = request->destination_page_offset + (UINT64)request->destination_size;
+        e.page_count = (UINT32)((span + 0xffff) >> 16);
+        if ((e.pages = calloc(e.page_count, sizeof(*e.pages)))
+                && !IsBadReadPtr(request->destination, e.page_count * sizeof(*e.pages)))
+            memcpy(e.pages, request->destination, e.page_count * sizeof(*e.pages));
+    }
     if (!(request->options & OPT_SOURCE_MEMORY) && request->source)
     {
         e.file = request->source;

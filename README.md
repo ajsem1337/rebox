@@ -316,7 +316,7 @@ down missing translations.
   queue under PyPy, far below the console's hardware. BC1 is the exception: bcpack-rs
   (`bcpack-serve`, MIT/Apache) decodes it at 34-40 MB/s per core. BC6H and BC7 often need history tables
   Leonida doesn't ship, so those use its provisional entries unless calibrated tables are given
-  (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page addresses in DirectStorage
+  (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page sources in DirectStorage
   requests aren't supported.
 - **Textures placed at title addresses are copies.** On the console a texture placed with
   `CreatePlacedResourceX` is the memory at its address, in a Gfx10 tiled layout. Here it has its
