@@ -1735,7 +1735,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     UINT64 address = 0;
                     UINT uploads = 0;
                     /* Only when logging: console_texture_of walks every texture the title made. */
-                    if (shown < 64 && InterlockedIncrement(&shown) <= 64)
+                    static LONG watched_shown;
+                    if ((console_stage_watched(stage_id) && InterlockedIncrement(&watched_shown) <= 24)
+                            || (shown < 64 && InterlockedIncrement(&shown) <= 64))
                     {
                         ID3D12Resource *res = console_texture_of(w);
                         D3D12_RESOURCE_DESC rd = { 0 };
@@ -1781,6 +1783,15 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
                 if ((b.kind == 4 || b.kind == 5) && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
                     null_view = shadow_reserve_null(heap, b.kind == 5, index);
+                if (console_stage_watched(stage_id))
+                {
+                    static LONG resolved_shown;
+                    if (InterlockedIncrement(&resolved_shown) <= 48)
+                        rebox_log("d3d12_xs: watched stage %016llx binding %u.%u (kind %u, %u words %08x %08x %08x %08x): "
+                                  "%s heap index %u, view %d%s", (unsigned long long)stage_id, b.binding, e, b.kind, per,
+                                  w[0], w[1], w[2], w[3], found ? "found at" : "not found;", *index,
+                                  found ? (int)shadow_slot_view(heap, *index) : -1, null_view ? ", a null view" : "");
+                }
                 /* An empty T# of a graphics stage: maybe one the title writes before it submits. Its
                  * address is the n-th texture slot of the code's tables that is empty now. */
                 if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3])
