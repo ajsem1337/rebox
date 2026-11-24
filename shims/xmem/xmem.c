@@ -343,6 +343,9 @@ static struct gpuva_mailbox *mailbox;
  * then is retried. One window at a time: it is set under physical_lock. */
 static volatile UINT64 remap_start, remap_size;
 
+static BOOL track_fault(ULONG_PTR address);
+
+/* And a write to a page armed for write tracking (Write tracking, below) is noted and goes on. */
 static LONG CALLBACK hold_busy_writes(EXCEPTION_POINTERS *ep)
 {
     const EXCEPTION_RECORD *r = ep->ExceptionRecord;
@@ -356,16 +359,20 @@ static LONG CALLBACK hold_busy_writes(EXCEPTION_POINTERS *ep)
             Sleep(0);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1
-            || !mailbox || !mailbox->busy_size)
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1)
         return EXCEPTION_CONTINUE_SEARCH;
     address = r->ExceptionInformation[1];
-    start = mailbox->busy_address;
-    if (address < start || address - start >= mailbox->busy_size)
-        return EXCEPTION_CONTINUE_SEARCH;
-    while (mailbox->busy_size && mailbox->busy_address == start)
-        Sleep(0);
-    return EXCEPTION_CONTINUE_EXECUTION;
+    if (mailbox && mailbox->busy_size)
+    {
+        start = mailbox->busy_address;
+        if (address >= start && address - start < mailbox->busy_size)
+        {
+            while (mailbox->busy_size && mailbox->busy_address == start)
+                Sleep(0);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return track_fault((ULONG_PTR)address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* The mailbox for making title memory GPU-visible (layers/gpuva_mailbox.h), or NULL. */
@@ -558,6 +565,8 @@ typedef struct
  * this is not VirtualQuery's signature. Every committed readable page is
  * reported GPU-accessible: on the console GPU and CPU addresses are the same,
  * and the shim's job is to make that true here (see docs/d3d12x.md). */
+static BOOL armed_at(ULONG_PTR address);
+
 BOOL WINAPI XMemVirtualQuery(HANDLE process, const void *address, XMEM_BASIC_INFORMATION *info)
 {
     const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
@@ -590,6 +599,10 @@ BOOL WINAPI XMemVirtualQuery(HANDLE process, const void *address, XMEM_BASIC_INF
     }
     if (!VirtualQueryEx(process, address, &info->mbi, sizeof(info->mbi)))
         return FALSE;
+    /* A page armed for write tracking is writable as far as the title knows (its first write
+     * faults, and is let through). */
+    if (info->mbi.Protect == PAGE_READONLY && armed_at((ULONG_PTR)address))
+        info->mbi.Protect = PAGE_READWRITE;
     if (info->mbi.State == MEM_COMMIT && !(info->mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
     {
         if (info->mbi.Protect & readable)
@@ -886,16 +899,31 @@ struct physical_unit
     BOOL copy;        /* mapped there as a copy (no placeholder), not a view */
     ULONG_PTR copy_at; /* where it is mapped as a copy, or 0: writes go there too */
     UINT size_units;  /* at a page's first unit: its size in 64 KiB units (1 or 64) */
+    BOOL armed;       /* write-tracked: read-only at every view of it (each 64 KiB unit of a page) */
+    SIZE_T first_alias; /* at a page's first unit: the first slot it is mapped at, plus one, or 0 */
 };
 
 static SRWLOCK physical_lock = SRWLOCK_INIT;
+static volatile DWORD physical_owner; /* the thread holding physical_lock exclusively, or 0 */
 static struct physical_unit *units;
 static ULONG_PTR unit_count, unit_capacity;
 
 /* Address -> the page mapped there: open addressing on 64 KiB-aligned addresses. A page mapped as
  * part of a run shares that run's view (view, view_bytes); a copy is its own. */
 #define MAPPED_SLOTS (1u << 20)
-static struct { ULONG_PTR address, unit, view; SIZE_T view_bytes; BOOL copy; BYTE *snapshot; } *mapped_at;
+static struct { ULONG_PTR address, unit, view; SIZE_T view_bytes; BOOL copy; BYTE *snapshot; SIZE_T next_alias; } *mapped_at;
+
+static void lock_physical(void)
+{
+    AcquireSRWLockExclusive(&physical_lock);
+    physical_owner = GetCurrentThreadId();
+}
+
+static void unlock_physical(void)
+{
+    physical_owner = 0;
+    ReleaseSRWLockExclusive(&physical_lock);
+}
 
 static SIZE_T mapped_slot(ULONG_PTR address, BOOL insert)
 {
@@ -976,7 +1004,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
         return FALSE;
     }
     s->live = (LONG)*count;
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     if (!mapped_at && !(mapped_at = VirtualAlloc(NULL, MAPPED_SLOTS * sizeof(*mapped_at), MEM_COMMIT | MEM_RESERVE,
                                                  PAGE_READWRITE)))
         ok = FALSE;
@@ -1002,7 +1030,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
             pages[i] = (unit_count + 1) << 4;
             unit_count += size_units;
         }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
     if (!ok)
     {
         UnmapViewOfFile(s->home);
@@ -1015,7 +1043,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
 
 BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
 {
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     for (ULONG_PTR i = 0; pages && i < count; i++)
     {
         ULONG_PTR u = page_unit(pages[i]);
@@ -1033,7 +1061,7 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
             free(s);
         }
     }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
     return TRUE;
 }
 
@@ -1073,6 +1101,19 @@ static SIZE_T slot_at(ULONG_PTR address)
     return slot != (SIZE_T)-1 && mapped_at[slot].address == address ? slot : (SIZE_T)-1;
 }
 
+/* Each page's slots (where it is mapped) are a list from its first unit's first_alias through
+ * next_alias (slot numbers plus one): write tracking protects and reports every address of a page.
+ * Under physical_lock. */
+static void alias_unlink(SIZE_T slot)
+{
+    SIZE_T *at = &units[mapped_at[slot].unit].first_alias;
+    while (*at && *at != slot + 1)
+        at = &mapped_at[*at - 1].next_alias;
+    if (*at)
+        *at = mapped_at[slot].next_alias;
+    mapped_at[slot].next_alias = 0;
+}
+
 static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view_bytes, BOOL copy)
 {
     SIZE_T slot = mapped_slot(address, TRUE);
@@ -1082,8 +1123,12 @@ static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view
         units[u].copy_at = address;
     if (slot == (SIZE_T)-1)
         return;
+    if (mapped_at[slot].address == address) /* mapped again in place: off the old page's list */
+        alias_unlink(slot);
     mapped_at[slot].address = address;
     mapped_at[slot].unit = u;
+    mapped_at[slot].next_alias = units[u].first_alias;
+    units[u].first_alias = slot + 1;
     mapped_at[slot].view = view;
     mapped_at[slot].view_bytes = view_bytes;
     mapped_at[slot].copy = copy;
@@ -1102,7 +1147,296 @@ static void clear_slot(SIZE_T slot)
         units[u].copy_at = 0;
     free(mapped_at[slot].snapshot);
     mapped_at[slot].snapshot = NULL;
+    alias_unlink(slot);
     mapped_at[slot].address = 1; /* a tombstone */
+}
+
+/* Write tracking for physical-page views. Write watching can't see section views, so d3d12_xs
+ * asks for the 64 KiB units under a placed texture to be tracked (ReboxTrackPages, when it is
+ * registered and before each upload reads it): each unit is made read-only at every address its
+ * page is mapped at ("armed"). The first write to any of them faults; hold_busy_writes takes it
+ * here, notes every address of the unit dirty, makes them writable again and lets the write go
+ * on. Before each submission d3d12_xs collects the dirty ranges (ReboxTrackedDirty) and uploads
+ * the textures on them, arming them again first, so a write after that faults again and one
+ * before it is in what the upload reads.
+ *
+ *   - A page mapped somewhere new starts dirty there (XMemMapPhysicalPages, ReboxMapPhysicalAlias),
+ *     and a view of an armed unit is protected as it is mapped. The units of a view mapped again
+ *     around an unmapped part (unmap_range) are briefly writable before they are protected again:
+ *     armed ones are noted dirty then too.
+ *   - Writes that don't fault are noted directly: xmem's own through a page's home view
+ *     (ReboxWritePhysicalPages, a copy written back at unmapping). A system call writing into an
+ *     armed view fails instead of faulting (ReadFile returns ERROR_NOACCESS), so the title's
+ *     ReadFile and DirectStorage's reads disarm their buffer first (ReboxPrepareWrite).
+ *   - Units mapped as copies (no placeholder there, or memory made GPU memory in place) aren't
+ *     tracked: ReboxTrackPages fails for a range with one, and its textures are fingerprinted.
+ *   - Protection is per 64 KiB unit, the physical page size, not the 4 KiB OS page: one fault a
+ *     unit, and textures sharing a unit are made dirty together.
+ *
+ * VIctory protects its view memory the same way (facts only, GPL-3.0). REBOX_TEXTURE_TRACKING=0
+ * turns it off. */
+static volatile LONG tracking_active; /* something was armed: dirty ranges are kept from then on */
+static struct { ULONG_PTR start, end; } *dirty_ranges;
+static UINT dirty_count, dirty_cap;
+static BOOL dirty_overflow;
+static SRWLOCK dirty_lock = SRWLOCK_INIT;
+static volatile LONG64 track_faults, track_armed, track_prepared;
+#define DIRTY_MAX (1u << 20)
+
+static BOOL tracking_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        char *v = rebox_getenv("REBOX_TEXTURE_TRACKING");
+        enabled = !v || strcmp(v, "0");
+        free(v);
+    }
+    return enabled;
+}
+
+/* [start, start + size) may have changed: kept for ReboxTrackedDirty. Any lock may be held. */
+static void note_dirty(ULONG_PTR start, SIZE_T size)
+{
+    if (!tracking_active || !size)
+        return;
+    AcquireSRWLockExclusive(&dirty_lock);
+    if (dirty_count && start <= dirty_ranges[dirty_count - 1].end && start + size >= dirty_ranges[dirty_count - 1].start)
+    {
+        dirty_ranges[dirty_count - 1].start = min(dirty_ranges[dirty_count - 1].start, start);
+        dirty_ranges[dirty_count - 1].end = max(dirty_ranges[dirty_count - 1].end, start + size);
+    }
+    else
+    {
+        if (dirty_count == dirty_cap && dirty_cap < DIRTY_MAX)
+        {
+            UINT cap = dirty_cap ? dirty_cap * 2 : 4096;
+            void *grown = realloc(dirty_ranges, cap * sizeof(*dirty_ranges));
+            if (grown)
+                dirty_ranges = grown, dirty_cap = cap;
+        }
+        if (dirty_count < dirty_cap)
+        {
+            dirty_ranges[dirty_count].start = start;
+            dirty_ranges[dirty_count++].end = start + size;
+        }
+        else
+            dirty_overflow = TRUE;
+    }
+    ReleaseSRWLockExclusive(&dirty_lock);
+}
+
+/* For d3d12_xs: up to max dirty ranges as (start, size) pairs, taken; how many. *overflow is set
+ * if some were lost (too many between two calls): everything tracked should be thought dirty. */
+UINT WINAPI ReboxTrackedDirty(ULONGLONG *pairs, UINT max, BOOL *overflow)
+{
+    UINT n = 0;
+    AcquireSRWLockExclusive(&dirty_lock);
+    while (n < max && dirty_count)
+    {
+        dirty_count--;
+        pairs[2 * n] = dirty_ranges[dirty_count].start;
+        pairs[2 * n + 1] = dirty_ranges[dirty_count].end - dirty_ranges[dirty_count].start;
+        n++;
+    }
+    if (overflow)
+        *overflow = dirty_overflow;
+    dirty_overflow = FALSE;
+    ReleaseSRWLockExclusive(&dirty_lock);
+    return n;
+}
+
+/* The slot of the page mapped over address and the 64 KiB unit of it address is in. Under
+ * physical_lock. */
+static BOOL locate(ULONG_PTR address, SIZE_T *slot, ULONG_PTR *sub)
+{
+    ULONG_PTR base = address & ~(ULONG_PTR)(PAGE_UNIT - 1);
+    if (!mapped_at)
+        return FALSE;
+    for (ULONG_PTR k = 0; k < 64 && base >= k * PAGE_UNIT; k++)
+    {
+        SIZE_T s = slot_at(base - k * PAGE_UNIT);
+        if (s == (SIZE_T)-1)
+            continue;
+        if (units[mapped_at[s].unit].size_units <= k)
+            return FALSE;
+        *slot = s;
+        *sub = k;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Unit sub of the page whose first unit is first, at every view of it: protect set, or noted
+ * dirty. Under physical_lock. */
+static void protect_unit(ULONG_PTR first, ULONG_PTR sub, DWORD protect)
+{
+    for (SIZE_T a = units[first].first_alias; a; a = mapped_at[a - 1].next_alias)
+    {
+        DWORD old;
+        if (mapped_at[a - 1].copy)
+            continue;
+        if (!VirtualProtect((void *)(mapped_at[a - 1].address + sub * PAGE_UNIT), PAGE_UNIT, protect, &old))
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("xmem: write tracking: protecting %#llx as %#lx failed (error %lu)",
+                          (unsigned long long)(mapped_at[a - 1].address + sub * PAGE_UNIT), protect, GetLastError());
+        }
+    }
+}
+
+static void dirty_unit(ULONG_PTR first, ULONG_PTR sub)
+{
+    for (SIZE_T a = units[first].first_alias; a; a = mapped_at[a - 1].next_alias)
+        if (!mapped_at[a - 1].copy)
+            note_dirty(mapped_at[a - 1].address + sub * PAGE_UNIT, PAGE_UNIT);
+}
+
+/* Every unit of page u's [offset, offset + size) noted dirty wherever it is mapped: written
+ * through its home. Under physical_lock. */
+static void dirty_page_bytes(ULONG_PTR u, SIZE_T offset, SIZE_T size)
+{
+    if (!tracking_active || !size)
+        return;
+    for (ULONG_PTR sub = offset / PAGE_UNIT; sub <= (offset + size - 1) / PAGE_UNIT; sub++)
+        dirty_unit(u, sub);
+}
+
+static void disarm(ULONG_PTR first, ULONG_PTR sub)
+{
+    units[first + sub].armed = FALSE;
+    dirty_unit(first, sub);
+    protect_unit(first, sub, PAGE_READWRITE);
+}
+
+/* A write fault at address (hold_busy_writes): TRUE if it was write tracking's, now writable. The
+ * faulting thread may hold physical_lock itself. */
+static BOOL track_fault(ULONG_PTR address)
+{
+    BOOL owned, handled = FALSE;
+    ULONG_PTR sub;
+    SIZE_T slot;
+
+    if (!tracking_active)
+        return FALSE;
+    if (!(owned = physical_owner == GetCurrentThreadId()))
+        lock_physical();
+    if (locate(address, &slot, &sub) && !mapped_at[slot].copy)
+    {
+        ULONG_PTR first = mapped_at[slot].unit;
+        if (units[first + sub].armed)
+        {
+            disarm(first, sub);
+            handled = TRUE;
+            LONG64 n = InterlockedIncrement64(&track_faults);
+            if (n == 1)
+                rebox_log("xmem: write tracking: the first write to an armed page, at %#llx", (unsigned long long)address);
+            else if (!(n & 0xffff))
+                rebox_log("xmem: write tracking: %lld writes taken, %lld units armed, %lld disarmed for system writes",
+                          n, track_armed, track_prepared);
+        }
+        else
+        {
+            /* Disarmed by another thread meanwhile: the write goes on, unless the page is
+             * read-only for another reason. */
+            MEMORY_BASIC_INFORMATION mbi;
+            handled = VirtualQuery((void *)address, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT
+                    && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+        }
+    }
+    if (!owned)
+        unlock_physical();
+    return handled;
+}
+
+/* For d3d12_xs: arm [address, address + size), every 64 KiB unit of it, if each is a view of a
+ * physical page; otherwise nothing is armed and it returns FALSE (the texture is fingerprinted). */
+BOOL WINAPI ReboxTrackPages(ULONGLONG address, ULONGLONG size)
+{
+    ULONG_PTR start = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1), end = (ULONG_PTR)(address + size), sub;
+    SIZE_T slot;
+    BOOL ok = TRUE;
+
+    if (!size || !mapped_at || !tracking_enabled())
+        return FALSE;
+    lock_physical();
+    for (ULONG_PTR at = start; ok && at < end; at += PAGE_UNIT)
+        ok = locate(at, &slot, &sub) && !mapped_at[slot].copy && !in_adopted(at);
+    if (ok && !tracking_active)
+    {
+        InterlockedExchange(&tracking_active, 1);
+        rebox_log("xmem: write tracking: the first texture in physical-page views armed, at %#llx+%#llx",
+                  (unsigned long long)address, (unsigned long long)size);
+    }
+    for (ULONG_PTR at = start; ok && at < end; at += PAGE_UNIT)
+    {
+        ULONG_PTR first;
+        locate(at, &slot, &sub);
+        first = mapped_at[slot].unit;
+        if (!units[first + sub].armed)
+        {
+            units[first + sub].armed = TRUE;
+            protect_unit(first, sub, PAGE_READONLY);
+            InterlockedIncrement64(&track_armed);
+        }
+    }
+    unlock_physical();
+    return ok;
+}
+
+/* Something that doesn't fault (a system call: ReadFile) is about to write [address, address +
+ * size): the armed units there are disarmed, noted dirty. */
+void WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size)
+{
+    ULONG_PTR sub;
+    SIZE_T slot;
+
+    if (!tracking_active || !size)
+        return;
+    lock_physical();
+    for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); at < address + size; at += PAGE_UNIT)
+        if (locate(at, &slot, &sub) && !mapped_at[slot].copy && units[mapped_at[slot].unit + sub].armed)
+        {
+            disarm(mapped_at[slot].unit, sub);
+            InterlockedIncrement64(&track_prepared);
+        }
+    unlock_physical();
+}
+
+/* Whether address is in an armed unit, read-only only for tracking (XMemVirtualQuery). */
+static BOOL armed_at(ULONG_PTR address)
+{
+    BOOL armed = FALSE;
+    ULONG_PTR sub;
+    SIZE_T slot;
+    if (!tracking_active)
+        return FALSE;
+    AcquireSRWLockShared(&physical_lock);
+    armed = locate(address, &slot, &sub) && !mapped_at[slot].copy && units[mapped_at[slot].unit + sub].armed;
+    ReleaseSRWLockShared(&physical_lock);
+    return armed;
+}
+
+/* Units of n pages just mapped as views from at: armed ones protected (and, mapped again around
+ * an unmapping, noted dirty: briefly writable); all of them noted dirty if fresh. Under
+ * physical_lock. */
+static void track_mapped(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n, BOOL fresh)
+{
+    ULONG_PTR a = at;
+    if (!tracking_active)
+        return;
+    for (ULONG_PTR k = 0; k < n; k++)
+        for (ULONG_PTR sub = 0; sub < units[us[k]].size_units; sub++, a += PAGE_UNIT)
+            if (units[us[k] + sub].armed)
+            {
+                DWORD old;
+                VirtualProtect((void *)a, PAGE_UNIT, PAGE_READONLY, &old);
+                if (!fresh)
+                    note_dirty(a, PAGE_UNIT);
+            }
+    if (fresh)
+        note_dirty(at, a - at);
 }
 
 /* A view of size bytes of section s at offset, at address: in the placeholder there, split off a
@@ -1176,8 +1510,9 @@ static BOOL place_copy(ULONG_PTR address, ULONG_PTR u)
 
 /* Maps n page units at consecutive addresses from at, where nothing is mapped: runs of pages that
  * follow each other in one section as one view each; a run that can't be one view page by page;
- * a page with no placeholder as a copy. Under physical_lock. */
-static BOOL map_units(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n)
+ * a page with no placeholder as a copy. Fresh: newly mapped there, not mapped again around an
+ * unmapping (write tracking notes it dirty). Under physical_lock. */
+static BOOL map_units(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n, BOOL fresh)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     BOOL ok = TRUE;
@@ -1195,6 +1530,7 @@ static BOOL map_units(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n)
         {
             for (ULONG_PTR k = i, a = at; k < j; a += (SIZE_T)units[us[k]].size_units * PAGE_UNIT, k++)
                 set_slot(a, us[k], at, bytes, FALSE);
+            track_mapped(at, us + i, j - i, fresh);
             at += bytes;
             continue;
         }
@@ -1202,9 +1538,17 @@ static BOOL map_units(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n)
         {
             SIZE_T size = (SIZE_T)units[us[k]].size_units * PAGE_UNIT;
             if (j - i > 1 && place_view(at, size, s, units[us[k]].offset))
+            {
                 set_slot(at, us[k], at, size, FALSE);
+                track_mapped(at, us + k, 1, fresh);
+            }
+            else if (place_copy(at, us[k]))
+            {
+                if (fresh)
+                    note_dirty(at, size);
+            }
             else
-                ok &= place_copy(at, us[k]);
+                ok = FALSE;
             at += size;
         }
     }
@@ -1243,6 +1587,7 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
                 if (changed)
                 {
                     static LONG logged;
+                    dirty_page_bytes(u, 0, size); /* its views see it now */
                     if (InterlockedIncrement(&logged) <= 16)
                         rebox_log("xmem: a copy of physical page %#llx at %#llx unmapped: %llu qwords written through "
                                   "it go back", (unsigned long long)((u + 1) << 4), (unsigned long long)at,
@@ -1296,9 +1641,9 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
                           (unsigned long long)view, (unsigned long long)view_bytes, (unsigned long long)trace_address(),
                           (unsigned long long)start, (unsigned long long)end);
             if (keep_count[0])
-                map_units(keep_at[0], keep, keep_count[0]);
+                map_units(keep_at[0], keep, keep_count[0], FALSE);
             if (keep_count[1])
-                map_units(keep_at[1], keep + (start - view) / PAGE_UNIT, keep_count[1]);
+                map_units(keep_at[1], keep + (start - view) / PAGE_UNIT, keep_count[1], FALSE);
             free(keep);
             MemoryBarrier();
             remap_size = 0;
@@ -1337,17 +1682,17 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     if (!mapped_at)
     {
-        ReleaseSRWLockExclusive(&physical_lock);
+        unlock_physical();
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     if ((end = list_end(start, count, pages)) == (ULONG_PTR)-1)
     {
         static LONG logged;
-        ReleaseSRWLockExclusive(&physical_lock);
+        unlock_physical();
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("xmem: XMemMapPhysicalPages(%p): a page number this process didn't allocate", address);
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1388,7 +1733,7 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
                 continue;
             }
             if (n)
-                ok &= map_units(run_at, us, n);
+                ok &= map_units(run_at, us, n, TRUE);
             n = 0;
             if (i < count)
             {
@@ -1437,7 +1782,7 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
                       "split or coalesced; %llu copies", calls, pages_total, ms_total, plain_total, split_total,
                       copy_total);
     }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
     return ok;
 }
 
@@ -1449,7 +1794,7 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
 {
     UINT converted = 0;
 
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     if (adopted_count < ARRAYSIZE(adopted))
     {
         adopted[adopted_count].start = (ULONG_PTR)address;
@@ -1466,6 +1811,11 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
         if (slot == (SIZE_T)-1 || mapped_at[slot].copy)
             continue;
         u = mapped_at[slot].unit;
+        /* Protection there went with the pages: an armed texture there is uploaded, and found
+         * untrackable then. */
+        for (ULONG_PTR sub = 0; sub < units[u].size_units; sub++)
+            if (units[u + sub].armed)
+                note_dirty(at + sub * PAGE_UNIT, PAGE_UNIT);
         mapped_at[slot].copy = TRUE;
         mapped_at[slot].view = at;
         mapped_at[slot].view_bytes = (SIZE_T)units[u].size_units * PAGE_UNIT;
@@ -1477,7 +1827,7 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
             units[u].copy = TRUE;
         converted++;
     }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
     rebox_log("xmem: %#llx+%#llx is GPU memory in place now: %u physical pages mapped there are copies",
               (unsigned long long)address, (unsigned long long)size, converted);
 }
@@ -1575,7 +1925,7 @@ BOOL WINAPI ReboxMapPhysicalAlias(ULONGLONG to, ULONGLONG from, ULONGLONG len)
     if (!to || !len || (to | from | len) & (PAGE_UNIT - 1) || !mapped_at
             || !(us = malloc((len / PAGE_UNIT) * sizeof(*us))))
         return FALSE;
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     for (ULONG_PTR at = (ULONG_PTR)from; from && at < from + len;)
     {
         SIZE_T slot = slot_at(at);
@@ -1589,8 +1939,8 @@ BOOL WINAPI ReboxMapPhysicalAlias(ULONGLONG to, ULONGLONG from, ULONGLONG len)
     }
     unmap_range((ULONG_PTR)to, (ULONG_PTR)(to + len));
     if (from && ok)
-        ok = map_units((ULONG_PTR)to, us, n);
-    ReleaseSRWLockExclusive(&physical_lock);
+        ok = map_units((ULONG_PTR)to, us, n, TRUE);
+    unlock_physical();
     free(us);
     {
         static LONG logged;
@@ -1646,7 +1996,7 @@ static struct { ULONG_PTR base, size; } physical_ranges[256];
 
 static void note_physical_range(void *base, SIZE_T size)
 {
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     for (UINT i = 0; i < ARRAYSIZE(physical_ranges); i++)
         if (!physical_ranges[i].size)
         {
@@ -1654,7 +2004,7 @@ static void note_physical_range(void *base, SIZE_T size)
             physical_ranges[i].size = size;
             break;
         }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
 }
 
 
@@ -1671,7 +2021,7 @@ static BOOL release_physical_range(void *base)
 {
     ULONG_PTR start = 0, end = 0;
 
-    AcquireSRWLockExclusive(&physical_lock);
+    lock_physical();
     for (UINT i = 0; i < ARRAYSIZE(physical_ranges); i++)
         if (physical_ranges[i].size && physical_ranges[i].base == (ULONG_PTR)base)
         {
@@ -1693,7 +2043,7 @@ static BOOL release_physical_range(void *base)
             VirtualFree((void *)at, 0, MEM_RELEASE);
         at += size;
     }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
     return end != 0;
 }
 typedef void (WINAPI *title_memory_written_fn)(UINT64, UINT64);
@@ -1701,8 +2051,9 @@ typedef void (WINAPI *title_memory_written_fn)(UINT64, UINT64);
 /* Writes size bytes into physical pages, from offset bytes into the first: a DirectStorage request
  * whose destination is a page array (xcrdapi). The bytes go to the pages' sections, which every
  * view of them shares; a page mapped as a copy gets them too. The address each page was last
- * mapped at is reported to d3d12_xs, which uploads textures placed there. FALSE if a page isn't
- * one this process allocated. */
+ * mapped at is reported to d3d12_xs, which uploads textures placed there, once physical_lock is
+ * let go (d3d12_xs arms pages under its own lock); write tracking notes every view of them dirty.
+ * FALSE if a page isn't one this process allocated. */
 BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZE_T offset, const void *data,
                                     SIZE_T size)
 {
@@ -1710,6 +2061,8 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
     static BOOL resolved;
     const BYTE *from = data;
     BOOL ok = TRUE;
+    struct { UINT64 address, size; } *reports;
+    ULONG_PTR report_count = 0;
 
     if (!resolved)
     {
@@ -1717,7 +2070,8 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
         written = m ? (title_memory_written_fn)(void *)GetProcAddress(m, "ReboxTitleMemoryWritten") : NULL;
         resolved = TRUE;
     }
-    AcquireSRWLockExclusive(&physical_lock);
+    reports = written && count ? malloc(2 * count * sizeof(*reports)) : NULL;
+    lock_physical();
     for (ULONG_PTR i = 0; i < count && size; i++)
     {
         ULONG_PTR u = page_unit(pages[i]);
@@ -1740,6 +2094,7 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
                       (unsigned long long)n, (unsigned long long)pages[i], (unsigned long long)offset,
                       (unsigned long long)units[u].mapped, GetCurrentThreadId());
         memcpy(unit_home(u) + offset, from, n);
+        dirty_page_bytes(u, offset, n);
         if (units[u].copy_at)
         {
             SIZE_T slot = slot_at(units[u].copy_at);
@@ -1747,15 +2102,18 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
             if (slot != (SIZE_T)-1 && mapped_at[slot].snapshot) /* not a write through the copy */
                 memcpy(mapped_at[slot].snapshot + offset, from, n);
         }
-        if (units[u].mapped && written)
-            written((UINT64)(units[u].mapped + offset), n);
-        if (units[u].copy_at && units[u].copy_at != units[u].mapped && written)
-            written((UINT64)(units[u].copy_at + offset), n);
+        if (units[u].mapped && reports)
+            reports[report_count].address = units[u].mapped + offset, reports[report_count++].size = n;
+        if (units[u].copy_at && units[u].copy_at != units[u].mapped && reports)
+            reports[report_count].address = units[u].copy_at + offset, reports[report_count++].size = n;
         from += n;
         size -= n;
         offset = 0;
     }
-    ReleaseSRWLockExclusive(&physical_lock);
+    unlock_physical();
+    for (ULONG_PTR i = 0; i < report_count; i++)
+        written(reports[i].address, reports[i].size);
+    free(reports);
     return ok && !size;
 }
 

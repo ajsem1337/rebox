@@ -335,6 +335,25 @@ static BOOL push(struct entry **list, UINT32 *count, UINT32 *size, const struct 
 }
 
 /* Whether [p, p + size) is all committed, writable memory. */
+typedef void (WINAPI *prepare_write_fn)(ULONGLONG, ULONGLONG);
+
+static BOOL CALLBACK find_prepare_write(INIT_ONCE *once, void *param, void **out)
+{
+    HMODULE m = GetModuleHandleA("xmem.dll");
+    *out = m ? (void *)GetProcAddress(m, "ReboxPrepareWrite") : NULL;
+    return TRUE;
+}
+
+static void prepare_write(void *address, SIZE_T size)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    prepare_write_fn prepare;
+
+    InitOnceExecuteOnce(&once, find_prepare_write, NULL, (void **)&prepare);
+    if (prepare && address && size)
+        prepare((ULONGLONG)(ULONG_PTR)address, size);
+}
+
 static BOOL writable_range(const void *p, SIZE_T size)
 {
     const BYTE *at = p, *end = (const BYTE *)p + size;
@@ -618,6 +637,9 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     if (!(r->options & OPT_ZLIB) && !bcpack && r->destination_size < r->source_size)
         return E_INVALIDARG;
 
+    /* Pages there armed for write tracking (xmem) are made writable first: a read into them fails
+     * rather than faulting, and writable_range would refuse them. */
+    prepare_write(r->destination, r->destination_size);
     if (from_memory)
         data = r->source;
     else

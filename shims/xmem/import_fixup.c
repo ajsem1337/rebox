@@ -572,9 +572,14 @@ void xmem_note_page_op(const char *what, ULONG_PTR buffer, ULONG_PTR size)
         }
 }
 
+/* A read into pages armed for write tracking (xmem.c) would fail (ERROR_NOACCESS) rather than
+ * fault: they are disarmed first, and noted written. */
+void WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size);
+
 static BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD size, DWORD *read, OVERLAPPED *overlapped)
 {
     xmem_note_page_op("ReadFile", (ULONG_PTR)buffer, size);
+    ReboxPrepareWrite((ULONG_PTR)buffer, size);
     if (!real_read_file)
         real_read_file = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFile");
     return ((BOOL (WINAPI *)(HANDLE, void *, DWORD, DWORD *, OVERLAPPED *))real_read_file)(file, buffer, size, read,
@@ -585,7 +590,10 @@ static BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT *segments
                                      OVERLAPPED *overlapped)
 {
     for (DWORD i = 0; segments && i < (size + 4095) / 4096; i++)
+    {
         xmem_note_page_op("ReadFileScatter", (ULONG_PTR)segments[i].Buffer, 4096);
+        ReboxPrepareWrite((ULONG_PTR)segments[i].Buffer, 4096);
+    }
     if (!real_read_file_scatter)
         real_read_file_scatter = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFileScatter");
     return ((BOOL (WINAPI *)(HANDLE, FILE_SEGMENT_ELEMENT *, DWORD, DWORD *, OVERLAPPED *))real_read_file_scatter)(

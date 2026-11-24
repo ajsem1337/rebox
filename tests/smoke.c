@@ -4358,6 +4358,220 @@ done:
     free(linear);
 }
 
+/* The texture's GPU copy read back after a submission: how many texels differ from expected (all
+ * of them if it can't be read). */
+static UINT tracked_readback(void *queue, void *list, ID3D12CommandAllocator *alloc, ID3D12Fence *fence,
+                             UINT64 *value, ID3D12Resource *tex, ID3D12Resource *buf, const UINT32 *expected,
+                             UINT w, UINT h)
+{
+    D3D12_TEXTURE_COPY_LOCATION src = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+    D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                        { .PlacedFootprint = { 0, { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, w * 4 } } } };
+    UINT32 *out = NULL;
+    UINT changed = 0;
+
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+          const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++*value);
+    for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(fence) < *value; i++)
+        Sleep(10);
+    if (ID3D12Fence_GetCompletedValue(fence) < *value || FAILED(ID3D12Resource_Map(buf, 0, NULL, (void **)&out)))
+        return w * h;
+    for (UINT i = 0; i < w * h; i++)
+        changed += out[i] != expected[i];
+    ID3D12Resource_Unmap(buf, 0, NULL);
+    return changed;
+}
+
+/* A texture placed in physical pages mapped into a range reserved for them (views of the pages'
+ * sections, which write watching can't see): xmem write-tracks it. After its first upload its
+ * pages are read-only; a CPU write into it, away from its fingerprint's points, faults, is let
+ * through, and is uploaded at the next submission; so is a write through another mapping of the
+ * same page, a ReadFile into it, a DirectStorage-style write into its pages, and a page mapped
+ * anew under it (a remap). */
+static void test_placed_texture_tracked(void *dev, void *queue)
+{
+    enum { W = 2048, H = 1024, UNIT = 64 << 10 };
+    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
+            { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 1, FALSE, FALSE };
+    typedef void *(WINAPI *valloc_fn)(void *, SIZE_T, DWORD, ULONGLONG, DWORD);
+    typedef BOOL (WINAPI *vfree_fn)(void *, SIZE_T, DWORD);
+    typedef BOOL (WINAPI *palloc_fn)(ULONGLONG, ULONG_PTR *, ULONG_PTR *);
+    typedef BOOL (WINAPI *pmap_fn)(void *, ULONG_PTR, ULONG_PTR *);
+    typedef BOOL (WINAPI *pwrite_fn)(const ULONG_PTR *, ULONG_PTR, SIZE_T, const void *, SIZE_T);
+    typedef UINT64 (WINAPI *size_fn)(const void *);
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll"), x = GetModuleHandleA("xmem.dll");
+    valloc_fn valloc = (valloc_fn)(void *)GetProcAddress(x, "XMemVirtualAlloc");
+    vfree_fn vfree = (vfree_fn)(void *)GetProcAddress(x, "XMemVirtualFree");
+    palloc_fn palloc = (palloc_fn)(void *)GetProcAddress(x, "XMemAllocatePhysicalPages");
+    pmap_fn pmap = (pmap_fn)(void *)GetProcAddress(x, "XMemMapPhysicalPages");
+    pwrite_fn pwrite = (pwrite_fn)(void *)GetProcAddress(x, "ReboxWritePhysicalPages");
+    vquery_fn xquery = (vquery_fn)(void *)GetProcAddress(x, "XMemVirtualQuery");
+    size_fn surface_size = (size_fn)(void *)GetProcAddress(m, "ReboxDetileSize");
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(m, "ReboxTile");
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, W, H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, W * 4 * H, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    ID3D12Resource *tex = NULL, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *list = NULL;
+    UINT32 *expected = malloc(W * 4 * H), *where = NULL;
+    BYTE *memory = NULL, *alias = NULL, *spare = NULL;
+    ULONG_PTR pages[160], count = 0, extra[1], one = 1;
+    UINT64 size = 0, value = 0, step;
+    UINT units = 0, changed;
+    MEMORY_BASIC_INFORMATION mbi;
+    HRESULT hr = E_FAIL;
+    char path[MAX_PATH];
+    HANDLE file;
+    DWORD done;
+
+    if (!valloc || !vfree || !palloc || !pmap || !pwrite || !xquery || !surface_size || !tile || !expected
+            || !(size = surface_size(&surface)) || (units = (UINT)((size + UNIT - 1) / UNIT)) > ARRAYSIZE(pages))
+    {
+        printf("skip write-tracked placed texture: no addrlib or xmem\n");
+        free(expected);
+        return;
+    }
+    count = units;
+    /* The texture's pages, one range reserved for physical pages (placeholders: views), a range
+     * to map one of them at again, and a spare page for the remap. */
+    if (!palloc(0, &count, pages) || count != units || !palloc(0, &one, extra)
+            || !(memory = valloc(NULL, (SIZE_T)units * UNIT, MEM_RESERVE | 0x400000 /* MEM_PHYSICAL */, 0x3, PAGE_READWRITE))
+            || !(alias = valloc(NULL, 2 * UNIT, MEM_RESERVE | 0x400000, 0x3, PAGE_READWRITE))
+            || !pmap(memory, units, pages) || !(where = malloc((size_t)size)))
+        goto done;
+    spare = alias + UNIT;
+    /* Where each texel lies in title memory: its index tiled. */
+    for (int i = 0; i < W * H; i++)
+        expected[i] = i;
+    tile(&surface, where, 0, 0, expected, W * 4, (UINT64)W * 4 * H);
+    for (int i = 0; i < W * H; i++)
+        expected[i] = i * 2654435761u;
+    tile(&surface, memory, 0, 0, expected, W * 4, (UINT64)W * 4 * H);
+    hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+               const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, (UINT64)(ULONG_PTR)memory, &td,
+               D3D12_RESOURCE_STATE_COPY_SOURCE, NULL, &IID_ID3D12Resource, (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (FAILED(hr))
+        goto done;
+    XSLOT(list, 9, HRESULT)(list);
+    changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+    CHECK(!changed, "a texture in physical-page views is uploaded when placed (%u texels differ)", changed);
+    {
+        xmem_info info;
+        CHECK(VirtualQuery(memory + 3 * UNIT, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_READONLY
+              && xquery(GetCurrentProcess(), memory + 3 * UNIT, &info) && info.mbi.Protect == PAGE_READWRITE
+              && (info.gpu_access & 2),
+              "its pages are armed for write tracking: read-only, though XMemVirtualQuery says writable (%#lx)",
+              mbi.Protect);
+    }
+    /* Offsets in a unit at least 8 bytes from every fingerprint point (32 over the texture). */
+    step = (size - 8) / 31;
+#define AWAY(unit, from) ({ UINT64 o_ = (UINT64)(unit) * UNIT + (from); \
+        while (o_ % step < 8 || o_ % step + 4 > step) o_ += 4; o_; })
+    {
+        /* A CPU write. */
+        UINT64 at = AWAY(10, 0x1234);
+        expected[where[at / 4]] = 0xff0000ff;
+        *(volatile UINT32 *)(memory + at) = 0xff0000ff;
+        changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+        CHECK(!changed, "a CPU write into a write-tracked texture in physical-page views is uploaded at the next "
+              "submission (%u texels differ)", changed);
+    }
+    if (pmap(alias, 1, &pages[20]))
+    {
+        /* A write through another mapping of one of its pages. */
+        UINT64 at = AWAY(20, 0x2468);
+        expected[where[at / 4]] = 0xff00ff00;
+        *(volatile UINT32 *)(alias + at - 20 * UNIT) = 0xff00ff00;
+        changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+        CHECK(!changed && memory[at] == alias[at - 20 * UNIT],
+              "a write through another mapping of a write-tracked page is uploaded (%u texels differ)", changed);
+        pmap(alias, 1, NULL);
+    }
+    else
+        CHECK(FALSE, "a page of the texture maps at a second address");
+    if (pmap(spare, 1, extra))
+    {
+        /* A page mapped anew under the texture: what it holds is uploaded, and it is armed then. */
+        UINT64 at = AWAY(30, 0x3000);
+        memcpy(spare, memory + 30 * UNIT, UNIT);
+        *(UINT32 *)(spare + at - 30 * UNIT) = 0xffff0000;
+        expected[where[at / 4]] = 0xffff0000;
+        CHECK(pmap(spare, 1, NULL) && pmap(memory + 30 * UNIT, 1, extra), "a spare page maps under the texture");
+        changed = tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H);
+        CHECK(!changed, "a page mapped anew under a write-tracked texture makes it upload (%u texels differ)", changed);
+        CHECK(VirtualQuery(memory + 30 * UNIT, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_READONLY,
+              "the page mapped anew is armed after the upload (protect %#lx)", mbi.Protect);
+    }
+    else
+        CHECK(FALSE, "a spare physical page maps");
+    {
+        /* DirectStorage into the pages (xmem writes through their home). */
+        UINT64 at = AWAY(40, 0x800);
+        UINT32 v = 0xff123456;
+        expected[where[at / 4]] = v;
+        changed = pwrite(&pages[40], 1, (SIZE_T)(at - 40 * UNIT), &v, 4)
+                ? tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H) : W * H;
+        CHECK(!changed, "a write into a write-tracked texture's physical pages (ReboxWritePhysicalPages) is uploaded "
+              "(%u texels differ)", changed);
+    }
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "rebox-tracked.bin");
+    file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        /* A file read into it: the system writes it, which doesn't fault; the read must not fail. */
+        UINT64 at = AWAY(50, 0x400);
+        UINT32 v = 0xff654321;
+        BOOL ok = WriteFile(file, &v, 4, &done, NULL) && SetFilePointer(file, 0, NULL, FILE_BEGIN) == 0
+                && ReadFile(file, memory + at, 4, &done, NULL) && done == 4;
+        expected[where[at / 4]] = v;
+        changed = ok ? tracked_readback(queue, list, alloc, fence, &value, tex, buf, expected, W, H) : W * H;
+        CHECK(ok && !changed, "a ReadFile into a write-tracked texture succeeds and is uploaded (error %lu, %u texels "
+              "differ)", ok ? 0 : GetLastError(), changed);
+        CloseHandle(file);
+    }
+#undef AWAY
+done:
+    CHECK(SUCCEEDED(hr) && list, "a texture placed in physical-page views (%#lx)", hr);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (tex) ID3D12Resource_Release(tex);
+    if (memory)
+    {
+        pmap(memory, units, NULL);
+        vfree(memory, 0, MEM_RELEASE);
+    }
+    if (alias)
+        vfree(alias, 0, MEM_RELEASE);
+    free(where);
+    free(expected);
+}
+
 /* The older SDK's list has PC's query methods at 28-31 (XValkyrie; a UE5 title calls them): a
  * timestamp through EndQuery (29) and ResolveQueryData (30) reaches a readback buffer. */
 static void test_list_queries(void *dev, void *queue)
@@ -5093,6 +5307,7 @@ static void test_xbox(void)
     test_placed_texture_array(dev, queue);
     test_placed_texture_late(dev, queue);
     test_placed_texture_written(dev, queue);
+    test_placed_texture_tracked(dev, queue);
     test_list_queries(dev, queue);
     test_mip_major_layout();
     test_console_shader(dev, queue);

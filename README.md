@@ -179,7 +179,8 @@ method the title asked for that isn't implemented.
 | `REBOX_LOG=/path` | Also append shim logs to this file |
 | `REBOX_GPUVA_WINDOW` | `BASE:SIZE` (hex) for identity-mapped GPU memory; default `200000000000:10000000000`; `off` stops xmem reserving it |
 | `REBOX_GPU_MEMORY=0` | Give GPU-visible `XMemAlloc` types plain `VirtualAlloc` memory instead of D3D12 heaps |
-| `REBOX_DIRTY_PAGES=0` | Don't reserve title memory (`XMemVirtualAlloc`, `XMemAlloc` pages) with `MEM_WRITE_WATCH`: placed textures there are found changed by fingerprints, as in physical-page views, instead of by the pages written before each submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
+| `REBOX_DIRTY_PAGES=0` | Don't reserve title memory (`XMemVirtualAlloc`, `XMemAlloc` pages) with `MEM_WRITE_WATCH`: placed textures there are found changed by fingerprints, as in GPU memory, instead of by the pages written before each submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
+| `REBOX_TEXTURE_TRACKING=0` | Don't write-track placed textures in physical-page views (their pages read-only, the first write to each 64 KiB page noted): they are found changed by fingerprints again, the hot ones every submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
 | `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
 | `REBOX_VSYNC=N` | `PresentX` sync interval, default 1. Frames the display isn't taking (a hidden Wayland window) are dropped, never waited for |
@@ -350,8 +351,11 @@ down missing translations.
   it is created and whenever DirectStorage reports writing there, before the next submission.
   In title memory xmem reserves with write watching (`XMemVirtualAlloc`, `XMemAlloc` pages), the
   pages written since the last submission make their textures upload, as xcl does
-  ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes"). Elsewhere (physical-page views, GPU
-  memory) writes nothing reports (the CPU, GPU copies to the address) are caught by sampling: each
+  ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes"). In physical-page views xmem keeps the
+  textures' pages read-only and notes the first write to each (and each page mapped anew), and
+  those textures upload; each is fingerprinted at most every 4 seconds as a safety net
+  (`REBOX_TEXTURE_TRACKING=0` turns tracking off). Elsewhere (GPU memory, title memory made GPU
+  memory in place) writes nothing reports (the CPU, GPU copies to the address) are caught by sampling: each
   submission re-checks a fingerprint of 32 points in up to 512 textures (round robin), which sees
   a texture rewritten but not a small edit between the points (`REBOX_TEXTURE_WATCH=0` turns
   it off). A texture placed on memory that isn't committed yet waits until it is (rechecked after

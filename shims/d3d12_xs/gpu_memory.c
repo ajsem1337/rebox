@@ -18,6 +18,7 @@
 #include "../common/rebox_log.h"
 #include "../../layers/gpuva_mailbox.h"
 #include "gpu_memory.h"
+#include "title_textures.h"
 
 #define CHUNK_SIZE (64u << 20)
 #define DEDICATED_THRESHOLD (16u << 20)
@@ -386,10 +387,12 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
  * out from address's region both ways and no further than the window: a title's reservations hold
  * thousands of physical-page views, and a walk from the allocation's base took thousands of
  * VirtualQuery calls a draw. */
+/* Read-only too with write tracking on: xmem arms textures' physical pages so (title_textures.c),
+ * and a run stopping at them left buffers beside them out of GPU memory. */
 static BOOL usable_region(const MEMORY_BASIC_INFORMATION *mbi)
 {
-    return mbi->AllocationBase && mbi->State == MEM_COMMIT
-            && (mbi->Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi->Protect & PAGE_GUARD);
+    DWORD usable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | (title_textures_tracking() ? PAGE_READONLY : 0);
+    return mbi->AllocationBase && mbi->State == MEM_COMMIT && (mbi->Protect & usable) && !(mbi->Protect & PAGE_GUARD);
 }
 
 static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, UINT64 *start, UINT64 *end)

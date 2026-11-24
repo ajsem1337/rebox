@@ -17,8 +17,14 @@
  * REBOX_TEXTURE_WATCH=0 turns the sampling off. Textures wholly in write-watched title memory
  * (xmem reserves it with MEM_WRITE_WATCH) aren't sampled: before each submission the pages written
  * since the last one are asked for (GetWriteWatch, reset), and the textures on them made dirty, as
- * xcl does (ivall/xcl, GPL-2.0-only, title_textures.rs). Physical-page views and GPU memory chunks
- * can't be watched; their textures are sampled as before.
+ * xcl does (ivall/xcl, GPL-2.0-only, title_textures.rs). Textures wholly in physical-page views
+ * are write-tracked instead (xmem.c, "Write tracking"): xmem makes their pages read-only
+ * (ReboxTrackPages, at registration and before each upload reads them), notes the first write to
+ * each 64 KiB unit (and every page newly mapped), and before each submission the ranges noted
+ * (ReboxTrackedDirty) make the textures there dirty. They aren't sampled either, but for a slow
+ * safety net: each is fingerprinted at most every SAFETY_MS. REBOX_TEXTURE_TRACKING=0 turns it
+ * off. GPU memory chunks and title memory adopted as GPU memory can't be watched or tracked;
+ * their textures are sampled as before.
  *
  * The swizzle mode: a console Layout from 0x100 is 0x100 plus the AMD swizzle mode (0x100 linear,
  * 0x105 SW_4KB_S, 0x10A SW_64KB_D; xcl and TuxBox, xcl checked against xg_xs.dll on 29,700 descs).
@@ -58,6 +64,8 @@ struct title_texture
     BOOL gpu_written;           /* a GPU copy wrote it: title memory isn't its contents (font atlases) */
     BOOL target;                /* a render target kept in step anyway (small_cpu_filled_target) */
     BOOL watched;               /* wholly in write-watched memory: written pages find its changes */
+    BOOL tracked;               /* wholly in physical-page views armed by xmem: write faults find its changes */
+    ULONGLONG checked_at;       /* tracked: when last fingerprinted or uploaded (GetTickCount64) */
     UINT callback;
     struct title_texture *next;
     struct title_texture *rnext;  /* in by_resource */
@@ -156,6 +164,7 @@ static UINT submissions;
 #define FULL_HASH_MAX (4u << 20)           /* textures this size or smaller are hashed whole */
 #define FULL_HASH_BUDGET (4u << 20)        /* bytes hashed whole per submission */
 #define HOT_BUDGET (32u << 20)             /* bytes of hot textures checked every submission (a movie's planes; 8 MiB left some out) */
+#define SAFETY_MS 4000                     /* a write-tracked texture is fingerprinted at most this often */
 
 static BOOL full_hash(const struct title_texture *t)
 {
@@ -211,6 +220,88 @@ static UINT64 fingerprint(const struct title_texture *t)
         h = (h ^ v) * 0x100000001b3ull;
     }
     return h;
+}
+
+/* The same hash over a copy of the texture's bytes (what an upload read). */
+static UINT64 fingerprint_bytes(const struct title_texture *t, const BYTE *bytes)
+{
+    UINT64 h = 0xcbf29ce484222325ull, step = t->size > 8 ? (t->size - 8) / (WATCH_SAMPLES - 1) : 0, v;
+
+    if (full_hash(t))
+    {
+        UINT64 i;
+        for (i = 0; i + 8 <= t->size; i += 8)
+        {
+            memcpy(&v, bytes + i, 8);
+            h = (h ^ v) * 0x9e3779b97f4a7c15ull;
+            h ^= h >> 29;
+        }
+        for (; i < t->size; i++)
+            h = (h ^ bytes[i]) * 0x100000001b3ull;
+        return h;
+    }
+    for (UINT i = 0; i < WATCH_SAMPLES; i++)
+    {
+        v = 0;
+        memcpy(&v, bytes + (t->size > 8 ? i * step : 0), t->size >= 8 ? 8 : (SIZE_T)t->size);
+        h = (h ^ v) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+static BOOL tracking_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        char *v = rebox_getenv("REBOX_TEXTURE_TRACKING");
+        enabled = !v || strcmp(v, "0");
+        free(v);
+    }
+    return enabled;
+}
+
+BOOL title_textures_tracking(void)
+{
+    return tracking_enabled();
+}
+
+/* xmem's write tracking for physical-page views: arming a range, and taking the ranges noted
+ * dirty since. */
+static BOOL (WINAPI *track_pages)(ULONGLONG, ULONGLONG);
+static UINT (WINAPI *tracked_dirty)(ULONGLONG *, UINT, BOOL *);
+
+static BOOL CALLBACK find_tracking(INIT_ONCE *once, void *param, void **ctx)
+{
+    HMODULE xmem = tracking_enabled() ? GetModuleHandleA("xmem.dll") : NULL;
+    track_pages = xmem ? (void *)GetProcAddress(xmem, "ReboxTrackPages") : NULL;
+    tracked_dirty = xmem ? (void *)GetProcAddress(xmem, "ReboxTrackedDirty") : NULL;
+    if (!track_pages || !tracked_dirty)
+        track_pages = NULL, tracked_dirty = NULL;
+    return TRUE;
+}
+
+static BOOL in_chunk(UINT64 start, UINT64 end);
+static struct { LONG64 ranges, textures, safety_checks, safety_changes, arm_ticks; } track_stats;
+static LONG64 stat_ticks(void);
+
+/* Under the lock: arms the texture's memory if it can be tracked; TRUE if it is now. Its memory is
+ * read-only after this, so a write it doesn't see faults and is noted. Not memory made GPU memory
+ * (the driver's mapping) or write-watched. */
+static BOOL track(const struct title_texture *t)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    LONG64 start;
+    BOOL ok;
+
+    InitOnceExecuteOnce(&once, find_tracking, NULL, NULL);
+    if (!track_pages || t->chunk || !t->cpu || t->watched || t->gpu_written
+            || in_chunk((UINT64)(ULONG_PTR)t->cpu, (UINT64)(ULONG_PTR)t->cpu + t->size))
+        return FALSE;
+    start = stat_ticks();
+    ok = track_pages((UINT64)(ULONG_PTR)t->cpu, t->size);
+    track_stats.arm_ticks += stat_ticks() - start;
+    return ok;
 }
 
 static BOOL watch_enabled(void)
@@ -368,6 +459,16 @@ static void refresh_watched(void)
         {
             set_watched(t);
             in += t->watched;
+            /* Made GPU memory in place since: the driver's mapping isn't tracked. */
+            if (t->tracked && in_chunk((UINT64)(ULONG_PTR)t->cpu, (UINT64)(ULONG_PTR)t->cpu + t->size))
+            {
+                t->tracked = FALSE;
+                if (!t->dirty && !t->unreadable && !t->gpu_written)
+                {
+                    t->dirty = TRUE;
+                    InterlockedIncrement(&dirty_count);
+                }
+            }
         }
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: %u write-watched reservation(s), %u GPU memory chunk(s); %u of %u placed textures "
@@ -480,19 +581,81 @@ static UINT watch_written(void)
     return changed;
 }
 
+/* Under the lock: textures on what xmem's write tracking noted dirty since the last submission
+ * (written pages of physical-page views, pages mapped anew) made dirty, tracked or not. */
+static UINT track_written(void)
+{
+    static ULONGLONG pairs[2 * 1024];
+    UINT changed = 0, n;
+    BOOL overflow = FALSE, lost = FALSE;
+
+    if (!tracked_dirty)
+        return 0;
+    do
+    {
+        n = tracked_dirty(pairs, ARRAYSIZE(pairs) / 2, &overflow);
+        lost |= overflow;
+        track_stats.ranges += n;
+        for (UINT i = 0; i < n; i++)
+            for (UINT64 start = pairs[2 * i], end = start + pairs[2 * i + 1], page = start >> 16; page <= (end - 1) >> 16; page++)
+                for (struct page_node *node = by_page[page_bucket(page)]; node; node = node->next)
+                {
+                    struct title_texture *t = node->t;
+                    UINT64 cpu = (UINT64)(ULONG_PTR)t->cpu;
+                    if (node->page == page && !t->dirty && !t->unreadable && !t->gpu_written
+                            && start < cpu + t->size && cpu < end)
+                    {
+                        t->dirty = TRUE;
+                        InterlockedIncrement(&dirty_count);
+                        changed++;
+                    }
+                }
+    } while (n == ARRAYSIZE(pairs) / 2);
+    if (lost) /* too many to keep: every tracked texture may have changed */
+        for (struct title_texture *t = textures; t; t = t->next)
+            if (t->tracked && !t->dirty && !t->unreadable && !t->gpu_written)
+            {
+                t->dirty = TRUE;
+                InterlockedIncrement(&dirty_count);
+                changed++;
+            }
+    track_stats.textures += changed;
+    return changed;
+}
+
+/* Under the lock: a tracked texture's slow safety net is due (its fingerprint, at most every
+ * SAFETY_MS). Writes tracking can't see: the title's system calls other than ReadFile, a view
+ * briefly writable while it is mapped again. */
+static BOOL safety_due(struct title_texture *t, ULONGLONG now)
+{
+    if (now - t->checked_at < SAFETY_MS)
+        return FALSE;
+    t->checked_at = now;
+    track_stats.safety_checks++;
+    return TRUE;
+}
+
 /* Called with the lock held. */
 static void watch(void)
 {
     struct title_texture *t = textures;
-    UINT skipped = 0, checked = 0, changed = 0, written = watch_written();
+    UINT skipped = 0, checked = 0, changed = 0, written = watch_written(), tracked = track_written();
     UINT64 hashed = 0;
     BOOL sample = watch_enabled();
+    ULONGLONG now = GetTickCount64();
 
     if (written)
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 4)
             rebox_log("d3d12_xs: %u placed texture(s) on pages written since the last submission", written);
+    }
+    if (tracked)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("d3d12_xs: %u placed texture(s) on physical pages written or mapped since the last submission",
+                      tracked);
     }
     for (; t && skipped < watch_cursor; t = t->next)
         skipped++;
@@ -501,13 +664,22 @@ static void watch(void)
     for (; t && checked < WATCH_BUDGET && hashed < FULL_HASH_BUDGET; t = t->next, checked++)
         if (t->unreadable)
             recheck(t);
-        else if (sample && !t->watched && !t->dirty && !t->gpu_written && still_readable(t)
-                 && (hashed += full_hash(t) ? t->size : 0, TRUE)
+        else if (sample && !t->watched && !t->dirty && !t->gpu_written && (!t->tracked || safety_due(t, now))
+                 && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, TRUE)
                  && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
             InterlockedIncrement(&dirty_count);
             changed++;
+            if (t->tracked)
+            {
+                /* A write tracking missed. */
+                static LONG logged;
+                track_stats.safety_changes++;
+                if (InterlockedIncrement(&logged) <= 8)
+                    rebox_log("d3d12_xs: write-tracked texture at %#llx (%ux%u) changed without a write noted; found "
+                              "by its fingerprint", (unsigned long long)t->address, t->surface.width, t->surface.height);
+            }
         }
     watch_cursor = t ? watch_cursor + checked : 0;
     /* Hot textures, ones the CPU has rewritten since they were made (a glyph atlas gains letters
@@ -519,7 +691,7 @@ static void watch(void)
      * overwrote what the GPU drew into them (menu text got worse). */
     hashed = 0;
     for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (hot(t) && !t->watched && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
+        if (hot(t) && !t->watched && !t->tracked && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
                 && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, fingerprint(t) != t->fingerprint))
         {
             t->dirty = TRUE;
@@ -827,6 +999,9 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     index_add(t);
     refresh_watched();
     set_watched(t);
+    /* Armed now, if its memory is in physical-page views; the first upload arms it again. */
+    if (!t->unreadable)
+        t->tracked = track(t);
     if (t->dirty)
         InterlockedIncrement(&dirty_count);
     ReleaseSRWLockExclusive(&lock);
@@ -919,6 +1094,8 @@ static ID3D12Resource *record_upload(ID3D12Device *device, ID3D12GraphicsCommand
         BYTE *source = ok ? malloc(t->size) : NULL;
         if (ok && (!source || !read_title(t->cpu, source, t->size)))
             ok = FALSE;
+        if (ok && t->tracked)
+            t->fingerprint = fingerprint_bytes(t, source);
         for (UINT i = 0; i < t->subresources && ok; i++)
         {
             UINT mip = i % t->surface.mips, layer = i / t->surface.mips;
@@ -1060,7 +1237,10 @@ static void log_large(void)
         rebox_log("d3d12_xs: large title texture at %#llx: %ux%u format %u, mode %u, %u uploads%s%s%s%s, "
                   "%llu of %llu sampled bytes nonzero", (unsigned long long)t->address, t->surface.width,
                   t->surface.height, t->surface.format, t->surface.mode, t->uploads, t->dirty ? ", dirty" : "",
-                  t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "", t->watched ? ", watched" : "",
+                  t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "",
+                  t->watched ? ", watched" : t->tracked ? ", tracked" : t->chunk ? ", in a GPU memory chunk"
+                  : in_chunk((UINT64)(ULONG_PTR)t->cpu, (UINT64)(ULONG_PTR)t->cpu + t->size) ? ", GPU memory in place"
+                  : ", fingerprinted",
                   (unsigned long long)nonzero, (unsigned long long)sampled);
         dump_title_texture(t, rounds);
     }
@@ -1093,6 +1273,19 @@ static void upload_stats_log(void)
               upload_stats.objects * ms, upload_stats.record * ms, upload_stats.submit * ms, upload_stats.uploads,
               upload_stats.bytes / 1048576.0);
     memset(&upload_stats, 0, sizeof(upload_stats));
+    if (tracked_dirty)
+    {
+        UINT count = 0, tracked = 0;
+        AcquireSRWLockShared(&lock);
+        for (struct title_texture *t = textures; t; t = t->next, count++)
+            tracked += t->tracked;
+        ReleaseSRWLockShared(&lock);
+        rebox_log("d3d12_xs: write tracking over those: %u of %u placed textures tracked; arming %.3f ms per "
+                  "submission; %lld dirty ranges made %lld dirty; safety net %lld checks, %lld changes found", tracked,
+                  count, track_stats.arm_ticks * ms, track_stats.ranges, track_stats.textures,
+                  track_stats.safety_checks, track_stats.safety_changes);
+        memset(&track_stats, 0, sizeof(track_stats));
+    }
 }
 
 void title_textures_upload(ID3D12CommandQueue *queue)
@@ -1141,8 +1334,17 @@ void title_textures_upload(ID3D12CommandQueue *queue)
         {
             t->dirty = FALSE;
             InterlockedDecrement(&dirty_count);
-            /* None for a watched texture: if it stops being one, the old one makes it upload again. */
-            if (!t->watched)
+            /* Armed before it is read: a write from here on faults and makes it dirty again, one
+             * before is in what is read. A texture no longer in views (remapped as a copy, made GPU
+             * memory in place) is fingerprinted from now on; one back in views is tracked again. */
+            if (tracking_enabled() && !t->watched && !t->chunk)
+            {
+                t->tracked = track(t);
+                t->checked_at = GetTickCount64();
+            }
+            /* None for a watched texture: if it stops being one, the old one makes it upload again.
+             * A tracked one's is taken from what the upload reads. */
+            if (!t->watched && !t->tracked)
                 t->fingerprint = fingerprint(t);
             if ((b->buffers[b->count] = record_upload(device, b->list, t)))
             {
