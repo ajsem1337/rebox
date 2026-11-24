@@ -1930,8 +1930,28 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     UINT uploads = 0;
                     /* Only when logging: console_texture_of walks every texture the title made. */
                     static LONG watched_shown;
+                    /* The first 4 textures of each of the first 128 stages (one stage could use them all). */
+                    static struct { UINT64 id; LONG count; } per_stage[128];
+                    static LONG stages_seen;
+                    BOOL stage_first = FALSE;
+                    for (LONG k = 0; k < min(stages_seen, 128); k++)
+                        if (per_stage[k].id == stage_id)
+                        {
+                            stage_first = InterlockedIncrement(&per_stage[k].count) <= 4;
+                            goto counted;
+                        }
+                    {
+                        LONG k = InterlockedIncrement(&stages_seen) - 1;
+                        if (k < 128)
+                        {
+                            per_stage[k].id = stage_id;
+                            per_stage[k].count = 1;
+                            stage_first = TRUE;
+                        }
+                    }
+                counted:
                     if ((console_stage_watched(stage_id) && InterlockedIncrement(&watched_shown) <= 24)
-                            || (shown < 64 && InterlockedIncrement(&shown) <= 64))
+                            || (stage_first && InterlockedIncrement(&shown) <= 512))
                     {
                         ID3D12Resource *res = console_texture_of(w);
                         D3D12_RESOURCE_DESC rd = { 0 };
