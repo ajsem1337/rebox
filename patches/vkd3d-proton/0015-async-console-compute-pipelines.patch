@@ -1,0 +1,288 @@
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 1f4d4fd..2a712d6 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3394,9 +3394,9 @@ void vkd3d_rebox_bindless_targets(struct d3d12_device *device, uint32_t targets[
+     }
+ }
+ 
+-/* The pipeline for one compile of a deferred console shader, made on first use. */
+-VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state,
+-        const struct vkd3d_rebox_compile_out *out)
++/* The compute pipeline for one compile of a deferred console shader. */
++static VkPipeline d3d12_pipeline_state_rebox_create_compute(struct d3d12_pipeline_state *state,
++        const uint32_t *spirv, uint32_t spirv_words, uint32_t subgroup_size)
+ {
+     struct d3d12_device *device = state->device;
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+@@ -3405,21 +3405,13 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state
+     VkShaderModuleCreateInfo module_info;
+     VkPipeline vk_pipeline = VK_NULL_HANDLE;
+     VkShaderModule module;
+-    size_t i;
++    uint64_t start, took;
+     VkResult vr;
+ 
+-    rwlock_lock_read(&state->lock);
+-    for (i = 0; i < state->rebox_variant_count; i++)
+-        if (!memcmp(state->rebox_variants[i].key, out->key, sizeof(out->key)))
+-            vk_pipeline = state->rebox_variants[i].vk_pipeline;
+-    rwlock_unlock_read(&state->lock);
+-    if (vk_pipeline)
+-        return vk_pipeline;
+-
+     memset(&module_info, 0, sizeof(module_info));
+     module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+-    module_info.codeSize = out->spirv_words * sizeof(uint32_t);
+-    module_info.pCode = out->spirv;
++    module_info.codeSize = spirv_words * sizeof(uint32_t);
++    module_info.pCode = spirv;
+     if ((vr = VK_CALL(vkCreateShaderModule(device->vk_device, &module_info, NULL, &module))) < 0)
+     {
+         ERR("rebox: failed to create a console shader module, vr %d.\n", vr);
+@@ -3436,43 +3428,234 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state
+     pipeline_info.basePipelineIndex = -1;
+     if (d3d12_device_uses_descriptor_buffers(device))
+         pipeline_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+-    if (out->subgroup_size && (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
+-            && out->subgroup_size >= device->device_info.vulkan_1_3_properties.minSubgroupSize
+-            && out->subgroup_size <= device->device_info.vulkan_1_3_properties.maxSubgroupSize)
++    if (subgroup_size && (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
++            && subgroup_size >= device->device_info.vulkan_1_3_properties.minSubgroupSize
++            && subgroup_size <= device->device_info.vulkan_1_3_properties.maxSubgroupSize)
+     {
+         memset(&subgroup_info, 0, sizeof(subgroup_info));
+         subgroup_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+-        subgroup_info.requiredSubgroupSize = out->subgroup_size;
++        subgroup_info.requiredSubgroupSize = subgroup_size;
+         pipeline_info.stage.pNext = &subgroup_info;
+     }
+-    else if (out->subgroup_size)
+-        WARN("rebox: console shader wants subgroup size %u, which can't be required.\n", out->subgroup_size);
++    else if (subgroup_size)
++        WARN("rebox: console shader wants subgroup size %u, which can't be required.\n", subgroup_size);
+ 
++    start = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkCreateComputePipelines(device->vk_device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &vk_pipeline));
++    took = vkd3d_get_current_time_ns() - start;
+     VK_CALL(vkDestroyShaderModule(device->vk_device, module, NULL));
+     if (vr < 0)
+     {
+         ERR("rebox: failed to create a console compute pipeline, vr %d.\n", vr);
+         return VK_NULL_HANDLE;
+     }
++    {
++        static uint64_t total_ns;
++        static uint32_t count;
++        uint32_t n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
++        uint64_t total = __atomic_add_fetch(&total_ns, took, __ATOMIC_RELAXED);
++        if (took > 50000000ull || !(n & (n - 1)))
++            ERR("rebox: console compute pipeline %u took %.1f ms (%u SPIR-V words); %.1f s in %u so far.\n", n,
++                    took / 1e6, spirv_words, total / 1e9, n);
++    }
++    return vk_pipeline;
++}
++
++/* Console compute pipelines are made by worker threads (REBOX_CONSOLE_ASYNC=0: at the dispatch):
++ * the driver's compile of a large module takes up to hundreds of milliseconds, and made in the
++ * title's recording threads, a scene's first hundreds of them stalled its frames until the title's
++ * GPU watchdog ended it. A variant being made is listed with no pipeline, and its dispatches are
++ * skipped, as while AnyPS5 compiles. */
++struct rebox_pipeline_job
++{
++    struct rebox_pipeline_job *next;
++    struct d3d12_pipeline_state *state;
++    const uint32_t *spirv; /* d3d12_xs's, valid for the process's lifetime */
++    uint32_t spirv_words, subgroup_size;
++    uint64_t key[2];
++};
++
++static struct
++{
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++    struct rebox_pipeline_job *head, **tail;
++    unsigned int threads;
++} rebox_pipeline_jobs = { .tail = &rebox_pipeline_jobs.head };
++static pthread_once_t rebox_pipeline_jobs_once = PTHREAD_ONCE_INIT;
++
++static void rebox_pipeline_jobs_init(void)
++{
++    pthread_mutex_init(&rebox_pipeline_jobs.lock, NULL);
++    pthread_cond_init(&rebox_pipeline_jobs.cond, NULL);
++}
++
++static void d3d12_pipeline_state_rebox_set_variant(struct d3d12_pipeline_state *state, const uint64_t key[2],
++        VkPipeline vk_pipeline)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
++    size_t i;
+ 
+     rwlock_lock_write(&state->lock);
+     for (i = 0; i < state->rebox_variant_count; i++)
+-        if (!memcmp(state->rebox_variants[i].key, out->key, sizeof(out->key)))
++        if (!memcmp(state->rebox_variants[i].key, key, sizeof(state->rebox_variants[i].key)))
+             break;
+-    if (i < state->rebox_variant_count)
++    if (i < state->rebox_variant_count && state->rebox_variants[i].vk_pipeline)
+     {
+         /* Another thread made it first. */
+-        VK_CALL(vkDestroyPipeline(device->vk_device, vk_pipeline, NULL));
+-        vk_pipeline = state->rebox_variants[i].vk_pipeline;
++        VK_CALL(vkDestroyPipeline(state->device->vk_device, vk_pipeline, NULL));
+     }
++    else if (i < state->rebox_variant_count)
++        state->rebox_variants[i].vk_pipeline = vk_pipeline;
+     else if (vkd3d_array_reserve((void **)&state->rebox_variants, &state->rebox_variant_capacity,
+             state->rebox_variant_count + 1, sizeof(*state->rebox_variants)))
+     {
+-        memcpy(state->rebox_variants[state->rebox_variant_count].key, out->key, sizeof(out->key));
++        memcpy(state->rebox_variants[state->rebox_variant_count].key, key, sizeof(state->rebox_variants[0].key));
+         state->rebox_variants[state->rebox_variant_count++].vk_pipeline = vk_pipeline;
+     }
++    else
++        VK_CALL(vkDestroyPipeline(state->device->vk_device, vk_pipeline, NULL));
+     rwlock_unlock_write(&state->lock);
++}
++
++static void *rebox_pipeline_worker(void *arg)
++{
++    struct rebox_pipeline_job *job;
++    VkPipeline vk_pipeline;
++
++    vkd3d_set_thread_name("rebox-pipelines");
++    for (;;)
++    {
++        pthread_mutex_lock(&rebox_pipeline_jobs.lock);
++        while (!rebox_pipeline_jobs.head)
++            pthread_cond_wait(&rebox_pipeline_jobs.cond, &rebox_pipeline_jobs.lock);
++        job = rebox_pipeline_jobs.head;
++        if (!(rebox_pipeline_jobs.head = job->next))
++            rebox_pipeline_jobs.tail = &rebox_pipeline_jobs.head;
++        pthread_mutex_unlock(&rebox_pipeline_jobs.lock);
++
++        /* A failed compile stays listed with no pipeline: its dispatches are skipped. */
++        if ((vk_pipeline = d3d12_pipeline_state_rebox_create_compute(job->state, job->spirv, job->spirv_words,
++                job->subgroup_size)))
++            d3d12_pipeline_state_rebox_set_variant(job->state, job->key, vk_pipeline);
++        d3d12_pipeline_state_dec_ref(job->state);
++        vkd3d_free(job);
++    }
++    return NULL;
++}
++
++static unsigned int rebox_cpu_count(void)
++{
++#ifdef _WIN32
++    SYSTEM_INFO info;
++    GetSystemInfo(&info);
++    return info.dwNumberOfProcessors;
++#else
++    long n = sysconf(_SC_NPROCESSORS_ONLN);
++    return n > 0 ? n : 1;
++#endif
++}
++
++static bool rebox_pipelines_async(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char value[8];
++        on = !(vkd3d_get_env_var("REBOX_CONSOLE_ASYNC", value, sizeof(value)) && !strcmp(value, "0"));
++    }
++    return on;
++}
++
++static bool d3d12_pipeline_state_rebox_queue_variant(struct d3d12_pipeline_state *state,
++        const struct vkd3d_rebox_compile_out *out)
++{
++    struct rebox_pipeline_job *job;
++    unsigned int want;
++    pthread_t thread;
++
++    if (!(job = vkd3d_calloc(1, sizeof(*job))))
++        return false;
++    job->state = state;
++    job->spirv = out->spirv;
++    job->spirv_words = out->spirv_words;
++    job->subgroup_size = out->subgroup_size;
++    memcpy(job->key, out->key, sizeof(job->key));
++    d3d12_pipeline_state_inc_ref(state);
++
++    pthread_once(&rebox_pipeline_jobs_once, rebox_pipeline_jobs_init);
++    pthread_mutex_lock(&rebox_pipeline_jobs.lock);
++    *rebox_pipeline_jobs.tail = job;
++    rebox_pipeline_jobs.tail = &job->next;
++    /* Half the CPUs, at most 8, as d3d12_xs's AnyPS5 workers. */
++    want = rebox_cpu_count() / 2;
++    want = want < 1 ? 1 : want > 8 ? 8 : want;
++    while (rebox_pipeline_jobs.threads < want)
++    {
++        /* The workers run for the process's lifetime. */
++        if (pthread_create(&thread, NULL, rebox_pipeline_worker, NULL))
++            break;
++        rebox_pipeline_jobs.threads++;
++    }
++    pthread_cond_signal(&rebox_pipeline_jobs.cond);
++    pthread_mutex_unlock(&rebox_pipeline_jobs.lock);
++    return rebox_pipeline_jobs.threads != 0;
++}
++
++/* The pipeline for one compile of a deferred console shader: made on first use, by a worker thread
++ * unless REBOX_CONSOLE_ASYNC=0 (VK_NULL_HANDLE until it is ready). */
++VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state,
++        const struct vkd3d_rebox_compile_out *out)
++{
++    VkPipeline vk_pipeline = VK_NULL_HANDLE;
++    bool listed = false;
++    size_t i;
++
++    rwlock_lock_read(&state->lock);
++    for (i = 0; i < state->rebox_variant_count; i++)
++        if (!memcmp(state->rebox_variants[i].key, out->key, sizeof(out->key)))
++        {
++            vk_pipeline = state->rebox_variants[i].vk_pipeline;
++            listed = true;
++        }
++    rwlock_unlock_read(&state->lock);
++    if (listed)
++        return vk_pipeline;
++
++    if (rebox_pipelines_async())
++    {
++        rwlock_lock_write(&state->lock);
++        for (i = 0; i < state->rebox_variant_count; i++)
++            if (!memcmp(state->rebox_variants[i].key, out->key, sizeof(out->key)))
++                break;
++        if (i < state->rebox_variant_count)
++        {
++            vk_pipeline = state->rebox_variants[i].vk_pipeline;
++            rwlock_unlock_write(&state->lock);
++            return vk_pipeline;
++        }
++        if (!vkd3d_array_reserve((void **)&state->rebox_variants, &state->rebox_variant_capacity,
++                state->rebox_variant_count + 1, sizeof(*state->rebox_variants)))
++        {
++            rwlock_unlock_write(&state->lock);
++            return VK_NULL_HANDLE;
++        }
++        memset(&state->rebox_variants[state->rebox_variant_count], 0, sizeof(state->rebox_variants[0]));
++        memcpy(state->rebox_variants[state->rebox_variant_count++].key, out->key, sizeof(out->key));
++        rwlock_unlock_write(&state->lock);
++        if (d3d12_pipeline_state_rebox_queue_variant(state, out))
++            return VK_NULL_HANDLE;
++        /* No worker: made here. */
++    }
++
++    if ((vk_pipeline = d3d12_pipeline_state_rebox_create_compute(state, out->spirv, out->spirv_words,
++            out->subgroup_size)))
++        d3d12_pipeline_state_rebox_set_variant(state, out->key, vk_pipeline);
++    rwlock_lock_read(&state->lock);
++    for (i = 0; i < state->rebox_variant_count; i++)
++        if (!memcmp(state->rebox_variants[i].key, out->key, sizeof(out->key)))
++            vk_pipeline = state->rebox_variants[i].vk_pipeline;
++    rwlock_unlock_read(&state->lock);
+     return vk_pipeline;
+ }
+ 
