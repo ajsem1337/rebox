@@ -904,6 +904,21 @@ static BOOL in_adopted(ULONG_PTR address)
     return FALSE;
 }
 
+/* REBOX_PHYSICAL_TRACE=<address> (hex): every mapping or unmapping of physical pages that covers
+ * the address, and every write through ReboxWritePhysicalPages into the page mapped there, is
+ * logged with its thread and caller: what happens to a title's data at that address. */
+static ULONG_PTR trace_address(void)
+{
+    static ULONG_PTR address = ~(ULONG_PTR)0;
+    if (address == ~(ULONG_PTR)0)
+    {
+        char *v = rebox_getenv("REBOX_PHYSICAL_TRACE");
+        address = v ? (ULONG_PTR)_strtoui64(v, NULL, 16) : 0;
+        free(v);
+    }
+    return address;
+}
+
 /* The slot of the page mapped at address, or -1. Under physical_lock. */
 static SIZE_T slot_at(ULONG_PTR address)
 {
@@ -1068,6 +1083,11 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
         }
         if (keep)
         {
+            if (trace_address() && trace_address() >= view && trace_address() < view + view_bytes
+                    && (trace_address() < start || trace_address() >= end))
+                rebox_log("xmem: trace: the view at %#llx+%#llx holding %#llx is unmapped for %#llx-%#llx, the rest mapped again",
+                          (unsigned long long)view, (unsigned long long)view_bytes, (unsigned long long)trace_address(),
+                          (unsigned long long)start, (unsigned long long)end);
             if (keep_count[0])
                 map_units(keep_at[0], keep, keep_count[0]);
             if (keep_count[1])
@@ -1122,6 +1142,16 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
             rebox_log("xmem: XMemMapPhysicalPages(%p): a page number this process didn't allocate", address);
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+    if (trace_address() && trace_address() >= start && trace_address() < end)
+    {
+        ULONG_PTR i = 0, at = start;
+        while (pages && i < count && at + (pages[i] && page_unit(pages[i]) != (ULONG_PTR)-1 ? (SIZE_T)units[page_unit(pages[i])].size_units * PAGE_UNIT : PAGE_UNIT) <= trace_address())
+            at += pages[i] && page_unit(pages[i]) != (ULONG_PTR)-1 ? (SIZE_T)units[page_unit(pages[i])].size_units * PAGE_UNIT : PAGE_UNIT, i++;
+        rebox_log("xmem: trace: XMemMapPhysicalPages(%#llx, %lu, %s) covers %#llx: page %#llx there now (thread %#lx, from %p)",
+                  (unsigned long long)start, (unsigned long)count, pages ? "pages" : "none",
+                  (unsigned long long)trace_address(), (unsigned long long)(pages && i < count ? pages[i] : 0),
+                  GetCurrentThreadId(), __builtin_return_address(0));
     }
     unmap_range(start, end);
     /* Then the pages, a stretch of non-empty entries at a time. */
@@ -1312,6 +1342,10 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
             continue;
         }
         n = min(size, page_size - offset);
+        if (trace_address() && units[u].mapped && trace_address() - units[u].mapped < page_size)
+            rebox_log("xmem: trace: %#llx bytes written into page %#llx at +%#llx, mapped at %#llx (thread %#lx)",
+                      (unsigned long long)n, (unsigned long long)pages[i], (unsigned long long)offset,
+                      (unsigned long long)units[u].mapped, GetCurrentThreadId());
         memcpy(unit_home(u) + offset, from, n);
         if (units[u].copy_at)
             memcpy((BYTE *)units[u].copy_at + offset, from, n);
