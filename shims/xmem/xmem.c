@@ -824,7 +824,16 @@ static BOOL map_page_at(ULONG_PTR address, ULONG_PTR u)
         return FALSE;
     }
     if (units[u].mapped)
-        memcpy((void *)address, (void *)units[u].mapped, size); /* mapped elsewhere too: a copy */
+    {
+        /* Mapped elsewhere too: a copy, which the two addresses don't share from now on. */
+        static LONG copies;
+        LONG n = InterlockedIncrement(&copies);
+        if (n <= 8 || !(n & (n - 1)))
+            rebox_log("xmem: physical page %#llx mapped at %#llx while still at %#llx: a copy (%ld so far)",
+                      (unsigned long long)((u + 1) << 4), (unsigned long long)address,
+                      (unsigned long long)units[u].mapped, n);
+        memcpy((void *)address, (void *)units[u].mapped, size);
+    }
     else if (units[u].saved)
     {
         memcpy((void *)address, units[u].saved, size);
