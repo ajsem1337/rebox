@@ -200,8 +200,6 @@ void WINAPI ReboxHeartbeat(void)
     InterlockedIncrement64(&heartbeats);
 }
 
-/* The stack of another thread of this process: its context while briefly
- * suspended, unwound live (a hung thread's stack doesn't move). */
 /* Another thread's frames from a copy of its stack: rip, then each stack value that is a return
  * address, one just after a call instruction (E8 rel32, or FF /2 of 2, 3 or 6 bytes) in a loaded
  * module. A scan, not an unwind: a stale return address can show up, but nothing can fault. */
@@ -210,8 +208,11 @@ static void log_stack_scan(ULONG_PTR rip, const ULONG_PTR *stack, SIZE_T count, 
     char where[MAX_PATH + 32];
     int n = 0;
 
-    describe(rip, where, sizeof(where));
-    rebox_log("  #%-2d %s", n++, where);
+    if (rip)
+    {
+        describe(rip, where, sizeof(where));
+        rebox_log("  #%-2d %s", n++, where);
+    }
     for (SIZE_T i = 0; i < count && n < frames; i++)
     {
         ULONG_PTR v = stack[i];
@@ -227,6 +228,164 @@ static void log_stack_scan(ULONG_PTR rip, const ULONG_PTR *stack, SIZE_T count, 
             continue;
         describe(v, where, sizeof(where));
         rebox_log("  #%-2d %s", n++, where);
+    }
+}
+
+/* The function table entry for rip, from its module's exception directory: read from the
+ * module's mapped image only, without the loader or Wine's unwinder (neither may be entered while
+ * a sampled thread could hold their locks, and the unwinder faulted on stale addresses). */
+static const RUNTIME_FUNCTION *copy_function_entry(ULONG_PTR rip, ULONG_PTR *image_base)
+{
+    HMODULE module;
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS64 *nt;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const RUNTIME_FUNCTION *table;
+    DWORD rva, lo = 0, hi;
+
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (const WCHAR *)rip, &module))
+        return NULL;
+    dos = (const IMAGE_DOS_HEADER *)module;
+    nt = (const IMAGE_NT_HEADERS64 *)((const BYTE *)module + dos->e_lfanew);
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!dir->VirtualAddress || dir->Size < sizeof(RUNTIME_FUNCTION))
+        return NULL;
+    *image_base = (ULONG_PTR)module;
+    table = (const RUNTIME_FUNCTION *)((const BYTE *)module + dir->VirtualAddress);
+    hi = dir->Size / sizeof(RUNTIME_FUNCTION);
+    rva = (DWORD)(rip - (ULONG_PTR)module);
+    while (lo < hi)
+    {
+        DWORD mid = (lo + hi) / 2;
+        if (rva < table[mid].BeginAddress)
+            hi = mid;
+        else if (rva >= table[mid].EndAddress)
+            lo = mid + 1;
+        else
+            return &table[mid];
+    }
+    return NULL;
+}
+
+/* One frame of an x64 unwind (the PE unwind codes) over a copy of the stack: regs are the 16
+ * general registers in CONTEXT order (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15), rsp the
+ * live address, stack the copy of [base, base + bytes). FALSE when a read leaves the copy. */
+static BOOL copy_unwind_frame(ULONG_PTR *rip, ULONG_PTR regs[16], ULONG_PTR base, const BYTE *stack, SIZE_T bytes)
+{
+#define COPY_READ(addr, out) \
+    do { if ((addr) < base || (addr) + 8 > base + bytes) return FALSE; memcpy(&(out), stack + ((addr) - base), 8); } while (0)
+    ULONG_PTR image_base;
+    const RUNTIME_FUNCTION *fn = copy_function_entry(*rip, &image_base);
+    DWORD offset;
+
+    if (!fn)
+    {
+        /* A leaf: the return address is at the top of the stack. */
+        COPY_READ(regs[4], *rip);
+        regs[4] += 8;
+        return TRUE;
+    }
+    offset = (DWORD)(*rip - image_base - fn->BeginAddress);
+    for (int depth = 0; depth < 32; depth++)
+    {
+        const BYTE *info = (const BYTE *)image_base + fn->UnwindData;
+        BYTE prolog = info[1], count = info[2], frame_reg = info[3] & 15, frame_off = info[3] >> 4;
+        const USHORT *codes = (const USHORT *)(info + 4);
+        ULONG_PTR frame = regs[4];
+
+        /* Saves are relative to the frame: the frame register less its offset once the prolog set
+         * it up, else rsp in the body (Wine's RtlVirtualUnwind does the same). */
+        for (unsigned i = 0; i < count; i++)
+        {
+            BYTE at = codes[i] & 0xff, op = (codes[i] >> 8) & 15;
+            if (op == 3 /* UWOP_SET_FPREG */ && frame_reg && (depth || offset >= at || offset >= prolog))
+                frame = regs[frame_reg] - frame_off * 16;
+            if (op == 1) i += ((codes[i] >> 12) ? 2 : 1);
+            else if (op == 4 || op == 8) i += 1;
+            else if (op == 5 || op == 9) i += 2;
+        }
+        for (unsigned i = 0; i < count; i++)
+        {
+            BYTE at = codes[i] & 0xff, op = (codes[i] >> 8) & 15, arg = codes[i] >> 12;
+            BOOL done = depth || offset >= at || offset >= prolog;
+            switch (op)
+            {
+            case 0: /* UWOP_PUSH_NONVOL */
+                if (done) { COPY_READ(regs[4], regs[arg]); regs[4] += 8; }
+                break;
+            case 1: /* UWOP_ALLOC_LARGE */
+            {
+                ULONG size = arg ? *(const ULONG *)&codes[i + 1] : codes[i + 1] * 8u;
+                if (done) regs[4] += size;
+                i += arg ? 2 : 1;
+                break;
+            }
+            case 2: /* UWOP_ALLOC_SMALL */
+                if (done) regs[4] += arg * 8u + 8;
+                break;
+            case 3: /* UWOP_SET_FPREG */
+                if (done) regs[4] = frame;
+                break;
+            case 4: /* UWOP_SAVE_NONVOL */
+                if (done) COPY_READ(frame + codes[i + 1] * 8u, regs[arg]);
+                i += 1;
+                break;
+            case 5: /* UWOP_SAVE_NONVOL_FAR */
+                if (done) COPY_READ(frame + *(const ULONG *)&codes[i + 1], regs[arg]);
+                i += 2;
+                break;
+            case 8: /* UWOP_SAVE_XMM128 */
+                i += 1;
+                break;
+            case 9: /* UWOP_SAVE_XMM128_FAR */
+                i += 2;
+                break;
+            case 10: /* UWOP_PUSH_MACHFRAME: rip and rsp from the frame */
+            {
+                ULONG_PTR at_rsp = regs[4] + (arg ? 8 : 0);
+                COPY_READ(at_rsp, *rip);
+                COPY_READ(at_rsp + 24, regs[4]);
+                return TRUE;
+            }
+            default:
+                return FALSE;
+            }
+        }
+        if (!(info[0] >> 3 & 4 /* UNW_FLAG_CHAININFO */))
+            break;
+        fn = (const RUNTIME_FUNCTION *)(info + 4 + ((count + 1) & ~1) * 2);
+        offset = ~0u;
+    }
+    COPY_READ(regs[4], *rip);
+    regs[4] += 8;
+    return TRUE;
+#undef COPY_READ
+}
+
+/* Another thread's frames from a copy of its stack, unwound by the modules' unwind codes; where
+ * the unwind leaves the copy or a module, the rest is scanned. */
+static void log_stack_copy(const CONTEXT *ctx, const ULONG_PTR *stack, SIZE_T count, int frames)
+{
+    char where[MAX_PATH + 32];
+    ULONG_PTR regs[16], rip = ctx->Rip, base = ctx->Rsp;
+    int n = 0;
+
+    memcpy(regs, &ctx->Rax, sizeof(regs));
+    while (n < frames && rip)
+    {
+        describe(rip, where, sizeof(where));
+        rebox_log("  #%-2d %s", n++, where);
+        if (!copy_unwind_frame(&rip, regs, base, (const BYTE *)stack, count * 8) || regs[4] <= base
+                || regs[4] >= base + count * 8)
+        {
+            if (regs[4] > base && regs[4] < base + count * 8 && n < frames)
+            {
+                rebox_log("  (unwind stopped; scanning the rest)");
+                log_stack_scan(0, stack + (regs[4] - base) / 8, count - (regs[4] - base) / 8, frames - n);
+            }
+            return;
+        }
     }
 }
 
@@ -289,7 +448,7 @@ static void log_thread(DWORD tid)
     if (name)
         LocalFree(name);
     if (ok)
-        log_stack_scan(ctx.Rip, stack, copied / 8, 20);
+        log_stack_copy(&ctx, stack, copied / 8, 24);
     HeapFree(GetProcessHeap(), 0, stack);
     CloseHandle(thread);
 }
