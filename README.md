@@ -126,6 +126,7 @@ method the title asked for that isn't implemented.
 | `REBOX_SHADER_CACHE` | Unix path to the cache; default `$WINEPREFIX/shader-cache` |
 | `REBOX_DRAW_CENSUS=1` | The per-100-presents log of which console stages draw names draws into every render target (as "other target -1"), not only the display-sized ones: finds a stage, such as a UI text shader, for `REBOX_WATCH_STAGE` or `REBOX_GRAPHICS_DEBUG=magenta:<id>` |
 | `REBOX_WATCH_STAGE=<id>[:<offset>]` | At that console graphics stage's draws (the first 16, then every 100th), the four floats at the offset (hex, default 0x20) of the buffer its s8 table's first V# names; at its first 4, every buffer V# in that table with its first 8 floats |
+| `REBOX_WATCH_TARGET=<address>` | Log when a render target at that title address (hex) is bound, or is a copy's destination (render target views keep what they view through descriptor copies); also counts bound render target handles no view was made at (descriptors a title writes itself) |
 | `REBOX_DUMP_STAGES=<id>,...` | With `REBOX_DUMP_SPIRV`, those console graphics stages' code and the first 256 bytes of their s8 table, once each, as `<id>.code.bin` and `<id>.table.bin` |
 | (always) | The title's `OutputDebugString` text, its own boot log, is in the log as `title: ...` lines |
 | `REBOX_DUMP_SHADERS=1` | Write each shader that misses the cache to `<cache>/dump/<hash>.<stage>.bin` |

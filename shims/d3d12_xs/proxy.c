@@ -1477,7 +1477,7 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(struct proxy *p, ID3
 /* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
 /* Every render target view's texture size and view format by handle (open addressing; a later view
  * at the same handle replaces it), so a watched stage's draws can name their target. */
-static struct { volatile SIZE_T cpu; UINT width, height, format; } rtv_info[4096];
+static struct { volatile SIZE_T cpu; UINT width, height, format; UINT64 address; } rtv_info[4096];
 
 static UINT rtv_slot(SIZE_T cpu)
 {
@@ -1495,12 +1495,49 @@ static void note_rtv(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DE
         SIZE_T c = rtv_info[i].cpu;
         if (c == cpu || (!c && !InterlockedCompareExchangePointer((void *volatile *)&rtv_info[i].cpu, (void *)cpu, NULL)))
         {
+            UINT uploads = 0;
             rtv_info[i].width = (UINT)d.Width;
             rtv_info[i].height = d.Height;
             rtv_info[i].format = desc ? desc->Format : d.Format;
+            rtv_info[i].address = 0;
+            title_texture_info(resource, &rtv_info[i].address, &uploads);
             return;
         }
     }
+}
+
+/* An RTV copied from one handle to another keeps what it views (CopyDescriptors*). */
+static void copy_rtv_info(SIZE_T dst, SIZE_T src)
+{
+    UINT from = ARRAYSIZE(rtv_info);
+    for (UINT n = 0, i = rtv_slot(src); src && n < ARRAYSIZE(rtv_info) && rtv_info[i].cpu; n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+        if (rtv_info[i].cpu == src)
+        {
+            from = i;
+            break;
+        }
+    if (from == ARRAYSIZE(rtv_info) || !dst)
+        return;
+    for (UINT n = 0, i = rtv_slot(dst); n < ARRAYSIZE(rtv_info); n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+    {
+        SIZE_T c = rtv_info[i].cpu;
+        if (c == dst || (!c && !InterlockedCompareExchangePointer((void *volatile *)&rtv_info[i].cpu, (void *)dst, NULL)))
+        {
+            rtv_info[i].width = rtv_info[from].width;
+            rtv_info[i].height = rtv_info[from].height;
+            rtv_info[i].format = rtv_info[from].format;
+            rtv_info[i].address = rtv_info[from].address;
+            return;
+        }
+    }
+}
+
+static UINT64 rtv_address(SIZE_T cpu)
+{
+    for (UINT n = 0, i = rtv_slot(cpu); cpu && n < ARRAYSIZE(rtv_info) && rtv_info[i].cpu; n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+        if (rtv_info[i].cpu == cpu)
+            return rtv_info[i].address ? rtv_info[i].address : 1;
+    return 0;
 }
 
 static BOOL find_rtv(SIZE_T cpu, UINT *width, UINT *height, UINT *format)
@@ -1561,6 +1598,18 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(struct proxy *p, UINT dst_c
     }
     ID3D12Device_CopyDescriptors(INNER(p, ID3D12Device), dst_count, dst_starts, dst_sizes, src_count, src_starts,
                                  src_sizes, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && dst_starts && src_starts)
+    {
+        UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), type);
+        UINT di = 0, si = 0, dn = 0, sn = 0;
+        while (di < dst_count && si < src_count)
+        {
+            UINT dsize = dst_sizes ? dst_sizes[di] : 1, ssize = src_sizes ? src_sizes[si] : 1;
+            copy_rtv_info(dst_starts[di].ptr + (SIZE_T)dn * inc, src_starts[si].ptr + (SIZE_T)sn * inc);
+            if (++dn >= dsize) di++, dn = 0;
+            if (++sn >= ssize) si++, sn = 0;
+        }
+    }
     shadow_copy_ranges(dst_count, dst_starts, dst_sizes, src_count, src_starts, src_sizes);
     if (dst != dst_local) free(dst);
     if (src != src_local) free(src);
@@ -1572,6 +1621,12 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT
     D3D12_CPU_DESCRIPTOR_HANDLE d = { dst = shadow_cpu_to_inner(dst) }, s = { src = shadow_cpu_to_inner(src) };
     ID3D12Device_CopyDescriptorsSimple(INNER(p, ID3D12Device), count, d, s, type);
     shadow_copy(dst, src, count);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+    {
+        UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), type);
+        for (UINT i = 0; i < count; i++)
+            copy_rtv_info(dst + (SIZE_T)i * inc, src + (SIZE_T)i * inc);
+    }
 }
 
 /* Command signatures the title creates (slot 41, as on PC), so list slot 61 can tell
@@ -4054,6 +4109,19 @@ static void note_copy_dest(ID3D12Resource *dst)
     D3D12_RESOURCE_DESC rd;
     if (!dst)
         return;
+    {
+        static UINT64 watched = ~0ull;
+        static LONG logged;
+        UINT64 at = 0;
+        UINT uploads = 0;
+        if (watched == ~0ull)
+        {
+            const char *v = getenv("REBOX_WATCH_TARGET");
+            watched = v ? _strtoui64(v, NULL, 16) : 0;
+        }
+        if (watched && title_texture_info(dst, &at, &uploads) && at == watched && InterlockedIncrement(&logged) <= 32)
+            rebox_log("d3d12_xs: the watched render target %#llx is a copy's destination", (unsigned long long)watched);
+    }
     ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)dst)[10])(dst, &rd);
     if (rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         title_texture_gpu_written(dst);
@@ -4156,6 +4224,29 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT coun
         display = display_rtv(rts[i].ptr);
     p->display_bound = display + 1;
     p->render_target0 = rts && count ? rts[0].ptr : 0;
+    /* REBOX_WATCH_TARGET=<hex title address>: binds of a render target at it; and how many bound
+     * handles view nothing we made a view for (descriptors the title wrote itself). */
+    {
+        static UINT64 watched = ~0ull;
+        static LONG unknown, binds, watched_binds;
+        if (watched == ~0ull)
+        {
+            const char *v = getenv("REBOX_WATCH_TARGET");
+            watched = v ? _strtoui64(v, NULL, 16) : 0;
+        }
+        for (UINT i = 0; rts && i < count; i++)
+        {
+            SIZE_T h = single ? rts[0].ptr + i * 32 : rts[i].ptr;
+            UINT64 at = rtv_address(h);
+            LONG b = InterlockedIncrement(&binds);
+            if (!at && !(InterlockedIncrement(&unknown) & (unknown - 1)))
+                rebox_log("d3d12_xs: %ld of %ld render targets bound are handles no view was made at (%#llx)", unknown,
+                          b, (unsigned long long)h);
+            if (watched && at == watched && InterlockedIncrement(&watched_binds) <= 32)
+                rebox_log("d3d12_xs: the watched render target %#llx is bound in list %p (slot %u)",
+                          (unsigned long long)watched, (void *)p, i);
+        }
+    }
     if (display >= 0)
         InterlockedIncrement(&display_binds[display]);
     ID3D12GraphicsCommandList_OMSetRenderTargets(INNER(p, ID3D12GraphicsCommandList), count, rts, single, ds);
