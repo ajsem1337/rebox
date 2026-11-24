@@ -2693,6 +2693,83 @@ static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy
     return device_CreateGraphicsPipelineState(p, &desc, riid, out);
 }
 
+/* Textures the GPU writes (render targets, depth, unordered access) placed in title memory, and
+ * textures placed where one of those is: on the console all of them at one address are the same
+ * memory, and a title draws through one and samples through another (the target title's world
+ * composites from such a pair). Each address gets a heap, sized for the largest texture placed
+ * there so far, and every such texture is placed at its start, so vkd3d-proton backs them with one
+ * memory. A texture larger than the heap gets a new one (aliases made before it no longer share). */
+struct alias_heap { UINT64 address, size; ID3D12Heap *heap; };
+static struct alias_heap alias_heaps[4096];
+static SRWLOCK alias_lock = SRWLOCK_INIT;
+
+static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D12_RESOURCE_DESC *d,
+        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out, BOOL gpu)
+{
+    ID3D12Device *device = INNER(p, ID3D12Device);
+    D3D12_RESOURCE_ALLOCATION_INFO info;
+    D3D12_CLEAR_VALUE clear_storage;
+    struct alias_heap *e = NULL, *free_slot = NULL;
+    ID3D12Heap *heap = NULL;
+    HRESULT hr;
+
+    {
+        typedef D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *fn)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT,
+                UINT, const D3D12_RESOURCE_DESC *);
+        ((fn)PC_SLOT(p->inner, 25))(p->inner, &info, 0, 1, d);
+    }
+    if (!info.SizeInBytes || info.SizeInBytes == ~0ull)
+        return E_FAIL;
+    AcquireSRWLockExclusive(&alias_lock);
+    {
+        SIZE_T start = (SIZE_T)((address >> 16) * 0x9e3779b97f4a7c15ull >> 52) % ARRAYSIZE(alias_heaps);
+        for (SIZE_T i = 0; i < ARRAYSIZE(alias_heaps) && !e; i++)
+        {
+            struct alias_heap *a = &alias_heaps[(start + i) % ARRAYSIZE(alias_heaps)];
+            if (a->heap && a->address == address)
+                e = a;
+            else if (!a->heap)
+            {
+                free_slot = a;
+                break;
+            }
+        }
+    }
+    if (!e && !gpu)
+    {
+        ReleaseSRWLockExclusive(&alias_lock);
+        return S_FALSE; /* a texture only sampled, where nothing the GPU writes is: as before */
+    }
+    if (!e && !(e = free_slot))
+    {
+        ReleaseSRWLockExclusive(&alias_lock);
+        return E_OUTOFMEMORY;
+    }
+    if (!e->heap || e->size < info.SizeInBytes)
+    {
+        D3D12_HEAP_DESC hd = { 0 };
+        hd.SizeInBytes = info.SizeInBytes;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = max(info.Alignment, (UINT64)D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        if (FAILED(hr = ID3D12Device_CreateHeap(device, &hd, &IID_ID3D12Heap, (void **)&heap)))
+        {
+            ReleaseSRWLockExclusive(&alias_lock);
+            return hr;
+        }
+        if (e->heap)
+            ID3D12Heap_Release(e->heap);
+        e->address = address;
+        e->size = info.SizeInBytes;
+        e->heap = heap;
+    }
+    heap = e->heap;
+    ID3D12Heap_AddRef(heap);
+    ReleaseSRWLockExclusive(&alias_lock);
+    hr = ID3D12Device_CreatePlacedResource(device, heap, 0, d, state, pc_clear(clear, &clear_storage), riid, out);
+    ID3D12Heap_Release(heap);
+    return hr;
+}
+
 /* Slot 44: CreatePlacedResourceX(address, desc, state, clear, iid, out) (ScarlettX, XValkyrie):
  * a resource on memory the title already has, at a GPU address it chose. A buffer in GPU memory
  * from ReboxGpuAlloc (XMemAlloc's GPU-visible memory) is placed in that chunk's heap at the
@@ -2764,6 +2841,30 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     {
         present_track_state(*out, state);
         return hr;
+    }
+    /* A texture the GPU writes, or one placed where such a texture is: memory shared by address. */
+    if (why == 0)
+    {
+        BOOL gpu = !!(d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                  | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        static LONG shared;
+        hr = place_aliased_texture(p, address, d, state, clear, riid, out, gpu);
+        if (hr == S_OK && *out)
+        {
+            LONG n = InterlockedIncrement(&shared);
+            if (!(n & (n - 1)))
+                rebox_log("d3d12_xs: %ld textures placed in title memory share it by address (this one %llux%u, "
+                          "format %u, flags %#x, at %#llx)", n, (unsigned long long)d->Width, d->Height, d->Format,
+                          (UINT)d->Flags, (unsigned long long)address);
+            present_track_state(*out, state);
+            title_texture_register(*out, address, desc, d, state);
+            /* A sampled alias of what the GPU draws there: that is its contents, no uploads over it.
+             * (The GPU-written ones are registered as such already, small CPU-filled targets aside.) */
+            if (!gpu)
+                title_texture_gpu_written(*out);
+            return hr;
+        }
+        hr = E_FAIL;
     }
     if (!InterlockedExchange(&logged[why], 1))
         rebox_log("d3d12_xs: CreatePlacedResourceX(%#llx, dimension %u, %llu bytes): %s; it gets its own memory",
