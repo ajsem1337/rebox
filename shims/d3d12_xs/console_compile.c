@@ -414,6 +414,7 @@ static UINT64 page_table(UINT32 *bytes)
     static SRWLOCK table_lock = SRWLOCK_INIT;
     static UINT64 table_va;
     static LONG table_key[3];
+    static ULONGLONG table_built;
     static BYTE *table_cpu;
     struct shadow_region regions[MAX_REGIONS];
     struct gpu_memory_region chunks[MAX_REGIONS];
@@ -432,14 +433,34 @@ static UINT64 page_table(UINT32 *bytes)
         ReleaseSRWLockShared(&table_lock);
         return va;
     }
+    /* Remade at most every 200 ms, and never waited for: a world's constant buffers and adopted
+     * memory change what it maps at nearly every dispatch, and remaking it each time (sorting
+     * every buffer range) took most of a dispatch's 20 ms while the other recording threads
+     * queued for the lock. A range added meanwhile is mapped a little later; a read of it before
+     * then becomes an AnyPS5 fault record, not a GPU fault. */
+    if (table_va && GetTickCount64() - table_built < 200)
+    {
+        va = table_va;
+        ReleaseSRWLockShared(&table_lock);
+        return va;
+    }
     ReleaseSRWLockShared(&table_lock);
-    AcquireSRWLockExclusive(&table_lock);
+    if (!TryAcquireSRWLockExclusive(&table_lock))
+    {
+        AcquireSRWLockShared(&table_lock);
+        va = table_va;
+        ReleaseSRWLockShared(&table_lock);
+        if (va)
+            return va;
+        AcquireSRWLockExclusive(&table_lock);
+    }
     if (table_va && !memcmp(key, table_key, sizeof(key)))
     {
         va = table_va;
         ReleaseSRWLockExclusive(&table_lock);
         return va;
     }
+    table_built = GetTickCount64();
     n = shadow_regions(regions, MAX_REGIONS);
     nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
     if (!table_cpu && FAILED(ReboxGpuAlloc(*bytes, 256, (void **)&table_cpu, &table_va)))
