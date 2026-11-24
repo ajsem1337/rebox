@@ -336,10 +336,14 @@ static void gfx10_vgprs(const UINT32 *ins, UINT size, UINT64 *read, UINT64 *writ
  * on every cached shader of three titles). Attribute and param numbers name signature registers,
  * numbered by what the code uses, not elements: a UE5 title's Slate pixel shader reads COLOR0 as attr0
  * and TEXCOORD1 as attr1. The tables sit after a sub-version at +0x10 (5 in a UE5 title's GDK, 6 adds
- * 8 bytes). Pixel: 32 records of 8 bytes at +0x130 (kind, register, mask, attribute number, 0, 0,
- * register again, 1 flat / 2 interpolated), the count at +0x100 after them, SPI_PS_INPUT_ENA at
- * +0x110. Vertex: 32 records of 6 bytes at +0x1D4 (kind, register, param number, 0, 0, 0), the
- * count at +0xC0 after them. FALSE if the tables aren't there or don't check out. */
+ * 8 bytes). Pixel: 32 records of 8 bytes at +0x130 (kind, register, mask, attribute number, 0, a
+ * packed pair's second register, the param the console's own linking gives it, flags: bit 0 flat),
+ * the count at +0x100 after them, SPI_PS_INPUT_ENA at +0x110. Vertex: 32 records of 6 bytes at
+ * +0x1D4 (kind, register, param number, a packed pair's second register, 0, flags), the count at
+ * +0xC0 after them. FALSE if the tables aren't there or don't check out. Packed pairs (two fp16
+ * values in one param, flags 3 for a vertex output, 0x1A for a pixel input) and that param number,
+ * which counts pairs once, are in 3,566 of the target title's 8,523 pixel tables and 189 of its
+ * 1,165 vertex tables (VIctory names the fields); a pair links by its first register. */
 static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct rebox_deferred_graphics *g,
                            UINT32 *input_ena)
 {
@@ -362,13 +366,13 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
         for (UINT k = 0; k < n; k++)
         {
             const BYTE *r = fssm + base + 8 * k;
-            if (r[3] != k || r[4] || r[5] || r[6] != r[1])
+            if (r[3] != k || r[4])
                 return FALSE;
         }
         for (UINT k = 0; k < n; k++)
         {
             g->registers[k] = fssm[base + 8 * k + 1];
-            g->flat[k] = fssm[base + 8 * k + 7] == 1;
+            g->flat[k] = fssm[base + 8 * k + 7] & 1;
         }
         *input_ena = u32(fssm + base + 0x110);
     }
@@ -380,7 +384,7 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
         for (UINT k = 0; k < n; k++)
         {
             const BYTE *r = fssm + base + 6 * k;
-            if (r[2] != k || r[3] || r[4] || r[5])
+            if (r[2] != k || r[4])
                 return FALSE;
         }
         for (UINT k = 0; k < n; k++)
@@ -510,6 +514,10 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
         free(fssm);
         return NULL;
     }
+    /* Sub-version 6 (the target title's): the record at 0xC0 (as the mesh record above), its code size
+     * counting the 24-byte shader ID. */
+    if (fssm_size >= 0x14 && u32(fssm + 0x10) == 6 && code_bytes > FSSM_SHADER_ID)
+        code_bytes -= FSSM_SHADER_ID;
     code_bytes = min(code_bytes, fssm_size - code_offset) & ~(SIZE_T)3;
     code = (const UINT32 *)(fssm + code_offset);
     dwords = (UINT)(code_bytes / 4);
@@ -596,6 +604,11 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
     h->stage = stage;
     h->wave_size = 0;                                     /* inferred from the code (console_compile.c) */
     h->rsrc1 = (u32(fssm + FSSM_GFX_RSRC1) & ~(0xffu << 12)) | (u32(fssm + FSSM_SHORT_FLOAT_MODE) & 0xff) << 12;
+    /* Sub-version 6 has the float mode 8 bytes later, at 0x104 (the record's +0x44, as compute's),
+     * and no RSRC1: 0xFC holds the record's count of resources it uses (0-0x13 in the title's) and
+     * 0x108 zero. Built as for compute. */
+    if (u32(fssm + 0x10) == 6)
+        h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(fssm + FSSM_FLOAT_MODE) & 0xff) << 12;
     h->rsrc2 = (user & 0x1f) << 1 | (user >> 5 & 1) << 27; /* USER_SGPR, USER_SGPR_MSB (32 for vertex shaders) */
     h->code_offset = sizeof(*h) + sizeof(*g);
     h->code_dwords = dwords;

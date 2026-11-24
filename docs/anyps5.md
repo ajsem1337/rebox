@@ -69,7 +69,9 @@ instructions from a wave32 one where the container says.
 
 Graphics FSSMs (the shorter layout) carry less register state: the code at the u32 at 0xC0 plus
 0x28 (its size in bytes at 0xC8), `SPI_SHADER_PGM_RSRC1` at 0x108, the float mode at 0xFC. The
-rest comes from the code:
+target title's (sub-version 6 at +0x10) have the float mode at 0x104 (0xC0 in all its vertex and
+pixel shaders; 0xFC holds a count there) and no `RSRC1`, which is then built as for compute, and
+their code size counts the 24-byte shader ID before the code. The rest comes from the code:
 
 - **vertex**: the first instruction calls the fetch shader (`s_swappc_b64 s[4:5], s[4:5]`) the
   console driver builds from the PSO's input layout, which leaves input r in `v[4+4r..7+4r]`; the
@@ -83,7 +85,9 @@ rest comes from the code:
   `exp paramN` name signature registers numbered by what each shader uses. The FSSM's interface
   tables give them (xcl, GPL-2.0-only: sub-version at +0x10; pixel records at +0x130 with
   `SPI_PS_INPUT_ENA`, vertex records at +0x1D4), and `SPI_PS_INPUT_CNTL_n` is the VS param whose
-  OSG1 register has the semantic of the PS's ISG1 register for attribute n.
+  OSG1 register has the semantic of the PS's ISG1 register for attribute n. A param can hold a
+  packed pair of fp16 values from two registers (the target title's: 3,566 of 8,523 pixel tables
+  and 189 of 1,165 vertex tables); it links by its first.
 
 The `FLAT_SCRATCH` setup many console shaders open with (`s_setreg_imm32_b32` or `s_setreg_b32`
 to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size `s_nop`s before each compile. Only the scalar
