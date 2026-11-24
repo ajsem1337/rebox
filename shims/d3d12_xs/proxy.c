@@ -3296,7 +3296,7 @@ static void submit_mark(LARGE_INTEGER *mark, UINT part)
     *mark = now;
 }
 
-static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
+static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
     ID3D12CommandList *stack[64] = { 0 }, **raw = count <= ARRAYSIZE(stack) ? stack : malloc(count * sizeof(*raw));
     LARGE_INTEGER mark;
@@ -3369,6 +3369,27 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
     submit_mark(&mark, 4);
     if (raw != stack)
         free(raw);
+}
+
+/* A list's memory waits are made before it, not before the whole submission: a title batches many
+ * lists (up to 256 through ExecuteCommandListsX), and a wait for a counter an earlier list in the
+ * same batch writes, made before that list, had the queue wait on itself until the 2 s timeout, at
+ * every submission once the target title reached its world. So the batch is split before each list
+ * that waits. */
+static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
+{
+    UINT start = 0;
+
+    for (UINT i = 1; i < count; i++)
+    {
+        const struct proxy *l = (const struct proxy *)lists[i];
+        if (is_proxy(l) && l->wait_count)
+        {
+            submit_lists(p, i - start, lists + start);
+            start = i;
+        }
+    }
+    submit_lists(p, count - start, lists + start);
 }
 
 /* Older-layout slot 35: the target title submits batches of up to 256 lists through it,
