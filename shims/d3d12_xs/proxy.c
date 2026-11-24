@@ -3152,6 +3152,25 @@ static struct pending_value_wait pending_value_waits[256];
 static UINT pending_value_wait_count;
 static BOOL wait_satisfied(const struct memory_wait *w);
 
+/* Whether to log another line about this address: up to 4 each, for 64 addresses (under
+ * value_fence_lock). */
+static BOOL log_address(UINT64 address)
+{
+    static struct { UINT64 address; UINT count; } seen[64];
+    for (UINT i = 0; i < ARRAYSIZE(seen); i++)
+    {
+        if (seen[i].address == address)
+            return ++seen[i].count <= 4;
+        if (!seen[i].address)
+        {
+            seen[i].address = address;
+            seen[i].count = 1;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* Under value_fence_lock, exclusive. */
 static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLONG timeout)
 {
@@ -3164,7 +3183,7 @@ static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLON
         static LONG logged;
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
-        if ((now - pw->since) * 10 >= f.QuadPart && InterlockedIncrement(&logged) <= 32) /* 100 ms or more */
+        if ((now - pw->since) * 10 >= f.QuadPart && log_address(pw->wait.address) && InterlockedIncrement(&logged) <= 256)
             rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p met in memory after %.0f ms; signalled "
                       "from the CPU", (unsigned long long)pw->wait.address, (unsigned long long)pw->target, pw->queue,
                       (now - pw->since) * 1000.0 / (double)f.QuadPart);
@@ -3173,7 +3192,7 @@ static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLON
     {
         static LONG logged;
         InterlockedIncrement(&value_timeouts);
-        if (InterlockedIncrement(&logged) <= 32)
+        if (log_address(pw->wait.address) && InterlockedIncrement(&logged) <= 256)
         {
             LARGE_INTEGER f;
             QueryPerformanceFrequency(&f);
