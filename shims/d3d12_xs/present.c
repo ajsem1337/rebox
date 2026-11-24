@@ -594,16 +594,17 @@ static BOOL dump_wanted(UINT64 frame)
 }
 
 static void write_dump_named(const char *name, UINT64 frame, const D3D12_RESOURCE_DESC *desc,
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, const BYTE *data);
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, UINT rows, const BYTE *data);
 
 static void write_dump(UINT64 frame, const D3D12_RESOURCE_DESC *desc, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp,
         const BYTE *data)
 {
-    write_dump_named("frame", frame, desc, fp, data);
+    write_dump_named("frame", frame, desc, fp, desc->Height, data);
 }
 
+/* rows is the footprint's row count, which is less than the height for block-compressed formats. */
 static void write_dump_named(const char *name, UINT64 frame, const D3D12_RESOURCE_DESC *desc,
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, const BYTE *data)
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, UINT rows, const BYTE *data)
 {
     const char *dir = getenv("REBOX_DUMP_FRAMES");
     BOOL rgba = swapchain_format(desc->Format) == DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -653,7 +654,7 @@ static void write_dump_named(const char *name, UINT64 frame, const D3D12_RESOURC
         /* Raw rows as laid out by the GPU, behind a small header. */
         UINT32 hdr[4] = { w, h, desc->Format, fp->Footprint.RowPitch };
         fwrite(hdr, 1, sizeof(hdr), f);
-        fwrite(data + fp->Offset, 1, (SIZE_T)fp->Footprint.RowPitch * h, f);
+        fwrite(data + fp->Offset, 1, (SIZE_T)fp->Footprint.RowPitch * rows, f);
     }
     fclose(f);
     rebox_log("d3d12_xs: dumped frame %llu to %s", (unsigned long long)frame, path);
@@ -797,7 +798,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     ID3D12Resource *gpu_tex = NULL, *gpu_readback = NULL;
     D3D12_RESOURCE_DESC gpu_desc;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT gpu_fp;
-    UINT64 gpu_total = 0;
+    UINT64 gpu_total = 0, gpu_row_bytes = 0;
+    UINT gpu_rows = 0;
     unsigned r;
     static LONG logged;
 
@@ -979,7 +981,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
             if (at && (gpu_tex = title_texture_at(at)))
             {
                 gpu_desc = ID3D12Resource_GetDesc(gpu_tex);
-                ID3D12Device_GetCopyableFootprints(s->device, &gpu_desc, 0, 1, 0, &gpu_fp, NULL, NULL, &gpu_total);
+                ID3D12Device_GetCopyableFootprints(s->device, &gpu_desc, 0, 1, 0, &gpu_fp, &gpu_rows, &gpu_row_bytes, &gpu_total);
                 bd.Width = gpu_total;
                 if (gpu_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
                         && SUCCEEDED(ID3D12Device_CreateCommittedResource(s->device, &heap, D3D12_HEAP_FLAG_NONE, &bd,
@@ -1036,17 +1038,17 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
         if (SUCCEEDED(ID3D12Resource_Map(gpu_readback, 0, &range, &data)))
         {
             UINT64 sum = 0, n = 0;
-            for (UINT y = 0; y < gpu_desc.Height; y += 16)
+            for (UINT y = 0; y < gpu_rows; y += 16)
             {
                 const BYTE *row = (const BYTE *)data + gpu_fp.Offset + (SIZE_T)y * gpu_fp.Footprint.RowPitch;
-                for (UINT x = 0; x < gpu_fp.Footprint.RowPitch && x < gpu_desc.Width * 4; x += 64, n++)
+                for (UINT x = 0; x + 2 < gpu_row_bytes; x += 64, n++)
                     sum += row[x] + row[x + 1] + row[x + 2];
             }
             rebox_log("d3d12_xs: frame %llu: the GPU texture at %s (%llux%u, format %u) has mean %.2f",
                       (unsigned long long)frame, getenv("REBOX_DUMP_GPU_TEXTURE"),
                       (unsigned long long)gpu_desc.Width, gpu_desc.Height, gpu_desc.Format,
                       n ? (double)sum / (3.0 * n) : 0.0);
-            write_dump_named("texture", frame, &gpu_desc, &gpu_fp, data);
+            write_dump_named("texture", frame, &gpu_desc, &gpu_fp, gpu_rows, data);
             ID3D12Resource_Unmap(gpu_readback, 0, NULL);
         }
         ID3D12Resource_Release(gpu_readback);

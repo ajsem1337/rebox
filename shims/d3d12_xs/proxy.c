@@ -4900,6 +4900,11 @@ static void STDMETHODCALLTYPE list_PipelineSyncX(struct proxy *p, UINT flags, UI
 {
 }
 
+/* DriverHintX(feature, value): the host driver takes no hints (VIctory, GPL-3.0, facts). */
+static UINT64 STDMETHODCALLTYPE list_DriverHintX(struct proxy *p, UINT64 feature, UINT64 value)
+{
+    return 0;
+}
 
 /* Acceleration structure builds, postbuild info and copies (PC 72-74). Ray tracing isn't translated
  * (state_object.c), so no ray reads them, and building them faulted the GPU: a UE5 sample fills its
@@ -5484,6 +5489,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(80, list_DispatchX),
         FN(86, list_CopyResourceX),
         FN(131, list_PipelineSyncX), FN(132, list_PipelineSyncX),
+        FN(101, list_DriverHintX),                    /* the older 99 */
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
         FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
