@@ -309,7 +309,10 @@ reads back and logs. Patch 0012's loop guard is on by default too: `d3d12_xs` se
 `APS5_LOOP_GUARD=0x100000`, so every translated loop leaves after 2^20 iterations per entry
 instead of running as long as data we got wrong says (a GPU hang, then a lost device). A loop
 stopped this way is logged as `console shader <hash> left a loop at its limit`; `APS5_LOOP_GUARD=0`
-turns the guard off and another value sets the limit. The other patches are listed in
+turns the guard off and another value sets the limit. With patch 0014, `APS5_LOOP_GUARD=stages`
+gives each stage its own limit instead (128 iterations in pixel programs, 256 in vertex and mesh
+programs, 4096 in compute programs), and `APS5_LOOP_GUARD_PIXEL`, `_VERTEX`, `_MESH` and `_COMPUTE`
+set one stage's. The other patches are listed in
 [patches/anyps5/README.md](../patches/anyps5/README.md).
 
 ## Where AnyPS5 runs

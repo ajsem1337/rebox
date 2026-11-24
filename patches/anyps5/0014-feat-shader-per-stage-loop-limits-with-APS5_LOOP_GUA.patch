@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 22:01:34 +0000
+Subject: [PATCH 14/14] feat(shader): per-stage loop limits with
+ APS5_LOOP_GUARD=stages
+
+APS5_LOOP_GUARD gave every stage one limit. A limit loose enough for a
+compute program's long loops lets a pixel or vertex program whose loop
+bound came from data the host got wrong run for long enough to hang the
+GPU first: another translation layer that runs the same kind of title
+lost the device early with every single limit from 2^20 down to 1024,
+and kept it with 128 iterations in pixel programs, 256 in vertex and
+mesh programs and 4096 in compute programs.
+
+APS5_LOOP_GUARD=stages gives those limits (tessellation and local
+programs take the vertex one), and APS5_LOOP_GUARD_PIXEL, _VERTEX, _MESH
+and _COMPUTE override one stage while APS5_LOOP_GUARD is set. A single
+numeric limit behaves, and keys the disk cache, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  16 +++
+ core/shader/recompiler/LoopGuard.hpp          |  67 +++++++++-
+ .../Optimization/src/ShaderInfoCollector.cpp  |   2 +-
+ core/shader/recompiler/ShaderDiskCache.cpp    |   2 +-
+ .../SpirvBackend/src/SpirvEmitter.cpp         |   2 +-
+ .../recompiler/tests/LoopGuardStageTests.cpp  | 121 ++++++++++++++++++
+ docs/dev/ENVIRONMENT.md                       |   2 +
+ .../changes/feat-shader-loop-cap-stages.md    |   5 +
+ 8 files changed, 209 insertions(+), 8 deletions(-)
+ create mode 100644 core/shader/recompiler/tests/LoopGuardStageTests.cpp
+ create mode 100644 docs/dev/debt/changes/feat-shader-loop-cap-stages.md
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index 8589bfa627..6b717a9c8f 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -484,6 +484,22 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND NOT TARGET loop_guard_stage_tests)
++        add_test_executable(loop_guard_stage_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardStageTests.cpp")
++        target_link_libraries(loop_guard_stage_tests PRIVATE ${target} ${runtimeTarget})
++        target_include_directories(loop_guard_stage_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(loop_guard_stage_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(loop_guard_stage_tests)
++        add_test(NAME loop_guard_stage COMMAND loop_guard_stage_tests)
++        set_tests_properties(loop_guard_stage PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(loop_guard_stage_tests PRIVATE libc)
++            set_tests_properties(loop_guard_stage PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET loop_guard_tests)
+         add_test_executable(loop_guard_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardTests.cpp")
+         target_link_libraries(loop_guard_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-static)
+diff --git a/core/shader/recompiler/LoopGuard.hpp b/core/shader/recompiler/LoopGuard.hpp
+index 7051f98dc2..5cdbb467f4 100644
+--- a/core/shader/recompiler/LoopGuard.hpp
++++ b/core/shader/recompiler/LoopGuard.hpp
+@@ -1,17 +1,74 @@
+ #ifndef CORE_SHADER_RECOMPILER_LOOPGUARD_HPP
+ #define CORE_SHADER_RECOMPILER_LOOPGUARD_HPP
+ 
++#include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
++#include <algorithm>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstring>
+ 
+ namespace ShaderRecompiler {
+ 
++struct LoopGuardLimits {
++    std::uint32_t pixel = 0;
++    std::uint32_t vertex = 0;
++    std::uint32_t mesh = 0;
++    std::uint32_t compute = 0;
++
++    [[nodiscard]] std::uint32_t For(IrShaderStage stage) const {
++        switch (stage) {
++            case IrShaderStage::Pixel: return pixel;
++            case IrShaderStage::Mesh: return mesh;
++            case IrShaderStage::Compute: return compute;
++            default: return vertex;
++        }
++    }
++
++    [[nodiscard]] std::uint32_t Any() const {
++        return std::max({pixel, vertex, mesh, compute});
++    }
++
++    [[nodiscard]] std::uint64_t Key() const {
++        std::uint64_t key = 0xcbf29ce484222325ull;
++        for (const auto limit : {pixel, vertex, mesh, compute}) key = (key ^ limit) * 0x100000001b3ull;
++        return pixel == vertex && vertex == mesh && mesh == compute ? pixel : key;
++    }
++};
++
++inline constexpr LoopGuardLimits LoopGuardStageDefaults{128u, 256u, 256u, 4096u};
++
++template <typename TGetEnvironment>
++[[nodiscard]] LoopGuardLimits ParseLoopGuardLimits(TGetEnvironment&& getEnvironment) {
++    const char* text = getEnvironment("APS5_LOOP_GUARD");
++    if (text == nullptr) return {};
++    LoopGuardLimits limits;
++    if (std::strcmp(text, "stages") == 0) {
++        limits = LoopGuardStageDefaults;
++    } else {
++        const auto limit = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0));
++        limits = {limit, limit, limit, limit};
++    }
++    const auto stage = [&](const char* name, std::uint32_t& limit) {
++        if (const char* value = getEnvironment(name)) limit = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0));
++    };
++    stage("APS5_LOOP_GUARD_PIXEL", limits.pixel);
++    stage("APS5_LOOP_GUARD_VERTEX", limits.vertex);
++    stage("APS5_LOOP_GUARD_MESH", limits.mesh);
++    stage("APS5_LOOP_GUARD_COMPUTE", limits.compute);
++    return limits;
++}
++
++[[nodiscard]] inline const LoopGuardLimits& CurrentLoopGuardLimits() {
++    static const LoopGuardLimits limits = ParseLoopGuardLimits([](const char* name) { return static_cast<const char*>(std::getenv(name)); });
++    return limits;
++}
++
+ [[nodiscard]] inline std::uint32_t LoopGuardLimit() {
+-    static const std::uint32_t limit = [] {
+-        const char* text = std::getenv("APS5_LOOP_GUARD");
+-        return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0));
+-    }();
+-    return limit;
++    return CurrentLoopGuardLimits().Any();
++}
++
++[[nodiscard]] inline std::uint32_t LoopGuardLimit(IrShaderStage stage) {
++    return CurrentLoopGuardLimits().For(stage);
+ }
+ 
+ }
+diff --git a/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp b/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
+index c065720e7b..dd9b9ae722 100644
+--- a/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
++++ b/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
+@@ -630,7 +630,7 @@ void ShaderInfoCollector::Collect(IrProgram& program, const ShaderStageInputInfo
+         return std::ranges::any_of(block->Instructions(), [](const IrValue* inst) {
+             return SharedAccessOf(inst->Opcode()) == SharedAccess::Atomic && inst->Type() == IrType::U64;
+         });
+-    }) || (LoopGuardLimit() != 0 && std::ranges::any_of(program.Metadata().blockInfo, [](const auto& info) { return info.terminator.loopHeader; }));
++    }) || (LoopGuardLimit(program.Resources().stage) != 0 && std::ranges::any_of(program.Metadata().blockInfo, [](const auto& info) { return info.terminator.loopHeader; }));
+     switch (program.Resources().stage) {
+         case IrShaderStage::Vertex:
+         case IrShaderStage::Local:
+diff --git a/core/shader/recompiler/ShaderDiskCache.cpp b/core/shader/recompiler/ShaderDiskCache.cpp
+index 6c232f7004..1b8d4df133 100644
+--- a/core/shader/recompiler/ShaderDiskCache.cpp
++++ b/core/shader/recompiler/ShaderDiskCache.cpp
+@@ -1974,7 +1974,7 @@ DiskStore& store() {
+ 
+ std::uint64_t SourceVersion() {
+     const std::uint64_t version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+-    return version ^ static_cast<std::uint64_t>(LoopGuardLimit()) * 0xff51afd7ed558ccdull;
++    return version ^ CurrentLoopGuardLimits().Key() * 0xff51afd7ed558ccdull;
+ }
+ 
+ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
+diff --git a/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp b/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
+index c2993cebb9..57ef750ae2 100644
+--- a/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
++++ b/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
+@@ -337,7 +337,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
+         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
+     }
+     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
+-    state.loopGuardLimit = LoopGuardLimit();
++    state.loopGuardLimit = LoopGuardLimit(program.Resources().stage);
+     // Stopped invocations would leave the wave LDS barriers incomplete.
+     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+     state.meshWindowBuffer = target.meshWindowBuffer && program.Resources().stage == IrShaderStage::Mesh && program.Metadata().vectorWindowSize != 0u && state.laneCount * MeshWindowInvocations(state) * program.Metadata().vectorWindowSize <= MeshWindowSlotDwords;
+diff --git a/core/shader/recompiler/tests/LoopGuardStageTests.cpp b/core/shader/recompiler/tests/LoopGuardStageTests.cpp
+new file mode 100644
+index 0000000000..b116143805
+--- /dev/null
++++ b/core/shader/recompiler/tests/LoopGuardStageTests.cpp
+@@ -0,0 +1,121 @@
++#include "BdaAbi.hpp"
++#include "LoopGuard.hpp"
++#include "Recompiler.hpp"
++#include <spirv/unified1/spirv.hpp>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <initializer_list>
++#include <optional>
++#include <span>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++LoopGuardLimits Parse(std::initializer_list<std::pair<const char*, const char*>> environment) {
++    return ParseLoopGuardLimits([&](const char* name) -> const char* {
++        for (const auto& [key, value] : environment) {
++            if (std::strcmp(key, name) == 0) return value;
++        }
++        return nullptr;
++    });
++}
++
++void TestParsing() {
++    const auto off = Parse({});
++    Require(off.Any() == 0u, "no APS5_LOOP_GUARD guards no stage");
++    Require(Parse({{"APS5_LOOP_GUARD_PIXEL", "64"}}).Any() == 0u, "a stage limit alone guards nothing");
++
++    const auto one = Parse({{"APS5_LOOP_GUARD", "0x100000"}});
++    for (const auto stage : {IrShaderStage::Pixel, IrShaderStage::Vertex, IrShaderStage::Mesh, IrShaderStage::Compute, IrShaderStage::Local, IrShaderStage::TessellationControl}) {
++        Require(one.For(stage) == 0x100000u, "one limit applies to every stage");
++    }
++    Require(one.Key() == 0x100000u, "one limit keys the disk cache as before");
++
++    const auto stages = Parse({{"APS5_LOOP_GUARD", "stages"}});
++    Require(stages.For(IrShaderStage::Pixel) == 128u, "pixel loops stop after 128 iterations");
++    Require(stages.For(IrShaderStage::Vertex) == 256u && stages.For(IrShaderStage::TessellationEvaluation) == 256u, "vertex-side loops stop after 256 iterations");
++    Require(stages.For(IrShaderStage::Mesh) == 256u, "mesh loops stop after 256 iterations");
++    Require(stages.For(IrShaderStage::Compute) == 4096u, "compute loops stop after 4096 iterations");
++    Require(stages.Key() != one.Key() && stages.Key() != Parse({{"APS5_LOOP_GUARD", "256"}}).Key(), "per-stage limits key the disk cache apart");
++
++    const auto mixed = Parse({{"APS5_LOOP_GUARD", "4096"}, {"APS5_LOOP_GUARD_PIXEL", "128"}, {"APS5_LOOP_GUARD_COMPUTE", "0"}});
++    Require(mixed.For(IrShaderStage::Pixel) == 128u && mixed.For(IrShaderStage::Vertex) == 4096u, "a stage limit overrides APS5_LOOP_GUARD for that stage");
++    Require(mixed.For(IrShaderStage::Compute) == 0u, "a stage limit of 0 leaves that stage unguarded");
++}
++
++constexpr std::array<std::uint32_t, 5> EndlessLoop{
++    0xbe880381u,
++    0x80088108u,
++    0xbf078008u,
++    0xbf85fffdu,
++    0xbf810000u,
++};
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 4> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++bool HasConstant(std::span<const std::uint32_t> words, std::uint32_t value) {
++    for (std::size_t index = 5; index < words.size();) {
++        const auto count = words[index] >> 16u;
++        Require(count != 0u && index + count <= words.size(), "the module's instructions are well formed");
++        if ((words[index] & 0xffffu) == spv::OpConstant && count == 4u && words[index + 3] == value) return true;
++        index += count;
++    }
++    return false;
++}
++
++void TestComputeLimit() {
++    Require(LoopGuardLimit(IrShaderStage::Compute) == 1000u && LoopGuardLimit(IrShaderStage::Pixel) == 128u, "the process's limits come from the environment");
++    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    const std::vector<MemoryRegion> regions;
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, std::span<const std::uint32_t>(EndlessLoop), 0, {}},
++        {32u, 0, {}, compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    const auto result = Recompile(request);
++    const auto words = result.spirv.Words();
++    Require(HasConstant(words, 1000u), "a compute loop is guarded with the compute limit");
++    Require(!HasConstant(words, 128u) && !HasConstant(words, 256u), "a compute loop is not guarded with another stage's limit");
++}
++
++}
++
++int main() {
++#ifdef _WIN32
++    _putenv("APS5_LOOP_GUARD=stages");
++    _putenv("APS5_LOOP_GUARD_COMPUTE=1000");
++#else
++    setenv("APS5_LOOP_GUARD", "stages", 1);
++    setenv("APS5_LOOP_GUARD_COMPUTE", "1000", 1);
++#endif
++    try {
++        TestParsing();
++        TestComputeLimit();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++    std::puts("loop guard stage tests passed");
++    return 0;
++}
+diff --git a/docs/dev/ENVIRONMENT.md b/docs/dev/ENVIRONMENT.md
+index 882956ed36..975947d127 100644
+--- a/docs/dev/ENVIRONMENT.md
++++ b/docs/dev/ENVIRONMENT.md
+@@ -34,6 +34,8 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
+ 
+ `APS5_LOOP_GUARD=<iterations>` (decimal or `0x` hex) makes every loop of a recompiled program leave after that many iterations per entry (`core/shader/recompiler/LoopGuard.hpp`, `SpirvBackend/src/SpirvFlowEmitter.cpp`); `0` or an unset variable disables it. Each loop counts its back edges in a variable of its own, cleared when the loop is entered; once the count reaches the limit, its conditional exits leave, every other loop of the invocation leaves at its next conditional exit, and the invocation records one `LoopLimit` fault (address: shader hash, bytes: the limit, instruction: PC of the first exit the guard forced). Loops that finish sooner run as before. Programs with loops then bind a fault buffer, and the disk cache keys on the value. A loop whose exits are all unconditional branches inside its body is not stopped. Its presence separately enables the AGC fault buffer, as listed under `libSceAgcDriver`.
+ 
++`APS5_LOOP_GUARD=stages` gives each stage its own limit instead: 128 iterations in pixel programs, 256 in vertex, tessellation and mesh programs, and 4096 in compute programs. With `APS5_LOOP_GUARD` set, `APS5_LOOP_GUARD_PIXEL`, `APS5_LOOP_GUARD_VERTEX` (vertex, local and tessellation programs), `APS5_LOOP_GUARD_MESH` and `APS5_LOOP_GUARD_COMPUTE` set one stage's limit (`0` leaves that stage unguarded); without it they do nothing. The disk cache keys on every stage's limit.
++
+ | Name | Kind | Source | Default | Description |
+ |------|------|--------|---------|-------------|
+ | `ANYPS5_NO_SHADER_CACHE` | string | `core/shader/recompiler/ShaderDiskCache.cpp` |  | disables the on-disk shader cache when set to a non-empty value other than 0 |
+diff --git a/docs/dev/debt/changes/feat-shader-loop-cap-stages.md b/docs/dev/debt/changes/feat-shader-loop-cap-stages.md
+new file mode 100644
+index 0000000000..3aa293a3ad
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-loop-cap-stages.md
+@@ -0,0 +1,5 @@
++# shader
++
++## add Functional
++
++- [Per-stage loop limits](../../../core/shader/recompiler/LoopGuard.hpp) (shader recompiler) - `APS5_LOOP_GUARD=stages` stops loops after 128 iterations per entry in pixel programs, 256 in vertex, tessellation and mesh programs and 4096 in compute programs, and `APS5_LOOP_GUARD_<PIXEL|VERTEX|MESH|COMPUTE>` override one stage. The defaults are what another translation layer needed for one title to keep the GPU from hanging, not limits the console has: a console loop that runs longer is cut short (the `LoopLimit` fault reports it), and the limits were not measured against other titles.
+-- 
+2.55.0
+
