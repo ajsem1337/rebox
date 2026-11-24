@@ -1422,25 +1422,31 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         /* REBOX_DEBUG_VS_WHITE=<stage id>,...: the stage's own code, with its param0 export made
          * (1, 1, 1, 1): v_mov_b32 1.0 into the export's four sources just before it. Whether a
          * vertex colour it passes through is what blackens a draw. */
+        /* REBOX_DEBUG_VS_UV=<stage id>,...: the same with param1 made (0.5, 0.5, 0.5, 0.5) (texture
+         * coordinates at the centre). */
         static UINT32 whitened[4096];
-        const char *white = getenv("REBOX_DEBUG_VS_WHITE");
-        if (!constant && !replace && white && req.code_dwords + 4 <= ARRAYSIZE(whitened))
+        const char *white = getenv("REBOX_DEBUG_VS_WHITE"), *uv = getenv("REBOX_DEBUG_VS_UV");
+        char stage_text[24];
+        snprintf(stage_text, sizeof(stage_text), "%016llx", (unsigned long long)stage_id);
+        BOOL make_uv = uv && strstr(uv, stage_text);
+        if (!constant && !replace && ((white && strstr(white, stage_text)) || make_uv)
+                && req.code_dwords + 4 <= ARRAYSIZE(whitened))
         {
-            char id[24];
-            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
-            if (strstr(white, id))
-                for (UINT k = 0; k + 1 < req.code_dwords; k++)
-                    if ((req.code[k] & 0xfc0003f0u) == 0xf8000200u) /* exp param0 */
+            const char *id = stage_text;
+            UINT32 target = make_uv ? 0xf8000210u : 0xf8000200u; /* exp param1 or param0 */
+            UINT32 value = make_uv ? 0xf0u : 0xf2u;             /* inline 0.5 or 1.0 */
+            for (UINT k = 0; k + 1 < req.code_dwords; k++)
+                    if ((req.code[k] & 0xfc0003f0u) == target)
                     {
                         UINT32 sources = req.code[k + 1];
                         memcpy(whitened, req.code, k * 4);
-                        for (UINT c = 0; c < 4; c++) /* v_mov_b32 v<src>, 1.0 */
-                            whitened[k + c] = 0x7e0002f2u | ((sources >> (8 * c)) & 0xff) << 17;
+                        for (UINT c = 0; c < 4; c++) /* v_mov_b32 v<src>, <value> */
+                            whitened[k + c] = 0x7e000200u | value | ((sources >> (8 * c)) & 0xff) << 17;
                         memcpy(whitened + k + 4, req.code + k, (req.code_dwords - k) * 4);
                         vreq.code = whitened;
                         vreq.code_dwords = req.code_dwords + 4;
-                        rebox_log("d3d12_xs: REBOX_DEBUG_VS_WHITE: stage %s exports param0 = 1 (sources %08x)", id,
-                                  sources);
+                        rebox_log("d3d12_xs: REBOX_DEBUG_VS_%s: stage %s exports param%u as a constant (sources %08x)",
+                                  make_uv ? "UV" : "WHITE", id, make_uv, sources);
                         break;
                     }
         }
