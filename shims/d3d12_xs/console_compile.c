@@ -1178,7 +1178,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
             }
             /* At its first 4 draws, every buffer V# in its s8 table (16-byte entries whose type
-             * nibble is a buffer's) and its first 32 values: its constants. */
+             * nibble is a buffer's) and its first 48 values: its constants. */
             if (n <= 4 && in->user_sgprs[8])
             {
                 UINT32 table[64];
@@ -1192,7 +1192,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                             continue;
                         rebox_log("d3d12_xs: stage %s draw %ld: table +%#x V# %08x %08x %08x %08x", id, n, e * 16,
                                   w[0], w[1], w[2], w[3]);
-                        for (UINT q = 0; q < 32 && !IsBadReadPtr(f + q, 32); q += 8)
+                        for (UINT q = 0; q < 48 && !IsBadReadPtr(f + q, 32); q += 8)
                             rebox_log("d3d12_xs:   +%#x: %g %g %g %g %g %g %g %g (%08x %08x %08x %08x %08x %08x %08x %08x)",
                                       q * 4, f[q], f[q + 1], f[q + 2], f[q + 3], f[q + 4], f[q + 5], f[q + 6], f[q + 7],
                                       ((const UINT32 *)f)[q], ((const UINT32 *)f)[q + 1], ((const UINT32 *)f)[q + 2],
