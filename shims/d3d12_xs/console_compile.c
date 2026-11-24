@@ -1364,7 +1364,7 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
     return hr;
 }
 
-HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
+static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     UINT64 key;
 
@@ -1401,6 +1401,30 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     default:
         return compile_within_budget(in, out);
     }
+}
+
+/* With REBOX_WATCH_STAGE naming a graphics stage, each of its compiles' results is logged (the first
+ * 64): whether its draws are skipped, and why. */
+HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
+{
+    HRESULT hr = console_compile(in, out);
+    const struct rebox_deferred_shader *h = in ? in->shader : NULL;
+
+    if (getenv("REBOX_WATCH_STAGE") && h && in->shader_size >= sizeof(*h) && h->version == 2
+            && h->code_offset <= in->shader_size && h->code_dwords * 4ull <= in->shader_size - h->code_offset)
+    {
+        UINT64 id = hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
+                               (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+        static LONG logged;
+        if (console_stage_watched(id) && InterlockedIncrement(&logged) <= 64)
+        {
+            char message[512];
+            ReboxConsoleLastResult(message, sizeof(message));
+            rebox_log("d3d12_xs: watched %s stage %016llx: compile %#lx (%s)", stage_name(h->stage),
+                      (unsigned long long)id, (unsigned long)hr, message);
+        }
+    }
+    return hr;
 }
 
 /* Guest memory for AnyPS5: the shadow heaps at their title addresses, then the GPU memory chunks
