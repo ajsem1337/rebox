@@ -225,6 +225,13 @@ void WINAPI ReboxConsoleFree(void *blob)
     free(blob);
 }
 
+/* For tests: the deferred graphics stage console_fssm_graphics makes (stage 0x1, 0x10 or 0x80), in
+ * memory the caller frees with ReboxConsoleFree. */
+void *WINAPI ReboxConsoleGraphicsFromContainer(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size)
+{
+    return console_fssm_graphics(container, size, stage, blob_size);
+}
+
 /* ------------------------------------------------------------------ graphics stages
  *
  * The older graphics FSSM layout (Unreal Engine 5 titles) carries less register state than compute: the code (at
@@ -383,6 +390,102 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
     return TRUE;
 }
 
+/* ------------------------------------------------------------------ mesh stages
+ *
+ * A mesh shader's FSSM, as all 6,685 of the target title's have it (sub-version 6; the layout
+ * VIctory describes, crates/victory-shader/src/native.rs): after "FSSM", its version (0x101) and a
+ * u64 size, the payload at 0x10 opens with the slot count (6), then a u64 record offset per hardware
+ * stage (payload-relative; 0xDEADBEEF_DEADBEEF for none), the mesh stage's at +0x48. Its record:
+ *   +0x00  u64 code offset (payload-relative) and +0x08 its size: a 24-byte shader ID, then the
+ *          code (every one opens with s_inst_prefetch there)
+ *   +0x14  flags: bit 5 wave32 (clear in all: wave64), bits 16-20 user SGPRs (13-17)
+ *   +0x44  float mode (0xC0 in all), +0x4C LDS bytes (0 in all but 5)
+ * then its stage data, E = record + 0x54:
+ *   E+0xC8   32 outputs of 6 bytes (count at E+0x188): usage, OSG1 register, param, a packed
+ *            pair's second register, 0, flags (3: two fp16 halves); param bit 7 would mark a
+ *            per-primitive output (none in the title)
+ *   E+0x194  PA_CL_VS_OUT_CNTL (clip distances in 1,438)
+ *   E+0x448  u16 lanes per group, u16 maximum vertices, u16 maximum primitives (128 each in all),
+ *            u8 user SGPRs, u8 output topology (2 triangles in all; 1 lines)
+ * The group stride the code divides v5 by is max(lanes, vertices, primitives) (VIctory; xcl's
+ * notes have v5 >> 7 in the retail code for 128). The title's mesh shaders have no amplification
+ * stage. */
+#define FSSM_PAYLOAD 0x10
+#define FSSM_MESH_SLOT 0x48
+#define FSSM_SHADER_ID 24
+#define FSSM_RECORD 0x54
+#define MESH_OUTPUTS 0xc8
+#define MESH_OUTPUT_COUNT 0x188
+#define MESH_CLIP_CNTL 0x194
+#define MESH_INFO 0x448
+
+static UINT64 u64(const BYTE *p)
+{
+    return u32(p) | (UINT64)u32(p + 4) << 32;
+}
+
+static void *fssm_mesh(const BYTE *fssm, SIZE_T size, SIZE_T *blob_size)
+{
+    const BYTE *payload = fssm + FSSM_PAYLOAD, *record, *data, *info;
+    SIZE_T payload_size = size - FSSM_PAYLOAD;
+    struct rebox_deferred_shader *h;
+    struct rebox_deferred_graphics *g;
+    UINT64 at, code_at, code_bytes;
+    UINT32 flags, outputs, topology;
+
+    if (size < FSSM_PAYLOAD + FSSM_MESH_SLOT + 8 || u32(fssm + 4) != 0x101 || u64(payload) != 6
+            || (at = u64(payload + FSSM_MESH_SLOT)) > payload_size || payload_size - at < FSSM_RECORD + MESH_INFO + 8)
+        return NULL;
+    record = payload + at;
+    data = record + FSSM_RECORD;
+    info = data + MESH_INFO;
+    code_at = u64(record) + FSSM_SHADER_ID;
+    code_bytes = u64(record + 8);
+    if (code_bytes <= FSSM_SHADER_ID || code_at > payload_size || code_at % 4)
+        return NULL;
+    code_bytes = min(code_bytes - FSSM_SHADER_ID, payload_size - code_at) & ~(UINT64)3;
+    flags = u32(record + 0x14);
+    outputs = u32(data + MESH_OUTPUT_COUNT);
+    topology = info[7];
+    if (!code_bytes || outputs > 32 || topology < 1 || topology > 2 || !(info[0] | info[1] << 8)
+            || !(info[2] | info[3] << 8) || !(info[4] | info[5] << 8))
+        return NULL;
+    if (!(h = calloc(1, sizeof(*h) + sizeof(*g) + code_bytes)))
+        return NULL;
+    g = (struct rebox_deferred_graphics *)(h + 1);
+    for (UINT k = 0; k < outputs; k++)
+    {
+        const BYTE *r = data + MESH_OUTPUTS + 6 * k;
+        if (r[2] != k || r[4]) /* per-primitive (param bit 7) isn't modelled; the rest not seen */
+        {
+            free(h);
+            return NULL;
+        }
+        g->registers[k] = r[1];
+    }
+    g->register_count = outputs;
+    g->mesh.threads = info[0] | info[1] << 8;
+    g->mesh.max_vertices = info[2] | info[3] << 8;
+    g->mesh.max_primitives = info[4] | info[5] << 8;
+    g->mesh.group_stride = max(g->mesh.threads, max(g->mesh.max_vertices, g->mesh.max_primitives));
+    g->mesh.primitive_vertices = topology + 1;
+    g->mesh.lds_bytes = u32(record + 0x4c);
+    g->mesh.clip_cntl = u32(data + MESH_CLIP_CNTL);
+    h->magic = REBOX_DEFERRED_MAGIC;
+    h->version = 2;
+    h->size = (UINT32)(sizeof(*h) + sizeof(*g) + code_bytes);
+    h->stage = 0x80; /* VK_SHADER_STAGE_MESH_BIT_EXT */
+    h->wave_size = (flags & FSSM_WAVE32) ? 32 : 64;
+    h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(record + 0x44) & 0xff) << 12;
+    h->rsrc2 = 1u << 27; /* USER_SGPR_MSB: 32 user SGPRs, s8 on the root parameters */
+    h->code_offset = sizeof(*h) + sizeof(*g);
+    h->code_dwords = (UINT32)(code_bytes / 4);
+    h->code_address = 0x10000000000ull;
+    memcpy((BYTE *)h + h->code_offset, payload + code_at, code_bytes);
+    *blob_size = h->size;
+    return h;
+}
+
 void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size)
 {
     struct rebox_deferred_shader *h;
@@ -394,6 +497,12 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
 
     if (!fssm)
         return NULL;
+    if (stage == 0x80)
+    {
+        h = fssm_mesh(fssm, fssm_size, blob_size);
+        free(fssm);
+        return h;
+    }
     code_offset = u32(fssm + FSSM_CODE_POINTER) + 0x28;
     code_bytes = fssm_size > FSSM_GFX_RSRC1 + 4 ? u32(fssm + FSSM_GFX_CODE_SIZE) : 0;
     if (code_offset % 4 || code_offset >= fssm_size || code_offset < FSSM_GFX_RSRC1 + 4)

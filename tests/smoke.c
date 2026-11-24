@@ -19,6 +19,7 @@
 
 #include "../generated/test_shaders.h"
 #include "../anyps5/rebox_anyps5.h"
+#include "../shims/d3d12_xs/console_compile.h"
 
 /* The title's allocation hooks, exported as a title does (__XMemAllocationHooks__: alloc, free):
  * xmem uses them for every XMemAlloc. Everything goes to the defaults except a descriptor heap
@@ -1015,14 +1016,15 @@ static BOOL read_dump_pixel(const char *dir, int frame, BYTE bgra[4])
  * 0x108, float mode at 0xFC. zlib in stored blocks, which puff reads. Free with free(). */
 /* With an interface table (FSSM sub-version 5: the pixel table's records at 0x130, the vertex
  * table's at 0x1D4) and a signature part (sig_tag ISG1 or OSG1, its chunk), when given. */
+static BYTE *console_container_around(BYTE *fssm, UINT fssm_size, const char *sig_tag, const BYTE *sig,
+                                      UINT sig_size, SIZE_T *size);
+
 static BYTE *console_graphics_container_ex(const UINT32 *code, UINT dwords, const BYTE *table, UINT table_at,
                                            UINT table_size, const char *sig_tag, const BYTE *sig, UINT sig_size, SIZE_T *size)
 {
     UINT code_at = table ? 0x300 : 0x160;
-    UINT fssm_size = code_at + dwords * 4, zsize = 2 + 5 + fssm_size + 4, part, total, parts = sig ? 2 : 1;
-    UINT dxil_at = 0x20 + 4 * parts;
-    BYTE *fssm = calloc(1, fssm_size), *out;
-    UINT32 a = 1, b = 0;
+    UINT fssm_size = code_at + dwords * 4;
+    BYTE *fssm = calloc(1, fssm_size);
 
     memcpy(fssm, "FSSM", 4);
     *(UINT32 *)(fssm + 0xc0) = code_at - 0x28;
@@ -1035,6 +1037,19 @@ static BYTE *console_graphics_container_ex(const UINT32 *code, UINT dwords, cons
         memcpy(fssm + table_at, table, table_size);
     }
     memcpy(fssm + code_at, code, dwords * 4);
+    return console_container_around(fssm, fssm_size, sig_tag, sig, sig_size, size);
+}
+
+/* The container (DXBC, DXIL part, XBCH, zlib in stored blocks) around an FSSM, which it frees; with a
+ * signature part when given. */
+static BYTE *console_container_around(BYTE *fssm, UINT fssm_size, const char *sig_tag, const BYTE *sig,
+                                      UINT sig_size, SIZE_T *size)
+{
+    UINT zsize = 2 + 5 + fssm_size + 4, part, total, parts = sig ? 2 : 1;
+    UINT dxil_at = 0x20 + 4 * parts;
+    UINT32 a = 1, b = 0;
+    BYTE *out;
+
     part = 4 + 0x60 + 4 + 0x14 + zsize;
     part = (part + 3) & ~3u;
     total = dxil_at + 8 + part + (sig ? 8 + sig_size : 0);
@@ -2220,6 +2235,104 @@ static void test_console_mesh_stream(void)
               && out.topology.value == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
               "a stream's rectangle topology type 0x13 reaches the desktop as TRIANGLE (%u)", out.topology.value);
     }
+}
+
+/* A console mesh shader in its container, as the target title's FSSMs have it (console_fssm.c: the
+ * slot table at 0x10, the mesh record and stage data, a 24-byte shader ID before the code), made a
+ * deferred mesh stage and compiled through ReboxConsoleCompile as at a mesh dispatch (patch 0013):
+ * AnyPS5's mesh path, then sa5_finalize_draw with the draw block's address at push byte 96. No
+ * pipeline is made (lavapipe has no mesh shaders here). The program: three vertices and one
+ * triangle, lane n at (n, 0, 0, 1) with param0 = 1. */
+static void test_console_mesh_compile(void)
+{
+    static const UINT32 code[] = {
+        0xbfa00003,                         /* s_inst_prefetch 3, as the title's open */
+        0xd7650000, 0x000100c1,             /* v_mbcnt_lo_u32_b32 v0, -1, 0 */
+        0xd7660000, 0x000200c1,             /* v_mbcnt_hi_u32_b32 v0, -1, v0 */
+        0xb07c1003,                         /* s_movk_i32 m0, 0x1003: 3 vertices, 1 primitive */
+        0xbf900009,                         /* s_sendmsg GS_ALLOC_REQ */
+        0x7d880083,                         /* v_cmp_gt_u32 vcc, 3, v0 */
+        0xbefe046a,                         /* s_mov_b64 exec, vcc */
+        0x7e020d00,                         /* v_cvt_f32_u32 v1, v0 */
+        0x7e040280,                         /* v_mov_b32 v2, 0 */
+        0x7e0602f2,                         /* v_mov_b32 v3, 1.0 */
+        0xf80008cf, 0x03020201,             /* exp pos0 v1, v2, v2, v3 done */
+        0xf800020f, 0x03030303,             /* exp param0 v3, v3, v3, v3 */
+        0x7d840080,                         /* v_cmp_eq_u32 vcc, 0, v0 */
+        0xbefe046a,                         /* s_mov_b64 exec, vcc */
+        0x7e0802ff, 0x00200400,             /* v_mov_b32 v4, 0 | 1 << 10 | 2 << 20 */
+        0xf8000941, 0x00000004,             /* exp prim v4 done */
+        0xbf810000,                         /* s_endpgm */
+    };
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void *(WINAPI *from_container)(const void *, SIZE_T, UINT32, SIZE_T *) = (void *)GetProcAddress(m,
+            "ReboxConsoleGraphicsFromContainer");
+    HRESULT (WINAPI *compile)(const struct rebox_compile_in *, struct rebox_compile_out *) = (void *)GetProcAddress(m,
+            "ReboxConsoleCompile");
+    void (WINAPI *release)(void *) = (void *)GetProcAddress(m, "ReboxConsoleFree");
+    /* Payload at 0x10: the slot count, 12 record offsets, the mesh record (0x54 bytes) at 0x68, its
+     * stage data to the info at 0x448, then the shader ID and code at 0x45c. */
+    const UINT payload = 0x10, record = 0x68, data = record + 0x54, code_at = data + 0x45c;
+    UINT fssm_size = payload + code_at + 24 + sizeof(code);
+    BYTE *fssm = calloc(1, fssm_size), *container;
+    const struct rebox_deferred_shader *h;
+    const struct rebox_deferred_graphics *g;
+    struct rebox_compile_in in;
+    struct rebox_compile_out out;
+    UINT32 sgprs[32] = { 0 };
+    SIZE_T size, blob_size = 0;
+    HRESULT hr;
+
+    CHECK(from_container && compile && release, "d3d12_xs exports ReboxConsoleGraphicsFromContainer");
+    if (!from_container || !compile || !release || !fssm)
+    {
+        free(fssm);
+        return;
+    }
+    memcpy(fssm, "FSSM", 4);
+    *(UINT32 *)(fssm + 4) = 0x101;
+    *(UINT64 *)(fssm + 8) = fssm_size - payload;
+    *(UINT64 *)(fssm + payload) = 6;
+    for (UINT at = 0x08; at < 0x68; at += 8)
+        *(UINT64 *)(fssm + payload + at) = at == 0x48 ? record : 0xdeadbeefdeadbeefull;
+    *(UINT64 *)(fssm + payload + record) = code_at;
+    *(UINT64 *)(fssm + payload + record + 8) = 24 + sizeof(code);
+    *(UINT32 *)(fssm + payload + record + 0x14) = 17u << 16;        /* wave64, 17 user SGPRs */
+    *(UINT32 *)(fssm + payload + record + 0x44) = 0xc0;             /* float mode */
+    fssm[payload + data + 0xc8 + 1] = 1;                            /* param0 writes OSG1 register 1 */
+    *(UINT32 *)(fssm + payload + data + 0x188) = 1;
+    *(UINT16 *)(fssm + payload + data + 0x448) = 128;               /* lanes */
+    *(UINT16 *)(fssm + payload + data + 0x44a) = 128;               /* vertices */
+    *(UINT16 *)(fssm + payload + data + 0x44c) = 128;               /* primitives */
+    fssm[payload + data + 0x44e] = 17;
+    fssm[payload + data + 0x44f] = 2;                               /* triangles */
+    memset(fssm + payload + code_at, 0x5a, 24);                     /* the shader ID */
+    memcpy(fssm + payload + code_at + 24, code, sizeof(code));
+    container = console_container_around(fssm, fssm_size, NULL, NULL, 0, &size);
+
+    h = from_container(container, size, 0x80, &blob_size);
+    g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
+    CHECK(h && h->version == 2 && h->stage == 0x80 && h->wave_size == 64 && h->code_dwords == ARRAYSIZE(code)
+          && !memcmp((const BYTE *)h + h->code_offset, code, sizeof(code)) && g->mesh.threads == 128
+          && g->mesh.group_stride == 128 && g->mesh.primitive_vertices == 3 && g->register_count == 1
+          && g->registers[0] == 1, "a console mesh container becomes a deferred mesh stage (%u dwords of code, "
+          "stride %u)", h ? h->code_dwords : 0, g ? g->mesh.group_stride : 0);
+    if (h)
+    {
+        memset(&in, 0, sizeof(in));
+        memset(&out, 0, sizeof(out));
+        memset(in.bindless, 0xff, sizeof(in.bindless));
+        in.shader = h;
+        in.shader_size = (UINT32)blob_size;
+        in.user_sgpr_count = 32;
+        in.user_sgprs = sgprs;
+        hr = compile(&in, &out);
+        CHECK(SUCCEEDED(hr) && out.spirv_words && out.subgroup_size == 64 && (out.push[24] | out.push[25]),
+              "a deferred mesh stage compiles through AnyPS5's mesh path and finalizes with its draw block at "
+              "push byte 96 (%#lx, %u SPIR-V words, subgroup %u)", hr, out.spirv_words, out.subgroup_size);
+        release((void *)h);
+    }
+    free(container);
 }
 
 static void test_xbox_root_flags(void *dev)
@@ -4717,6 +4830,7 @@ static void test_xbox(void)
     test_title_heap_properties(dev);
     test_depth_uav_texture(dev);
     test_console_mesh_stream();
+    test_console_mesh_compile();
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_NONE);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);

@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index 8ee48ff..57fcdc8 100644
+index 8ee48ff..06d22a2 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -7604,10 +7604,13 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
@@ -40,7 +40,7 @@ index 8ee48ff..57fcdc8 100644
 +    {
 +        static unsigned int logged;
 +        if (logged++ < 4)
-+            ERR("rebox: indirect console mesh dispatch, up to %u records of %u bytes (Y and Z group counts taken as 1).\n",
++            ERR("rebox: indirect console mesh dispatch, up to %u records of %u bytes (groups along Y and Z repeat X's).\n",
 +                    max_command_count, signature_desc->ByteStride);
 +    }
 +

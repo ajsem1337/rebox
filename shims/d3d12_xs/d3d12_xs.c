@@ -312,13 +312,15 @@ static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, vo
     }
 }
 
-static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
+/* first: the first stage, in desc->VS: 0x1 a vertex shader, 0x80 a mesh shader (a mesh pipeline:
+ * no input layout, and the mesh shader's output table and signature link the interpolants). */
+static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso, UINT32 first)
 {
     static LONG attached, refused_vs, refused_ps, refused_other;
     struct rebox_graphics *g;
     void *vs = NULL, *ps = NULL;
     SIZE_T vs_size = 0, ps_size = 0;
-    const char *env = getenv("REBOX_CONSOLE_GRAPHICS");
+    const char *env = getenv("REBOX_CONSOLE_GRAPHICS"), *first_name = first == 0x80 ? "mesh" : "vertex";
 
     if ((env && *env == '0') || !pso)
         return;
@@ -327,18 +329,18 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
     {
         LONG n = InterlockedIncrement(&refused_other);
         if (!(n & (n - 1)))
-            rebox_log("d3d12_xs: graphics PSOs not deferred: %ld without both a vertex and a pixel shader, or with "
-                         "tessellation or geometry stages", n);
+            rebox_log("d3d12_xs: graphics PSOs not deferred: %ld without both a %s and a pixel shader, or with "
+                         "tessellation or geometry stages", n, first_name);
         return;
     }
-    if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0x1, &vs_size))
+    if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, first, &vs_size))
             || !(ps = console_fssm_graphics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, 0x10, &ps_size))
             || !(g = calloc(1, sizeof(*g) + vs_size + ps_size)))
     {
         LONG n = InterlockedIncrement(vs ? &refused_ps : &refused_vs);
         if (!(n & (n - 1)))
             rebox_log("d3d12_xs: graphics PSOs not deferred: %ld whose %s shader isn't one we can read", n,
-                         vs ? "pixel" : "vertex");
+                         vs ? "pixel" : first_name);
         free(vs);
         free(ps);
         return;
@@ -355,6 +357,7 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
      * the fetch by matching them; a UE5 title's inputs aren't in the layout's order, e.g. ATTRIBUTE0
      * then ATTRIBUTE13). Offsets are resolved here, D3D12_APPEND_ALIGNED_ELEMENT by the layout's own
      * order (patch 0006 resolves them only for elements in order). Without a signature, layout order. */
+    if (first == 0x1)
     {
         const char *names[32];
         UINT indices[32], regs = signature_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, FALSE, names, indices);
@@ -430,8 +433,8 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
             && !(InterlockedIncrement(&attached) & (attached - 1)))
         rebox_log("d3d12_xs: graphics PSOs deferred to draw time: %ld", attached);
     if (attached <= 4)
-        rebox_log("d3d12_xs: graphics PSO: console vertex shader (%u inputs) and pixel shader (%u interpolants) "
-                     "deferred to draw time, %u input elements",
+        rebox_log("d3d12_xs: graphics PSO: console %s shader (%u inputs) and pixel shader (%u interpolants) "
+                     "deferred to draw time, %u input elements", first_name,
                      ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)vs + 1))->input_count,
                      ((const struct rebox_deferred_graphics *)((const struct rebox_deferred_shader *)ps + 1))->interpolator_count,
                      g->element_count);
@@ -478,7 +481,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         hr = orig_create_graphics(device, &copy, riid, pso);
     }
     if (SUCCEEDED(hr) && miss && fallback_enabled() && pso)
-        attach_console_graphics(desc, *pso);
+        attach_console_graphics(desc, *pso, 0x1);
     /* Bytecode that passed as PC's or came from the cache can still fail to compile: Xbox DXIL
      * calling @xbox.* intrinsics (XboxBvhBuilder), or a bad translation. Fallbacks then, too. */
     if (FAILED(hr) && !miss && fallback_enabled() && hr != E_OUTOFMEMORY)
@@ -567,8 +570,11 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     UINT stage_count = 0;
     BOOL miss = FALSE;
     /* The title's stages and input layout, for attach_console_graphics: Unreal 5 makes every
-     * graphics PSO from a stream (a UE5 sample), so without this none drew. */
+     * graphics PSO from a stream (a UE5 sample), so without this none drew. A mesh pipeline's mesh
+     * shader (the desktop's type 25 by now: proxy.c renumbers the console's) goes where the vertex
+     * shader would. */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC console = { 0 };
+    D3D12_SHADER_BYTECODE mesh = { 0 };
     BOOL other_stages = FALSE;
     const D3D12_BLEND_DESC *blend = NULL;
     const struct D3D12_RT_FORMAT_ARRAY *rt_formats = NULL;
@@ -611,6 +617,8 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
                 console.VS = *bc;
             else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS)
                 console.PS = *bc;
+            else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
+                mesh = *bc;
             else if (bc->BytecodeLength)
                 other_stages = TRUE;
             if (stage_count < ARRAYSIZE(stages))
@@ -660,7 +668,16 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
         hr = orig_create_pipeline(device, &copy, riid, pso);
     }
-    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages)
+    /* A mesh pipeline: its mesh and pixel shaders, compiled at each mesh dispatch (patch 0013). One
+     * with an amplification shader (other_stages) keeps its fallbacks: AnyPS5 has no task stage. */
+    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages && mesh.BytecodeLength
+            && !console.VS.BytecodeLength)
+    {
+        console.VS = mesh;
+        console.InputLayout.NumElements = 0;
+        attach_console_graphics(&console, *pso, 0x80);
+    }
+    else if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages)
     {
         /* The first console graphics streams' blending and targets, to check that state reaches the
          * pipelines console draws get. */
@@ -674,7 +691,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
                       blend ? blend->RenderTarget[0].DestBlendAlpha : 0, blend ? blend->RenderTarget[0].BlendOpAlpha : 0,
                       blend ? blend->RenderTarget[0].RenderTargetWriteMask : 0, rt_formats ? rt_formats->NumRenderTargets : 0,
                       rt_formats ? rt_formats->RTFormats[0] : 0);
-        attach_console_graphics(&console, *pso);
+        attach_console_graphics(&console, *pso, 0x1);
     }
     /* As for graphics and compute PSOs: bytecode that passed as PC's can still fail to compile. */
     if (FAILED(hr) && !miss && stage_count && fallback_enabled() && hr != E_OUTOFMEMORY)

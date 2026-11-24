@@ -105,7 +105,7 @@ $(BUILD)/stub/%.dll: $(GEN)/dlls/$$*/stubs.c $(GEN)/dlls/$$*/$$*.def $(COMMON) s
 	$(MINGW_CC) $(CFLAGS) -Ishims/common -o $@ $(GEN)/dlls/$*/stubs.c $(COMMON) $(GEN)/dlls/$*/$*.def $(LDFLAGS)
 
 # Smoke test executable, run under Wine by tests/run-smoke.sh.
-$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h anyps5/rebox_anyps5.h
+$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h anyps5/rebox_anyps5.h shims/d3d12_xs/console_compile.h
 	@mkdir -p $(BUILD)
 	$(MINGW_CC) $(CFLAGS) -o $@ $<
 

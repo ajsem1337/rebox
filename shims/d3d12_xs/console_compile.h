@@ -20,9 +20,22 @@ struct rebox_deferred_shader
     UINT64 code_address;       /* the code's guest address */
 };
 
-/* Graphics stages (version 2): the header above with stage VK_SHADER_STAGE_VERTEX_BIT (1) or
- * FRAGMENT_BIT (0x10), then this, then the code (console_fssm.c). rsrc2's user SGPR count is the
- * stage's. */
+/* Graphics stages (version 2): the header above with stage VK_SHADER_STAGE_VERTEX_BIT (1),
+ * FRAGMENT_BIT (0x10) or MESH_BIT_EXT (0x80), then this, then the code (console_fssm.c). rsrc2's
+ * user SGPR count is the stage's. TASK_BIT_EXT (0x40), an amplification stage, is never made:
+ * AnyPS5 has no task stage, and a pipeline with one keeps its fallbacks. */
+
+/* A mesh stage's limits, from its FSSM's stage data (sa5_mesh_request). */
+struct rebox_deferred_mesh
+{
+    UINT32 threads;              /* lanes per group */
+    UINT32 max_vertices, max_primitives;
+    UINT32 group_stride;         /* v5 holds the group id times this */
+    UINT32 primitive_vertices;   /* 3 triangles, 2 lines, 1 points */
+    UINT32 lds_bytes;
+    UINT32 clip_cntl;            /* PA_CL_VS_OUT_CNTL */
+};
+
 struct rebox_deferred_graphics
 {
     UINT32 input_count;          /* vertex: inputs r at v[4+4r..7+4r] */
@@ -36,11 +49,13 @@ struct rebox_deferred_graphics
     UINT32 register_count;
     BYTE registers[32];
     BYTE flat[32];               /* pixel: attribute N is flat (not interpolated) */
+    struct rebox_deferred_mesh mesh; /* mesh */
 };
 
 /* What d3d12_xs attaches to a graphics PSO whose stages are console vertex and pixel shaders,
  * as private data under REBOX_GRAPHICS_GUID (patch 0006 reads it at the first draw): the two
- * deferred stages and the input layout, AlignedByteOffset resolved. */
+ * deferred stages and the input layout, AlignedByteOffset resolved. A mesh pipeline's (patch 0013)
+ * has its mesh stage where the vertex stage goes, and no input layout. */
 #define REBOX_GRAPHICS_MAGIC 0x47524353u /* "SCRG" */
 struct rebox_graphics_element
 {
@@ -68,7 +83,7 @@ struct rebox_compile_in
     UINT64 heap_cpu[2];        /* CPU handle of descriptor 0 of the bound CBV/SRV/UAV and sampler heaps */
     UINT32 increment[2];
     UINT32 bindless[7][2];     /* per AnyPS5 DescriptorKind: Vulkan set and binding, set ~0u if none */
-    UINT32 push_offset;        /* graphics: where this stage's 128 bytes of push data go (0 or 128) */
+    UINT32 push_offset;        /* graphics: where this stage's 128 bytes of push data go (0 or 128; a mesh stage's, 0) */
     UINT32 rect_list;          /* graphics (patch 0011): a rect-list draw: the result is kept for ReboxConsoleRectStages */
 };
 

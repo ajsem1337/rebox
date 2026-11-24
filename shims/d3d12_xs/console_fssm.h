@@ -6,7 +6,7 @@
  * FSSM, or NULL if the container holds none. Free it with free(). See console_fssm.c. */
 void *console_fssm_compute(const void *container, SIZE_T size, SIZE_T *blob_size);
 
-/* A deferred console vertex (stage 0x1) or pixel (0x10) shader (SCRD version 2, with
+/* A deferred console vertex (stage 0x1), pixel (0x10) or mesh (0x80) shader (SCRD version 2, with
  * rebox_deferred_graphics after the header) from a console container's FSSM, or NULL. */
 void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size);
 
