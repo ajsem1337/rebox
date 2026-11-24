@@ -593,8 +593,17 @@ static BOOL dump_wanted(UINT64 frame)
     return FALSE;
 }
 
+static void write_dump_named(const char *name, UINT64 frame, const D3D12_RESOURCE_DESC *desc,
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, const BYTE *data);
+
 static void write_dump(UINT64 frame, const D3D12_RESOURCE_DESC *desc, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp,
         const BYTE *data)
+{
+    write_dump_named("frame", frame, desc, fp, data);
+}
+
+static void write_dump_named(const char *name, UINT64 frame, const D3D12_RESOURCE_DESC *desc,
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp, const BYTE *data)
 {
     const char *dir = getenv("REBOX_DUMP_FRAMES");
     BOOL rgba = swapchain_format(desc->Format) == DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -603,7 +612,7 @@ static void write_dump(UINT64 frame, const D3D12_RESOURCE_DESC *desc, const D3D1
     char path[MAX_PATH];
     FILE *f;
 
-    snprintf(path, sizeof(path), "%s\\frame_%llu.%s", dir, (unsigned long long)frame, rgba || bgra ? "bmp" : "bin");
+    snprintf(path, sizeof(path), "%s\\%s_%llu.%s", dir, name, (unsigned long long)frame, rgba || bgra ? "bmp" : "bin");
     if (!(f = fopen(path, "wb")))
     {
         rebox_log("d3d12_xs: cannot write %s", path);
@@ -782,6 +791,13 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     BOOL show, dump, convert, scale = FALSE;
     UINT out_w, out_h;
     UINT64 frame, total = 0;
+    /* REBOX_DUMP_GPU_TEXTURE=<hex title address>: at each dumped frame, also the GPU contents of the
+     * texture placed there (DIR\texture_<n>.bmp), and its mean byte value in the log: whether a
+     * target the title samples was drawn at all. */
+    ID3D12Resource *gpu_tex = NULL, *gpu_readback = NULL;
+    D3D12_RESOURCE_DESC gpu_desc;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT gpu_fp;
+    UINT64 gpu_total = 0;
     unsigned r;
     static LONG logged;
 
@@ -957,6 +973,30 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
             from_loc.SubresourceIndex = 0;
             ID3D12GraphicsCommandList_CopyTextureRegion(s->ring[r].list, &dst, 0, 0, 0, &from_loc, NULL);
         }
+        {
+            const char *v = getenv("REBOX_DUMP_GPU_TEXTURE");
+            UINT64 at = v ? _strtoui64(v, NULL, 16) : 0;
+            if (at && (gpu_tex = title_texture_at(at)))
+            {
+                gpu_desc = ID3D12Resource_GetDesc(gpu_tex);
+                ID3D12Device_GetCopyableFootprints(s->device, &gpu_desc, 0, 1, 0, &gpu_fp, NULL, NULL, &gpu_total);
+                bd.Width = gpu_total;
+                if (gpu_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && SUCCEEDED(ID3D12Device_CreateCommittedResource(s->device, &heap, D3D12_HEAP_FLAG_NONE, &bd,
+                                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&gpu_readback)))
+                {
+                    D3D12_TEXTURE_COPY_LOCATION dst = { gpu_readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    D3D12_TEXTURE_COPY_LOCATION from_loc = { gpu_tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    dst.PlacedFootprint = gpu_fp;
+                    /* Its state is the title's: taken as shader readable, as the composite samples it. */
+                    barrier(s->ring[r].list, gpu_tex, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    ID3D12GraphicsCommandList_CopyTextureRegion(s->ring[r].list, &dst, 0, 0, 0, &from_loc, NULL);
+                    barrier(s->ring[r].list, gpu_tex, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+                }
+            }
+        }
     }
     if (convert)
         barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -986,6 +1026,30 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
             ID3D12Resource_Unmap(readback, 0, NULL);
         }
         ID3D12Resource_Release(readback);
+    }
+    if (gpu_readback)
+    {
+        void *data;
+        D3D12_RANGE range = { 0, (SIZE_T)gpu_total };
+
+        wait_idle(s);
+        if (SUCCEEDED(ID3D12Resource_Map(gpu_readback, 0, &range, &data)))
+        {
+            UINT64 sum = 0, n = 0;
+            for (UINT y = 0; y < gpu_desc.Height; y += 16)
+            {
+                const BYTE *row = (const BYTE *)data + gpu_fp.Offset + (SIZE_T)y * gpu_fp.Footprint.RowPitch;
+                for (UINT x = 0; x < gpu_fp.Footprint.RowPitch && x < gpu_desc.Width * 4; x += 64, n++)
+                    sum += row[x] + row[x + 1] + row[x + 2];
+            }
+            rebox_log("d3d12_xs: frame %llu: the GPU texture at %s (%llux%u, format %u) has mean %.2f",
+                      (unsigned long long)frame, getenv("REBOX_DUMP_GPU_TEXTURE"),
+                      (unsigned long long)gpu_desc.Width, gpu_desc.Height, gpu_desc.Format,
+                      n ? (double)sum / (3.0 * n) : 0.0);
+            write_dump_named("texture", frame, &gpu_desc, &gpu_fp, data);
+            ID3D12Resource_Unmap(gpu_readback, 0, NULL);
+        }
+        ID3D12Resource_Release(gpu_readback);
     }
     return S_OK;
 }

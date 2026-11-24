@@ -196,6 +196,7 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_FRAMES_AT` | Which frames to dump, comma-separated; default `1,60,600` |
 | `REBOX_DUMP_FRAMES_EVERY=N` | Also dump a frame every N seconds (the first frame, then the first one N seconds after the last dump) |
 | `REBOX_DUMP_TITLE_TEXTURE=<address>` | With `REBOX_DUMP_FRAMES`, write the title memory of the placed texture at that hex address as `DIR/texture_<address>_<n>.bin` each time the texture state log runs (every 600 submissions, eight times) |
+| `REBOX_DUMP_GPU_TEXTURE=<address>` | With `REBOX_DUMP_FRAMES`, at each dumped frame also read back the GPU contents of the texture placed at that hex title address, as `DIR/texture_<n>.bmp`, and log its mean value: whether a target the title samples was drawn at all |
 | `REBOX_DSTORAGE_IGNORE_FAILURES=1` | A DirectStorage request that fails (logged and counted as before) no longer makes the next status entry report the failure: whether a title gives up on a whole batch for one failed request (a BCPack block the decoder refuses) |
 | `REBOX_DISPATCHX=1` | Console DispatchX calls (list slot 80, 78 on older lists) run as Dispatch; by default they are dropped, since the title's ray tracing builder dispatches this way and run, they faulted the GPU |
 | `REBOX_MEMORY_WAITS=0` | Console memory waits in lists (Wait32/64BitValueX) are ignored; lists are ordered only by the title's fences: whether the waits are what stalls a title's queues |
