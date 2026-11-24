@@ -65,7 +65,7 @@ struct embedded
 
 /* A write of count dwords, or (size set) a copy of size bytes from source. */
 struct cpu_write { UINT64 address; UINT32 values[2]; UINT count; UINT64 source, size; };
-struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; UINT writes_before; };
+struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; UINT writes_before, cpu_before, gpu_before; };
 
 struct proxy
 {
@@ -3055,7 +3055,8 @@ volatile UINT64 rebox_table_watch; /* console_compile.c: a table to show at the 
 volatile UINT64 rebox_value_watch; /* console_compile.c (REBOX_WATCH_STAGE): 4 floats to show at the next submission */
 BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
 
-static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists);
+static void lists_wait(struct proxy *queue, UINT count, ID3D12CommandList *const *lists);
+static void queue_cpu_writes(struct proxy *queue, const struct cpu_write *const *arrays, const UINT *counts, UINT n);
 static volatile LONG timed_out_count;
 static BOOL after_timed_out_wait(UINT64 address, UINT bytes);
 static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists);
@@ -3105,6 +3106,29 @@ static struct value_fence *value_fence(UINT64 address)
 
 /* After a submission on queue: each write in the lists signals its address's fence (values only
  * go up: a fence can't go back). */
+/* Under value_fence_lock, exclusive: writes' fences signalled on queue. */
+static void signal_writes(ID3D12CommandQueue *queue, const struct cpu_write *w, UINT n)
+{
+    for (UINT k = 0; k < n; k++)
+    {
+        UINT64 value = w[k].count == 2 ? (UINT64)w[k].values[1] << 32 | w[k].values[0] : w[k].values[0];
+        struct value_fence *f = w[k].size ? NULL : value_fence(w[k].address);
+        if (f)
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            f->last_queue = queue;
+            f->last_value = value;
+            f->last_at = now.QuadPart;
+        }
+        if (f && value > f->signalled)
+        {
+            ID3D12CommandQueue_Signal(queue, f->fence, value);
+            f->signalled = value;
+        }
+    }
+}
+
 static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists)
 {
     AcquireSRWLockExclusive(&value_fence_lock);
@@ -3113,29 +3137,8 @@ static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12Com
         struct proxy *l = (struct proxy *)lists[i];
         if (!is_proxy(l))
             continue;
-        for (UINT pass = 0; pass < 2; pass++)
-        {
-            const struct cpu_write *w = pass ? l->cpu_writes : l->gpu_writes;
-            UINT n = pass ? l->cpu_write_count : l->gpu_write_count;
-            for (UINT k = 0; k < n; k++)
-            {
-                UINT64 value = w[k].count == 2 ? (UINT64)w[k].values[1] << 32 | w[k].values[0] : w[k].values[0];
-                struct value_fence *f = value_fence(w[k].address);
-                if (f)
-                {
-                    LARGE_INTEGER now;
-                    QueryPerformanceCounter(&now);
-                    f->last_queue = queue;
-                    f->last_value = value;
-                    f->last_at = now.QuadPart;
-                }
-                if (f && value > f->signalled)
-                {
-                    ID3D12CommandQueue_Signal(queue, f->fence, value);
-                    f->signalled = value;
-                }
-            }
-        }
+        signal_writes(queue, l->gpu_writes, l->gpu_write_count);
+        signal_writes(queue, l->cpu_writes, l->cpu_write_count);
     }
     ReleaseSRWLockExclusive(&value_fence_lock);
 }
@@ -3369,7 +3372,7 @@ static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *
                               "(thread %#lx)", l, (unsigned long long)l->cpu_writes[k].address, p, GetCurrentThreadId());
         }
     /* Memory waits the lists start with: on the GPU for counters, else on the CPU (lists_wait). */
-    lists_wait(INNER(p, ID3D12CommandQueue), count, lists);
+    lists_wait(p, count, lists);
     submit_mark(&mark, 0);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
@@ -4192,7 +4195,8 @@ static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64
         p->wait_capacity = capacity;
     }
     p->waits[p->wait_count++] = (struct memory_wait){ address, value, mask, comparison, width,
-                                                      p->cpu_write_count + p->gpu_write_count };
+                                                      p->cpu_write_count + p->gpu_write_count,
+                                                      p->cpu_write_count, p->gpu_write_count };
 }
 
 static void STDMETHODCALLTYPE list_Wait32BitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT32 value,
@@ -4234,11 +4238,42 @@ static BOOL wait_satisfied(const struct memory_wait *w)
 
 /* Before a submission: each list's waits; a counter not reached yet on the GPU (gpu_wait_for_value),
  * others on the CPU (up to 2 s each, then logged and passed). */
-static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists)
+/* The writes a list records before a wait are made before it too: its fences signalled on the
+ * queue, its writes outside GPU memory by the worker once the queue gets there. A compute queue's
+ * list that wrote a counter and then waited for one the graphics queue writes after waiting for
+ * the first had both queues wait until the timeout, every frame, with the wait made at the list's
+ * start and the write after the list. (The list's own work before the wait still runs after it.) */
+static void writes_before_wait(struct proxy *queue, struct proxy *l, const struct memory_wait *w, UINT *cpu_done,
+                               UINT *gpu_done)
 {
+    UINT cpu = min(w->cpu_before, l->cpu_write_count), gpu = min(w->gpu_before, l->gpu_write_count);
+
+    if (cpu <= *cpu_done && gpu <= *gpu_done)
+        return;
+    AcquireSRWLockExclusive(&value_fence_lock);
+    if (gpu > *gpu_done)
+        signal_writes(INNER(queue, ID3D12CommandQueue), l->gpu_writes + *gpu_done, gpu - *gpu_done);
+    if (cpu > *cpu_done)
+        signal_writes(INNER(queue, ID3D12CommandQueue), l->cpu_writes + *cpu_done, cpu - *cpu_done);
+    ReleaseSRWLockExclusive(&value_fence_lock);
+    if (cpu > *cpu_done)
+    {
+        const struct cpu_write *arrays[1] = { l->cpu_writes + *cpu_done };
+        UINT counts[1] = { cpu - *cpu_done };
+        queue_cpu_writes(queue, arrays, counts, 1);
+    }
+    *cpu_done = max(*cpu_done, cpu);
+    *gpu_done = max(*gpu_done, gpu);
+}
+
+static void lists_wait(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
+{
+    ID3D12CommandQueue *queue = INNER(p, ID3D12CommandQueue);
+
     for (UINT i = 0; i < count; i++)
     {
         struct proxy *l = (struct proxy *)lists[i];
+        UINT cpu_done = 0, gpu_done = 0;
         if (!is_proxy(l))
             continue;
         for (UINT k = 0; k < l->wait_count; k++)
@@ -4246,7 +4281,10 @@ static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList 
             const struct memory_wait *w = &l->waits[k];
             LARGE_INTEGER start, now, freq;
             BOOL ok;
-            if (wait_satisfied(w) || gpu_wait_for_value(queue, w))
+            if (wait_satisfied(w))
+                continue;
+            writes_before_wait(p, l, w, &cpu_done, &gpu_done);
+            if (gpu_wait_for_value(queue, w))
                 continue;
             QueryPerformanceCounter(&start);
             QueryPerformanceFrequency(&freq);
@@ -4274,46 +4312,77 @@ static void lists_wait(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList 
 
 /* After a submission: the lists' CPU writes, made by a worker once the queue's fence passes the
  * value signalled after them, in submission order (up to 10 s, then made anyway). */
-struct cpu_write_job { ID3D12Fence *fence; UINT64 value; struct cpu_write *writes; UINT count; struct cpu_write_job *next; };
+struct cpu_write_job { ID3D12Fence *fence; UINT64 value; struct cpu_write *writes; UINT count; LONGLONG queued; struct cpu_write_job *next; };
 static struct cpu_write_job *write_jobs, **write_jobs_tail = &write_jobs;
 static CRITICAL_SECTION write_jobs_cs;
 static CONDITION_VARIABLE write_jobs_cv;
 
+static void cpu_write_job_run(struct cpu_write_job *job)
+{
+    for (UINT i = 0; i < job->count; i++)
+    {
+        const struct cpu_write *w = &job->writes[i];
+        if (w->size)
+        {
+            if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, (UINT_PTR)w->size)
+                    && !IsBadReadPtr((const void *)(ULONG_PTR)w->source, (UINT_PTR)w->size))
+                memmove((void *)(ULONG_PTR)w->address, (const void *)(ULONG_PTR)w->source, (size_t)w->size);
+        }
+        else if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, 4 * w->count))
+        {
+            volatile UINT32 *to = (volatile UINT32 *)(ULONG_PTR)w->address;
+            for (UINT k = 0; k < w->count; k++)
+                to[k] = w->values[k];
+        }
+    }
+    ID3D12Fence_Release(job->fence);
+    free(job->writes);
+    free(job);
+}
+
+/* Makes each job whose queue has got there, in submission order per queue (a queue's fence only
+ * goes up, so its jobs come due in order), without one queue's pending job holding back another
+ * queue's: a compute queue waiting for a counter the graphics queue's CPU writes set would
+ * otherwise wait for itself. A job still pending after 10 s is made anyway. */
 static DWORD WINAPI cpu_write_worker(void *arg)
 {
-    HANDLE event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
     for (;;)
     {
-        struct cpu_write_job *job;
+        struct cpu_write_job *due = NULL, **due_tail = &due, **at;
+        BOOL pending;
+        LARGE_INTEGER now;
+
+        QueryPerformanceCounter(&now);
         EnterCriticalSection(&write_jobs_cs);
         while (!write_jobs)
             SleepConditionVariableCS(&write_jobs_cv, &write_jobs_cs, INFINITE);
-        job = write_jobs;
-        if (!(write_jobs = job->next))
-            write_jobs_tail = &write_jobs;
-        LeaveCriticalSection(&write_jobs_cs);
-        if (ID3D12Fence_GetCompletedValue(job->fence) < job->value
-                && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(job->fence, job->value, event)))
-            WaitForSingleObject(event, 10000);
-        for (UINT i = 0; i < job->count; i++)
+        for (at = &write_jobs; *at;)
         {
-            const struct cpu_write *w = &job->writes[i];
-            if (w->size)
+            struct cpu_write_job *job = *at;
+            if (ID3D12Fence_GetCompletedValue(job->fence) >= job->value
+                    || now.QuadPart - job->queued >= 10 * freq.QuadPart)
             {
-                if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, (UINT_PTR)w->size)
-                        && !IsBadReadPtr((const void *)(ULONG_PTR)w->source, (UINT_PTR)w->size))
-                    memmove((void *)(ULONG_PTR)w->address, (const void *)(ULONG_PTR)w->source, (size_t)w->size);
+                *at = job->next;
+                job->next = NULL;
+                *due_tail = job;
+                due_tail = &job->next;
             }
-            else if (!IsBadWritePtr((void *)(ULONG_PTR)w->address, 4 * w->count))
-            {
-                volatile UINT32 *to = (volatile UINT32 *)(ULONG_PTR)w->address;
-                for (UINT k = 0; k < w->count; k++)
-                    to[k] = w->values[k];
-            }
+            else
+                at = &job->next;
         }
-        ID3D12Fence_Release(job->fence);
-        free(job->writes);
-        free(job);
+        write_jobs_tail = at;
+        pending = write_jobs != NULL;
+        LeaveCriticalSection(&write_jobs_cs);
+        while (due)
+        {
+            struct cpu_write_job *next = due->next;
+            cpu_write_job_run(due);
+            due = next;
+        }
+        if (pending)
+            Sleep(1);
     }
     return 0;
 }
@@ -4330,13 +4399,34 @@ static BOOL CALLBACK cpu_writes_init(INIT_ONCE *once, void *param, void **ctx)
 
 static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList *const *lists)
 {
+    const struct cpu_write *arrays_stack[64], **arrays = count <= 64 ? arrays_stack : malloc(count * sizeof(*arrays));
+    UINT counts_stack[64], *counts = count <= 64 ? counts_stack : malloc(count * sizeof(*counts)), n = 0;
+
+    if (arrays && counts)
+    {
+        for (UINT i = 0; i < count; i++)
+            if (is_proxy(lists[i]) && ((struct proxy *)lists[i])->cpu_write_count)
+            {
+                arrays[n] = ((struct proxy *)lists[i])->cpu_writes;
+                counts[n++] = ((struct proxy *)lists[i])->cpu_write_count;
+            }
+        queue_cpu_writes(queue, arrays, counts, n);
+    }
+    if (arrays != arrays_stack)
+        free((void *)arrays);
+    if (counts != counts_stack)
+        free(counts);
+}
+
+/* Writes made by the worker once the queue gets past this point. */
+static void queue_cpu_writes(struct proxy *queue, const struct cpu_write *const *arrays, const UINT *counts, UINT n)
+{
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     struct cpu_write_job *job;
     UINT total = 0, at = 0;
 
-    for (UINT i = 0; i < count; i++)
-        if (is_proxy(lists[i]))
-            total += ((struct proxy *)lists[i])->cpu_write_count;
+    for (UINT i = 0; i < n; i++)
+        total += counts[i];
     if (!total || !InitOnceExecuteOnce(&once, cpu_writes_init, NULL, NULL))
         return;
     if (!queue->cpu_fence)
@@ -4355,14 +4445,17 @@ static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList 
         free(job);
         return;
     }
-    for (UINT i = 0; i < count; i++)
-        if (is_proxy(lists[i]))
-        {
-            struct proxy *l = (struct proxy *)lists[i];
-            memcpy(job->writes + at, l->cpu_writes, l->cpu_write_count * sizeof(*job->writes));
-            at += l->cpu_write_count;
-        }
+    for (UINT i = 0; i < n; i++)
+    {
+        memcpy(job->writes + at, arrays[i], counts[i] * sizeof(*job->writes));
+        at += counts[i];
+    }
     job->count = total;
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        job->queued = now.QuadPart;
+    }
     job->value = ++queue->cpu_fence_value;
     job->fence = queue->cpu_fence;
     ID3D12Fence_AddRef(job->fence);
