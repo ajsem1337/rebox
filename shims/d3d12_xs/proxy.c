@@ -1160,6 +1160,59 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandListX(struct proxy *p, cons
     return create_list(p, desc[0], alloc, pso, out);
 }
 
+/* Slot 16: CreateRootSignature (as on PC). The first root signatures are logged: each parameter's
+ * kind (a table's range types, a constant count), its register and visibility, the static samplers
+ * and the flags, to match the user SGPRs a console stage reads against its root parameters. */
+static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(struct proxy *p, UINT node_mask, const void *blob,
+        SIZE_T size, REFIID riid, void **out)
+{
+    static LONG logged;
+    HRESULT hr = ID3D12Device_CreateRootSignature(INNER(p, ID3D12Device), node_mask, blob, size, riid, out);
+    PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER create;
+    ID3D12VersionedRootSignatureDeserializer *d = NULL;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v;
+    HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
+
+    if (InterlockedIncrement(&logged) > 48 || !d3d12
+            || !(create = (PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER)(void *)GetProcAddress(d3d12,
+                    "D3D12CreateVersionedRootSignatureDeserializer"))
+            || FAILED(create(blob, size, &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&d)))
+        return hr;
+    if (SUCCEEDED(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(d,
+            D3D_ROOT_SIGNATURE_VERSION_1_1, &v)))
+    {
+        const D3D12_ROOT_SIGNATURE_DESC1 *r = &v->Desc_1_1;
+        char line[600];
+        int at = 0;
+        for (UINT i = 0; i < r->NumParameters && at < 540; i++)
+        {
+            const D3D12_ROOT_PARAMETER1 *q = &r->pParameters[i];
+            static const char *const kinds[] = { "table", "constants", "CBV", "SRV", "UAV" };
+            at += snprintf(line + at, sizeof(line) - at, " %u:%s", i, q->ParameterType < 5 ? kinds[q->ParameterType] : "?");
+            if (q->ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                for (UINT k = 0; k < q->DescriptorTable.NumDescriptorRanges && at < 540; k++)
+                {
+                    const D3D12_DESCRIPTOR_RANGE1 *g = &q->DescriptorTable.pDescriptorRanges[k];
+                    static const char *const ranges[] = { "srv", "uav", "cbv", "sampler" };
+                    at += snprintf(line + at, sizeof(line) - at, "%s%s%u+%d", k ? "," : "(", g->RangeType < 4
+                                   ? ranges[g->RangeType] : "?", g->BaseShaderRegister, (INT)g->NumDescriptors);
+                }
+            if (q->ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && q->DescriptorTable.NumDescriptorRanges && at < 540)
+                at += snprintf(line + at, sizeof(line) - at, ")");
+            else if (q->ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS && at < 540)
+                at += snprintf(line + at, sizeof(line) - at, "x%u(b%u)", q->Constants.Num32BitValues,
+                               q->Constants.ShaderRegister);
+            if (at < 540)
+                at += snprintf(line + at, sizeof(line) - at, "/v%u", q->ShaderVisibility);
+        }
+        line[min(at, (int)sizeof(line) - 1)] = 0;
+        rebox_log("d3d12_xs: root signature %p: %u parameters:%s; %u static samplers, flags %#x",
+                  out ? *out : NULL, r->NumParameters, line, r->NumStaticSamplers, r->Flags);
+    }
+    ID3D12VersionedRootSignatureDeserializer_Release(d);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, const D3D12_DESCRIPTOR_HEAP_DESC *desc,
         REFIID riid, void **out)
 {
@@ -4193,6 +4246,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(11, device_CreateComputePipelineState),
         FN(12, device_CreateCommandList),
         FN(14, device_CreateDescriptorHeap),
+        FN(16, device_CreateRootSignature),
         FN(17, device_CreateConstantBufferView),
         FN(18, device_CreateShaderResourceView),
         FN(19, device_CreateUnorderedAccessView),
