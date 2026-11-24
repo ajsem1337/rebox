@@ -334,26 +334,36 @@ static BOOL push(struct entry **list, UINT32 *count, UINT32 *size, const struct 
     return TRUE;
 }
 
-/* Whether [p, p + size) is all committed, writable memory. */
-typedef void (WINAPI *prepare_write_fn)(ULONGLONG, ULONGLONG);
+/* xmem's write tracking (xmem.c): a request's destination is held writable while it is read and
+ * decoded, and noted written after. Armed pages are read-only: a read into them fails rather than
+ * faulting, and writable_range would refuse them. */
+static void *(WINAPI *prepare_write)(ULONGLONG, ULONGLONG);
+static void (WINAPI *finish_write)(void *);
 
 static BOOL CALLBACK find_prepare_write(INIT_ONCE *once, void *param, void **out)
 {
     HMODULE m = GetModuleHandleA("xmem.dll");
-    *out = m ? (void *)GetProcAddress(m, "ReboxPrepareWrite") : NULL;
+    prepare_write = m ? (void *)GetProcAddress(m, "ReboxPrepareWrite") : NULL;
+    finish_write = m ? (void *)GetProcAddress(m, "ReboxFinishWrite") : NULL;
+    if (!prepare_write || !finish_write)
+        prepare_write = NULL, finish_write = NULL;
     return TRUE;
 }
 
-static void prepare_write(void *address, SIZE_T size)
+static void *hold_for_write(void *address, SIZE_T size)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    prepare_write_fn prepare;
-
-    InitOnceExecuteOnce(&once, find_prepare_write, NULL, (void **)&prepare);
-    if (prepare && address && size)
-        prepare((ULONGLONG)(ULONG_PTR)address, size);
+    InitOnceExecuteOnce(&once, find_prepare_write, NULL, NULL);
+    return prepare_write && address && size ? prepare_write((ULONGLONG)(ULONG_PTR)address, size) : NULL;
 }
 
+static void release_write(void *hold)
+{
+    if (hold && finish_write)
+        finish_write(hold);
+}
+
+/* Whether [p, p + size) is all committed, writable memory. */
 static BOOL writable_range(const void *p, SIZE_T size)
 {
     const BYTE *at = p, *end = (const BYTE *)p + size;
@@ -553,6 +563,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     BOOL from_memory = !!(r->options & OPT_SOURCE_MEMORY);
     BYTE *data = NULL;
     HRESULT hr = S_OK;
+    void *hold = NULL;
 
     BOOL bcpack = !!(r->options & OPT_BCPACK);
     BOOL to_pages = !!(r->options & OPT_DEST_PHYSICAL);
@@ -637,9 +648,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     if (!(r->options & OPT_ZLIB) && !bcpack && r->destination_size < r->source_size)
         return E_INVALIDARG;
 
-    /* Pages there armed for write tracking (xmem) are made writable first: a read into them fails
-     * rather than faulting, and writable_range would refuse them. */
-    prepare_write(r->destination, r->destination_size);
+    hold = hold_for_write(r->destination, r->destination_size);
     if (from_memory)
         data = r->source;
     else
@@ -651,7 +660,10 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         if (r->options & OPT_ZLIB || bcpack)
         {
             if (!(data = malloc(r->source_size)))
+            {
+                release_write(hold);
                 return E_OUTOFMEMORY;
+            }
         }
         else
             data = r->destination;
@@ -693,6 +705,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         memcpy(r->destination, r->source, r->source_size);
     if (data && data != r->destination && data != r->source)
         free(data);
+    release_write(hold);
     return hr;
 }
 

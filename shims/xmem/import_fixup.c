@@ -573,31 +573,51 @@ void xmem_note_page_op(const char *what, ULONG_PTR buffer, ULONG_PTR size)
 }
 
 /* A read into pages armed for write tracking (xmem.c) would fail (ERROR_NOACCESS) rather than
- * fault: they are disarmed first, and noted written. */
-void WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size);
+ * fault: they are held writable for it, and noted written after. */
+void *WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size);
+void WINAPI ReboxFinishWrite(void *hold);
 
 static BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD size, DWORD *read, OVERLAPPED *overlapped)
 {
+    void *hold;
+    BOOL ok;
+    DWORD error;
+
     xmem_note_page_op("ReadFile", (ULONG_PTR)buffer, size);
-    ReboxPrepareWrite((ULONG_PTR)buffer, size);
+    hold = ReboxPrepareWrite((ULONG_PTR)buffer, size);
     if (!real_read_file)
         real_read_file = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFile");
-    return ((BOOL (WINAPI *)(HANDLE, void *, DWORD, DWORD *, OVERLAPPED *))real_read_file)(file, buffer, size, read,
-                                                                                              overlapped);
+    ok = ((BOOL (WINAPI *)(HANDLE, void *, DWORD, DWORD *, OVERLAPPED *))real_read_file)(file, buffer, size, read,
+                                                                                            overlapped);
+    error = GetLastError();
+    ReboxFinishWrite(hold);
+    SetLastError(error);
+    return ok;
 }
 
 static BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT *segments, DWORD size, DWORD *reserved,
                                      OVERLAPPED *overlapped)
 {
-    for (DWORD i = 0; segments && i < (size + 4095) / 4096; i++)
+    DWORD pages = segments ? (size + 4095) / 4096 : 0, error;
+    void **holds = pages ? calloc(pages, sizeof(*holds)) : NULL;
+    BOOL ok;
+
+    for (DWORD i = 0; i < pages; i++)
     {
         xmem_note_page_op("ReadFileScatter", (ULONG_PTR)segments[i].Buffer, 4096);
-        ReboxPrepareWrite((ULONG_PTR)segments[i].Buffer, 4096);
+        if (holds)
+            holds[i] = ReboxPrepareWrite((ULONG_PTR)segments[i].Buffer, 4096);
     }
     if (!real_read_file_scatter)
         real_read_file_scatter = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFileScatter");
-    return ((BOOL (WINAPI *)(HANDLE, FILE_SEGMENT_ELEMENT *, DWORD, DWORD *, OVERLAPPED *))real_read_file_scatter)(
+    ok = ((BOOL (WINAPI *)(HANDLE, FILE_SEGMENT_ELEMENT *, DWORD, DWORD *, OVERLAPPED *))real_read_file_scatter)(
             file, segments, size, reserved, overlapped);
+    error = GetLastError();
+    for (DWORD i = 0; holds && i < pages; i++)
+        ReboxFinishWrite(holds[i]);
+    free(holds);
+    SetLastError(error);
+    return ok;
 }
 
 static void *real_virtual_free, *real_discard_virtual_memory, *real_offer_virtual_memory;

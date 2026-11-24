@@ -900,6 +900,7 @@ struct physical_unit
     ULONG_PTR copy_at; /* where it is mapped as a copy, or 0: writes go there too */
     UINT size_units;  /* at a page's first unit: its size in 64 KiB units (1 or 64) */
     BOOL armed;       /* write-tracked: read-only at every view of it (each 64 KiB unit of a page) */
+    LONG held;        /* a system call is writing it (ReboxPrepareWrite): not armed until it is done */
     SIZE_T first_alias; /* at a page's first unit: the first slot it is mapped at, plus one, or 0 */
 };
 
@@ -1167,7 +1168,12 @@ static void clear_slot(SIZE_T slot)
  *   - Writes that don't fault are noted directly: xmem's own through a page's home view
  *     (ReboxWritePhysicalPages, a copy written back at unmapping). A system call writing into an
  *     armed view fails instead of faulting (ReadFile returns ERROR_NOACCESS), so the title's
- *     ReadFile and DirectStorage's reads disarm their buffer first (ReboxPrepareWrite).
+ *     ReadFile and DirectStorage's requests hold their buffer for the write (ReboxPrepareWrite
+ *     to ReboxFinishWrite): its units are disarmed and not armed again meanwhile, and noted dirty
+ *     when it is done. Without the hold, the upload of a texture there, which the disarming made
+ *     dirty, armed the pages again between a request's disarming and its write: the request
+ *     failed (xcrdapi refuses a destination that isn't writable) and the title read what wasn't
+ *     loaded.
  *   - Units mapped as copies (no placeholder there, or memory made GPU memory in place) aren't
  *     tracked: ReboxTrackPages fails for a range with one, and its textures are fingerprinted.
  *   - Protection is per 64 KiB unit, the physical page size, not the 4 KiB OS page: one fault a
@@ -1374,7 +1380,8 @@ BOOL WINAPI ReboxTrackPages(ULONGLONG address, ULONGLONG size)
         ULONG_PTR first;
         locate(at, &slot, &sub);
         first = mapped_at[slot].unit;
-        if (!units[first + sub].armed)
+        /* A unit being written by a system call stays writable: noted dirty when that's done. */
+        if (!units[first + sub].armed && !units[first + sub].held)
         {
             units[first + sub].armed = TRUE;
             protect_unit(first, sub, PAGE_READONLY);
@@ -1385,23 +1392,60 @@ BOOL WINAPI ReboxTrackPages(ULONGLONG address, ULONGLONG size)
     return ok;
 }
 
-/* Something that doesn't fault (a system call: ReadFile) is about to write [address, address +
- * size): the armed units there are disarmed, noted dirty. */
-void WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size)
+/* Something that doesn't fault (a system call: ReadFile, a DirectStorage request) is about to
+ * write [address, address + size): the units of views there are disarmed and held writable until
+ * ReboxFinishWrite with what this returns (NULL if there are none), which notes them dirty. */
+struct write_hold { ULONG_PTR count, first[1]; }; /* first unit and sub-unit, in pairs */
+
+void *WINAPI ReboxPrepareWrite(ULONGLONG address, ULONGLONG size)
 {
-    ULONG_PTR sub;
+    ULONG_PTR sub, n = 0, max = size ? (ULONG_PTR)((size + 2 * PAGE_UNIT - 1) / PAGE_UNIT) : 0;
+    struct write_hold *hold;
     SIZE_T slot;
 
-    if (!tracking_active || !size)
-        return;
+    if (!tracking_active || !size || !(hold = malloc(sizeof(*hold) + 2 * max * sizeof(ULONG_PTR))))
+        return NULL;
     lock_physical();
-    for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); at < address + size; at += PAGE_UNIT)
-        if (locate(at, &slot, &sub) && !mapped_at[slot].copy && units[mapped_at[slot].unit + sub].armed)
+    for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); at < address + size && n < max; at += PAGE_UNIT)
+        if (locate(at, &slot, &sub) && !mapped_at[slot].copy)
         {
-            disarm(mapped_at[slot].unit, sub);
-            InterlockedIncrement64(&track_prepared);
+            ULONG_PTR first = mapped_at[slot].unit;
+            if (units[first + sub].armed)
+            {
+                disarm(first, sub);
+                InterlockedIncrement64(&track_prepared);
+            }
+            units[first + sub].held++;
+            hold->first[2 * n] = first;
+            hold->first[2 * n++ + 1] = sub;
         }
     unlock_physical();
+    if (!n)
+    {
+        free(hold);
+        return NULL;
+    }
+    hold->count = n;
+    return hold;
+}
+
+/* The write ReboxPrepareWrite was for is done: its units may be armed again, and are noted dirty
+ * wherever they are mapped now. */
+void WINAPI ReboxFinishWrite(void *token)
+{
+    struct write_hold *hold = token;
+    if (!hold)
+        return;
+    lock_physical();
+    for (ULONG_PTR i = 0; i < hold->count; i++)
+    {
+        ULONG_PTR first = hold->first[2 * i], sub = hold->first[2 * i + 1];
+        if (units[first + sub].held)
+            units[first + sub].held--;
+        dirty_unit(first, sub);
+    }
+    unlock_physical();
+    free(hold);
 }
 
 /* Whether address is in an armed unit, read-only only for tracking (XMemVirtualQuery). */
