@@ -1712,16 +1712,30 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             UINT at = strtoul(cut + 17, &end, 10), rgb[3] = { 0, 0, 0 };
             if (*end == ':')
                 sscanf(end + 1, "%u,%u,%u", &rgb[0], &rgb[1], &rgb[2]);
-            if (at && at <= req.code_dwords && at + 6 <= ARRAYSIZE(cut_code))
+            if (at && at <= req.code_dwords && at + 8 <= ARRAYSIZE(cut_code))
             {
                 memcpy(cut_code, own, at * 4);
                 cut_code[at] = 0xbf8c0070u;                      /* s_waitcnt vmcnt(0) lgkmcnt(0) */
                 cut_code[at + 1] = 0x7ffe02f2u;                  /* v_mov_b32 v255, 1.0 */
-                cut_code[at + 2] = 0xf800180fu;                  /* exp mrt0 r, g, b, v255 done vm */
-                cut_code[at + 3] = (rgb[0] & 0xff) | (rgb[1] & 0xff) << 8 | (rgb[2] & 0xff) << 16 | 0xffu << 24;
-                cut_code[at + 4] = 0xbf810000u;                  /* s_endpgm */
+                if ((g->col_format & 0xf) == 4)
+                {
+                    /* The stage exports MRT0 as packed halves (compr): the same, or the target's
+                     * format reads the words wrongly. */
+                    cut_code[at + 2] = 0x5e000000u | 253u << 17 | (rgb[1] & 0xff) << 9 | (256 + (rgb[0] & 0xff));
+                    cut_code[at + 3] = 0x5e000000u | 254u << 17 | 255u << 9 | (256 + (rgb[2] & 0xff));
+                    cut_code[at + 4] = 0xf8001c0fu;              /* exp mrt0 v253, v254 done compr vm */
+                    cut_code[at + 5] = 253u | 254u << 8;
+                    cut_code[at + 6] = 0xbf810000u;
+                    cut_dwords = at + 7;
+                }
+                else
+                {
+                    cut_code[at + 2] = 0xf800180fu;              /* exp mrt0 r, g, b, v255 done vm */
+                    cut_code[at + 3] = (rgb[0] & 0xff) | (rgb[1] & 0xff) << 8 | (rgb[2] & 0xff) << 16 | 0xffu << 24;
+                    cut_code[at + 4] = 0xbf810000u;              /* s_endpgm */
+                    cut_dwords = at + 5;
+                }
                 own = cut_code;
-                cut_dwords = at + 5;
                 rebox_log("d3d12_xs: REBOX_DEBUG_PS_CUT: stage %s cut at dword %u, exporting v%u v%u v%u", lz_id, at,
                           rgb[0], rgb[1], rgb[2]);
             }
