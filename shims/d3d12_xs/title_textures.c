@@ -51,6 +51,7 @@ struct title_texture
     UINT64 fingerprint;
     UINT uploads;
     BOOL gpu_written;           /* a GPU copy wrote it: title memory isn't its contents (font atlases) */
+    BOOL target;                /* a render target kept in step anyway (small_cpu_filled_target) */
     UINT callback;
     struct title_texture *next;
 };
@@ -176,10 +177,11 @@ static void watch(void)
     /* Hot textures, ones the CPU has rewritten since they were made (a glyph atlas gains letters
      * as text is laid out, and the frame draws them at once), are checked every submission: the
      * round robin over hundreds of textures came back to them only after the text had been
-     * drawn without its letters. */
+     * drawn without its letters. Not render targets: uploading those more often overwrote what
+     * the GPU drew into them (menu text got worse). */
     hashed = 0;
     for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (t->uploads >= 2 && full_hash(t) && !t->dirty && !t->gpu_written && !t->unreadable
+        if (t->uploads >= 2 && !t->target && full_hash(t) && !t->dirty && !t->gpu_written && !t->unreadable
                 && still_readable(t) && (hashed += t->size, fingerprint(t) != t->fingerprint))
         {
             t->dirty = TRUE;
@@ -464,7 +466,7 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     t->gpu_written = (console_desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
             | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
     if (t->gpu_written && small_cpu_filled_target(console_desc))
-        t->gpu_written = FALSE;
+        t->gpu_written = FALSE, t->target = TRUE;
     /* A console-only format made a desktop one (proxy.c's pc_format) has another layout than the
      * console memory's: it isn't uploaded (detiling it overran the upload buffer). */
     if (desc->Format != console_desc->Format)
