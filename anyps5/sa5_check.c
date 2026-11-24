@@ -15,7 +15,10 @@
  *                                              same way, no guest memory
  *   sa5_check bench THREADS PLAN [FIRST [COUNT]]  compile throughput: the pixel shaders in PLAN (format:
  *                                              pixel_sweep), compiled and validated on THREADS
- *                                              threads at once, no cache */
+ *                                              threads at once
+ * Compute shaders (built-in or dumped), ps and bench compile with no cache unless SA5_USE_CACHE is set:
+ * then through AnyPS5's caches, its disk cache included (ANYPS5_SHADER_CACHE_DIR), as d3d12_xs
+ * compiles. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +40,7 @@ static int compile(const uint32_t *code, uint32_t dwords, uint32_t rsrc1, uint32
     memcpy(req.threads, threads, sizeof(req.threads));
     req.rsrc1 = rsrc1;
     req.rsrc2 = rsrc2;
+    req.use_cache = getenv("SA5_USE_CACHE") != NULL;
     wave = 32;
     req.wave = wave;
     if (sa5_compile_compute(&req, &result, error, sizeof(error)))
@@ -126,6 +130,7 @@ static int pixel_parse(const char *line, char name[64], struct sa5_pixel_request
     }
     req->col_format = col;
     req->depth_export = depth;
+    req->use_cache = getenv("SA5_USE_CACHE") != NULL;
     req->wave = !sa5_analyse(req->code, req->code_dwords, req->user_data_count, &layout, slots, 0, ignored,
                              sizeof(ignored)) ? layout.wave : 64;
     return 1;
@@ -195,8 +200,7 @@ static int pixel_sweep(const char *plan, int first, int count)
 }
 
 /* Compile throughput: the pixel shaders of a plan, read first, then compiled and validated by
- * THREADS threads at once (each takes the next shader), as d3d12_xs's compile workers do. No cache,
- * so every compile is a full one. */
+ * THREADS threads at once (each takes the next shader), as d3d12_xs's compile workers do. */
 static struct bench_shader
 {
     struct sa5_pixel_request req;

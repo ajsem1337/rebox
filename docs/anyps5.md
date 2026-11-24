@@ -118,7 +118,10 @@ entry 6 the code behind a 0x24-byte header, up to its last `s_endpgm`.
    skipped too. `REBOX_CONSOLE_ASYNC=0` compiles in the calling thread every time.
 4. **Compile** (`console_compile.c`). AnyPS5 compiles against the shadow heaps and `d3d12_xs`'s
    GPU memory chunks (at their GPU VAs) through its in-memory cache, which parses the code once
-   and makes a variant per new set of descriptors. Each guest binding's elements are found in the
+   and makes a variant per new set of descriptors. Its disk cache (`ANYPS5_SHADER_CACHE_DIR`)
+   keeps variants and resource plans across runs, and with patch 0009 the plan builds and
+   variants that failed as well, with their errors: a later run fails them at once instead of
+   compiling them again. Each guest binding's elements are found in the
    bound heap's shadow, which gives heap slots. `sa5_finalize` (`anyps5/spirv_remap.cpp`) then
    freezes the specialisation constants, moves each guest descriptor array onto the bindless set
    as a runtime array indexed by those slots, turns host buffers into BDA pointers read from push
@@ -251,7 +254,9 @@ its code; `tools/ps09.py` reads the PS09 PSO cache. `sa5_check.exe` compiles sha
 DLL outside a title: a built-in one, a dumped one (`CODE.bin SKIP RSRC1 RSRC2 X,Y,Z`), or the
 vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a built-in mesh
 program (`mesh`). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
-shaders compiled and validated on that many threads at once, with no cache. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
+shaders compiled and validated on that many threads at once. Compute shaders, `ps` and `bench`
+compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the disk cache
+included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
 and finalize with no guest memory (`ms PLAN`, as d3d12_xs compiles them); 619 more need the
 descriptors a draw's memory gives (the SRT walk), and 526 use `v_mad_legacy_f32` with clamp,
 which AnyPS5's decoder refuses ("VOP3 source modifiers are not implemented").
