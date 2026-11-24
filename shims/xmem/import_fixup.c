@@ -505,6 +505,43 @@ static BOOL WINAPI net_winhttp_send_request(void *request, const WCHAR *headers,
     return FALSE;
 }
 
+/* The title's thread priorities and affinities, logged (the first 64 calls of each): a console
+ * title can rely on a higher-priority thread on the same core keeping a lower one from running,
+ * which Wine's scheduling on Linux doesn't give. */
+static void *real_set_thread_priority, *real_set_thread_affinity_mask, *real_set_thread_ideal_processor_ex;
+
+static BOOL WINAPI set_thread_priority(HANDLE thread, int priority)
+{
+    static LONG logged;
+    BOOL ok = real_set_thread_priority && ((BOOL (WINAPI *)(HANDLE, int))real_set_thread_priority)(thread, priority);
+    if (InterlockedIncrement(&logged) <= 64)
+        rebox_log("SetThreadPriority(thread %#lx, %d) -> %d", GetThreadId(thread), priority, ok);
+    return ok;
+}
+
+static DWORD_PTR WINAPI set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask)
+{
+    static LONG logged;
+    DWORD_PTR old = real_set_thread_affinity_mask
+            ? ((DWORD_PTR (WINAPI *)(HANDLE, DWORD_PTR))real_set_thread_affinity_mask)(thread, mask) : 0;
+    if (InterlockedIncrement(&logged) <= 64)
+        rebox_log("SetThreadAffinityMask(thread %#lx, %#llx) -> %#llx", GetThreadId(thread),
+                  (unsigned long long)mask, (unsigned long long)old);
+    return old;
+}
+
+static BOOL WINAPI set_thread_ideal_processor_ex(HANDLE thread, PROCESSOR_NUMBER *ideal, PROCESSOR_NUMBER *previous)
+{
+    static LONG logged;
+    BOOL ok = real_set_thread_ideal_processor_ex
+            && ((BOOL (WINAPI *)(HANDLE, PROCESSOR_NUMBER *, PROCESSOR_NUMBER *))real_set_thread_ideal_processor_ex)(
+                    thread, ideal, previous);
+    if (InterlockedIncrement(&logged) <= 64)
+        rebox_log("SetThreadIdealProcessorEx(thread %#lx, %u) -> %d", GetThreadId(thread),
+                  ideal ? ideal->Number : 0xffu, ok);
+    return ok;
+}
+
 static struct
 {
     const char *dll, *name;
@@ -525,6 +562,12 @@ static struct
     /* The title's reservations below 2^46, the console's address width (xmem.c). */
     { "kernelbase.dll", "VirtualAlloc", xmem_low_virtual_alloc },
     { "kernel32.dll", "VirtualAlloc", xmem_low_virtual_alloc },
+    { "kernelbase.dll", "SetThreadPriority", set_thread_priority },
+    { "kernel32.dll", "SetThreadPriority", set_thread_priority },
+    { "kernelbase.dll", "SetThreadAffinityMask", set_thread_affinity_mask },
+    { "kernel32.dll", "SetThreadAffinityMask", set_thread_affinity_mask },
+    { "kernelbase.dll", "SetThreadIdealProcessorEx", set_thread_ideal_processor_ex },
+    { "kernel32.dll", "SetThreadIdealProcessorEx", set_thread_ideal_processor_ex },
     { "kernelbase.dll", "OutputDebugStringA", output_debug_string_a },
     { "kernel32.dll", "OutputDebugStringA", output_debug_string_a },
     { "kernelbase.dll", "OutputDebugStringW", output_debug_string_w },
@@ -731,6 +774,9 @@ void import_fixup_run(void)
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
         if (replacements[i].ours == (void *)net_connect) real_connect = replacements[i].wine;
+        if (replacements[i].ours == (void *)set_thread_priority && replacements[i].wine) real_set_thread_priority = replacements[i].wine;
+        if (replacements[i].ours == (void *)set_thread_affinity_mask && replacements[i].wine) real_set_thread_affinity_mask = replacements[i].wine;
+        if (replacements[i].ours == (void *)set_thread_ideal_processor_ex && replacements[i].wine) real_set_thread_ideal_processor_ex = replacements[i].wine;
         if (replacements[i].ours == (void *)net_wsa_connect) real_wsa_connect = replacements[i].wine;
         if (replacements[i].ours == (void *)net_sendto) real_sendto = replacements[i].wine;
         if (replacements[i].ours == (void *)net_wsa_sendto) real_wsa_sendto = replacements[i].wine;
