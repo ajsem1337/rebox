@@ -651,6 +651,51 @@ static struct module *find_module(const UINT64 key[2])
     return m;
 }
 
+/* Modules being built: a thread wanting one waits for the thread building it instead of building
+ * it too. Draws that overran their wait asked again and again, and all 8 compile workers built the
+ * same 1.7M-word module at once while a loading screen's compiles queued behind them. */
+static SRWLOCK building_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE building_done = CONDITION_VARIABLE_INIT;
+static UINT64 building[64][2];
+
+/* The module for key if another thread built it meanwhile; NULL with the key claimed (or, with
+ * no room to note it, unclaimed) for the caller to build and then pass to module_built. */
+static struct module *module_wait(const UINT64 key[2])
+{
+    struct module *m = NULL;
+    UINT i, free_slot;
+
+    AcquireSRWLockExclusive(&building_lock);
+    for (;;)
+    {
+        free_slot = ARRAYSIZE(building);
+        for (i = 0; i < ARRAYSIZE(building); i++)
+        {
+            if (!memcmp(building[i], key, sizeof(building[i])))
+                break;
+            if (free_slot == ARRAYSIZE(building) && !building[i][0] && !building[i][1])
+                free_slot = i;
+        }
+        if (i == ARRAYSIZE(building))
+            break;
+        SleepConditionVariableSRW(&building_done, &building_lock, INFINITE, 0);
+    }
+    if (!(m = find_module(key)) && free_slot < ARRAYSIZE(building))
+        memcpy(building[free_slot], key, sizeof(building[free_slot]));
+    ReleaseSRWLockExclusive(&building_lock);
+    return m;
+}
+
+static void module_built(const UINT64 key[2])
+{
+    AcquireSRWLockExclusive(&building_lock);
+    for (UINT i = 0; i < ARRAYSIZE(building); i++)
+        if (!memcmp(building[i], key, sizeof(building[i])))
+            memset(building[i], 0, sizeof(building[i]));
+    ReleaseSRWLockExclusive(&building_lock);
+    WakeAllConditionVariable(&building_done);
+}
+
 static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT32 count)
 {
     struct module *m = malloc(sizeof(*m)), *other;
@@ -2780,17 +2825,20 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
 
     phase_end(&mark, PHASE_BINDINGS);
-    if (!(module = find_module(key)))
+    if (!(module = find_module(key)) && !(module = module_wait(key)))
     {
-        if (sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
-                              graphics ? in->push_offset + stage_push : COMPUTE_DRAW_BLOCK, &words, &word_count, error,
-                              sizeof(error)))
+        BOOL failed = sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
+                                        graphics ? in->push_offset + stage_push : COMPUTE_DRAW_BLOCK, &words,
+                                        &word_count, error, sizeof(error));
+        if (!failed)
+            module = add_module(key, words, word_count);
+        module_built(key);
+        if (failed)
         {
             log_failure(h, "fitting it to vkd3d-proton's bindings failed", error);
             binding_failure_note(failure_id);
             goto done;
         }
-        module = add_module(key, words, word_count);
         if (!module)
             goto done;
         if (getenv("REBOX_DUMP_SPIRV"))
