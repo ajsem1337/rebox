@@ -542,6 +542,56 @@ static BOOL WINAPI set_thread_ideal_processor_ex(HANDLE thread, PROCESSOR_NUMBER
     return ok;
 }
 
+/* REBOX_PHYSICAL_TRACE: the title's own file reads (ReadFile, ReadFileScatter) that land on the
+ * physical page mapped at the traced address, through any address of it: the kernel writes those,
+ * which no write watch sees. */
+static void *real_read_file, *real_read_file_scatter;
+ULONG_PTR WINAPI ReboxPhysicalPageAt(ULONGLONG address);
+
+static void note_read(const char *what, ULONG_PTR buffer, ULONG_PTR size)
+{
+    static ULONG_PTR trace = ~(ULONG_PTR)0;
+    static LONG logged;
+    ULONG_PTR traced;
+    if (trace == ~(ULONG_PTR)0)
+    {
+        char *v = rebox_getenv("REBOX_PHYSICAL_TRACE");
+        trace = v ? (ULONG_PTR)_strtoui64(v, NULL, 16) : 0;
+        free(v);
+    }
+    if (!trace || !size || !(traced = ReboxPhysicalPageAt(trace)))
+        return;
+    for (ULONG_PTR at = buffer & ~(ULONG_PTR)0xffff; at < buffer + size; at += 0x10000)
+        if (ReboxPhysicalPageAt(at) == traced)
+        {
+            if (InterlockedIncrement(&logged) <= 64)
+                rebox_log("xmem: trace: %s of %#llx bytes into %#llx writes page %#llx (at %#llx, thread %#lx, from %p)",
+                          what, (unsigned long long)size, (unsigned long long)buffer, (unsigned long long)traced,
+                          (unsigned long long)at, GetCurrentThreadId(), __builtin_return_address(1));
+            return;
+        }
+}
+
+static BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD size, DWORD *read, OVERLAPPED *overlapped)
+{
+    note_read("ReadFile", (ULONG_PTR)buffer, size);
+    if (!real_read_file)
+        real_read_file = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFile");
+    return ((BOOL (WINAPI *)(HANDLE, void *, DWORD, DWORD *, OVERLAPPED *))real_read_file)(file, buffer, size, read,
+                                                                                              overlapped);
+}
+
+static BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT *segments, DWORD size, DWORD *reserved,
+                                     OVERLAPPED *overlapped)
+{
+    for (DWORD i = 0; segments && i < (size + 4095) / 4096; i++)
+        note_read("ReadFileScatter", (ULONG_PTR)segments[i].Buffer, 4096);
+    if (!real_read_file_scatter)
+        real_read_file_scatter = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ReadFileScatter");
+    return ((BOOL (WINAPI *)(HANDLE, FILE_SEGMENT_ELEMENT *, DWORD, DWORD *, OVERLAPPED *))real_read_file_scatter)(
+            file, segments, size, reserved, overlapped);
+}
+
 static struct
 {
     const char *dll, *name;
@@ -562,6 +612,10 @@ static struct
     /* The title's reservations below 2^46, the console's address width (xmem.c). */
     { "kernelbase.dll", "VirtualAlloc", xmem_low_virtual_alloc },
     { "kernel32.dll", "VirtualAlloc", xmem_low_virtual_alloc },
+    { "kernelbase.dll", "ReadFile", read_file },
+    { "kernel32.dll", "ReadFile", read_file },
+    { "kernelbase.dll", "ReadFileScatter", read_file_scatter },
+    { "kernel32.dll", "ReadFileScatter", read_file_scatter },
     { "kernelbase.dll", "SetThreadPriority", set_thread_priority },
     { "kernel32.dll", "SetThreadPriority", set_thread_priority },
     { "kernelbase.dll", "SetThreadAffinityMask", set_thread_affinity_mask },
@@ -774,6 +828,8 @@ void import_fixup_run(void)
         if (replacements[i].ours == (void *)create_window_a)
             real_create_window_a = replacements[i].wine;
         if (replacements[i].ours == (void *)net_connect) real_connect = replacements[i].wine;
+        if (replacements[i].ours == (void *)read_file && replacements[i].wine) real_read_file = replacements[i].wine;
+        if (replacements[i].ours == (void *)read_file_scatter && replacements[i].wine) real_read_file_scatter = replacements[i].wine;
         if (replacements[i].ours == (void *)set_thread_priority && replacements[i].wine) real_set_thread_priority = replacements[i].wine;
         if (replacements[i].ours == (void *)set_thread_affinity_mask && replacements[i].wine) real_set_thread_affinity_mask = replacements[i].wine;
         if (replacements[i].ours == (void *)set_thread_ideal_processor_ex && replacements[i].wine) real_set_thread_ideal_processor_ex = replacements[i].wine;
