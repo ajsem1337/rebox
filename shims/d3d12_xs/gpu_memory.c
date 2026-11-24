@@ -392,6 +392,8 @@ static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, UINT64 *start, U
         return FALSE;
     run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
     run_end = run_start + mbi.RegionSize;
+    /* Not back past the allocation's base, as the walk from the base never went. */
+    lo = max(lo, (UINT64)(ULONG_PTR)mbi.AllocationBase);
     while (run_start > lo && VirtualQuery((void *)(ULONG_PTR)(run_start - 1), &mbi, sizeof(mbi))
            && usable_region(&mbi))
         run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
