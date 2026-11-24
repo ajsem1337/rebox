@@ -1275,12 +1275,12 @@ static BOOL locate(ULONG_PTR address, SIZE_T *slot, ULONG_PTR *sub)
 
 /* Unit sub of the page whose first unit is first, at every view of it: protect set, or noted
  * dirty. Under physical_lock. */
-static void protect_unit(ULONG_PTR first, ULONG_PTR sub, DWORD protect)
+static void protect_unit_but(ULONG_PTR first, ULONG_PTR sub, DWORD protect, ULONG_PTR skip)
 {
     for (SIZE_T a = units[first].first_alias; a; a = mapped_at[a - 1].next_alias)
     {
         DWORD old;
-        if (mapped_at[a - 1].copy)
+        if (mapped_at[a - 1].copy || mapped_at[a - 1].address + sub * PAGE_UNIT == skip)
             continue;
         if (!VirtualProtect((void *)(mapped_at[a - 1].address + sub * PAGE_UNIT), PAGE_UNIT, protect, &old))
         {
@@ -1290,6 +1290,22 @@ static void protect_unit(ULONG_PTR first, ULONG_PTR sub, DWORD protect)
                           (unsigned long long)(mapped_at[a - 1].address + sub * PAGE_UNIT), protect, GetLastError());
         }
     }
+}
+
+static void protect_unit(ULONG_PTR first, ULONG_PTR sub, DWORD protect)
+{
+    protect_unit_but(first, sub, protect, 0);
+}
+
+/* [*start, *end) of view, made read-only in one call (a wineserver-free syscall each, but arming
+ * a texture unit by unit took up to 5 ms a submission), then emptied. */
+static void protect_run(ULONG_PTR *start, ULONG_PTR *end)
+{
+    DWORD old;
+    if (*end > *start && !VirtualProtect((void *)*start, *end - *start, PAGE_READONLY, &old))
+        for (ULONG_PTR at = *start; at < *end; at += PAGE_UNIT) /* not one view after all */
+            VirtualProtect((void *)at, PAGE_UNIT, PAGE_READONLY, &old);
+    *start = *end = 0;
 }
 
 static void dirty_unit(ULONG_PTR first, ULONG_PTR sub)
@@ -1375,18 +1391,33 @@ BOOL WINAPI ReboxTrackPages(ULONGLONG address, ULONGLONG size)
         rebox_log("xmem: write tracking: the first texture in physical-page views armed, at %#llx+%#llx",
                   (unsigned long long)address, (unsigned long long)size);
     }
-    for (ULONG_PTR at = start; ok && at < end; at += PAGE_UNIT)
+    /* The range's own units a view's run at a time; other addresses of their pages one by one. */
+    for (ULONG_PTR at = start, run_start = 0, run_end = 0, run_view = 0; ok; at += PAGE_UNIT)
     {
         ULONG_PTR first;
+        if (at >= end)
+        {
+            protect_run(&run_start, &run_end);
+            break;
+        }
         locate(at, &slot, &sub);
         first = mapped_at[slot].unit;
         /* A unit being written by a system call stays writable: noted dirty when that's done. */
-        if (!units[first + sub].armed && !units[first + sub].held)
+        if (units[first + sub].armed || units[first + sub].held)
         {
-            units[first + sub].armed = TRUE;
-            protect_unit(first, sub, PAGE_READONLY);
-            InterlockedIncrement64(&track_armed);
+            protect_run(&run_start, &run_end);
+            continue;
         }
+        units[first + sub].armed = TRUE;
+        protect_unit_but(first, sub, PAGE_READONLY, at);
+        InterlockedIncrement64(&track_armed);
+        if (run_end != at || mapped_at[slot].view != run_view)
+        {
+            protect_run(&run_start, &run_end);
+            run_start = at;
+            run_view = mapped_at[slot].view;
+        }
+        run_end = at + PAGE_UNIT;
     }
     unlock_physical();
     return ok;
@@ -1855,11 +1886,24 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
         if (slot == (SIZE_T)-1 || mapped_at[slot].copy)
             continue;
         u = mapped_at[slot].unit;
-        /* Protection there went with the pages: an armed texture there is uploaded, and found
-         * untrackable then. */
+        /* An armed unit there: its texture is uploaded, and found untrackable then (a copy). Wine
+         * still keeps the view's read-only protection for the address, though the driver's mapping
+         * replaced it: VirtualQuery said read-only, so DirectStorage refused the destination and
+         * a ReadFile into it failed, for good (a copy is never disarmed), and the title read data
+         * never loaded. Made writable here, as the memory now is. */
         for (ULONG_PTR sub = 0; sub < units[u].size_units; sub++)
             if (units[u + sub].armed)
+            {
+                DWORD old;
                 note_dirty(at + sub * PAGE_UNIT, PAGE_UNIT);
+                if (!VirtualProtect((void *)(at + sub * PAGE_UNIT), PAGE_UNIT, PAGE_READWRITE, &old))
+                {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 8)
+                        rebox_log("xmem: write tracking: %#llx, made GPU memory in place, stays read-only (error %lu)",
+                                  (unsigned long long)(at + sub * PAGE_UNIT), GetLastError());
+                }
+            }
         mapped_at[slot].copy = TRUE;
         mapped_at[slot].view = at;
         mapped_at[slot].view_bytes = (SIZE_T)units[u].size_units * PAGE_UNIT;
