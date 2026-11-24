@@ -1315,8 +1315,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 fwrite(table, 1, sizeof(table), f);
                 fclose(f);
             }
-            rebox_log("d3d12_xs: dumped stage %s (%u dwords; s8 %#x, s9 %#x)", id, h->code_dwords, in->user_sgprs[8],
-                      in->user_sgprs[9]);
+            rebox_log("d3d12_xs: dumped stage %s (%u dwords; s8-s15 %08x %08x %08x %08x %08x %08x %08x %08x)", id,
+                      h->code_dwords, in->user_sgprs[8], in->user_sgprs[9], in->user_sgprs[10], in->user_sgprs[11],
+                      in->user_sgprs[12], in->user_sgprs[13], in->user_sgprs[14], in->user_sgprs[15]);
         }
     }
     if (graphics)
@@ -1800,7 +1801,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         {
             /* The first graphics stages' bindings: which roles and kinds their resources come as. */
             static LONG shown[2];
-            if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 32)
+            if (console_stage_watched(stage_id) || InterlockedIncrement(&shown[h->stage == 0x10]) <= 32)
                 rebox_log("d3d12_xs: console %s shader %016llx binding %u: role %u kind %u set %u binding %u, "
                              "%u elements, %u words%s %08x %08x %08x %08x", h->stage == 0x10 ? "pixel" : "vertex",
                              (unsigned long long)stage_id, i, b.role, b.kind, b.set, b.binding, b.count, b.word_count,
