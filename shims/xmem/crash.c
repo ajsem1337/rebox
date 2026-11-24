@@ -171,6 +171,19 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
     rebox_log("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx", c->Rsi, c->Rdi, c->Rbp, c->Rsp);
     rebox_log("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx", c->R8, c->R9, c->R10, c->R11);
     rebox_log("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx", c->R12, c->R13, c->R14, c->R15);
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        /* The title memory the registers point at (not the stack): what kind of memory the object
+         * being read is. */
+        const ULONG_PTR values[] = { c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->R8, c->R9, c->R10,
+                                     c->R11, c->R12, c->R13, c->R14, c->R15 };
+        static const char *const names[] = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10",
+                                             "r11", "r12", "r13", "r14", "r15" };
+        for (UINT i = 0; i < ARRAYSIZE(values); i++)
+            if (values[i] >= 0x100000000ull && values[i] < 0x400000000000ull
+                    && values[i] - (c->Rsp & ~(ULONG_PTR)0xfffff) >= 0x200000)
+                xmem_describe_address(names[i], values[i]);
+    }
     if (rec->ExceptionCode != EXCEPTION_STACK_OVERFLOW)
         log_stack(*c);
 

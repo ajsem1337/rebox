@@ -1278,6 +1278,39 @@ void WINAPI ReboxPhysicalDescribe(ULONGLONG address, ULONGLONG size)
         rebox_log("xmem: describe: %u of the pages at %#llx+%#llx have no physical page", empty,
                   (unsigned long long)address, (unsigned long long)size);
 }
+
+/* For a fault report (crash.c): what the memory a register points at is. The region (type,
+ * protection, allocation), whether d3d12_xs made it GPU memory in place, the physical page mapped
+ * there (view or copy, and its other addresses), and the first qwords there. The physical lock is
+ * only tried: a report never waits. */
+void xmem_describe_address(const char *name, ULONG_PTR address)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    char page[240] = "", data[120] = "";
+    int len = 0;
+
+    if (!VirtualQuery((void *)address, &mbi, sizeof(mbi)) || mbi.State == MEM_FREE)
+        return;
+    if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && !IsBadReadPtr((void *)address, 32))
+        snprintf(data, sizeof(data), "; %#llx %#llx %#llx %#llx", ((const UINT64 *)address)[0],
+                 ((const UINT64 *)address)[1], ((const UINT64 *)address)[2], ((const UINT64 *)address)[3]);
+    if (mapped_at && TryAcquireSRWLockShared(&physical_lock))
+    {
+        SIZE_T slot = slot_at(address & ~(ULONG_PTR)(PAGE_UNIT - 1));
+        if (slot != (SIZE_T)-1)
+        {
+            len = snprintf(page, sizeof(page), "; physical page %#llx (%s), also at",
+                           (unsigned long long)((mapped_at[slot].unit + 1) << 4), mapped_at[slot].copy ? "copy" : "view");
+            for (SIZE_T k = 0; k < MAPPED_SLOTS && len < 200; k++)
+                if (k != slot && mapped_at[k].address > 1 && mapped_at[k].unit == mapped_at[slot].unit)
+                    len += snprintf(page + len, sizeof(page) - len, " %#llx", (unsigned long long)mapped_at[k].address);
+        }
+        ReleaseSRWLockShared(&physical_lock);
+    }
+    rebox_log("  %s %#llx: region %p+%#llx of %p, state %#lx, type %#lx, protect %#lx%s%s%s", name,
+              (unsigned long long)address, mbi.BaseAddress, (unsigned long long)mbi.RegionSize, mbi.AllocationBase,
+              mbi.State, mbi.Type, mbi.Protect, in_adopted(address) ? ", GPU memory in place" : "", page, data);
+}
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)
