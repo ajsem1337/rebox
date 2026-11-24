@@ -4132,7 +4132,9 @@ static void test_placed_texture_array(void *dev, void *queue)
     if (tex) ID3D12Resource_Release(tex);
 }
 
-static void test_placed_texture(void *dev, void *queue)
+/* flags: 0, or ALLOW_RENDER_TARGET: a small colour target the CPU fills (a title's glyph cache) is
+ * kept in step with its memory too. */
+static void test_placed_texture(void *dev, void *queue, D3D12_RESOURCE_FLAGS flags)
 {
     struct test_surface surface =
             { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE };
@@ -4156,7 +4158,10 @@ static void test_placed_texture(void *dev, void *queue)
     void *list = NULL, *cpu = NULL;
     UINT32 linear[64 * 64];
     UINT64 gpu = 0, size;
+    const char *what = flags ? " (a 64x64 render target the CPU fills)" : "";
     HRESULT hr;
+
+    td.Flags = flags;
 
     if (!gpu_alloc || !surface_size || !tile || !written)
     {
@@ -4246,11 +4251,12 @@ static void test_placed_texture(void *dev, void *queue)
         same = out && !memcmp(out, linear, sizeof(linear));
         if (out) ID3D12Resource_Unmap(buf, 0, NULL);
         if (pass == 2)
-            CHECK(same, "an unreported rewrite of the title memory is noticed and uploaded at the next submission");
+            CHECK(same, "an unreported rewrite of the title memory is noticed and uploaded at the next submission%s",
+                  what);
         else if (pass)
-            CHECK(same, "a reported write to the title memory is uploaded at the next submission");
+            CHECK(same, "a reported write to the title memory is uploaded at the next submission%s", what);
         else
-            CHECK(same, "a texture placed at a title address is filled from its tiled memory (SW_4KB_S)");
+            CHECK(same, "a texture placed at a title address is filled from its tiled memory (SW_4KB_S)%s", what);
     }
     if (list) XSLOT(list, 2, ULONG)(list);
     if (fence) ID3D12Fence_Release(fence);
@@ -4597,7 +4603,8 @@ static void test_xbox(void)
     test_depth_uav_texture(dev);
     test_console_mesh_stream();
     test_real_heap_va(dev, queue);
-    test_placed_texture(dev, queue);
+    test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_NONE);
+    test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     test_placed_texture_array(dev, queue);
     test_placed_texture_late(dev, queue);
     test_list_queries(dev, queue);

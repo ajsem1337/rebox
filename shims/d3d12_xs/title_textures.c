@@ -300,6 +300,24 @@ static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12
     return TRUE;
 }
 
+/* A small single-sample colour render target with nothing else allowed (REBOX_SYNC_SMALL_TARGETS=0
+ * turns this off): 64x64 to 1024x1024, as xcl's. */
+static BOOL small_cpu_filled_target(const D3D12_RESOURCE_DESC *d)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        char *v = rebox_getenv("REBOX_SYNC_SMALL_TARGETS");
+        enabled = !v || strcmp(v, "0");
+        free(v);
+    }
+    return enabled && d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && (d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+        && d->SampleDesc.Count <= 1 && d->DepthOrArraySize == 1
+        && d->Width >= 64 && d->Width <= 1024 && d->Height >= 64 && d->Height <= 1024;
+}
+
 void title_texture_gpu_written(ID3D12Resource *resource)
 {
     struct title_texture *t;
@@ -425,9 +443,14 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     ID3DDestructionNotifier_RegisterDestructionCallback(notifier, destroyed, t, &t->callback);
     ID3DDestructionNotifier_Release(notifier);
     /* A render target, depth or UAV texture is the GPU's (as xcl's GPU-owned textures): never
-     * filled from title memory, which would overwrite what the GPU drew into it. */
+     * filled from title memory, which would overwrite what the GPU drew into it. Except a small
+     * single-sample colour target: a title's glyph caches are 256x256 R8 render targets the CPU
+     * fills as text is laid out (xcl, ivall/xcl #211), and without them most letters were missing.
+     * Those are filled when their memory changes, which a GPU draw into them doesn't do. */
     t->gpu_written = (console_desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
             | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
+    if (t->gpu_written && small_cpu_filled_target(console_desc))
+        t->gpu_written = FALSE;
     /* A console-only format made a desktop one (proxy.c's pc_format) has another layout than the
      * console memory's: it isn't uploaded (detiling it overran the upload buffer). */
     if (desc->Format != console_desc->Format)

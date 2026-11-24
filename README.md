@@ -323,7 +323,9 @@ down missing translations.
   plain 2D textures `SW_4KB_S` and other arrays `SW_64KB_D` (xcl, TuxBox, measured texture pools); each
   distinct layout is logged; `64KB_D`, `4KB_S`, `linear` or `off` force one. A texture a GPU copy
   writes (an Unreal 5 title's font atlas) stops being uploaded from title memory, and textures up to 4 MiB
-  are compared whole, so small edits are seen.
+  are compared whole, so small edits are seen. Render target, depth and UAV textures are the GPU's and
+  aren't filled, except small single-sample colour targets (64x64 to 1024x1024): a title's glyph
+  caches are such targets the CPU fills (`REBOX_SYNC_SMALL_TARGETS=0` treats them as the GPU's).
 - **Console root signatures and pipeline subobjects** pass through unchanged. Console root
   signatures set flags `0x03000000`. Windows' runtime rejects those bits, but vkd3d-proton
   ignores them, and the smoke test checks that it still does. Their meaning is unknown. Pipeline
