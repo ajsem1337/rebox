@@ -347,6 +347,34 @@ LONG WINAPI ReboxProbeHits(const void *address)
     return -1;
 }
 
+
+/* A write watch added while running (xmem's REBOX_PHYSICAL_TRACE: another address of the traced
+ * page), armed at once if its memory is committed. Only with REBOX_WRITE_WATCH set, which sets up
+ * the handler. */
+void probe_watch_add(ULONG_PTR start, ULONG_PTR length)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    struct watch *w;
+    DWORD old;
+
+    if (watch_slot == TLS_OUT_OF_INDEXES || !start || !length)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    if (watch_count < ARRAYSIZE(watches))
+    {
+        w = &watches[watch_count];
+        w->start = start;
+        w->length = length;
+        w->page_start = start & ~(ULONG_PTR)0xfff;
+        w->page_end = (start + length + 0xfff) & ~(ULONG_PTR)0xfff;
+        w->armed = VirtualProtect((void *)w->page_start, w->page_end - w->page_start, PAGE_READONLY, &old);
+        MemoryBarrier();
+        watch_count++;
+        rebox_log("write watch %#llx+%#llx added%s", (unsigned long long)start, (unsigned long long)length,
+                  w->armed ? " and armed" : ", not armed (not committed)");
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
 void probe_install(void)
 {
     char *spec = rebox_getenv("REBOX_PROBE"), *max = rebox_getenv("REBOX_PROBE_MAX"), *tok, *save = NULL;

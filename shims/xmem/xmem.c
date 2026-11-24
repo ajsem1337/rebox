@@ -1184,6 +1184,20 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
     else
         for (ULONG_PTR at = start; at < end; at += PAGE_UNIT)
             if (!in_adopted(at)) VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT); /* ordinary memory there: decommitted, as on unmapping */
+    /* The traced address's page now: its other addresses get write watches too (REBOX_WRITE_WATCH
+     * set), to catch a write through another mapping of the same page. */
+    if (trace_address() && trace_address() >= start && trace_address() < end && pages)
+    {
+        SIZE_T slot = slot_at(trace_address() & ~(ULONG_PTR)(PAGE_UNIT - 1));
+        ULONG_PTR off = trace_address() & (PAGE_UNIT - 1);
+        for (SIZE_T k = 0; slot != (SIZE_T)-1 && k < MAPPED_SLOTS; k++)
+            if (mapped_at[k].address > 1 && mapped_at[k].unit == mapped_at[slot].unit && k != slot)
+            {
+                rebox_log("xmem: trace: page %#llx is also mapped at %#llx", (unsigned long long)((mapped_at[slot].unit + 1) << 4),
+                          (unsigned long long)mapped_at[k].address);
+                probe_watch_add(mapped_at[k].address + off, 8);
+            }
+    }
     ReleaseSRWLockExclusive(&physical_lock);
     return ok;
 }
