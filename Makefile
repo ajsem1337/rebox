@@ -54,10 +54,15 @@ $(BUILD)/xgr/%.exe: $(XGR)/tests/%.cpp
 # static mingw libavcodec/libavutil); without it XMA2 plays as silence.
 ifneq ($(FFMPEG_XMA2),)
 CFLAGS_xaudio2_9 := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
-LIBS_xaudio2_9 := -L$(FFMPEG_XMA2)/lib -lavcodec -lavutil -lbcrypt
+LIBS_xaudio2_9 := -L$(FFMPEG_XMA2)/lib -lavcodec -lswresample -lavutil -lbcrypt
 endif
 # It asks mmdevapi whether there is an audio device.
 LIBS_xaudio2_9 += -lole32
+# Opus decoding in xapu needs the same FFmpeg build (its Opus decoder); without it, silence.
+ifneq ($(FFMPEG_XMA2),)
+CFLAGS_xapu := -DHAVE_FFMPEG_OPUS -I$(FFMPEG_XMA2)/include
+LIBS_xapu := -L$(FFMPEG_XMA2)/lib -lavcodec -lswresample -lavutil -lbcrypt
+endif
 
 # The DirectStorage shim talks to the BCPack helper over a localhost socket.
 LIBS_xcrdapi := -lws2_32

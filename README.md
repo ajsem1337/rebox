@@ -56,7 +56,7 @@ shims/amd_fidelityfx_loader_xbox/  FidelityFX API stub: FSR-style queries, bilin
 shims/xaudio2_9/          xaudio2_9.dll: Wine's XAudio2 (via xaudio2_8) with XMA2 voices played as silence
 shims/acphal/             acphal.dll: the APU heap, and an audio coprocessor channel that acknowledges
                           commands and ticks audio frames (nothing is mixed)
-shims/xapu/               xapu.dll: the audio decoder queue; every command is done at once, output is silence
+shims/xapu/               xapu.dll: the audio decoder queue: Opus packets decoded by FFmpeg as each command is queued
 shims/chad/               chad.dll: the audio DSP (XDsp); it connects and takes commands that do nothing
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
@@ -299,7 +299,7 @@ down missing translations.
   WMA decoder, which accepts only WMA formats, so creating an XMA2 source voice fails.
   `shims/xaudio2_9` wraps Wine's `xaudio2_8` (same FAudio code) and turns XMA2 voices into PCM
   voices. Each XMA2 buffer is decoded at submission by FFmpeg's `xma2` decoder: the flake's
-  `ffmpeg-xma2`, a static mingw libavcodec with only that decoder. If decoding fails, or the DLL is
+  `ffmpeg-xma2`, a static mingw libavcodec with only that decoder and Opus's. If decoding fails, or the DLL is
   built without `FFMPEG_XMA2`, the voice plays silence of about the buffer's length. A callback
   between the voice and the title keeps callback contexts intact and frees the PCM.
   FFmpeg has no XMA2 encoder, so no test feeds it real XMA2. Without an audio output device the
@@ -308,6 +308,12 @@ down missing translations.
   PulseAudio null sink. Bink's audio is decoded to PCM by Bink and is
   unaffected. Wine also reports a mastering voice as created when there's no audio device, after
   which FAudio crashes on the first source voice; that only matters on machines without audio.
+- **Audio: the console's decoder queue (`xapu.dll`) decodes Opus.** FMOD in a GDK title sends it
+  Opus packets per stream and takes back 48 kHz float PCM (VIctory, GPL-3.0, facts only). Each
+  Process command is decoded when it is queued by the same FFmpeg build's Opus decoder; a packet it
+  refuses, or a build without `FFMPEG_XMA2`, gives silence of the length asked for. The audio DSP
+  (`chad.dll`) and the coprocessor's SHAPE contexts (`acphal.dll`) still do nothing, so whatever a
+  title runs through them is lost.
 - **Upscaling is bilinear.** The console FidelityFX upscaler creates its passes from the console
   driver's own container (FSPX), which `d3d12_xs` defers to AnyPS5 like a title's shaders
   ([docs/anyps5.md](docs/anyps5.md)); whether its passes compile and run hasn't been tried, so

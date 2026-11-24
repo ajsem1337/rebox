@@ -3754,8 +3754,9 @@ static void test_acphal(void)
     XSLOT(hal, 5, void)(hal);
 }
 
-/* xapu.dll: the decoder queue answers each command at once, a Process with silence of the
- * length asked for (FMOD in a GDK title drives it); acphal's other FMOD imports answer too. */
+/* xapu.dll: the decoder queue answers each command at once, a Process with the Opus packet
+ * decoded, or silence of the length asked for without one (FMOD in a GDK title drives it);
+ * acphal's other FMOD imports answer too. */
 /* chad.dll, the console's audio DSP: connecting says it isn't there and leaves no connection, so a
  * title's audio engine goes on without it; the rest fail or do nothing. */
 static void test_chad(void)
@@ -3868,6 +3869,30 @@ static void test_xapu(void)
         silent &= buf[i] == 0;
     CHECK(silent && buf[256 * 8] == 0xaa, "the output is silence of that length");
     CHECK(dequeue(h, &r) == (HRESULT)0x8ac81001, "XApuDequeueResult says when there is nothing");
+    /* An Opus packet (TOC 0xfc: CELT, 20 ms, stereo, one frame, here a quiet one) decodes to 960
+     * frames at 48 kHz; from first_frame 100 on, 860 are kept. Silence would give the 1024 asked. */
+    {
+        static const BYTE packet[] = { 0xfc, 0xff, 0xfe };
+        static float pcm[2048 * 2];
+        struct { struct command id; UINT32 channels; } act;
+        memset(&act, 0, sizeof(act));
+        act.id.type = 1;
+        act.id.stream = 0;
+        act.channels = 2;
+        CHECK(enqueue(h, &act, &n) == S_OK && dequeue(h, &r) == S_OK, "XApuEnqueueCommand(Activate, 2 channels)");
+        memset(&p, 0, sizeof(p));
+        p.id.type = 3;
+        p.pitch = 1.0f;
+        p.first_frame = 100;
+        p.frames = 1024;
+        p.input = (void *)packet;
+        p.input_bytes = sizeof(packet);
+        p.output_bytes = sizeof(pcm);
+        p.output = pcm;
+        memset(&r, 0, sizeof(r));
+        CHECK(enqueue(h, &p, &n) == S_OK && dequeue(h, &r) == S_OK && r.frames == 860 && r.output_bytes == 860 * 8,
+              "an Opus packet decodes: 960 frames, 860 from frame 100 (%u, %u bytes)", r.frames, r.output_bytes);
+    }
     CHECK(disconnect(h) == S_OK, "XApuDisconnect");
 }
 

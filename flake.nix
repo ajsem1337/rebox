@@ -99,8 +99,9 @@
         # Use with VK_ICD_FILENAMES=$out/share/vulkan/icd.d/radeon_icd.x86_64.json.
         # Host Vulkan layer that maps host-visible memory at identical GPU
         # and CPU addresses (layers/gpuva_identity.c).
-        # Static mingw libavcodec/libavutil with only FFmpeg's XMA2 decoder,
-        # linked into shims/xaudio2_9 (nixpkgs' mingw FFmpeg is marked broken).
+        # Static mingw libavcodec/libavutil/libswresample with only FFmpeg's XMA2
+        # and Opus decoders, linked into shims/xaudio2_9 (XMA2) and shims/xapu
+        # (Opus) (nixpkgs' mingw FFmpeg is marked broken).
         ffmpeg-xma2 = pkgs.stdenv.mkDerivation {
           pname = "ffmpeg-xma2-mingw";
           inherit (pkgs.ffmpeg) version src;
@@ -109,9 +110,9 @@
           dontStrip = true; # native strip on mingw archives
           configurePhase = ''
             ./configure --prefix=$out --target-os=mingw32 --arch=x86_64 --enable-cross-compile \
-              --cross-prefix=x86_64-w64-mingw32- --disable-everything --enable-decoder=xma2 \
+              --cross-prefix=x86_64-w64-mingw32- --disable-everything --enable-decoder=xma2 --enable-decoder=opus \
               --disable-programs --disable-doc --disable-avdevice --disable-avformat --disable-swscale \
-              --disable-swresample --disable-avfilter --disable-network --disable-debug \
+              --disable-avfilter --disable-network --disable-debug \
               --enable-static --disable-shared --disable-autodetect --disable-asm
           '';
         };
