@@ -1320,7 +1320,14 @@ void xmem_describe_address(const char *name, ULONG_PTR address)
     char page[240] = "", data[120] = "";
     int len = 0;
 
-    if (!VirtualQuery((void *)address, &mbi, sizeof(mbi)) || mbi.State == MEM_FREE)
+    if (!VirtualQuery((void *)address, &mbi, sizeof(mbi)))
+    {
+        rebox_log("  %s %#llx: VirtualQuery fails (error %lu)", name, (unsigned long long)address, GetLastError());
+        memset(&mbi, 0, sizeof(mbi));
+    }
+    /* Free memory is described too only below 2^40, where title memory is: a value above is
+     * likely not a pointer. */
+    if (mbi.State == MEM_FREE && address >= (1ull << 40))
         return;
     if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && !IsBadReadPtr((void *)address, 32))
         snprintf(data, sizeof(data), "; %#llx %#llx %#llx %#llx", ((const UINT64 *)address)[0],
