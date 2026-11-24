@@ -3925,6 +3925,75 @@ static void test_acphal(void)
     XSLOT(hal, 5, void)(hal);
 }
 
+/* acphal.dll's XMA decoder: an enabled context's packets fill its output ring at the stream's pace
+ * (decoded, or silence for packets that don't decode); the ring stops when full until command 18
+ * moves the read block on; at the end of the input the context says so. A title's mixer waits on
+ * exactly these words. */
+static void test_acphal_xma(void)
+{
+    HMODULE m = LoadLibraryA("acphal.dll");
+    HRESULT (WINAPI *create)(void **) = m ? (void *)GetProcAddress(m, "AcpHalCreate") : NULL;
+    HRESULT (WINAPI *alloc)(void **, UINT32 *, UINT32, UINT32, UINT32) = m ? (void *)GetProcAddress(m, "ApuAlloc") : NULL;
+    HRESULT (WINAPI *shape)(BYTE *) = m ? (void *)GetProcAddress(m, "AcpHalAllocateShapeContexts") : NULL;
+    UINT32 (WINAPI *map)(const void *) = m ? (void *)GetProcAddress(m, "ApuMapVirtualAddress") : NULL;
+    BYTE request[0x48] = { 0 };
+    UINT32 *ctx, in_apu = 0, out_apu = 0, data[2], taken = 0, rounds = 0;
+    BYTE *input = NULL, *output = NULL;
+    void *hal = NULL;
+    DWORD start;
+
+    if (!create || !alloc || !shape || !map || FAILED(create(&hal)) || !hal)
+    {
+        CHECK(0, "acphal.dll exports what the XMA test needs");
+        return;
+    }
+    ((UINT32 *)request)[4] = 4; /* four XMA contexts */
+    CHECK(shape(request) == S_OK && (ctx = *(UINT32 **)(request + 0x18 + 8 * 4)) != NULL, "AcpHalAllocateShapeContexts(4 XMA)");
+    if (!ctx) return;
+    ctx += 16; /* context 1 */
+    CHECK(alloc((void **)&input, &in_apu, 2 * 2048, 0x800, 0) == S_OK && alloc((void **)&output, &out_apu, 4 * 256, 0x100, 0) == S_OK
+              && in_apu && map(input) == in_apu && map(output + 0x10) == out_apu + 0x10,
+          "ApuAlloc's APU addresses are not 0 and ApuMapVirtualAddress agrees");
+    /* Two packets of three 512-sample frames each, which no decoder takes. Mono: 3072 samples are
+     * 24 blocks of 128. */
+    memset(input, 0, 2 * 2048);
+    input[0] = input[2048] = 3 << 2;
+    memset(output, 0x55, 4 * 256);
+    ctx[0] = 2 | 1u << 20 | 4u << 22;
+    ctx[1] = 3u << 27 | 1u << 31;
+    ctx[5] = in_apu;
+    ctx[7] = out_apu;
+    CHECK(XSLOT(hal, 0, HRESULT, UINT32, UINT32)(hal, 64, 64) == S_OK, "IAcpHal Connect");
+    data[0] = 1;
+    XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 5, 0, ~0u, data, 0);
+    for (start = GetTickCount(); GetTickCount() - start < 3000 && rounds < 64; rounds++)
+    {
+        UINT32 write, read, blocks;
+        DWORD wait = GetTickCount();
+        /* Wait for a full ring, or the end of the input with the ring drained. */
+        while (GetTickCount() - wait < 500 && (ctx[1] >> 31) && !((ctx[2] >> 31) && (ctx[0] >> 27) == (ctx[9] & 31)))
+            Sleep(1);
+        write = ctx[0] >> 27;
+        read = ctx[9] & 31;
+        blocks = (ctx[1] >> 31) ? (write - read + 4) % 4 : 4;
+        if (!blocks)
+            break;
+        if (!taken)
+            CHECK(blocks == 4 && output[0] != 0x55 && output[3 * 256 + 255] != 0x55,
+                  "the ring fills: 4 blocks written, then it waits for the title (%u)", blocks);
+        taken += blocks;
+        data[1] = blocks;
+        XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 18, 0xf1f1f1f1, ~0u, data, 0);
+    }
+    CHECK(taken >= 24 && taken <= 32, "command 18 frees the ring: the two packets made %u blocks (24 to 32)", taken);
+    CHECK((ctx[2] >> 31) && ((ctx[2] >> 26) & 31) == 4 && !(ctx[0] & 3u << 20),
+          "at the end of the input the context says so (%08x %08x)", ctx[0], ctx[2]);
+    data[0] = 1;
+    XSLOT(hal, 2, HRESULT, UINT32, UINT64, UINT32, const void *, UINT32)(hal, 7, 0, ~0u, data, 0);
+    XSLOT(hal, 1, HRESULT)(hal);
+    XSLOT(hal, 5, void)(hal);
+}
+
 /* xapu.dll: the decoder queue answers each command at once, a Process with the Opus packet
  * decoded, or silence of the length asked for without one (FMOD in a GDK title drives it);
  * acphal's other FMOD imports answer too. */
@@ -4004,7 +4073,7 @@ static void test_xapu(void)
     HRESULT (WINAPI *enqueue)(HANDLE, const void *, UINT32 *) = m ? (void *)GetProcAddress(m, "XApuEnqueueCommand") : NULL;
     HRESULT (WINAPI *dequeue)(HANDLE, void *) = m ? (void *)GetProcAddress(m, "XApuDequeueResult") : NULL;
     HRESULT (WINAPI *disconnect)(HANDLE) = m ? (void *)GetProcAddress(m, "XApuDisconnect") : NULL;
-    HRESULT (WINAPI *map)(UINT32 *, void *, UINT32) = acp ? (void *)GetProcAddress(acp, "ApuMapVirtualAddress") : NULL;
+    UINT32 (WINAPI *map)(const void *) = acp ? (void *)GetProcAddress(acp, "ApuMapVirtualAddress") : NULL;
     BOOL (WINAPI *valid)(const void *, UINT32) = acp ? (void *)GetProcAddress(acp, "ApuIsVirtualAddressValid") : NULL;
     HRESULT (WINAPI *release)(void) = acp ? (void *)GetProcAddress(acp, "AcpHalReleaseShapeContexts") : NULL;
     BYTE buf[4096];
@@ -4013,12 +4082,19 @@ static void test_xapu(void)
     BOOL silent = TRUE;
 
     CHECK(map && valid && release, "acphal.dll exports FMOD's ApuMapVirtualAddress, ApuIsVirtualAddressValid and AcpHalReleaseShapeContexts");
-    if (map && valid && release)
-        CHECK(map(&a1, buf, 0x2000) == S_OK && map(&a2, buf + 0x2000, 16) == S_OK && a1 != a2 && valid(buf, 16)
-                  && release() == S_OK, "ApuMapVirtualAddress gives distinct addresses (%#x, %#x)", a1, a2);
+    /* Titles pass the pointer alone and keep the result: memory outside the heap gets an address
+     * too, and every byte of it maps back. */
     {
+        BYTE *own = VirtualAlloc(NULL, 0x4000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         void *(WINAPI *back)(UINT32) = acp ? (void *)GetProcAddress(acp, "ApuMapApuAddress") : NULL;
-        CHECK(back && back(a1 + 0x10) == buf + 0x10 && back(a2) == buf + 0x2000,
+        if (map && valid && release && own)
+        {
+            a1 = map(own);
+            a2 = map(own + 0x2000);
+            CHECK(a1 && a2 == a1 + 0x2000 && valid(own, 16) && release() == S_OK,
+                  "ApuMapVirtualAddress(va) gives an address for the title's memory (%#x, %#x)", a1, a2);
+        }
+        CHECK(back && own && back(a1 + 0x10) == own + 0x10 && back(a2) == own + 0x2000 && !back(0),
               "ApuMapApuAddress maps APU addresses back to memory");
     }
     CHECK(connect && enqueue && dequeue && disconnect, "xapu.dll exports FMOD's four imports");
@@ -5255,6 +5331,7 @@ int main(int argc, char **argv)
     test_xcrdapi();
     test_gameinput();
     test_acphal();
+    test_acphal_xma();
     test_xapu();
     test_chad();
     if (argc > 1)
