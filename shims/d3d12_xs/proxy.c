@@ -2794,37 +2794,89 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct pr
 }
 
 /* A resource placed at a title address for views of memory (slots 70 and 71), made once per address
- * and description and kept, as xcl's resource_at. */
-static struct memory_view_resource { UINT64 address; D3D12_RESOURCE_DESC desc; ID3D12Resource *res; } *memory_views;
-static SIZE_T memory_view_count, memory_view_capacity;
+ * and description and kept, as xcl's resource_at. Found through a hash table: a title loading its
+ * world makes views at hundreds of thousands of addresses, and a scan of every one per view (under
+ * an exclusive lock) left its threads queued here and its frames 30 s apart. */
+static struct memory_view_resource
+{
+    UINT64 address;
+    D3D12_RESOURCE_DESC desc;
+    ID3D12Resource *res;
+    SIZE_T next; /* the next in the bucket, plus one */
+} *memory_views;
+static SIZE_T memory_view_count, memory_view_capacity, *memory_view_buckets, memory_view_bucket_count;
 static SRWLOCK memory_view_lock = SRWLOCK_INIT;
+
+static SIZE_T memory_view_hash(UINT64 address, const D3D12_RESOURCE_DESC *desc)
+{
+    const BYTE *bytes = (const BYTE *)desc;
+    UINT64 h = 0xcbf29ce484222325ull ^ address;
+    for (SIZE_T i = 0; i < sizeof(*desc); i++)
+        h = (h ^ bytes[i]) * 0x100000001b3ull;
+    return (SIZE_T)(h ^ (h >> 32));
+}
+
+/* Under memory_view_lock (shared or exclusive). */
+static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DESC *desc, SIZE_T hash)
+{
+    if (!memory_view_bucket_count)
+        return NULL;
+    for (SIZE_T i = memory_view_buckets[hash & (memory_view_bucket_count - 1)]; i; i = memory_views[i - 1].next)
+        if (memory_views[i - 1].address == address && !memcmp(&memory_views[i - 1].desc, desc, sizeof(*desc)))
+            return memory_views[i - 1].res;
+    return NULL;
+}
+
+/* Under memory_view_lock, exclusive. */
+static void memory_view_add(UINT64 address, const D3D12_RESOURCE_DESC *desc, ID3D12Resource *res, SIZE_T hash)
+{
+    if (memory_view_count == memory_view_capacity)
+    {
+        SIZE_T n = memory_view_capacity ? memory_view_capacity * 2 : 1024;
+        struct memory_view_resource *grown = realloc(memory_views, n * sizeof(*grown));
+        if (!grown)
+            return;
+        memory_views = grown;
+        memory_view_capacity = n;
+    }
+    if (memory_view_count + 1 > memory_view_bucket_count)
+    {
+        SIZE_T n = memory_view_bucket_count ? memory_view_bucket_count * 4 : 4096, *buckets = calloc(n, sizeof(*buckets));
+        if (!buckets)
+            return;
+        free(memory_view_buckets);
+        memory_view_buckets = buckets;
+        memory_view_bucket_count = n;
+        for (SIZE_T i = 0; i < memory_view_count; i++)
+        {
+            SIZE_T b = memory_view_hash(memory_views[i].address, &memory_views[i].desc) & (n - 1);
+            memory_views[i].next = buckets[b];
+            buckets[b] = i + 1;
+        }
+    }
+    memory_views[memory_view_count] = (struct memory_view_resource){ address, *desc, res,
+            memory_view_buckets[hash & (memory_view_bucket_count - 1)] };
+    memory_view_buckets[hash & (memory_view_bucket_count - 1)] = ++memory_view_count;
+}
 
 static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address)
 {
-    ID3D12Resource *res = NULL;
+    ID3D12Resource *res;
+    SIZE_T hash;
 
     if (!desc || !address)
         return NULL;
+    hash = memory_view_hash(address, desc);
+    AcquireSRWLockShared(&memory_view_lock);
+    res = memory_view_find(address, desc, hash);
+    ReleaseSRWLockShared(&memory_view_lock);
+    if (res)
+        return res;
     AcquireSRWLockExclusive(&memory_view_lock);
-    for (SIZE_T i = 0; i < memory_view_count && !res; i++)
-        if (memory_views[i].address == address && !memcmp(&memory_views[i].desc, desc, sizeof(*desc)))
-            res = memory_views[i].res;
-    if (!res && SUCCEEDED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
-            &IID_ID3D12Resource, (void **)&res)) && res)
-    {
-        if (memory_view_count == memory_view_capacity)
-        {
-            SIZE_T n = memory_view_capacity ? memory_view_capacity * 2 : 64;
-            struct memory_view_resource *grown = realloc(memory_views, n * sizeof(*grown));
-            if (grown)
-            {
-                memory_views = grown;
-                memory_view_capacity = n;
-            }
-        }
-        if (memory_view_count < memory_view_capacity)
-            memory_views[memory_view_count++] = (struct memory_view_resource){ address, *desc, res };
-    }
+    if (!(res = memory_view_find(address, desc, hash))
+            && SUCCEEDED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                      &IID_ID3D12Resource, (void **)&res)) && res)
+        memory_view_add(address, desc, res, hash);
     ReleaseSRWLockExclusive(&memory_view_lock);
     return res;
 }
