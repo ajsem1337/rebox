@@ -4230,6 +4230,25 @@ static void STDMETHODCALLTYPE list_CopyMemoryToMemoryX(struct proxy *p, UINT64 d
     p->cpu_writes[p->cpu_write_count++] = (struct cpu_write){ destination, { 0, 0 }, 0, source, size };
 }
 
+/* DispatchX(x, y, z, flags), slot 80 (78 on the older layout): Dispatch with console flags (VIctory,
+ * GPL-3.0, facts). REBOX_DISPATCHX=0 drops them, as before they were handled. */
+static void STDMETHODCALLTYPE list_DispatchX(struct proxy *p, UINT x, UINT y, UINT z, UINT flags)
+{
+    static int enabled = -1;
+    static LONG logged;
+
+    if (enabled < 0)
+    {
+        const char *v = getenv("REBOX_DISPATCHX");
+        enabled = !(v && *v == '0');
+    }
+    if (InterlockedIncrement(&logged) <= 8)
+        rebox_log("d3d12_xs: DispatchX(%u, %u, %u, flags %#x) in list %p%s", x, y, z, flags, p,
+                  enabled ? "" : ": dropped (REBOX_DISPATCHX=0)");
+    if (enabled)
+        ID3D12GraphicsCommandList_Dispatch(INNER(p, ID3D12GraphicsCommandList), x, y, z);
+}
+
 /* Pipeline syncs at the top and bottom of the pipe (flags, control, address, size): vkd3d-proton
  * orders a list's work itself (VIctory, GPL-3.0, facts). */
 static void STDMETHODCALLTYPE list_PipelineSyncX(struct proxy *p, UINT flags, UINT control, UINT64 address,
@@ -4776,7 +4795,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(89, list_Write64BitValueTopOfPipeX),
         FN(90, list_Write32BitValueBottomOfPipeX),    /* Write32BitValueBottomOfShaderX */
         FN(60, list_CopyMemoryToMemoryX),
-        FWD(78, 14),                                  /* DispatchX: Dispatch plus flags */
+        FN(78, list_DispatchX),
         FN(129, list_PipelineSyncX), FN(130, list_PipelineSyncX),
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
@@ -4818,7 +4837,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(91, list_Write64BitValueTopOfPipeX),
         FN(92, list_Write32BitValueBottomOfPipeX),
         FN(62, list_CopyMemoryToMemoryX),             /* the older 60, 78, 84 and 129-130, two later */
-        FWD(80, 14),                                  /* DispatchX: Dispatch plus flags */
+        FN(80, list_DispatchX),
         FN(86, list_CopyResourceX),
         FN(131, list_PipelineSyncX), FN(132, list_PipelineSyncX),
         FN(123, list_DispatchRays),                   /* PC 76 */
