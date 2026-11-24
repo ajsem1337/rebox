@@ -3364,6 +3364,29 @@ static BOOL draw_rects(struct proxy *p, UINT vertices, UINT instances, UINT firs
     return TRUE;
 }
 
+/* At REBOX_WATCH_STAGE's vertex stage's first 4 draws (with REBOX_DRAW_CENSUS, which names the
+ * stage of a draw): the bound vertex buffers and the first vertices' bytes. */
+static void log_watched_vertex_buffers(struct proxy *p, UINT first_vertex, UINT vertices)
+{
+    static LONG logged;
+    if (!console_stage_watched(console_last_draw_vs()) || InterlockedIncrement(&logged) > 4)
+        return;
+    for (UINT i = 0; i < ARRAYSIZE(p->vertex_buffers); i++)
+        if (p->vertex_buffer_mask & (1u << i))
+        {
+            const D3D12_VERTEX_BUFFER_VIEW *v = &p->vertex_buffers[i];
+            const UINT32 *d = (const UINT32 *)(ULONG_PTR)(v->BufferLocation + (UINT64)first_vertex * v->StrideInBytes);
+            UINT n = min(min(vertices, 4u) * v->StrideInBytes / 4, 24u);
+            char line[300];
+            int at = 0;
+            for (UINT k = 0; k < n && !IsBadReadPtr(d + k, 4) && at < 280; k++)
+                at += snprintf(line + at, sizeof(line) - at, " %08x", d[k]);
+            line[at] = 0;
+            rebox_log("d3d12_xs: watched stage's draw: vertex buffer %u at %#llx, %u bytes, stride %u:%s", i,
+                      (unsigned long long)v->BufferLocation, v->SizeInBytes, v->StrideInBytes, line);
+        }
+}
+
 /* REBOX_DRAW_CENSUS=1: the per-100-presents draw log names draws into every target, not only the
  * display-sized ones (target -1), to find a stage (a UI text shader) for REBOX_WATCH_STAGE or
  * REBOX_GRAPHICS_DEBUG=magenta:<id>. */
@@ -3390,6 +3413,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
     console_display_draw_end();
+    log_watched_vertex_buffers(p, first_vertex, vertices);
 }
 
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT indices, UINT instances, UINT first_index,

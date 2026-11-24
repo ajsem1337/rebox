@@ -389,6 +389,18 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
             }
         }
     }
+    if (console_stage_watched(console_stage_id(vs, vs_size)))
+        for (UINT r = 0; r < g->element_count; r++)
+        {
+            const D3D12_INPUT_ELEMENT_DESC *e = NULL;
+            for (UINT k = 0; k < desc->InputLayout.NumElements; k++)
+                if (desc->InputLayout.pInputElementDescs[k].InputSlot == g->elements[r].slot
+                        && desc->InputLayout.pInputElementDescs[k].Format == g->elements[r].dxgi_format)
+                    e = &desc->InputLayout.pInputElementDescs[k];
+            rebox_log("d3d12_xs: watched stage's PSO: vertex input %u is %s%u, format %u, slot %u, offset %u%s", r,
+                      e ? e->SemanticName : "?", e ? e->SemanticIndex : 0, g->elements[r].dxgi_format, g->elements[r].slot,
+                      g->elements[r].offset, g->elements[r].per_instance ? ", per instance" : "");
+        }
     link_interpolants(desc, vs, ps);
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
     memcpy((BYTE *)g + g->ps_offset, ps, ps_size);

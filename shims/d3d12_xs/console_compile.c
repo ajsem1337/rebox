@@ -1013,6 +1013,33 @@ void console_display_draws_log(void)
     ReleaseSRWLockExclusive(&display_draw_lock);
 }
 
+/* A deferred console stage's id (as the logs name stages), or 0. */
+UINT64 console_stage_id(const void *shader, SIZE_T size)
+{
+    const struct rebox_deferred_shader *h = shader;
+    if (!h || size < sizeof(*h) || h->version != 2 || h->code_offset > size || h->code_dwords * 4ull > size - h->code_offset)
+        return 0;
+    return hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)), (const BYTE *)h + h->code_offset,
+                      h->code_dwords * 4u);
+}
+
+/* Whether a stage is REBOX_WATCH_STAGE's. */
+BOOL console_stage_watched(UINT64 id)
+{
+    const char *watch = getenv("REBOX_WATCH_STAGE");
+    char text[24];
+    if (!watch || !id)
+        return FALSE;
+    snprintf(text, sizeof(text), "%016llx", (unsigned long long)id);
+    return !strncmp(watch, text, 16);
+}
+
+/* The vertex stage of the calling thread's last bracketed draw (console_display_draw_begin). */
+UINT64 console_last_draw_vs(void)
+{
+    return current_draw.vs;
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     UINT64 key;
