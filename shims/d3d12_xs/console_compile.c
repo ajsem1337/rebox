@@ -1444,7 +1444,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         /* attr<N>:<stage id>,...: those pixel stages export their interpolant N's xyz instead (a
          * vertex colour, texture coordinates), alpha 1. */
         static UINT32 attr0[] = {
-            0xbefc0309,                         /* s_mov_b32 m0, s9 (the primitive mask) */
+            0xbefc0309,                         /* s_mov_b32 m0, s9 (the primitive mask; set below) */
             0xc8080000, 0xc8090001,             /* v_interp_p1/p2_f32 v2, attr0.x */
             0xc80c0100, 0xc80d0101,             /* v3, attr0.y */
             0xc8100200, 0xc8110201,             /* v4, attr0.z */
@@ -1482,6 +1482,22 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
             if (ids && strstr(ids, id))
             {
+                /* m0 (the primitive mask, which v_interp needs) from the SGPR the original code
+                 * takes it from: s_mov_b32 m0, sX, through an earlier s_mov_b32 sX, sY. */
+                UINT source = 9;
+                for (UINT k = 0; k < req.code_dwords && k < 64; k++)
+                    if ((req.code[k] & 0xffffff00u) == 0xbefc0300u)
+                    {
+                        UINT x = req.code[k] & 0xff;
+                        source = x;
+                        for (UINT j = 0; j < k; j++)
+                            if ((req.code[j] & 0xff80ff00u) == 0xbe800300u && ((req.code[j] >> 16) & 0x7f) == x
+                                    && (req.code[j] & 0xff) < 106)
+                                source = req.code[j] & 0xff;
+                        break;
+                    }
+                attr0[0] = 0xbefc0300u | source;
+                texture[0] = 0xbefc0300u | source;
                 solid = TRUE;
                 if (debug[0] == 'a')
                 {
