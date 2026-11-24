@@ -479,6 +479,36 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     BOOL to_pages = !!(r->options & OPT_DEST_PHYSICAL);
     DSTORAGE_REQUEST paged;
 
+    {
+        /* REBOX_PHYSICAL_TRACE: a request writing the physical page mapped at the traced address,
+         * through any address of it or as a physical-page destination. */
+        static UINT64 trace = ~0ull;
+        static ULONG_PTR (WINAPI *page_at)(ULONGLONG);
+        static LONG logged;
+        if (trace == ~0ull)
+        {
+            const char *v = getenv("REBOX_PHYSICAL_TRACE");
+            HMODULE xmem = GetModuleHandleA("xmem.dll");
+            trace = v ? _strtoui64(v, NULL, 16) : 0;
+            page_at = xmem ? (void *)GetProcAddress(xmem, "ReboxPhysicalPageAt") : NULL;
+        }
+        if (trace && page_at && r->destination_size)
+        {
+            ULONG_PTR traced = page_at(trace), hit = 0;
+            if (traced && to_pages)
+                for (UINT32 i = 0; i < e->page_count && !hit; i++)
+                    hit = e->pages[i] == traced ? 1 : 0;
+            else if (traced)
+                for (UINT64 at = (UINT64)(ULONG_PTR)r->destination & ~0xffffull;
+                     at < (UINT64)(ULONG_PTR)r->destination + r->destination_size && !hit; at += 0x10000)
+                    hit = page_at(at) == traced ? at : 0;
+            if (hit && InterlockedIncrement(&logged) <= 200)
+                rebox_log("xcrdapi: trace: a request writes page %#llx (options %#llx, file offset %llu, %u -> %u "
+                          "bytes, destination %p%s, at %#llx)", (unsigned long long)traced,
+                          (unsigned long long)r->options, (unsigned long long)r->file_offset, r->source_size,
+                          r->destination_size, r->destination, to_pages ? " pages" : "", (unsigned long long)hit);
+        }
+    }
     if (e->traced)
     {
         /* What its destination is as it runs (xmem). */

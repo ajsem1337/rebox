@@ -1376,6 +1376,21 @@ BOOL WINAPI ReboxMapPhysicalAlias(ULONGLONG to, ULONGLONG from, ULONGLONG len)
     }
     return ok;
 }
+
+/* The number of the physical page mapped at address, or 0 (xcrdapi's REBOX_PHYSICAL_TRACE: which
+ * requests write the traced page, through any of its addresses). Never waits for the lock. */
+ULONG_PTR WINAPI ReboxPhysicalPageAt(ULONGLONG address)
+{
+    ULONG_PTR page = 0;
+    if (mapped_at && TryAcquireSRWLockShared(&physical_lock))
+    {
+        SIZE_T slot = slot_at((ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1));
+        if (slot != (SIZE_T)-1)
+            page = (mapped_at[slot].unit + 1) << 4;
+        ReleaseSRWLockShared(&physical_lock);
+    }
+    return page;
+}
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)
