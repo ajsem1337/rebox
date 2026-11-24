@@ -250,8 +250,12 @@ void console_resolve_late(void)
                     static LONG shown, watched_shown;
                     ID3D12Resource *r = console_texture_of(w);
                     LONG wn = console_stage_watched(t->stage) ? InterlockedIncrement(&watched_shown) : 0;
-                    /* A watched stage's: the first 32, then every 256th (what it samples later on). */
-                    if ((wn && (wn <= 32 || !(wn % 256))) || (!wn && InterlockedIncrement(&shown) <= 8))
+                    /* A watched stage's: the first 32, then every 256th, and whenever its texture
+                     * changes (a scene can switch what a final pass reads). */
+                    static ID3D12Resource *watched_last;
+                    if ((wn && (wn <= 32 || !(wn % 256)
+                                || InterlockedExchangePointer((void **)&watched_last, r) != r))
+                            || (!wn && InterlockedIncrement(&shown) <= 8))
                     {
                         D3D12_RESOURCE_DESC rd = { 0 };
                         UINT64 at = 0;
@@ -2062,7 +2066,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                           (UINT)b.kind, (UINT)b.role);
                         }
                     }
-                    if ((console_stage_watched(stage_id) && InterlockedIncrement(&watched_shown) <= 24)
+                    /* A watched stage's: the first 24, and again whenever the texture it samples
+                     * changes (a scene can switch what a final pass reads). */
+                    static ID3D12Resource *watched_last;
+                    ID3D12Resource *watched_res = console_stage_watched(stage_id) ? console_texture_of(w) : NULL;
+                    if ((console_stage_watched(stage_id)
+                         && (InterlockedIncrement(&watched_shown) <= 24
+                             || InterlockedExchangePointer((void **)&watched_last, watched_res) != watched_res))
                             || (stage_first && InterlockedIncrement(&shown) <= 512))
                     {
                         ID3D12Resource *res = console_texture_of(w);
