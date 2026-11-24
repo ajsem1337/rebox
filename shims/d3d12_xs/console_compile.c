@@ -1743,6 +1743,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
             solid = strstr(debug + 8, id) != NULL;
         }
+        /* magenta-except:<stage id>,...: every pixel stage but those (a final pass kept real shows
+         * whether anything drawn before it reaches what it reads). */
+        if (debug && !strncmp(debug, "magenta-except:", 15))
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            solid = strstr(debug + 15, id) == NULL;
+        }
         /* REBOX_DEBUG_PS_LZ=<stage id>,...: those pixel stages' own code with every image_sample made
          * image_sample_lz (level 0, no derivatives): whether implicit-LOD sampling is what fails. */
         static __thread UINT32 lz_code[4096];
