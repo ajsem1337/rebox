@@ -29,7 +29,7 @@ index c3dff3f..6f66d35 100644
 + * not compiled yet skips the dispatch that writes it) can hold anything, all ones as often as not:
 + * billions of workgroups, and the GPU watchdog resets the device. This copies the records to
 + * scratch and bounds them (cs_rebox_indirect_clamp.comp): a dispatch or mesh dispatch with a
-+ * dimension of 65535 or more or more than REBOX_INDIRECT_CLAMP_GROUPS groups, or a draw of more
++ * dimension of 2^24 or more or more than REBOX_INDIRECT_CLAMP_GROUPS groups, or a draw of more
 + * than REBOX_INDIRECT_CLAMP_VERTICES vertices (or indices) times instances, runs empty. With a
 + * count buffer, the count is clamped to max_command_count and records past it run empty.
 + *
@@ -552,9 +552,9 @@ index 770efda..cbfa502 100644
 +        return;
 +    }
 +
-+    /* D3D12 allows 65535 groups a dimension; more, or a total past REBOX_INDIRECT_CLAMP_GROUPS,
-+     * is a buffer nobody filled. Draws: vertices (or indices) times instances. */
-+    ops->max_groups_per_dim = 65535;
++    /* A console dispatches past D3D12's 65535 groups in X (115200 seen); a dimension of 2^24 or more, or a total past
++     * REBOX_INDIRECT_CLAMP_GROUPS, is a buffer nobody filled. Draws: vertices (or indices) times instances. */
++    ops->max_groups_per_dim = vkd3d_rebox_env_u32("REBOX_INDIRECT_CLAMP_DIM", 1u << 24);
 +    ops->max_groups = vkd3d_rebox_env_u32("REBOX_INDIRECT_CLAMP_GROUPS", 1u << 22);
 +    ops->max_count_product = vkd3d_rebox_env_u32("REBOX_INDIRECT_CLAMP_VERTICES", 1u << 28);
 +

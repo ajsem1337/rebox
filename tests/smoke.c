@@ -2729,14 +2729,14 @@ static void test_real_heap_va(void *dev, void *queue)
             }
         }
         /* vkd3d-proton patch 0017: an argument record nobody filled (all ones) or past D3D12's
-         * 65535 groups a dimension runs empty instead of hanging the GPU, a good record after one
+         * 2^24 groups a dimension runs empty instead of hanging the GPU, a good record after one
          * still runs, and a count buffer's count is clamped to MaxCommandCount. Without the
          * clamp the first list never finishes. */
         if (SUCCEEDED(hr) && SUCCEEDED(hr = ID3D12Resource_Map(args, 0, NULL, (void **)&dispatch)))
         {
             dispatch[0] = (D3D12_DISPATCH_ARGUMENTS){ ~0u, ~0u, ~0u };
             dispatch[1] = (D3D12_DISPATCH_ARGUMENTS){ 1, 1, 1 };
-            dispatch[2] = (D3D12_DISPATCH_ARGUMENTS){ 65536, 1, 1 };
+            dispatch[2] = (D3D12_DISPATCH_ARGUMENTS){ 1u << 24, 1, 1 };
             ((UINT *)dispatch)[16] = ~0u; /* a count, at byte 64 */
             ID3D12Resource_Unmap(args, 0, NULL);
         }
@@ -2764,13 +2764,13 @@ static void test_real_heap_va(void *dev, void *queue)
             for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
                 Sleep(10);
             CHECK(ID3D12Fence_GetCompletedValue(fence) >= value, "ExecuteIndirect of %s finishes",
-                  pass ? "a count past MaxCommandCount" : "all-ones and 65536-group records");
+                  pass ? "a count past MaxCommandCount" : "all-ones and 2^24-group records");
             if (ID3D12Fence_GetCompletedValue(fence) < value)
                 break;
             if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
             {
                 if (!pass)
-                    CHECK(mapped[0] == 0, "all-ones and 65536-group ExecuteIndirect records run empty (%#x)", mapped[0]);
+                    CHECK(mapped[0] == 0, "all-ones and 2^24-group ExecuteIndirect records run empty (%#x)", mapped[0]);
                 else
                     CHECK(mapped[0] == 0x5ca71e77, "ExecuteIndirect runs the good record after an all-ones one, "
                           "its count clamped (%#x)", mapped[0]);
