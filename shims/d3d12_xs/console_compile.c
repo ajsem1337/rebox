@@ -1729,6 +1729,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 UINT64 base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
                 UINT32 stride = (w[1] >> 16) & 0x3fff;
                 UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
+                if (console_stage_watched(stage_id))
+                {
+                    static LONG buffers_shown;
+                    if (InterlockedIncrement(&buffers_shown) <= 24)
+                        rebox_log("d3d12_xs: watched stage %016llx buffer binding %u.%u: V# %08x %08x %08x %08x (base %#llx, "
+                                  "%llu bytes)", (unsigned long long)stage_id, b.binding, e, w[0], w[1], w[2], w[3],
+                                  (unsigned long long)base, (unsigned long long)bytes);
+                }
                 table[e * 4] = (UINT32)base;
                 table[e * 4 + 1] = (UINT32)(base >> 32);
                 table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
