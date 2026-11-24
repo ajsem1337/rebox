@@ -618,7 +618,8 @@ static void note_reservation(void *p, SIZE_T size, DWORD type, DWORD protect)
     AcquireSRWLockExclusive(&gpu_view_lock);
     if (gpu_only && last_cpu_reservation && last_cpu_reservation_size == size)
     {
-        for (UINT i = 0; i < ARRAYSIZE(gpu_views); i++)
+        UINT i;
+        for (i = 0; i < ARRAYSIZE(gpu_views); i++)
             if (!gpu_views[i].size)
             {
                 gpu_views[i].gpu = (ULONG_PTR)p;
@@ -628,6 +629,9 @@ static void note_reservation(void *p, SIZE_T size, DWORD type, DWORD protect)
                           (unsigned long long)last_cpu_reservation);
                 break;
             }
+        if (i == ARRAYSIZE(gpu_views))
+            rebox_log("xmem: no room for the GPU view at %p (%u kept); it is not translated", p,
+                      (UINT)ARRAYSIZE(gpu_views));
         last_cpu_reservation = 0;
     }
     else if (!gpu_only && (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
@@ -1332,6 +1336,9 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
         adopted[adopted_count].end = (ULONG_PTR)(address + size);
         adopted_count++;
     }
+    else
+        rebox_log("xmem: no room to note %#llx adopted bytes at %#llx (%u kept)", size, address,
+                  (UINT)ARRAYSIZE(adopted));
     for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); mapped_at && at < address + size; at += PAGE_UNIT)
     {
         SIZE_T slot = slot_at(at);

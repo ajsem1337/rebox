@@ -35,6 +35,15 @@
 
 #define TITLE_BASE 0x10000000ull
 #define MAX_REGIONS 64
+
+/* A region list that came back full may have left regions out: logged once per list. */
+static void note_regions_full(const char *what, UINT n, UINT max)
+{
+    static LONG logged[2];
+    LONG *flag = &logged[what[0] == 'G'];
+    if (n >= max && !InterlockedExchange(flag, 1))
+        rebox_log("AnyPS5 regions: %s filled all %u entries; later ones are left out", what, max);
+}
 #define MAX_BINDINGS 64
 #define MAX_ELEMENTS 4096
 /* Graphics stages share the push block, 128 bytes each: AnyPS5's push data, then the addresses of
@@ -463,6 +472,8 @@ static UINT64 page_table(UINT32 *bytes)
     table_built = GetTickCount64();
     n = shadow_regions(regions, MAX_REGIONS);
     nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
+    note_regions_full("Shadow heaps", n, MAX_REGIONS);
+    note_regions_full("GPU memory chunks", nchunks, MAX_REGIONS);
     if (!table_cpu && FAILED(ReboxGpuAlloc(*bytes, 256, (void **)&table_cpu, &table_va)))
     {
         table_cpu = NULL;
@@ -1594,6 +1605,8 @@ static UINT guest_regions(struct sa5_region *regions)
     for (UINT i = 0; i < n; i++)
         regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
     count = gpu_memory_regions(chunks, MAX_REGIONS - n);
+    note_regions_full("Shadow heaps", n, MAX_REGIONS);
+    note_regions_full("GPU memory chunks", n + count, MAX_REGIONS);
     shadow_count = n;
     for (UINT i = 0; i < count; i++)
     {
