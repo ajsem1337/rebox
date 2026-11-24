@@ -1388,8 +1388,27 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             0xf80008cf, 0x06050201, /* exp pos0 v1, v2, v5, v6 done */
             0xbf810000,             /* s_endpgm */
         };
-        const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
+        /* REBOX_DEBUG_VS_CONST=<stage id>,...: those vertex stages draw the full-screen triangle and
+         * export param0 = (1, 0, 1, 1), param1 = (0.5, 0.5, 0.5, 0.5): with REBOX_GRAPHICS_DEBUG=attr<N>
+         * on the pixel stage, whether parameters reach it at all. */
+        static const UINT32 constants[] = {
+            0x36020081, 0x2c040081, 0x36040481, 0x7e020d01, 0x7e040d02, /* x, y from the vertex ID */
+            0x100202f6, 0x100404f6, 0x060202f3, 0x060404f3,
+            0x7e0a02f2, 0x7e0c02f2, 0xf80008cf, 0x06050201,             /* exp pos0 v1, v2, 1, 1 done */
+            0x7e0e0280, 0x7e1002f0,                                     /* v7 = 0, v8 = 0.5 */
+            0xf800020f, 0x06060706,                                     /* exp param0 v6, v7, v6, v6 */
+            0xf800021f, 0x08080808,                                     /* exp param1 v8, v8, v8, v8 */
+            0xbf810000,
+        };
+        const char *debug = getenv("REBOX_GRAPHICS_DEBUG"), *vs_const = getenv("REBOX_DEBUG_VS_CONST");
         BOOL replace = debug && !strcmp(debug, "fullscreen");
+        BOOL constant = FALSE;
+        if (vs_const)
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            constant = strstr(vs_const, id) != NULL;
+        }
         struct sa5_vertex_request vreq;
         UINT32 user[32];
         memset(&vreq, 0, sizeof(vreq));
@@ -1397,14 +1416,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         memcpy(user, req.user_data, min(req.user_data_count, 32u) * 4);
         user[4] = 0x30000000u;
         user[5] = 0;
-        vreq.code = replace ? fullscreen : req.code;
-        vreq.code_dwords = replace ? ARRAYSIZE(fullscreen) : req.code_dwords;
+        vreq.code = constant ? constants : replace ? fullscreen : req.code;
+        vreq.code_dwords = constant ? ARRAYSIZE(constants) : replace ? ARRAYSIZE(fullscreen) : req.code_dwords;
         vreq.code_address = req.code_address;
         vreq.wave = req.wave;
         vreq.user_data = user;
         vreq.user_data_count = max(req.user_data_count, 6u);
         vreq.rsrc1 = h->rsrc1;
-        vreq.input_count = replace ? 0 : min(g->input_count, 32u);
+        vreq.input_count = replace || constant ? 0 : min(g->input_count, 32u);
         for (UINT32 r = 0; r < vreq.input_count; r++)
         {
             vreq.inputs[r].vsharp[0] = 0x20000000u + r * 0x100000u;
