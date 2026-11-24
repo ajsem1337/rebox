@@ -3597,6 +3597,64 @@ static void test_console_dispatch(void *dev, void *queue)
         if (crs) XSLOT(crs, 2, ULONG)(crs);
         if (crs_blob) ID3D10Blob_Release(crs_blob);
     }
+
+    /* A loop that would run four billion times (s8 counts up from 1 until it wraps to 0) goes
+     * back 2^20 times and leaves at the exit test at its top (patches/anyps5/0012, on by
+     * default): its s_add runs 2^20 + 1 times, so it writes 0x100002, and it reports a loop-limit
+     * fault. */
+    {
+        static const UINT32 endless[] = {
+            0xba80f814, 0x00001000, 0xba807815, 0x00000002, 0xf4080100, 0xfa000000,
+            0xbe880381, /* s_mov_b32 s8, 1 */
+            0xbf8cc07f,
+            0x80088108, /* s_add_u32 s8, s8, 1 */
+            0xbf078008, /* s_cmp_lg_u32 s8, 0 */
+            0xbf85fffd, /* s_cbranch_scc1 (the s_add) */
+            0x7e020208, /* v_mov_b32 v1, s8 */
+            0x7e040280, 0xe0701000, 0x80010102, 0xbf810000,
+        };
+        struct
+        {
+            UINT32 magic, version, size, stage, wave_size, workgroup_size[3], rsrc1, rsrc2, code_offset, code_dwords;
+            UINT64 code_address;
+            UINT32 code[ARRAYSIZE(endless)];
+        } lblob = { 0x44524353, 1, sizeof(lblob), 0x20, 32, { 1, 1, 1 }, 0x00ac0000, 2 << 1,
+                    offsetof(typeof(lblob), code), ARRAYSIZE(endless), 0x210000 };
+        UINT (WINAPI *console_faults)(void) = (void *)GetProcAddress(m, "ReboxConsoleFaults");
+        const char *guard = getenv("APS5_LOOP_GUARD");
+        UINT faults = console_faults ? console_faults() : 0;
+        void *lpso = NULL;
+
+        memcpy(lblob.code, endless, sizeof(endless));
+        out[0] = 0;
+        cd.pRootSignature = rs;
+        cd.CS = (D3D12_SHADER_BYTECODE){ &lblob, sizeof(lblob) };
+        hr = guard && strtoul(guard, NULL, 0) != 0x100000 ? E_ABORT
+             : XSLOT(dev, 11, HRESULT, const D3D12_COMPUTE_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &cd,
+                    &IID_ID3D12PipelineState, &lpso);
+        if (hr == E_ABORT)
+            printf("skip the loop guard test: APS5_LOOP_GUARD=%s\n", guard);
+        else if (SUCCEEDED(hr) && SUCCEEDED(ID3D12CommandAllocator_Reset(alloc))
+                && SUCCEEDED(XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL)))
+        {
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, lpso);
+            XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+            XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+            XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 5);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < 5; i++)
+                Sleep(10);
+            CHECK(ID3D12Fence_GetCompletedValue(fence) >= 5 && out[0] == 0x100002,
+                  "an endless console loop stops after 2^20 iterations (wrote %#x, expected 0x100002)", out[0]);
+            CHECK(console_faults && console_faults() > faults, "the stopped loop reports a loop-limit fault");
+        }
+        else
+            CHECK(0, "objects for the loop guard test (%#lx)", hr);
+        if (lpso) XSLOT(lpso, 2, ULONG)(lpso);
+    }
     ID3D12Resource_Unmap(out_buf, 0, NULL);
 
 done:

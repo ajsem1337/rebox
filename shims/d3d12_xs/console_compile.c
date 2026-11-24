@@ -127,6 +127,12 @@ static void set_anyps5_environment(void)
         if (!(speculate && speculate[0] == '0') && !getenv("APS5_SPECULATE_DESCRIPTORS"))
             _putenv("APS5_SPECULATE_DESCRIPTORS=1");
     }
+    /* patches/anyps5/0012: every translated loop leaves after 2^20 iterations per entry, so a loop
+     * whose exit depends on data we got wrong can't hang the GPU (a device lost after the kernel's
+     * hard recovery). A loop stopped this way is a "loop limit" fault (poll_faults logs it).
+     * APS5_LOOP_GUARD=0 turns it off; another value sets the limit. */
+    if (!getenv("APS5_LOOP_GUARD"))
+        _putenv("APS5_LOOP_GUARD=0x100000");
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
@@ -607,7 +613,13 @@ static void poll_faults(void)
     if (f[0] == 2)
     {
         UINT32 reason = f[1];
-        if (InterlockedIncrement(&fault_logs) <= 20)
+        if (reason == 6 /* LoopLimit: address is the shader hash, bytes the limit */)
+        {
+            if (InterlockedIncrement(&fault_logs) <= 20)
+                rebox_log("d3d12_xs: console shader %#llx left a loop at its limit of %u iterations (exit at pc %#x; "
+                             "APS5_LOOP_GUARD)", (unsigned long long)(f[2] | (UINT64)f[3] << 32), f[4], f[6]);
+        }
+        else if (InterlockedIncrement(&fault_logs) <= 20)
             rebox_log("d3d12_xs: console shader fault: %s at %#llx (%u bytes), instruction %#x",
                          reason < ARRAYSIZE(reasons) ? reasons[reason] : "?",
                          (unsigned long long)(f[2] | (UINT64)f[3] << 32), f[4], f[6]);

@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Tue, 24 Nov 2026 20:44:37 +0000
+Subject: [PATCH] feat(shader): cap every loop's iterations per entry with
+ APS5_LOOP_GUARD
+
+APS5_LOOP_GUARD=<n> limited the loop exits an invocation evaluated, over all
+its loops together. It now limits each loop: the loop counts its back edges in
+a variable of its own, cleared on every entry from outside, and its conditional
+exits leave once the count reaches n. After that, every other loop of the
+invocation leaves at its next conditional exit, so nested loops cannot run for
+n^depth iterations, and the invocation records one LoopLimit fault (shader
+hash, n, PC of the exit the guard forced) at its return. Loops that finish
+sooner run as before. A guest loop whose exit depends on memory the host got
+wrong otherwise runs for billions of iterations and hangs the GPU until the
+driver resets it.
+
+Programs with loops bind the fault buffer while the guard is on, and the disk
+cache keys on the limit. Split-state parts keep their 2^12 default.
+
+Tested: tests/LoopGuardTests.cpp (an endless scalar loop compiles to a module
+that validates, compares a per-loop count with the limit at its exit, and
+records LoopLimit) passes under Wine, built against Rebox's MinGW build of the
+recompiler; as do RequestMemoryView, ShaderMemoryDecoderTolerance,
+SpannedUniformity, SsaPassReads, RequestSerializer, SpirvLiteralFloat and
+SpirvValidatorExit. With the guard off the emitted SPIR-V is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Graphics/src/BdaResources.cpp             |   2 +-
+ core/shader/recompiler/CMakeLists.txt         |  17 +++
+ core/shader/recompiler/LoopGuard.hpp          |  19 +++
+ .../Optimization/src/ShaderInfoCollector.cpp  |   3 +-
+ core/shader/recompiler/ShaderDiskCache.cpp    |   4 +-
+ .../SpirvBackend/SpirvEmitterState.hpp        |  10 +-
+ .../SpirvBackend/src/SpirvEmitter.cpp         |   3 +-
+ .../SpirvBackend/src/SpirvFlowEmitter.cpp     |  86 +++++++----
+ .../recompiler/tests/LoopGuardTests.cpp       | 133 ++++++++++++++++++
+ docs/dev/ENVIRONMENT.md                       |   2 +-
+ docs/dev/debt/changes/feat-shader-loop-cap.md |   9 ++
+ 11 files changed, 250 insertions(+), 38 deletions(-)
+ create mode 100644 core/shader/recompiler/LoopGuard.hpp
+ create mode 100644 core/shader/recompiler/tests/LoopGuardTests.cpp
+ create mode 100644 docs/dev/debt/changes/feat-shader-loop-cap.md
+
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/BdaResources.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/BdaResources.cpp
+index ec5c24efc0..35bfbe50a5 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/BdaResources.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/BdaResources.cpp
+@@ -490,7 +490,7 @@ void BdaResources::checkFault(const BdaResources& record) const {
+     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
+         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
+         loopGuardTripped.store(true, std::memory_order_relaxed);
+-        std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
++        std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx was taken after %u iterations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
+         std::memset(record.faultBytes().data(), 0, record.faultBytes().size());
+         return;
+     }
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index 465c081c3b..6281a642f4 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -468,6 +468,23 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET loop_guard_tests)
++        add_test_executable(loop_guard_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardTests.cpp")
++        target_link_libraries(loop_guard_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-static)
++        target_include_directories(loop_guard_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(loop_guard_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(loop_guard_tests)
++        add_test(NAME loop_guard COMMAND loop_guard_tests)
++        set_tests_properties(loop_guard PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(loop_guard_tests PRIVATE libc)
++            set_tests_properties(loop_guard PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET spirv_validator_exit_tests)
+         add_test_executable(spirv_validator_exit_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/SpirvValidatorExit.cpp")
+         target_link_libraries(spirv_validator_exit_tests PRIVATE SPIRV-Tools-static)
+diff --git a/core/shader/recompiler/LoopGuard.hpp b/core/shader/recompiler/LoopGuard.hpp
+new file mode 100644
+index 0000000000..7051f98dc2
+--- /dev/null
++++ b/core/shader/recompiler/LoopGuard.hpp
+@@ -0,0 +1,19 @@
++#ifndef CORE_SHADER_RECOMPILER_LOOPGUARD_HPP
++#define CORE_SHADER_RECOMPILER_LOOPGUARD_HPP
++
++#include <cstdint>
++#include <cstdlib>
++
++namespace ShaderRecompiler {
++
++[[nodiscard]] inline std::uint32_t LoopGuardLimit() {
++    static const std::uint32_t limit = [] {
++        const char* text = std::getenv("APS5_LOOP_GUARD");
++        return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0));
++    }();
++    return limit;
++}
++
++}
++
++#endif
+diff --git a/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp b/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
+index c354d5da5a..c065720e7b 100644
+--- a/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
++++ b/core/shader/recompiler/Optimization/src/ShaderInfoCollector.cpp
+@@ -1,5 +1,6 @@
+ #include "Optimization/ShaderInfoCollector.hpp"
+ #include "Optimization/ResourceMaterializer.hpp"
++#include "LoopGuard.hpp"
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
+@@ -629,7 +630,7 @@ void ShaderInfoCollector::Collect(IrProgram& program, const ShaderStageInputInfo
+         return std::ranges::any_of(block->Instructions(), [](const IrValue* inst) {
+             return SharedAccessOf(inst->Opcode()) == SharedAccess::Atomic && inst->Type() == IrType::U64;
+         });
+-    });
++    }) || (LoopGuardLimit() != 0 && std::ranges::any_of(program.Metadata().blockInfo, [](const auto& info) { return info.terminator.loopHeader; }));
+     switch (program.Resources().stage) {
+         case IrShaderStage::Vertex:
+         case IrShaderStage::Local:
+diff --git a/core/shader/recompiler/ShaderDiskCache.cpp b/core/shader/recompiler/ShaderDiskCache.cpp
+index be758a9d11..6c232f7004 100644
+--- a/core/shader/recompiler/ShaderDiskCache.cpp
++++ b/core/shader/recompiler/ShaderDiskCache.cpp
+@@ -1,4 +1,5 @@
+ #include "ShaderDiskCache.hpp"
++#include "LoopGuard.hpp"
+ #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+ #include "prx/libc/include/HostThread.hpp"
+ #include "CacheKey.hpp"
+@@ -1972,7 +1973,8 @@ DiskStore& store() {
+ }
+ 
+ std::uint64_t SourceVersion() {
+-    return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
++    const std::uint64_t version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
++    return version ^ static_cast<std::uint64_t>(LoopGuardLimit()) * 0xff51afd7ed558ccdull;
+ }
+ 
+ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
+diff --git a/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp b/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
+index b0c8ff0844..3493c00c77 100644
+--- a/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
++++ b/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
+@@ -221,10 +221,14 @@ struct SpirvEmitterState {
+     // host invocations (see WaveLdsScope); 0 when none are emitted.
+     std::uint32_t waveLdsScope = 0;
+     bool insideLdsLock = false;
+-    // Debug aid (APS5_LOOP_GUARD=<exits>): after that many evaluated loop exits an invocation leaves its
+-    // loops, and the first loop that ran out is reported as a LoopLimit fault instead of hanging the GPU.
++    struct LoopGuardCounter {
++        std::uint32_t header = 0;
++        std::uint32_t merge = 0;
++        std::uint32_t continueBlock = 0;
++        std::uint32_t variable = 0;
++    };
+     std::uint32_t loopGuardLimit = 0;
+-    std::uint32_t loopGuardVisits = 0;
++    std::vector<LoopGuardCounter> loopGuardCounters;
+     std::uint32_t loopGuardPc = 0;
+     std::uint32_t srgbTableVariable = 0;
+     std::uint32_t gcnBufferFormatFunction = 0;
+diff --git a/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp b/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
+index b63d887787..c2993cebb9 100644
+--- a/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
++++ b/core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp
+@@ -1,3 +1,4 @@
++#include "LoopGuard.hpp"
+ #include "SpirvBackend/SpirvBda.hpp"
+ #include "SpirvBackend/SpirvEmitter.hpp"
+ #include "SpirvBackend/SpirvSpannedUniformity.hpp"
+@@ -336,7 +337,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
+         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
+     }
+     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
+-    if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
++    state.loopGuardLimit = LoopGuardLimit();
+     // Stopped invocations would leave the wave LDS barriers incomplete.
+     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+     state.meshWindowBuffer = target.meshWindowBuffer && program.Resources().stage == IrShaderStage::Mesh && program.Metadata().vectorWindowSize != 0u && state.laneCount * MeshWindowInvocations(state) * program.Metadata().vectorWindowSize <= MeshWindowSlotDwords;
+diff --git a/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp b/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
+index a896ae1745..70193782af 100644
+--- a/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
++++ b/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
+@@ -127,31 +127,61 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
+     EmitReturnReleasingScratch(state);
+ }
+ 
+-// The loop guard (see SpirvEmitterState::loopGuardLimit) at a branch that may leave a loop: counts the
+-// evaluation and, past the limit, takes the exit and remembers the block's PC (plus one, 0 = none).
+-std::uint32_t GuardLoopExit(SpirvEmitterState& state, const BlockInfo& info, std::uint32_t condition, bool exitWhenTrue) {
+-    const auto visits = state.module.AllocateId();
+-    state.module.AddFunction(spv::OpLoad, TypeU32(state), visits, state.loopGuardVisits);
+-    const auto next = EmitBinaryU32(state, spv::OpIAdd, visits, ConstantU32(state, 1u));
+-    state.module.AddFunction(spv::OpStore, state.loopGuardVisits, next);
+-    const auto tripped = Binary(state, spv::OpUGreaterThan, TypeBool(state), next, ConstantU32(state, state.loopGuardLimit));
++void DefineLoopGuard(SpirvEmitterState& state, const IrProgram& program) {
++    const auto pointer = TypePointer(state, spv::StorageClassPrivate, TypeU32(state));
++    if (state.loopGuardPc == 0) state.loopGuardPc = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
++    state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
++    state.loopGuardCounters.clear();
++    for (const auto& info : program.Metadata().blockInfo) {
++        const Terminator& term = info.terminator;
++        if (!term.loopHeader || term.mergeBlock == InvalidControlFlowId || term.continueBlock == InvalidControlFlowId) continue;
++        SpirvEmitterState::LoopGuardCounter counter;
++        counter.header = info.id;
++        counter.merge = term.mergeBlock;
++        counter.continueBlock = term.continueBlock;
++        counter.variable = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
++        state.module.AddFunction(spv::OpStore, counter.variable, ConstantU32(state, 0u));
++        state.loopGuardCounters.push_back(counter);
++    }
++}
++
++void CountLoopGuardEdges(SpirvEmitterState& state, const BlockInfo& info) {
++    if (state.loopGuardLimit == 0) return;
++    const Terminator& term = info.terminator;
++    for (const auto& counter : state.loopGuardCounters) {
++        if (counter.continueBlock == info.id) {
++            const auto count = state.module.AllocateId();
++            state.module.AddFunction(spv::OpLoad, TypeU32(state), count, counter.variable);
++            state.module.AddFunction(spv::OpStore, counter.variable, EmitBinaryU32(state, spv::OpIAdd, count, ConstantU32(state, 1u)));
++        } else if (counter.header == term.trueBlock || (term.kind == TerminatorKind::ConditionalBranch && counter.header == term.falseBlock)) {
++            state.module.AddFunction(spv::OpStore, counter.variable, ConstantU32(state, 0u));
++        }
++    }
++}
++
++const SpirvEmitterState::LoopGuardCounter* LoopGuardFor(const SpirvEmitterState& state, std::uint32_t merge) {
++    for (const auto& counter : state.loopGuardCounters) {
++        if (counter.merge == merge) return &counter;
++    }
++    return nullptr;
++}
++
++std::uint32_t GuardLoopExit(SpirvEmitterState& state, const BlockInfo& info, const SpirvEmitterState::LoopGuardCounter& counter, std::uint32_t condition, bool exitWhenTrue) {
++    const auto boolType = TypeBool(state);
++    const auto count = state.module.AllocateId();
++    state.module.AddFunction(spv::OpLoad, TypeU32(state), count, counter.variable);
+     const auto previous = state.module.AllocateId();
+     state.module.AddFunction(spv::OpLoad, TypeU32(state), previous, state.loopGuardPc);
+-    const auto first = Binary(state, spv::OpLogicalAnd, TypeBool(state), tripped, Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u)));
++    const auto clear = Binary(state, spv::OpIEqual, boolType, previous, ConstantU32(state, 0u));
++    const auto exhausted = Binary(state, spv::OpUGreaterThanEqual, boolType, count, ConstantU32(state, state.loopGuardLimit));
++    const auto tripped = Binary(state, spv::OpLogicalOr, boolType, exhausted, Unary(state, spv::OpLogicalNot, boolType, clear));
++    const auto exits = exitWhenTrue ? condition : Unary(state, spv::OpLogicalNot, boolType, condition);
++    const auto forced = Binary(state, spv::OpLogicalAnd, boolType, Binary(state, spv::OpLogicalAnd, boolType, exhausted, clear), Unary(state, spv::OpLogicalNot, boolType, exits));
+     const auto pc = state.module.AllocateId();
+-    state.module.AddFunction(spv::OpSelect, TypeU32(state), pc, first, ConstantU32(state, info.startPc + 1u), previous);
++    state.module.AddFunction(spv::OpSelect, TypeU32(state), pc, forced, ConstantU32(state, info.startPc + 1u), previous);
+     state.module.AddFunction(spv::OpStore, state.loopGuardPc, pc);
+-    if (exitWhenTrue) return Binary(state, spv::OpLogicalOr, TypeBool(state), condition, tripped);
+-    const auto stay = state.module.AllocateId();
+-    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), stay, tripped);
+-    return Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, stay);
+-}
+-
+-bool IsLoopMerge(const IrProgram& program, std::uint32_t block) {
+-    for (const auto& info : program.Metadata().blockInfo) {
+-        if (info.terminator.loopHeader && info.terminator.mergeBlock == block) return true;
+-    }
+-    return false;
++    if (exitWhenTrue) return Binary(state, spv::OpLogicalOr, boolType, condition, tripped);
++    return Binary(state, spv::OpLogicalAnd, boolType, condition, Unary(state, spv::OpLogicalNot, boolType, tripped));
+ }
+ 
+ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
+@@ -228,6 +258,7 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
+                 EmitReturnTerminator(ctx);
+                 return;
+             }
++            CountLoopGuardEdges(state, info);
+             emitMerge();
+             state.module.AddFunction(spv::OpBranch, ctx.Label(target));
+             return;
+@@ -244,6 +275,7 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
+                 const std::string message = "branch condition " + std::string(IrOpcodeName(resolved->Opcode())) + " of block " + std::to_string(info.id) + " (defined in " + where + ") was not emitted before the branch";
+                 ctx.Fail(message.c_str());
+             }
++            CountLoopGuardEdges(state, info);
+             if (ctx.Label(trueBlock) == ctx.Label(falseBlock)) {
+                 if (term.loopHeader) emitMerge();
+                 state.module.AddFunction(spv::OpBranch, ctx.Label(trueBlock));
+@@ -251,8 +283,8 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
+             }
+             auto condition = EmitBranchCondition(ctx, info);
+             if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {
+-                if (IsLoopMerge(program, term.trueBlock)) condition = GuardLoopExit(state, info, condition, true);
+-                else if (IsLoopMerge(program, term.falseBlock)) condition = GuardLoopExit(state, info, condition, false);
++                if (const auto* counter = LoopGuardFor(state, term.trueBlock)) condition = GuardLoopExit(state, info, *counter, condition, true);
++                else if (const auto* counter = LoopGuardFor(state, term.falseBlock)) condition = GuardLoopExit(state, info, *counter, condition, false);
+             }
+             static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+             if (debug) std::fprintf(stderr, "[spirv] block %u branches on %%%u = %s (kind %d)\n", static_cast<unsigned>(info.id), condition, std::string(IrOpcodeName(info.condition->Resolve()->Opcode())).c_str(), static_cast<int>(info.terminator.condition));
+@@ -1364,13 +1396,7 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
+     if (blocks.empty() || blocks.front() == nullptr) {
+         context.Fail("structured control flow requires at least one block");
+     }
+-    if (state.loopGuardLimit != 0) {
+-        const auto pointer = TypePointer(state, spv::StorageClassPrivate, TypeU32(state));
+-        if (state.loopGuardVisits == 0) state.loopGuardVisits = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+-        if (state.loopGuardPc == 0) state.loopGuardPc = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+-        state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
+-        state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
+-    }
++    if (state.loopGuardLimit != 0) DefineLoopGuard(state, program);
+     PlanFaultCheckDominators(state, program);
+     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
+     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+diff --git a/core/shader/recompiler/tests/LoopGuardTests.cpp b/core/shader/recompiler/tests/LoopGuardTests.cpp
+new file mode 100644
+index 0000000000..e71f963d3e
+--- /dev/null
++++ b/core/shader/recompiler/tests/LoopGuardTests.cpp
+@@ -0,0 +1,133 @@
++#include "BdaAbi.hpp"
++#include "LoopGuard.hpp"
++#include "Recompiler.hpp"
++#include <spirv-tools/libspirv.hpp>
++#include <spirv/unified1/spirv.hpp>
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <exception>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++constexpr std::uint32_t Limit = 0x100000u;
++
++constexpr std::array<std::uint32_t, 5> EndlessLoop{
++    0xbe880381u,
++    0x80088108u,
++    0xbf078008u,
++    0xbf85fffdu,
++    0xbf810000u,
++};
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 4> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++RecompileResult CompileEndlessLoop() {
++    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    const std::vector<MemoryRegion> regions;
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, std::span<const std::uint32_t>(EndlessLoop), 0, {}},
++        {32u, 0, {}, compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    return Recompile(request);
++}
++
++struct Instruction {
++    spv::Op op;
++    std::span<const std::uint32_t> operands;
++};
++
++std::vector<Instruction> Instructions(std::span<const std::uint32_t> words) {
++    std::vector<Instruction> instructions;
++    for (std::size_t index = 5; index < words.size();) {
++        const auto count = words[index] >> 16u;
++        Require(count != 0u && index + count <= words.size(), "the module's instructions are well formed");
++        instructions.push_back({static_cast<spv::Op>(words[index] & 0xffffu), words.subspan(index + 1u, count - 1u)});
++        index += count;
++    }
++    return instructions;
++}
++
++void TestEndlessLoopLeavesAtTheLimit() {
++    Require(LoopGuardLimit() == Limit, "APS5_LOOP_GUARD is read as the limit");
++    const auto result = CompileEndlessLoop();
++    const auto view = result.spirv.Words();
++    const std::vector<std::uint32_t> words(view.begin(), view.end());
++
++    std::string log;
++    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
++    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* message) { log += message; });
++    spvtools::ValidatorOptions options;
++    options.SetScalarBlockLayout(true);
++    if (!tools.Validate(words.data(), words.size(), options)) std::fprintf(stderr, "%s\n", log.c_str());
++    Require(tools.Validate(words.data(), words.size(), options), "the guarded loop validates");
++
++    Require(std::ranges::any_of(result.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "a program with a guarded loop binds the fault buffer");
++
++    const auto instructions = Instructions(words);
++    std::vector<std::uint32_t> merges;
++    std::vector<std::uint32_t> limitConstants;
++    for (const auto& instruction : instructions) {
++        if (instruction.op == spv::OpLoopMerge) merges.push_back(instruction.operands[0]);
++        if (instruction.op == spv::OpConstant && instruction.operands.size() == 3u && instruction.operands[2] == Limit) limitConstants.push_back(instruction.operands[1]);
++    }
++    Require(!merges.empty(), "the endless loop is a structured loop");
++    Require(!limitConstants.empty(), "the limit is a constant of the module");
++    for (const auto merge : merges) {
++        Require(std::ranges::any_of(instructions, [&](const Instruction& instruction) {
++            return instruction.op == spv::OpBranchConditional && (instruction.operands[1] == merge || instruction.operands[2] == merge);
++        }), "every loop has a conditional exit to its merge block");
++    }
++    Require(std::ranges::any_of(instructions, [&](const Instruction& instruction) {
++        return instruction.op == spv::OpUGreaterThanEqual && std::ranges::find(limitConstants, instruction.operands[3]) != limitConstants.end();
++    }), "an iteration count is compared with the limit");
++    Require(std::ranges::any_of(instructions, [&](const Instruction& instruction) {
++        return instruction.op == spv::OpFunctionCall && instruction.operands.size() > 3u && instruction.operands[3] == [&] {
++            for (const auto& constant : instructions) {
++                if (constant.op == spv::OpConstant && constant.operands.size() == 3u && constant.operands[2] == static_cast<std::uint32_t>(BdaAbi::FaultReason::LoopLimit)) return constant.operands[1];
++            }
++            return 0u;
++        }();
++    }), "a loop the guard stopped records a LoopLimit fault");
++}
++
++}
++
++int main() {
++#ifdef _WIN32
++    _putenv("APS5_LOOP_GUARD=0x100000");
++#else
++    setenv("APS5_LOOP_GUARD", "0x100000", 1);
++#endif
++    try {
++        TestEndlessLoopLeavesAtTheLimit();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++    std::puts("loop guard tests passed");
++    return 0;
++}
+diff --git a/docs/dev/ENVIRONMENT.md b/docs/dev/ENVIRONMENT.md
+index 9dd407db1c..882956ed36 100644
+--- a/docs/dev/ENVIRONMENT.md
++++ b/docs/dev/ENVIRONMENT.md
+@@ -32,7 +32,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
+ 
+ ### core/shader
+ 
+-`APS5_LOOP_GUARD=<exits>` limits evaluated loop exits per shader invocation (`core/shader/recompiler/SpirvBackend/src/SpirvEmitter.cpp`); `0` or an unset variable disables that limit. Its presence separately enables the AGC fault buffer, as listed under `libSceAgcDriver`.
++`APS5_LOOP_GUARD=<iterations>` (decimal or `0x` hex) makes every loop of a recompiled program leave after that many iterations per entry (`core/shader/recompiler/LoopGuard.hpp`, `SpirvBackend/src/SpirvFlowEmitter.cpp`); `0` or an unset variable disables it. Each loop counts its back edges in a variable of its own, cleared when the loop is entered; once the count reaches the limit, its conditional exits leave, every other loop of the invocation leaves at its next conditional exit, and the invocation records one `LoopLimit` fault (address: shader hash, bytes: the limit, instruction: PC of the first exit the guard forced). Loops that finish sooner run as before. Programs with loops then bind a fault buffer, and the disk cache keys on the value. A loop whose exits are all unconditional branches inside its body is not stopped. Its presence separately enables the AGC fault buffer, as listed under `libSceAgcDriver`.
+ 
+ | Name | Kind | Source | Default | Description |
+ |------|------|--------|---------|-------------|
+diff --git a/docs/dev/debt/changes/feat-shader-loop-cap.md b/docs/dev/debt/changes/feat-shader-loop-cap.md
+new file mode 100644
+index 0000000000..f04963acb5
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-loop-cap.md
+@@ -0,0 +1,9 @@
++# shader
++
++## change [Split table calls]
++
++- [Split table calls](../../../core/shader/recompiler/ControlFlow/src/GraphBuilder.cpp) - with `APS5_SPLIT_TABLE_CALLS`, a compute table call in a waterfall loop runs as an entry part, one part per callee and a resume part, in slices whose saved state fits in `APS5_SPLIT_STATE_BYTES`, with compute barriers between parts that the console does not have. An indirect dispatch runs `APS5_SPLIT_SLICES` slices, so its groups past them are not run. Not handled: a callee that writes a register the loop reads (the replay runs the loop without the other callees, so its picks can differ), and code after the loop that reads a scalar register a callee wrote (it sees the value from before the loop). Goto variables are not saved. Each part's loops stop with a reported fault after 2^12 iterations per entry, so a longer console loop is cut short. A part whose LDS or scratch is in device memory, or whose state exceeds `maxStorageBufferRange`, throws. Split dispatches use no recipes and no dispatch cache.
++
++## add Functional
++
++- [Loop guard](../../../core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp) (shader recompiler) - with `APS5_LOOP_GUARD=<iterations>`, each structured loop counts its back edges in a variable cleared when the loop is entered, and its conditional exits leave once the count reaches the limit; every other loop of the invocation then leaves at its next conditional exit, and one `LoopLimit` fault is recorded when the invocation returns. A console loop that legitimately runs longer is cut short, and the loops after it compute different results (the fault is reported). A loop whose exits are all unconditional branches inside a conditional part of its body has no exit the guard can force, and is not stopped. The cost per iteration (a counter increment, two loads and a compare at each exit) was not measured on hardware.
+-- 
+2.55.0
+

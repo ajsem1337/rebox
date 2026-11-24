@@ -238,7 +238,8 @@ The smoke test runs the whole path on lavapipe:
 - `test_console_dispatch`: a deferred PSO from RDNA2 code that stores `0x1234abcd` through the V#
   at the start of its descriptor table, dispatched and read back; again with the V# behind a
   pointer in root constants into `ReboxGpuAlloc` memory; and again from a console container
-  created as an ordinary compute PSO;
+  created as an ordinary compute PSO; and a scalar loop that would run four billion times, which
+  the loop guard (patch 0012) stops after 2^20 iterations with a loop-limit fault;
 - `test_console_draw`: a console vertex shader that calls the fetch and exports input 0 as the
   position, scaled by a constant buffer read through descriptor table 0 (s8), and a pixel shader
   exporting red, in real containers, draw a full-screen triangle;
@@ -265,6 +266,13 @@ which AnyPS5's decoder accepts from patch 0010. Of 497 of those (the other 29 ru
 minutes each; one with its clamp bits cleared runs as long without the patch), 177 now compile,
 validate and finalize, 303 need the draw's descriptors, and 17 fail later (8 bindings at finalize, 8 Phi
 dominance, 1 sampler pairs).
+
+`cs PLAN [FIRST [COUNT]]` compiles the compute shaders of a compute plan (`NAME CODE SKIP RSRC1
+RSRC2 X,Y,Z [WAVE]`) with no guest memory and validates them; each line also gives a hash of the
+SPIR-V and the entry point's loops: how many, and how many have no conditional exit (which patch
+0012's guard can't stop). `SA5_DUMP_SPIRV=DIR` writes each module there. With the guard at 2^20,
+329 of 353 of the target title's compute shaders (every seventh of its PS09 cache) compile this way
+and all validate; 212 have loops, 8,751 in all, and every one has a conditional exit.
 
 `memo PLAN NAME [ITERATIONS]` times the path every draw and dispatch takes once a shader is
 compiled: compute shader `NAME` of a compute plan (`NAME CODE SKIP RSRC1 RSRC2 X,Y,Z [WAVE]`),
@@ -294,7 +302,11 @@ dispatches captured them all before being refused.
 Patch 0004's speculation of descriptors and table pointers it can't evaluate is on by default:
 `d3d12_xs` sets `APS5_SPECULATE_DESCRIPTORS` when it loads, before anything loads AnyPS5, and
 `REBOX_ANYPS5_SPECULATE=0` turns it off. A wrong guess sets the fault buffer, which `d3d12_xs`
-reads back and logs. The other patches are listed in
+reads back and logs. Patch 0012's loop guard is on by default too: `d3d12_xs` sets
+`APS5_LOOP_GUARD=0x100000`, so every translated loop leaves after 2^20 iterations per entry
+instead of running as long as data we got wrong says (a GPU hang, then a lost device). A loop
+stopped this way is logged as `console shader <hash> left a loop at its limit`; `APS5_LOOP_GUARD=0`
+turns the guard off and another value sets the limit. The other patches are listed in
 [patches/anyps5/README.md](../patches/anyps5/README.md).
 
 ## Where AnyPS5 runs
