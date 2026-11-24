@@ -1441,8 +1441,57 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             0xf800180f, 0x00000100, /* exp mrt0 v0, v1, v0, v0 done vm */
             0xbf810000,             /* s_endpgm */
         };
+        /* attr0:<stage id>,...: those pixel stages export their interpolant 0's xyz instead (a
+         * vertex colour), alpha 1. */
+        static const UINT32 attr0[] = {
+            0xbefc0309,                         /* s_mov_b32 m0, s9 (the primitive mask) */
+            0xc8080000, 0xc8090001,             /* v_interp_p1/p2_f32 v2, attr0.x */
+            0xc80c0100, 0xc80d0101,             /* v3, attr0.y */
+            0xc8100200, 0xc8110201,             /* v4, attr0.z */
+            0x7e0a02f2,                         /* v_mov_b32 v5, 1.0 */
+            0x5e000702, 0x5e020b04,             /* v_cvt_pkrtz_f16_f32 v0, v2, v3; v1, v4, v5 */
+            0xf8001c0f, 0x00000100,             /* exp mrt0 v0, v0, v1, v1 done compr vm */
+            0xbf810000,                         /* s_endpgm */
+        };
+        /* texture<hex>:<stage id>,...: those pixel stages export, as grey, the first channel of the
+         * texture whose T# is at that offset of their s8 table, sampled (level 0) at interpolant
+         * 1's xy: whether a texture they read holds anything. */
+        static UINT32 texture[] = {
+            0xbefc0309, 0xbe890380,             /* s_mov_b32 m0, s9; s_mov_b32 s9, 0 */
+            0xf40c0504, 0xfa000040,             /* s_load_dwordx8 s[20:27], s[8:9], <offset> */
+            0xc8080400, 0xc8090401,             /* v_interp_p1/p2_f32 v2, attr1.x */
+            0xc80c0500, 0xc80d0501,             /* v3, attr1.y */
+            0xb0240092, 0xbea503ff, 0x00c00000, /* s[36:39]: the video shader's sampler (linear, clamp) */
+            0xbea603ff, 0x14500000, 0xbea70380,
+            0xbf8cc07f,                         /* s_waitcnt lgkmcnt(0) */
+            0xf09c0108, 0x01250402,             /* image_sample_lz v4, v[2:3], s[20:27], s[36:39] dmask:1 2D */
+            0xbf8c3f70,                         /* s_waitcnt vmcnt(0) */
+            0x7e0a02f2,                         /* v_mov_b32 v5, 1.0 */
+            0x5e000904, 0x5e020b04,             /* v_cvt_pkrtz_f16_f32 v0, v4, v4; v1, v4, v5 */
+            0xf8001c0f, 0x00000100,             /* exp mrt0 v0, v0, v1, v1 done compr vm */
+            0xbf810000,                         /* s_endpgm */
+        };
         const char *debug = getenv("REBOX_GRAPHICS_DEBUG");
         BOOL solid = debug && (!strcmp(debug, "magenta") || !strcmp(debug, "fullscreen"));
+        const UINT32 *replacement = magenta;
+        UINT replacement_dwords = ARRAYSIZE(magenta);
+        if (debug && (!strncmp(debug, "attr0:", 6) || !strncmp(debug, "texture", 7)))
+        {
+            char id[24];
+            const char *ids = strchr(debug, ':');
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            if (ids && strstr(ids, id))
+            {
+                solid = TRUE;
+                if (debug[0] == 'a')
+                    replacement = attr0, replacement_dwords = ARRAYSIZE(attr0);
+                else
+                {
+                    texture[3] = 0xfa000000 | (strtoul(debug + 7, NULL, 16) & 0x1fffff);
+                    replacement = texture, replacement_dwords = ARRAYSIZE(texture);
+                }
+            }
+        }
         /* magenta:<stage id>,...: only those pixel stages (ids as the log names them). */
         if (debug && !strncmp(debug, "magenta:", 8))
         {
@@ -1452,8 +1501,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         }
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
-        preq.code = solid ? magenta : req.code;
-        preq.code_dwords = solid ? ARRAYSIZE(magenta) : req.code_dwords;
+        preq.code = solid ? replacement : req.code;
+        preq.code_dwords = solid ? replacement_dwords : req.code_dwords;
         preq.code_address = req.code_address;
         preq.wave = req.wave;
         preq.user_data = req.user_data;
