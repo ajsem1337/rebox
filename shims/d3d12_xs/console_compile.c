@@ -921,6 +921,10 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes)
     static volatile LONG resolved;
     UINT64 address = *base, end;
 
+    /* Only its start is checked: V#s with all-ones record counts are raw pointers to memory of
+     * no stated size, and requiring all of that to be GPU memory refused them, which broke the
+     * shaders that use them. */
+    bytes = min(bytes, 0x10000ull);
     if (!address || !bytes || address < 0x100000000ull || address + bytes > 0x400000000000ull
             || (address + bytes > 0x200000000000ull && address < 0x210000000000ull))
         return TRUE;
