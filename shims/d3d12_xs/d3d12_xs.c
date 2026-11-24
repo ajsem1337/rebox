@@ -269,10 +269,17 @@ static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, vo
     char line[256];
     int at = 0;
 
+    BOOL in_ok = FALSE, out_ok = FALSE;
     if (!ps->register_count || !vs->register_count
-            || !signature_semantics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, FALSE, in_names, in_indices)
-            || !signature_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, TRUE, out_names, out_indices))
+            || !(in_ok = signature_semantics(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, FALSE, in_names, in_indices))
+            || !(out_ok = signature_semantics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, TRUE, out_names, out_indices)))
+    {
+        if (watched)
+            rebox_log("d3d12_xs: graphics PSO interpolants not linked: pixel stage reads %u, vertex stage exports %u, "
+                      "pixel signature %s, vertex signature %s", ps->register_count, vs->register_count,
+                      in_ok ? "read" : "not read", out_ok ? "read" : "not read");
         return;
+    }
     for (UINT n = 0; n < ps->register_count; n++)
     {
         UINT reg = ps->registers[n], out = 32, param = 32;
