@@ -1480,7 +1480,10 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
 
     if (InterlockedExchange(&budget_frame, frame) != frame)
         InterlockedExchange64(&frame_compile_ticks, 0);
-    if (graphics && budget && frame_compile_ticks >= budget)
+    /* Draws into display-sized targets (the UI, text, the final composite) are never left out:
+     * they come late in a frame, after the scene's draws have spent its budget, and an intro's
+     * title card text was skipped frame after frame. They still only wait a bounded time. */
+    if (graphics && budget && frame_compile_ticks >= budget && !(in_display_draw && current_draw.target >= 0))
     {
         LONG n = InterlockedIncrement(&budget_skips);
         if (!(n & (n - 1)) && n >= 64)
