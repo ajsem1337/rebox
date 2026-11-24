@@ -65,7 +65,7 @@ struct embedded
 
 /* A write of count dwords, or (size set) a copy of size bytes from source. */
 struct cpu_write { UINT64 address; UINT32 values[2]; UINT count; UINT64 source, size; };
-struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; };
+struct memory_wait { UINT64 address, value, mask; UINT32 comparison, width; UINT writes_before; };
 
 struct proxy
 {
@@ -3066,7 +3066,16 @@ static void cpu_writes_after(struct proxy *queue, UINT count, ID3D12CommandList 
  * list, frames seconds apart). So each address written so gets a fence, signalled with the value
  * after the writing list's submission, on its queue; a wait for a counter (greater, greater or
  * equal, all bits) is that queue waiting for the fence, on the GPU. */
-struct value_fence { UINT64 address; ID3D12Fence *fence; UINT64 signalled; struct value_fence *next; };
+struct value_fence
+{
+    UINT64 address;
+    ID3D12Fence *fence;
+    UINT64 signalled;
+    struct value_fence *next;
+    void *last_queue;     /* the queue a list writing it was last submitted on, the value and when */
+    UINT64 last_value;
+    LONGLONG last_at;
+};
 static struct value_fence *value_fences[4096];
 static SRWLOCK value_fence_lock = SRWLOCK_INIT;
 
@@ -3111,6 +3120,14 @@ static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12Com
             {
                 UINT64 value = w[k].count == 2 ? (UINT64)w[k].values[1] << 32 | w[k].values[0] : w[k].values[0];
                 struct value_fence *f = value_fence(w[k].address);
+                if (f)
+                {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    f->last_queue = queue;
+                    f->last_value = value;
+                    f->last_at = now.QuadPart;
+                }
                 if (f && value > f->signalled)
                 {
                     ID3D12CommandQueue_Signal(queue, f->fence, value);
@@ -3125,7 +3142,7 @@ static void signal_value_fences(ID3D12CommandQueue *queue, UINT count, ID3D12Com
 /* GPU waits whose value may come another way: written by the title's CPU or a shader, not a list's
  * Write*BitValue. A thread watches the memory of each pending one and signals its fence from the CPU
  * once the value is there, or after 2 s (as a CPU-side wait gave up), so no queue waits for ever. */
-struct pending_value_wait { struct memory_wait wait; struct value_fence *fence; UINT64 target; LONGLONG since; };
+struct pending_value_wait { struct memory_wait wait; struct value_fence *fence; UINT64 target; LONGLONG since; void *queue; };
 static struct pending_value_wait pending_value_waits[256];
 static UINT pending_value_wait_count;
 static BOOL wait_satisfied(const struct memory_wait *w);
@@ -3140,10 +3157,17 @@ static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLON
     if (now - pw->since >= timeout)
     {
         static LONG logged;
-        if (InterlockedIncrement(&logged) <= 8)
-            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx at %#llx timed out after 2 s; signalled from the CPU",
-                      (unsigned long long)pw->wait.address, (unsigned long long)pw->target,
-                      (unsigned long long)pw->wait.address);
+        if (InterlockedIncrement(&logged) <= 32)
+        {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p (its list wrote %u values before it) timed "
+                      "out after 2 s; signalled from the CPU. A list writing it was last submitted %s%p, value %#llx, "
+                      "%.0f ms before the wait", (unsigned long long)pw->wait.address, (unsigned long long)pw->target,
+                      pw->queue, pw->wait.writes_before, pw->fence->last_queue == pw->queue ? "on the same queue " : "on ",
+                      pw->fence->last_queue, (unsigned long long)pw->fence->last_value,
+                      pw->fence->last_at ? (pw->since - pw->fence->last_at) * 1000.0 / (double)f.QuadPart : 0.0);
+        }
     }
     ID3D12Fence_Signal(pw->fence->fence, pw->target);
     if (pw->target > pw->fence->signalled)
@@ -3189,7 +3213,7 @@ static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wa
         static LONG started;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        pending_value_waits[pending_value_wait_count++] = (struct pending_value_wait){ *w, f, target, now.QuadPart };
+        pending_value_waits[pending_value_wait_count++] = (struct pending_value_wait){ *w, f, target, now.QuadPart, queue };
         if (!InterlockedExchange(&started, 1))
             CloseHandle(CreateThread(NULL, 0, value_wait_watcher, NULL, 0, NULL));
         ID3D12CommandQueue_Wait(queue, f->fence, target);
@@ -4139,7 +4163,8 @@ static void list_wait(struct proxy *p, UINT64 address, UINT32 comparison, UINT64
         p->waits = grown;
         p->wait_capacity = capacity;
     }
-    p->waits[p->wait_count++] = (struct memory_wait){ address, value, mask, comparison, width };
+    p->waits[p->wait_count++] = (struct memory_wait){ address, value, mask, comparison, width,
+                                                      p->cpu_write_count + p->gpu_write_count };
 }
 
 static void STDMETHODCALLTYPE list_Wait32BitValueX(struct proxy *p, UINT64 address, UINT32 comparison, UINT32 value,
