@@ -28,6 +28,7 @@
 #define WIDL_C_INLINE_WRAPPERS
 #include <windows.h>
 #include <d3d12.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -656,6 +657,34 @@ static int batches_reclaim(ID3D12CommandQueue *queue)
     return free_slot;
 }
 
+/* REBOX_DUMP_TITLE_TEXTURE=<address>: with REBOX_DUMP_FRAMES, the title memory of the texture
+ * there is written at each round of the state log as DIR\texture_<address>_<round>.bin (its bytes
+ * as laid out; the log line gives the size and mode), to see what the title put in it. */
+static void dump_title_texture(const struct title_texture *t, UINT round)
+{
+    static UINT64 address = ~0ull;
+    const char *dir = getenv("REBOX_DUMP_FRAMES");
+    char path[MAX_PATH];
+    FILE *f;
+
+    if (address == ~0ull)
+    {
+        char *v = rebox_getenv("REBOX_DUMP_TITLE_TEXTURE");
+        address = v ? _strtoui64(v, NULL, 16) : 0;
+        free(v);
+    }
+    if (!address || t->address != address || !dir || t->unreadable || !t->cpu)
+        return;
+    snprintf(path, sizeof(path), "%s\\texture_%llx_%u.bin", dir, (unsigned long long)address, round);
+    if (!(f = fopen(path, "wb")))
+    {
+        rebox_log("d3d12_xs: cannot write %s", path);
+        return;
+    }
+    fwrite(t->cpu, 1, t->size, f);
+    fclose(f);
+}
+
 /* Screen-sized textures kept in step (a video's planes) and A8 ones (glyph atlases), every 600 submissions, eight times: how
  * they are laid out, how often uploaded, and whether their memory holds anything. Called with the
  * lock held. */
@@ -678,6 +707,7 @@ static void log_large(void)
                   t->surface.height, t->surface.format, t->surface.mode, t->uploads, t->dirty ? ", dirty" : "",
                   t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "",
                   (unsigned long long)nonzero, (unsigned long long)sampled);
+        dump_title_texture(t, rounds);
     }
 }
 
