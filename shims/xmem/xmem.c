@@ -130,130 +130,23 @@ void *WINAPI xmem_low_virtual_alloc(void *address, SIZE_T size, DWORD type, DWOR
     return address;
 }
 
-/* Write watching. Title memory that can hold textures (XMemVirtualAlloc's plain reservations and
- * XMemAlloc's page allocations) is reserved with MEM_WRITE_WATCH, so the system notes each 4 KiB
- * page written; before each submission d3d12_xs asks for the written pages (GetWriteWatch with
- * WRITE_WATCH_FLAG_RESET) and uploads the placed textures on them (title_textures.c), as xcl does
- * (ivall/xcl, GPL-2.0-only, title_textures.rs). Wine has write watches: the kernel's (userfaultfd
- * write-protect and PAGEMAP_SCAN, Linux 6.7 on) or else read-only pages its own fault handler
- * takes; either way a write by the system (ReadFile, DirectStorage) is noted, not failed. Physical
- * pages (section views) and GPU memory chunks can't be watched. Checked once with a write of our
- * own; REBOX_DIRTY_PAGES=0: no watching. */
-static struct { ULONG_PTR base, size; } *watched;
-static UINT watched_count, watched_cap;
-static LONG watched_generation;
-static SRWLOCK watched_lock = SRWLOCK_INIT;
-
-static BOOL CALLBACK check_write_watch(INIT_ONCE *once, void *param, void **ctx)
-{
-    char *v = rebox_getenv("REBOX_DIRTY_PAGES");
-    BOOL off = v && !strcmp(v, "0");
-    void *addresses[4];
-    ULONG_PTR count = ARRAYSIZE(addresses);
-    ULONG granularity;
-    BYTE *p;
-
-    free(v);
-    *ctx = NULL;
-    if (off)
-        return TRUE;
-    if (!(p = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)))
-    {
-        rebox_log("xmem: MEM_WRITE_WATCH refused (error %lu): placed textures are fingerprinted", GetLastError());
-        return TRUE;
-    }
-    GetWriteWatch(WRITE_WATCH_FLAG_RESET, p, 0x10000, addresses, &count, &granularity);
-    p[0x2000] = 1;
-    count = ARRAYSIZE(addresses);
-    if (!GetWriteWatch(WRITE_WATCH_FLAG_RESET, p, 0x10000, addresses, &count, &granularity) && count == 1
-            && addresses[0] == p + 0x2000)
-        *ctx = (void *)MEM_WRITE_WATCH;
-    else
-        rebox_log("xmem: write watching doesn't see a write (%lu pages): placed textures are fingerprinted",
-                  (unsigned long)count);
-    VirtualFree(p, 0, MEM_RELEASE);
-    return TRUE;
-}
-
-/* MEM_WRITE_WATCH if title memory is watched, else 0. */
-static DWORD write_watch(void)
-{
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    void *ctx = NULL;
-    InitOnceExecuteOnce(&once, check_write_watch, NULL, &ctx);
-    return (DWORD)(ULONG_PTR)ctx;
-}
-
-static void note_watched(void *p, SIZE_T size)
-{
-    if (!p)
-        return;
-    AcquireSRWLockExclusive(&watched_lock);
-    if (watched_count == watched_cap)
-    {
-        UINT cap = watched_cap ? watched_cap * 2 : 64;
-        void *grown = realloc(watched, cap * sizeof(*watched));
-        if (grown)
-            watched = grown, watched_cap = cap;
-    }
-    if (watched_count < watched_cap)
-    {
-        watched[watched_count].base = (ULONG_PTR)p;
-        watched[watched_count++].size = size;
-        InterlockedIncrement(&watched_generation);
-    }
-    ReleaseSRWLockExclusive(&watched_lock);
-}
-
-static void forget_watched(const void *p)
-{
-    AcquireSRWLockExclusive(&watched_lock);
-    for (UINT i = 0; i < watched_count; i++)
-        if (watched[i].base == (ULONG_PTR)p)
-        {
-            watched[i] = watched[--watched_count];
-            InterlockedIncrement(&watched_generation);
-            break;
-        }
-    ReleaseSRWLockExclusive(&watched_lock);
-}
-
-/* For d3d12_xs: the write-watched reservations, up to max as (base, size) pairs. Returns how many
- * there are; *generation changes whenever they do. */
-UINT WINAPI ReboxWatchedMemory(ULONGLONG *ranges, UINT max, LONG *generation)
-{
-    UINT n;
-    AcquireSRWLockShared(&watched_lock);
-    n = watched_count;
-    for (UINT i = 0; i < n && i < max; i++)
-        ranges[2 * i] = watched[i].base, ranges[2 * i + 1] = watched[i].size;
-    if (generation)
-        *generation = watched_generation;
-    ReleaseSRWLockShared(&watched_lock);
-    return n;
-}
-
 /* VirtualAlloc only guarantees 64 KiB: reserve extra, then re-reserve the
- * aligned part (another thread can take it in between, so retry). Write-watched. */
+ * aligned part (another thread can take it in between, so retry). */
 static void *virtual_alloc_aligned(SIZE_T size, SIZE_T alignment)
 {
-    DWORD watch = write_watch();
-    void *p = NULL;
-
     if (alignment <= (64 << 10))
-        p = xmem_low_virtual_alloc(NULL, size, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE);
-    for (int i = 0; !p && alignment > (64 << 10) && i < 8; i++)
+        return xmem_low_virtual_alloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    for (int i = 0; i < 8; i++)
     {
-        BYTE *probe = xmem_low_virtual_alloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS);
+        BYTE *probe = xmem_low_virtual_alloc(NULL, size + alignment, MEM_RESERVE, PAGE_NOACCESS), *p;
         if (!probe)
             return NULL;
         p = (BYTE *)(((ULONG_PTR)probe + alignment - 1) & ~(ULONG_PTR)(alignment - 1));
         VirtualFree(probe, 0, MEM_RELEASE);
-        p = VirtualAlloc(p, size, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE);
+        if ((p = VirtualAlloc(p, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+            return p;
     }
-    if (p && watch)
-        note_watched(p, size);
-    return p;
+    return NULL;
 }
 
 static BOOL wants_pages(XALLOC_ATTRIBUTES attr)
@@ -479,10 +372,7 @@ void WINAPI XMemFreeDefault(void *address, ULONGLONG attributes)
      * _aligned_malloc results are never the base of a VirtualAlloc region. */
     if (VirtualQuery(address, &mbi, sizeof(mbi)) && mbi.AllocationBase == address
         && mbi.Type == MEM_PRIVATE)
-    {
-        forget_watched(address);
         VirtualFree(address, 0, MEM_RELEASE);
-    }
     else
         _aligned_free(address);
 }
@@ -798,13 +688,6 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
     else if (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER))
         p = virtual_alloc2(address, size, host_type | (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)),
                            host_protect);
-    /* A reservation is write-watched, unless the title asked for that itself (its GetWriteWatch
-     * calls would then miss what ours reset). */
-    else if ((type & MEM_RESERVE) && !(type & MEM_WRITE_WATCH) && write_watch())
-    {
-        if ((p = xmem_low_virtual_alloc(address, size, host_type | MEM_WRITE_WATCH, host_protect)))
-            note_watched(p, size);
-    }
     else
         p = xmem_low_virtual_alloc(address, size, host_type, host_protect);
     /* Memory committed inside a range reserved for physical pages (a UE5 title commits 64 KiB of
@@ -838,10 +721,7 @@ BOOL WINAPI XMemVirtualFree(void *address, SIZE_T size, DWORD type)
     if (type & MEM_DECOMMIT)
         xmem_note_page_op("XMemVirtualFree(MEM_DECOMMIT)", (ULONG_PTR)address, size ? size : 1);
     if (type & MEM_RELEASE)
-    {
         forget_reservation(address);
-        forget_watched(address);
-    }
     if ((type & MEM_RELEASE) && release_physical_range(address))
         return TRUE;
     return VirtualFree(address, size, type);

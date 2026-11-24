@@ -14,11 +14,7 @@
  * FULL_HASH_MAX are hashed whole, within FULL_HASH_BUDGET bytes a submission, so a small edit is
  * seen too (Unreal's font atlas gains glyphs as text is first drawn); larger ones are sampled,
  * which sees a texture rewritten (a streaming slot refilled), not a small edit between samples.
- * REBOX_TEXTURE_WATCH=0 turns the sampling off. Textures wholly in write-watched title memory
- * (xmem reserves it with MEM_WRITE_WATCH) aren't sampled: before each submission the pages written
- * since the last one are asked for (GetWriteWatch, reset), and the textures on them made dirty, as
- * xcl does (ivall/xcl, GPL-2.0-only, title_textures.rs). Physical-page views and GPU memory chunks
- * can't be watched; their textures are sampled as before.
+ * REBOX_TEXTURE_WATCH=0 turns the sampling off.
  *
  * The swizzle mode: a console Layout from 0x100 is 0x100 plus the AMD swizzle mode (0x100 linear,
  * 0x105 SW_4KB_S, 0x10A SW_64KB_D; xcl and TuxBox, xcl checked against xg_xs.dll on 29,700 descs).
@@ -57,7 +53,6 @@ struct title_texture
     UINT uploads;
     BOOL gpu_written;           /* a GPU copy wrote it: title memory isn't its contents (font atlases) */
     BOOL target;                /* a render target kept in step anyway (small_cpu_filled_target) */
-    BOOL watched;               /* wholly in write-watched memory: written pages find its changes */
     UINT callback;
     struct title_texture *next;
     struct title_texture *rnext;  /* in by_resource */
@@ -273,227 +268,14 @@ static BOOL hot(const struct title_texture *t)
             || (t->uploads == 1 && t->surface.mips == 1 && detile_element(t->surface.format, &block) && block == 1);
 }
 
-/* Write-watched title memory, under the lock: xmem's watched reservations (ReboxWatchedMemory),
- * each with the span its watched textures lie in (only that is asked about), and the GPU memory
- * chunks, which can't be watched: memory adopted there is the Vulkan driver's mapping now, which
- * the kernel's write watch skips without a word. Both reread when they change. */
-struct watched_range { UINT64 start, end, lo, hi; BOOL failed; };
-static struct watched_range *watched_ranges;
-static UINT watched_count;
-static struct gpu_memory_region *chunk_regions;
-static UINT chunk_count;
-static LONG watched_generation = -1, chunks_generation = -1;
-
-static BOOL in_chunk(UINT64 start, UINT64 end)
-{
-    for (UINT i = 0; i < chunk_count; i++)
-        if (start < (UINT64)(ULONG_PTR)chunk_regions[i].cpu + chunk_regions[i].size
-                && (UINT64)(ULONG_PTR)chunk_regions[i].cpu < end)
-            return TRUE;
-    return FALSE;
-}
-
-static void set_watched(struct title_texture *t)
-{
-    UINT64 start = (UINT64)(ULONG_PTR)t->cpu, end = start + t->size;
-
-    t->watched = FALSE;
-    if (t->chunk || !t->cpu || in_chunk(start, end))
-        return;
-    for (UINT i = 0; i < watched_count; i++)
-    {
-        struct watched_range *r = &watched_ranges[i];
-        if (!r->failed && start >= r->start && end <= r->end)
-        {
-            t->watched = TRUE;
-            r->lo = r->hi > r->lo ? min(r->lo, start) : start;
-            r->hi = max(r->hi, end);
-            return;
-        }
-    }
-}
-
-static void refresh_watched(void)
-{
-    static UINT (WINAPI *ranges_of)(ULONGLONG *, UINT, LONG *);
-    static BOOL resolved;
-    LONG generation = 0, chunks = gpu_memory_generation();
-    ULONGLONG *pairs;
-    UINT n, cap;
-
-    if (!resolved)
-    {
-        HMODULE xmem = GetModuleHandleA("xmem.dll");
-        ranges_of = xmem ? (void *)GetProcAddress(xmem, "ReboxWatchedMemory") : NULL;
-        resolved = TRUE;
-    }
-    if (!ranges_of)
-        return;
-    n = ranges_of(NULL, 0, &generation);
-    if (generation == watched_generation && chunks == chunks_generation)
-        return;
-    for (;;) /* again if they grew in between */
-    {
-        cap = n + 16;
-        if (!(pairs = malloc(cap * 2 * sizeof(*pairs))))
-            return;
-        if ((n = ranges_of(pairs, cap, &generation)) <= cap)
-            break;
-        free(pairs);
-    }
-    free(watched_ranges);
-    if (!(watched_ranges = calloc(n ? n : 1, sizeof(*watched_ranges))))
-        n = 0;
-    for (UINT i = 0; i < n; i++)
-        watched_ranges[i].start = pairs[2 * i], watched_ranges[i].end = pairs[2 * i] + pairs[2 * i + 1];
-    free(pairs);
-    watched_count = n;
-    for (cap = chunk_count ? chunk_count * 2 : 64;; cap *= 2)
-    {
-        free(chunk_regions);
-        if (!(chunk_regions = calloc(cap, sizeof(*chunk_regions))))
-        {
-            chunk_count = 0;
-            break;
-        }
-        if ((chunk_count = gpu_memory_regions(chunk_regions, cap)) < cap)
-            break;
-    }
-    watched_generation = generation;
-    chunks_generation = chunks;
-    {
-        static LONG logged;
-        UINT count = 0, in = 0;
-        for (struct title_texture *t = textures; t; t = t->next, count++)
-        {
-            set_watched(t);
-            in += t->watched;
-        }
-        if (InterlockedIncrement(&logged) <= 8)
-            rebox_log("d3d12_xs: %u write-watched reservation(s), %u GPU memory chunk(s); %u of %u placed textures "
-                      "write-watched", watched_count, chunk_count, in, count);
-    }
-}
-
-/* Under the lock: textures whose memory overlaps [start, end), written, made dirty. */
-static UINT mark_written(UINT64 start, UINT64 end)
-{
-    UINT changed = 0;
-    for (UINT64 page = start >> 16; page <= (end - 1) >> 16; page++)
-        for (struct page_node *n = by_page[page_bucket(page)]; n; n = n->next)
-        {
-            struct title_texture *t = n->t;
-            UINT64 cpu = (UINT64)(ULONG_PTR)t->cpu;
-            if (n->page == page && t->watched && !t->dirty && !t->unreadable && !t->gpu_written
-                    && start < cpu + t->size && cpu < end)
-            {
-                t->dirty = TRUE;
-                InterlockedIncrement(&dirty_count);
-                changed++;
-            }
-        }
-    return changed;
-}
-
-/* Under the lock: the pages written in [start, end) since the last asking, which resets them.
- * FALSE if the system won't say (not write-watched memory). */
-static BOOL scan_written(UINT64 start, UINT64 end, UINT *changed)
-{
-    static void *written[4096];
-    UINT64 at = start;
-
-    while (at < end)
-    {
-        ULONG_PTR count = ARRAYSIZE(written);
-        ULONG granularity = 0;
-        UINT64 run_start = 0, run_end = 0;
-
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(ULONG_PTR)at, (SIZE_T)(end - at), written, &count,
-                          &granularity) || !granularity)
-            return FALSE;
-        for (ULONG_PTR i = 0; i < count; i++)
-        {
-            UINT64 page = (UINT64)(ULONG_PTR)written[i];
-            if (page != run_end)
-            {
-                if (run_end)
-                    *changed += mark_written(run_start, run_end);
-                run_start = page;
-            }
-            run_end = page + granularity;
-        }
-        if (run_end)
-            *changed += mark_written(run_start, run_end);
-        if (count < ARRAYSIZE(written))
-            break;
-        at = run_end;
-    }
-    return TRUE;
-}
-
-/* Under the lock: textures in write-watched memory written since the last submission made dirty.
- * Each watched span is asked about around the GPU memory chunks in it. */
-static UINT watch_written(void)
-{
-    UINT changed = 0;
-
-    refresh_watched();
-    for (UINT i = 0; i < watched_count; i++)
-    {
-        struct watched_range *r = &watched_ranges[i];
-        UINT64 at = r->lo & ~0xfffull, end = (r->hi + 0xfff) & ~0xfffull;
-        BOOL ok = TRUE;
-
-        while (!r->failed && at < end && ok)
-        {
-            UINT64 next = end, after = end;
-            for (UINT k = 0; k < chunk_count; k++)
-            {
-                UINT64 c0 = (UINT64)(ULONG_PTR)chunk_regions[k].cpu, c1 = c0 + chunk_regions[k].size;
-                if (c0 < end && c1 > at && max(c0, at) < next)
-                    next = max(c0, at), after = c1;
-            }
-            if (next > at)
-                ok = scan_written(at, next, &changed);
-            at = after;
-        }
-        if (!ok)
-        {
-            /* Released behind xmem's back, or not watched after all: its textures are sampled. */
-            static LONG logged;
-            if (InterlockedIncrement(&logged) <= 4)
-                rebox_log("d3d12_xs: GetWriteWatch on %#llx-%#llx failed (error %lu); its textures are fingerprinted",
-                          (unsigned long long)r->start, (unsigned long long)r->end, GetLastError());
-            r->failed = TRUE;
-            for (struct title_texture *t = textures; t; t = t->next)
-                if (t->watched && (UINT64)(ULONG_PTR)t->cpu >= r->start && (UINT64)(ULONG_PTR)t->cpu < r->end)
-                {
-                    t->watched = FALSE;
-                    if (!t->dirty && !t->unreadable && !t->gpu_written)
-                    {
-                        t->dirty = TRUE; /* written or not: its fingerprint is old */
-                        InterlockedIncrement(&dirty_count);
-                    }
-                }
-        }
-    }
-    return changed;
-}
-
 /* Called with the lock held. */
 static void watch(void)
 {
     struct title_texture *t = textures;
-    UINT skipped = 0, checked = 0, changed = 0, written = watch_written();
+    UINT skipped = 0, checked = 0, changed = 0;
     UINT64 hashed = 0;
     BOOL sample = watch_enabled();
 
-    if (written)
-    {
-        static LONG logged;
-        if (InterlockedIncrement(&logged) <= 4)
-            rebox_log("d3d12_xs: %u placed texture(s) on pages written since the last submission", written);
-    }
     for (; t && skipped < watch_cursor; t = t->next)
         skipped++;
     if (!t)
@@ -501,8 +283,7 @@ static void watch(void)
     for (; t && checked < WATCH_BUDGET && hashed < FULL_HASH_BUDGET; t = t->next, checked++)
         if (t->unreadable)
             recheck(t);
-        else if (sample && !t->watched && !t->dirty && !t->gpu_written && still_readable(t)
-                 && (hashed += full_hash(t) ? t->size : 0, TRUE)
+        else if (sample && !t->dirty && !t->gpu_written && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, TRUE)
                  && fingerprint(t) != t->fingerprint)
         {
             t->dirty = TRUE;
@@ -519,7 +300,7 @@ static void watch(void)
      * overwrote what the GPU drew into them (menu text got worse). */
     hashed = 0;
     for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (hot(t) && !t->watched && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
+        if (hot(t) && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
                 && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, fingerprint(t) != t->fingerprint))
         {
             t->dirty = TRUE;
@@ -819,8 +600,6 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     t->next = textures;
     textures = t;
     index_add(t);
-    refresh_watched();
-    set_watched(t);
     if (t->dirty)
         InterlockedIncrement(&dirty_count);
     ReleaseSRWLockExclusive(&lock);
@@ -1051,10 +830,10 @@ static void log_large(void)
         if (!t->unreadable && t->cpu && still_readable(t))
             for (UINT64 at = 0, step = t->size <= (4u << 20) ? 1 : 4093; at < t->size; at += step, sampled++)
                 nonzero += t->cpu[at] != 0; /* up to 4 MiB (a glyph atlas) every byte */
-        rebox_log("d3d12_xs: large title texture at %#llx: %ux%u format %u, mode %u, %u uploads%s%s%s%s, "
+        rebox_log("d3d12_xs: large title texture at %#llx: %ux%u format %u, mode %u, %u uploads%s%s%s, "
                   "%llu of %llu sampled bytes nonzero", (unsigned long long)t->address, t->surface.width,
                   t->surface.height, t->surface.format, t->surface.mode, t->uploads, t->dirty ? ", dirty" : "",
-                  t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "", t->watched ? ", watched" : "",
+                  t->unreadable ? ", unreadable" : "", t->gpu_written ? ", GPU's" : "",
                   (unsigned long long)nonzero, (unsigned long long)sampled);
         dump_title_texture(t, rounds);
     }
@@ -1099,9 +878,7 @@ void title_textures_upload(ID3D12CommandQueue *queue)
         {
             t->dirty = FALSE;
             InterlockedDecrement(&dirty_count);
-            /* None for a watched texture: if it stops being one, the old one makes it upload again. */
-            if (!t->watched)
-                t->fingerprint = fingerprint(t);
+            t->fingerprint = fingerprint(t);
             if ((b->buffers[b->count] = record_upload(device, b->list, t)))
             {
                 b->count++;
