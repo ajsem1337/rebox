@@ -3079,6 +3079,7 @@ struct value_fence
     LONGLONG last_at;
 };
 static struct value_fence *value_fences[4096];
+static volatile LONG value_timeouts; /* GPU waits that timed out (log_list_order) */
 static SRWLOCK value_fence_lock = SRWLOCK_INIT;
 
 /* Under value_fence_lock, exclusive. */
@@ -3171,6 +3172,7 @@ static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLON
     if (now - pw->since >= timeout)
     {
         static LONG logged;
+        InterlockedIncrement(&value_timeouts);
         if (InterlockedIncrement(&logged) <= 32)
         {
             LARGE_INTEGER f;
@@ -3334,6 +3336,45 @@ static void submit_mark(LARGE_INTEGER *mark, UINT part)
     *mark = now;
 }
 
+/* Once a GPU wait has timed out: the next submissions' lists, each wait and write in the order
+ * recorded (writes before a wait listed before it), to see which queue's order makes a cycle. */
+static void log_list_order(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
+{
+    static LONG logged;
+
+    if (!value_timeouts || logged >= 120)
+        return;
+    for (UINT i = 0; i < count; i++)
+    {
+        const struct proxy *l = (const struct proxy *)lists[i];
+        char line[1024];
+        int at = 0;
+        UINT c = 0, g = 0;
+        if (!is_proxy(l) || (!l->wait_count && !l->cpu_write_count && !l->gpu_write_count))
+            continue;
+        for (UINT k = 0; k <= l->wait_count && at < 900; k++)
+        {
+            UINT cpu_end = k < l->wait_count ? l->waits[k].cpu_before : l->cpu_write_count;
+            UINT gpu_end = k < l->wait_count ? l->waits[k].gpu_before : l->gpu_write_count;
+            for (; c < cpu_end && at < 900; c++)
+                if (!l->cpu_writes[c].size)
+                    at += snprintf(line + at, sizeof(line) - at, " w%llx=%x", (unsigned long long)l->cpu_writes[c].address & 0xfff,
+                                   l->cpu_writes[c].values[0]);
+            for (; g < gpu_end && at < 900; g++)
+                at += snprintf(line + at, sizeof(line) - at, " W%llx=%x", (unsigned long long)l->gpu_writes[g].address & 0xfff,
+                               l->gpu_writes[g].values[0]);
+            if (k < l->wait_count && at < 900)
+                at += snprintf(line + at, sizeof(line) - at, " wait%llx%s%llx", (unsigned long long)l->waits[k].address & 0xfff,
+                               l->waits[k].comparison == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? ">=" :
+                               l->waits[k].comparison == D3D12_COMPARISON_FUNC_GREATER ? ">" : "?",
+                               (unsigned long long)l->waits[k].value);
+        }
+        if (InterlockedIncrement(&logged) > 120)
+            return;
+        rebox_log("d3d12_xs: order: queue %p list %u/%u:%s", (void *)INNER(p, ID3D12CommandQueue), i, count, line);
+    }
+}
+
 static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
     ID3D12CommandList *stack[64] = { 0 }, **raw = count <= ARRAYSIZE(stack) ? stack : malloc(count * sizeof(*raw));
@@ -3371,6 +3412,7 @@ static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *
                     rebox_log("d3d12_xs: list %p writing %#llx by the CPU (where a wait timed out) submitted on queue %p "
                               "(thread %#lx)", l, (unsigned long long)l->cpu_writes[k].address, p, GetCurrentThreadId());
         }
+    log_list_order(p, count, lists);
     /* Memory waits the lists start with: on the GPU for counters, else on the CPU (lists_wait). */
     lists_wait(p, count, lists);
     submit_mark(&mark, 0);
