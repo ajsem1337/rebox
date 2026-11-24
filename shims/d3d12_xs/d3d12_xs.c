@@ -259,7 +259,7 @@ static UINT format_bytes(DXGI_FORMAT f)
  * A UE5 title's Slate PS reads COLOR0 as attr0 and TEXCOORD1 as attr1, so taking attr n = param n
  * sampled every UI texture at the wrong coordinates). Left as attr n = param n where a table or
  * signature is missing. */
-static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *vs_blob, void *ps_blob)
+static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *vs_blob, void *ps_blob, BOOL watched)
 {
     struct rebox_deferred_graphics *vs = (void *)((struct rebox_deferred_shader *)vs_blob + 1);
     struct rebox_deferred_graphics *ps = (void *)((struct rebox_deferred_shader *)ps_blob + 1);
@@ -288,15 +288,21 @@ static void link_interpolants(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, vo
             linked++;
         }
         if (at < 200)
-            at += snprintf(line + at, sizeof(line) - at, " attr%u=%s%u->param%d", n, reg < 32 && in_names[reg]
+            at += snprintf(line + at, sizeof(line) - at, " attr%u=%s%u->param%d%s", n, reg < 32 && in_names[reg]
                            ? in_names[reg] : "?", reg < 32 ? in_indices[reg] : 0, out < 32 && param < vs->register_count
-                           ? (int)param : -1);
+                           ? (int)param : -1, ps->flat[n] ? " flat" : "");
     }
     ps->interpolator_count = max(ps->interpolator_count, ps->register_count);
     line[min(at, (int)sizeof(line) - 1)] = 0;
-    if (InterlockedIncrement(&shown) <= 8)
+    if (watched || InterlockedIncrement(&shown) <= 8)
+    {
         rebox_log("d3d12_xs: graphics PSO interpolants: %u of %u linked by semantic:%s", linked,
                      ps->register_count, line);
+        if (watched)
+            for (UINT n = 0; n < ps->interpolator_count && n < 32; n++)
+                rebox_log("d3d12_xs:   SPI_PS_INPUT_CNTL_%u = %#x (VS exports %u params)", n, ps->interpolators[n],
+                          vs->register_count);
+    }
 }
 
 static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, void *pso)
@@ -401,7 +407,8 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
                       e ? e->SemanticName : "?", e ? e->SemanticIndex : 0, g->elements[r].dxgi_format, g->elements[r].slot,
                       g->elements[r].offset, g->elements[r].per_instance ? ", per instance" : "");
         }
-    link_interpolants(desc, vs, ps);
+    link_interpolants(desc, vs, ps, console_stage_watched(console_stage_id(vs, vs_size))
+                      || console_stage_watched(console_stage_id(ps, ps_size)));
     memcpy((BYTE *)g + g->vs_offset, vs, vs_size);
     memcpy((BYTE *)g + g->ps_offset, ps, ps_size);
     if (SUCCEEDED(ID3D12PipelineState_SetPrivateData((ID3D12PipelineState *)pso, &REBOX_GRAPHICS_GUID, g->size, g))
