@@ -1066,6 +1066,14 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
         ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)res)[10])(res, &rd);
         srv.Format = view_format(rd.Format);
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        /* The T#'s channel select is applied in the shader, to the texel as the console's hardware
+         * reads it, in memory order. The console has no A8 format: an A8 texture's T# is an 8-bit
+         * one taking alpha from its first channel, which the A8 view returns as 0, so a glyph
+         * atlas drew nothing. Its view returns the byte first instead. */
+        if (rd.Format == DXGI_FORMAT_A8_UNORM)
+            srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3,
+                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.DepthOrArraySize > 1)
         {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
