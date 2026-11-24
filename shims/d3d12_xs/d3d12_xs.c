@@ -371,7 +371,22 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
                         e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA };
             }
             else /* no element: no attribute (patch 0006 skips DXGI_FORMAT_UNKNOWN) */
+            {
+                static LONG logged;
                 g->elements[r] = (struct rebox_graphics_element){ 0, DXGI_FORMAT_UNKNOWN, 0, 0 };
+                if (InterlockedIncrement(&logged) <= 16)
+                {
+                    char layout[300];
+                    int at = 0;
+                    for (UINT k = 0; k < desc->InputLayout.NumElements && at < 260; k++)
+                        at += snprintf(layout + at, sizeof(layout) - at, " %s%u",
+                                       desc->InputLayout.pInputElementDescs[k].SemanticName,
+                                       desc->InputLayout.pInputElementDescs[k].SemanticIndex);
+                    layout[at] = 0;
+                    rebox_log("d3d12_xs: graphics PSO: vertex input %u (%s%u) has no input layout element; it reads "
+                              "zero (layout:%s)", r, names[r] ? names[r] : "?", indices[r], layout);
+                }
+            }
         }
     }
     link_interpolants(desc, vs, ps);
