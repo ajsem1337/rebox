@@ -404,6 +404,34 @@ static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, UINT64 *start, U
     return TRUE;
 }
 
+/* Ranges that couldn't be adopted aren't tried again for a second, by their first 64 KiB page:
+ * every root view bound asks, and each try is at least a VirtualQuery, slow in title memory full
+ * of physical-page views (a world's frames spent their time there). Racy by design: a torn entry
+ * only means another try. */
+static struct { UINT64 page, end; ULONGLONG at; } adopt_failures[4096];
+
+static UINT adopt_failure_slot(UINT64 page)
+{
+    return (UINT)((page * 0x9e3779b97f4a7c15ull) >> 52);
+}
+
+static BOOL adopt_failed_recently(UINT64 address, UINT64 end)
+{
+    UINT64 page = address >> 16;
+    UINT slot = adopt_failure_slot(page);
+    return adopt_failures[slot].page == page && end <= adopt_failures[slot].end
+            && GetTickCount64() - adopt_failures[slot].at < 1000;
+}
+
+static void note_adopt_failed(UINT64 address, UINT64 end)
+{
+    UINT64 page = address >> 16;
+    UINT slot = adopt_failure_slot(page);
+    adopt_failures[slot].page = page;
+    adopt_failures[slot].end = (end + 0xffff) & ~0xffffull;
+    adopt_failures[slot].at = GetTickCount64();
+}
+
 /* Makes [address, address + size) of the title's own memory GPU-visible at the same address: a
  * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address, fills with the
  * title's bytes and maps over the title's pages in one go (asked through the mailbox,
@@ -447,23 +475,12 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
     if (limit - end < ADOPT_MIN) /* near the granule's end: into the next one too */
         limit += ADOPT_GRANULE;
-    /* A range that couldn't be adopted isn't tried again for a second: committed_run walks the
-     * regions of the span, hundreds in title memory full of physical-page views. */
+    if (adopt_failed_recently(address, end))
+        return FALSE;
+    if (!committed_run(address, base, limit, &run_start, &run_end) || end > run_end)
     {
-        static struct { UINT64 address, end; ULONGLONG at; } failed[64];
-        static LONG next;
-        ULONGLONG now = GetTickCount64();
-        for (UINT i = 0; i < ARRAYSIZE(failed); i++)
-            if (failed[i].address <= address && end <= failed[i].end && now - failed[i].at < 1000)
-                return FALSE;
-        if (!committed_run(address, base, limit, &run_start, &run_end) || end > run_end)
-        {
-            UINT i = (UINT)InterlockedIncrement(&next) % ARRAYSIZE(failed);
-            failed[i].address = address & ~0xffffull;
-            failed[i].end = (end + 0xffff) & ~0xffffull;
-            failed[i].at = now;
-            return FALSE;
-        }
+        note_adopt_failed(address, end);
+        return FALSE;
     }
     if (base < run_start)
         base = run_start;
@@ -495,6 +512,7 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     if (base > address || limit < end || limit - base < ADOPT_MIN)
     {
         ReleaseSRWLockExclusive(&lock);
+        note_adopt_failed(address, end);
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: title memory %#llx+%#llx can't be made GPU-visible in place (committed run "
                       "%#llx-%#llx, span %#llx-%#llx)", (unsigned long long)address, (unsigned long long)size,
