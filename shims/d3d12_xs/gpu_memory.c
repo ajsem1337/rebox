@@ -52,6 +52,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static struct chunk *chunks;
 static UINT64 bytes_in_use;
 static struct allocation *table[BUCKETS];
+static volatile LONG generation; /* changes with the chunks */
 
 static unsigned bucket(const void *p)
 {
@@ -236,6 +237,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
         {
             c->next = chunks;
             chunks = c;
+            generation++;
         }
         else if (c)
         {
@@ -253,6 +255,7 @@ HRESULT WINAPI ReboxGpuAlloc(SIZE_T size, SIZE_T alignment, void **cpu, UINT64 *
             range_alloc(c, size, alignment, &offset);
             c->next = chunks;
             chunks = c;
+            generation++;
         }
     }
     if (!c)
@@ -312,6 +315,7 @@ void WINAPI ReboxGpuFree(void *cpu)
         for (cp = &chunks; *cp != c; cp = &(*cp)->next)
             ;
         *cp = c->next;
+        generation++;
         chunk_destroy(c);
     }
     ReleaseSRWLockExclusive(&lock);
@@ -518,6 +522,7 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         c->free_count = 0; /* nothing to suballocate */
         c->next = chunks;
         chunks = c;
+        generation++;
         ok = TRUE;
     }
     else if (c) /* mapped elsewhere: the title's pages are untouched */
@@ -577,4 +582,9 @@ BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset)
         }
     ReleaseSRWLockShared(&lock);
     return found;
+}
+
+LONG gpu_memory_generation(void)
+{
+    return generation;
 }

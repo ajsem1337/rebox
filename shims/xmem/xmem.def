@@ -20,6 +20,7 @@ EXPORTS
     ReboxHeartbeat
     ReboxGpuvaMailbox
     ReboxGpuViewToCpu
+    ReboxWatchedMemory
     ReboxWritePhysicalPages
     ReboxPhysicalAdopted
     ReboxPhysicalDescribe
