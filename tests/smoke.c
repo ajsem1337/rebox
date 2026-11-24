@@ -4648,6 +4648,29 @@ static void test_placed_texture_tracked(void *dev, void *queue)
               "protect %#lx)", changed, mbi.Protect);
     }
 #undef AWAY
+    {
+        /* Armed pages made GPU memory in place (d3d12_xs adopts the run around a buffer, read-only
+         * texture pages included): the driver's mapping replaces them, but Wine keeps their
+         * read-only protection, and a copy is never disarmed: DirectStorage refused the destination
+         * for good. Adoption makes them writable. Its own page and reservation, kept: an adopted
+         * range stays one. */
+        BOOL (WINAPI *track)(ULONGLONG, ULONGLONG) = (void *)GetProcAddress(x, "ReboxTrackPages");
+        void (WINAPI *adopted)(ULONGLONG, ULONGLONG) = (void *)GetProcAddress(x, "ReboxPhysicalAdopted");
+        BYTE *lone = valloc(NULL, UNIT, MEM_RESERVE | 0x400000, 0x3, PAGE_READWRITE);
+        ULONG_PTR page[1];
+        DWORD before = 0;
+
+        one = 1;
+        if (track && adopted && lone && palloc(0, &one, page) && pmap(lone, 1, page) && track((ULONG_PTR)lone, UNIT)
+                && VirtualQuery(lone, &mbi, sizeof(mbi)))
+        {
+            before = mbi.Protect;
+            adopted((ULONG_PTR)lone, UNIT);
+        }
+        CHECK(before == PAGE_READONLY && VirtualQuery(lone, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_READWRITE,
+              "armed physical pages made GPU memory in place are writable again (protect %#lx, then %#lx)", before,
+              mbi.Protect);
+    }
 done:
     CHECK(SUCCEEDED(hr) && list, "a texture placed in physical-page views (%#lx)", hr);
     if (list) XSLOT(list, 2, ULONG)(list);
