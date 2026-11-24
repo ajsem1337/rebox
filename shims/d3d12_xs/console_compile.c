@@ -27,6 +27,7 @@
 #include "../common/rebox_log.h"
 #include "../../anyps5/rebox_anyps5.h"
 #include "console_compile.h"
+#include "console_fssm.h"
 #include "console_desc.h"
 #include "gpu_memory.h"
 #include "shadow.h"
@@ -758,8 +759,44 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
 static UINT64 late_load_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n,
                                UINT32 opcode);
 
+/* The n-th T# the code's image instructions use, in the order they first use it (AnyPS5 numbers a
+ * binding's elements so: a video shader samples its Y plane, loaded third, first), traced to the
+ * s_load_dwordx8 off a table SGPR that loaded its registers; else the n-th such load. */
 static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
 {
+    const UINT32 *code = (const UINT32 *)((const BYTE *)h + h->code_offset);
+    struct { UINT sgpr; UINT64 address; } loads[32];
+    UINT load_count = 0, used[32], used_count = 0;
+
+    for (UINT32 i = 0, size; i + 1 < h->code_dwords; i += size)
+    {
+        UINT32 w0 = code[i], w1 = code[i + 1];
+        size = max(console_gfx10_size(code + i, h->code_dwords - i), 1u);
+        if (w0 == 0xbf810000u) /* s_endpgm */
+            break;
+        if (w0 >> 26 == 0x3d) /* SMEM */
+        {
+            UINT32 op = (w0 >> 18) & 0xff, sbase = (w0 & 0x3f) * 2;
+            if (op == 3 && sbase >= 8 && sbase <= 15 && in->user_sgprs[sbase] && (w1 >> 25) == 0x7d
+                    && load_count < ARRAYSIZE(loads))
+            {
+                loads[load_count].sgpr = (w0 >> 6) & 0x7f;
+                loads[load_count++].address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
+            }
+        }
+        else if (w0 >> 26 == 0x3c) /* MIMG: srsrc (in fours) in the second dword */
+        {
+            UINT sgpr = ((w1 >> 16) & 0x1f) * 4, k;
+            for (k = 0; k < used_count && used[k] != sgpr; k++)
+                ;
+            if (k == used_count && used_count < ARRAYSIZE(used))
+                used[used_count++] = sgpr;
+        }
+    }
+    if (n < used_count)
+        for (UINT k = load_count; k-- > 0;) /* the last load into those registers */
+            if (loads[k].sgpr == used[n])
+                return loads[k].address;
     return late_load_source(h, in, n, 3 /* s_load_dwordx8: a T# */);
 }
 

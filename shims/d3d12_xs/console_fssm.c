@@ -242,6 +242,13 @@ void WINAPI ReboxConsoleFree(void *blob)
 #define FSSM_GFX_RSRC1 0x108
 
 /* The next instruction's size in dwords (GFX10). */
+static UINT gfx10_size(const UINT32 *code, UINT left);
+
+UINT console_gfx10_size(const UINT32 *code, UINT left)
+{
+    return left ? gfx10_size(code, left) : 0;
+}
+
 static UINT gfx10_size(const UINT32 *code, UINT left)
 {
     UINT32 w = code[0], top9 = w >> 23, top6 = w >> 26;
