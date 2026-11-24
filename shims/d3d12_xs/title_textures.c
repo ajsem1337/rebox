@@ -150,7 +150,7 @@ static UINT submissions;
 #define WATCH_BUDGET 512                   /* textures fingerprinted per submission */
 #define FULL_HASH_MAX (4u << 20)           /* textures this size or smaller are hashed whole */
 #define FULL_HASH_BUDGET (4u << 20)        /* bytes hashed whole per submission */
-#define HOT_BUDGET (8u << 20)              /* bytes of hot textures checked every submission (a movie's planes fit) */
+#define HOT_BUDGET (32u << 20)             /* bytes of hot textures checked every submission (a movie's planes; 8 MiB left some out) */
 
 static BOOL full_hash(const struct title_texture *t)
 {
