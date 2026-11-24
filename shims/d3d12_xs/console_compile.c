@@ -1658,6 +1658,12 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             0xf800180f, 0x00000100, /* exp mrt0 v0, v1, v0, v0 done vm */
             0xbf810000,             /* s_endpgm */
         };
+        /* none:<stage id>,...: those pixel stages write nothing (an export to the null target):
+         * what a full-screen pass, such as a fade, covers. */
+        static const UINT32 nothing[] = {
+            0xf8001890, 0x00000000, /* exp null off, off, off, off done vm */
+            0xbf810000,             /* s_endpgm */
+        };
         /* attr<N>:<stage id>,...: those pixel stages export their interpolant N's xyz instead (a
          * vertex colour, texture coordinates), alpha 1. */
         static __thread UINT32 attr0[] = {
@@ -1742,6 +1748,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             char id[24];
             snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
             solid = strstr(debug + 8, id) != NULL;
+        }
+        if (debug && !strncmp(debug, "none:", 5))
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            if ((solid = strstr(debug + 5, id) != NULL))
+                replacement = nothing, replacement_dwords = ARRAYSIZE(nothing);
         }
         /* magenta-except:<stage id>,...: every pixel stage but those (a final pass kept real shows
          * whether anything drawn before it reaches what it reads). */
