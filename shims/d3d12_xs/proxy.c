@@ -3198,9 +3198,36 @@ static BOOL gpu_wait_for_value(ID3D12CommandQueue *queue, const struct memory_wa
     return f != NULL;
 }
 
+/* Time each part of a submission takes, logged at powers of two: memory waits, texture uploads,
+ * the rest before it, vkd3d-proton's ExecuteCommandLists, and what follows it. */
+static volatile LONG64 submit_ticks[5];
+static volatile LONG submit_count;
+
+static void submit_mark(LARGE_INTEGER *mark, UINT part)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    InterlockedAdd64(&submit_ticks[part], now.QuadPart - mark->QuadPart);
+    *mark = now;
+}
+
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT count, ID3D12CommandList *const *lists)
 {
     ID3D12CommandList *stack[64] = { 0 }, **raw = count <= ARRAYSIZE(stack) ? stack : malloc(count * sizeof(*raw));
+    LARGE_INTEGER mark;
+    LONG n = InterlockedIncrement(&submit_count);
+
+    if (!(n & (n - 1)) && n >= 64)
+    {
+        LARGE_INTEGER f;
+        double ms;
+        QueryPerformanceFrequency(&f);
+        ms = 1000.0 / (double)f.QuadPart / (n - 1);
+        rebox_log("d3d12_xs: %ld submissions, ms each on average: memory waits %.2f, texture uploads %.2f, other "
+                  "preparation %.2f, ExecuteCommandLists %.2f, after it %.2f", n, submit_ticks[0] * ms,
+                  submit_ticks[1] * ms, submit_ticks[2] * ms, submit_ticks[3] * ms, submit_ticks[4] * ms);
+    }
+    QueryPerformanceCounter(&mark);
 
     for (UINT i = 0; i < count; i++)
         raw[i] = proxy_unwrap(lists[i]);
@@ -3223,8 +3250,10 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
         }
     /* Memory waits the lists start with: on the GPU for counters, else on the CPU (lists_wait). */
     lists_wait(INNER(p, ID3D12CommandQueue), count, lists);
+    submit_mark(&mark, 0);
     /* Placed textures whose title memory changed are uploaded first (title_textures.c). */
     title_textures_upload(INNER(p, ID3D12CommandQueue));
+    submit_mark(&mark, 1);
     /* Descriptors the title wrote into heap memory that isn't GPU memory reach the GPU's copy. */
     shadow_sync_mirrors();
     /* Textures the title wrote after recording their draws (console_compile.c). */
@@ -3244,11 +3273,14 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(struct proxy *p, UINT co
                       "%08x %08x %08x %08x %08x %08x", (unsigned long long)at, t[0], t[1], t[2], t[3], t[4], t[5], t[6],
                       t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
     }
+    submit_mark(&mark, 2);
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
+    submit_mark(&mark, 3);
     /* Waits elsewhere for the values these lists write (signal_value_fences). */
     signal_value_fences(INNER(p, ID3D12CommandQueue), count, lists);
     /* Their writes outside GPU memory, once the GPU is there (cpu_writes_after). */
     cpu_writes_after(p, count, lists);
+    submit_mark(&mark, 4);
     if (raw != stack)
         free(raw);
 }

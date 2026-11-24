@@ -709,10 +709,10 @@ static UINT64 failed_stages[256];
 static LONG failed_stage_count;
 
 static volatile LONG graphics_calls;
-static volatile LONG64 graphics_ticks, phase_ticks[4]; /* regions, AnyPS5, bindings, module */
+static volatile LONG64 graphics_ticks, phase_ticks[8]; /* regions, AnyPS5, bindings, module; then compute's */
 static volatile LONG64 compute_ticks;
 static volatile LONG compute_calls;
-static volatile LONG64 part_ticks[4];                  /* within bindings: identity, lookups, page table, host buffers */
+static volatile LONG64 part_ticks[8];                  /* within bindings: identity, lookups, page table, host buffers; then compute's */
 
 static LONG64 ticks_now(void)
 {
@@ -1228,9 +1228,16 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         /* Compute compiles, timed the same way (at dispatch, the list's recording waits for them). */
         LONG n = InterlockedIncrement(&compute_calls);
         if (!(n & (n - 1)))
-            rebox_log("d3d12_xs: console compute: %ld compiles asked for, %.2f ms each on average", n,
-                         compute_ticks * 1000.0 / qpc_frequency() / max(n - 1, 1));
+        {
+            double ms = 1000.0 / qpc_frequency() / max(n - 1, 1);
+            rebox_log("d3d12_xs: console compute: %ld compiles asked for, %.2f ms each on average (memory regions "
+                      "%.2f, AnyPS5 %.2f, bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers "
+                      "%.2f], module %.2f)", n, compute_ticks * ms, phase_ticks[4] * ms, phase_ticks[5] * ms,
+                      phase_ticks[6] * ms, part_ticks[4] * ms, part_ticks[5] * ms, part_ticks[6] * ms,
+                      part_ticks[7] * ms, phase_ticks[7] * ms);
+        }
         QueryPerformanceCounter(&started);
+        mark = started;
     }
     if (graphics && stage_failed(stage_id))
         return E_FAIL;
@@ -1447,8 +1454,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         set_last(E_PENDING, "a background compile holds the compiler", NULL);
         return E_PENDING;
     }
-    if (graphics)
-        phase_end(&mark, 0);
+    phase_end(&mark, 0 + (graphics ? 0 : 4));
     if (graphics && h->stage == 0x1)
     {
         /* The console's fetch call (s_swappc_b64 s[4:5]) becomes Vulkan vertex attributes: input r
@@ -1778,13 +1784,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         goto done;
     }
 
-    if (graphics)
-        phase_end(&mark, 1);
+    phase_end(&mark, 1 + (graphics ? 0 : 4));
     {
         LONG64 t = ticks_now();
         sa5.identity(result, key);
-        if (graphics)
-            InterlockedAdd64(&part_ticks[0], ticks_now() - t);
+        InterlockedAdd64(&part_ticks[graphics ? 0 : 4], ticks_now() - t);
     }
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
     if (graphics)
@@ -1883,7 +1887,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = draw_buffer(table, (b.count ? b.count : 1) * 16, &table_cpu);
-                InterlockedAdd64(&part_ticks[3], ticks_now() - t);
+                InterlockedAdd64(&part_ticks[graphics ? 3 : 7], ticks_now() - t);
             }
             free(table);
             if (!va)
@@ -1990,8 +1994,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
                 BOOL null_view = FALSE;
-                if (graphics)
-                    InterlockedAdd64(&part_ticks[1], ticks_now() - lookup_start);
+                InterlockedAdd64(&part_ticks[graphics ? 1 : 5], ticks_now() - lookup_start);
                 /* A texture descriptor the title wrote outside our heaps, or an empty slot, reads
                  * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
                  * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
@@ -2145,7 +2148,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = b.word_count ? draw_buffer(b.words, bytes, NULL) : zero_buffer(bytes = 16);
-                InterlockedAdd64(&part_ticks[3], ticks_now() - t);
+                InterlockedAdd64(&part_ticks[graphics ? 3 : 7], ticks_now() - t);
                 break;
             }
             case ROLE_FAULT_BUFFER:
@@ -2167,8 +2170,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 LONG64 t = ticks_now();
                 va = page_table(&bytes);
-                if (graphics)
-                    InterlockedAdd64(&part_ticks[2], ticks_now() - t);
+                InterlockedAdd64(&part_ticks[graphics ? 2 : 6], ticks_now() - t);
                 break;
             }
             default:
@@ -2211,8 +2213,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         }
     }
 
-    if (graphics)
-        phase_end(&mark, 2);
+    phase_end(&mark, 2 + (graphics ? 0 : 4));
     if (!(module = find_module(key)))
     {
         if (graphics ? sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
@@ -2244,8 +2245,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                      req.code_dwords * 4u), module->count, remap_count, host_count, (unsigned long long)key[0]);
     }
 
-    if (graphics)
-        phase_end(&mark, 3);
+    phase_end(&mark, 3 + (graphics ? 0 : 4));
     memset(out, 0, sizeof(*out));
     out->spirv = module->words;
     out->spirv_words = module->count;
