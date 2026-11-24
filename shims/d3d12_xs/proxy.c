@@ -4245,6 +4245,9 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT coun
             if (watched && at == watched && InterlockedIncrement(&watched_binds) <= 32)
                 rebox_log("d3d12_xs: the watched render target %#llx is bound in list %p (slot %u)",
                           (unsigned long long)watched, (void *)p, i);
+            /* Its draws go in the draw census as "display target 7". */
+            if (watched && at == watched && !p->display_bound)
+                p->display_bound = 8;
         }
     }
     if (display >= 0)
