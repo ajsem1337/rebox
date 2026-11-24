@@ -2779,8 +2779,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateDerivedPipelineStateX(struct proxy
  * memory. A texture larger than the heap gets a new one (aliases made before it no longer share). */
 /* Resources placed in title memory that couldn't be made GPU memory when they were placed: a
  * title places them before it maps physical pages under them, and the GPU read them there later
- * (a fault that lost the device). Tried again before submissions, every 100 ms, until they are. */
-static struct { UINT64 address, size; } pending_adopts[1024];
+ * (a fault that lost the device). Tried again before submissions until they are: a few each time,
+ * each less often the longer it waits (every try walks the memory with VirtualQuery, and hundreds
+ * of them a submission held loading to a frame every few seconds). */
+static struct { UINT64 address, size; ULONGLONG due; UINT backoff; } pending_adopts[1024];
 static UINT pending_adopt_count;
 static SRWLOCK pending_adopt_lock = SRWLOCK_INIT;
 
@@ -2801,6 +2803,8 @@ static void adopt_or_retry(UINT64 address, UINT64 size)
         {
             pending_adopts[pending_adopt_count].address = address;
             pending_adopts[pending_adopt_count].size = size;
+            pending_adopts[pending_adopt_count].due = GetTickCount64() + 100;
+            pending_adopts[pending_adopt_count].backoff = 100;
             pending_adopt_count++;
         }
         else if (!InterlockedExchange(&full, 1))
@@ -2812,24 +2816,34 @@ static void adopt_or_retry(UINT64 address, UINT64 size)
 
 static void retry_pending_adopts(void)
 {
-    static ULONGLONG last;
+    static UINT cursor;
     static LONG made;
     ULONGLONG now = GetTickCount64();
+    UINT tries = 0;
 
-    if (!pending_adopt_count || now - last < 100)
+    if (!pending_adopt_count || !TryAcquireSRWLockExclusive(&pending_adopt_lock))
         return;
-    last = now;
-    AcquireSRWLockExclusive(&pending_adopt_lock);
-    for (UINT i = 0; i < pending_adopt_count;)
-        if (gpu_memory_adopt(pending_adopts[i].address, pending_adopts[i].size))
+    for (UINT seen = 0; seen < pending_adopt_count && tries < 4; seen++)
+    {
+        UINT i = cursor++ % pending_adopt_count;
+        if (pending_adopts[i].due > now)
+            continue;
+        tries++;
+        if (!gpu_memory_adopt(pending_adopts[i].address, pending_adopts[i].size))
+        {
+            pending_adopts[i].backoff = min(pending_adopts[i].backoff * 2, 10000u);
+            pending_adopts[i].due = now + pending_adopts[i].backoff;
+        }
+        else
         {
             if (InterlockedIncrement(&made) <= 16)
                 rebox_log("d3d12_xs: title memory at %#llx+%#llx under a placed resource is GPU memory now",
                           (unsigned long long)pending_adopts[i].address, (unsigned long long)pending_adopts[i].size);
             pending_adopts[i] = pending_adopts[--pending_adopt_count];
+            if (!pending_adopt_count)
+                break;
         }
-        else
-            i++;
+    }
     ReleaseSRWLockExclusive(&pending_adopt_lock);
 }
 
