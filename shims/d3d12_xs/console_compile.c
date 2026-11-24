@@ -1553,7 +1553,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
                 else
                 {
-                    texture[3] = 0xfa000000 | (strtoul(debug + 7, NULL, 16) & 0x1fffff);
+                    /* texturec<hex>: at the texture's centre, no interpolation */
+                    BOOL centre = debug[7] == 'c';
+                    texture[3] = 0xfa000000 | (strtoul(debug + 7 + centre, NULL, 16) & 0x1fffff);
+                    texture[4] = centre ? 0x7e0402f0 : 0xc8080400; /* v_mov_b32 v2, 0.5 */
+                    texture[5] = centre ? 0xbf800000 : 0xc8090401; /* s_nop 0 */
+                    texture[6] = centre ? 0x7e0602f0 : 0xc80c0500; /* v_mov_b32 v3, 0.5 */
+                    texture[7] = centre ? 0xbf800000 : 0xc80d0501;
                     replacement = texture, replacement_dwords = ARRAYSIZE(texture);
                 }
             }
