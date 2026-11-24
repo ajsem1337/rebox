@@ -1615,10 +1615,37 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 rebox_log("d3d12_xs: REBOX_DEBUG_PS_LZ: stage %s, %u image_sample made image_sample_lz", id, changed);
             }
         }
+        /* REBOX_DEBUG_PS_CUT=<stage id>:<dword offset>:<r>,<g>,<b>: that pixel stage's own code up
+         * to the offset (an instruction boundary), then a wait for its loads and an export of VGPRs
+         * r, g, b (alpha 1): what the code has computed by then, cut down run by run to find an
+         * instruction translated wrongly. */
+        static UINT32 cut_code[4096];
+        const char *cut = getenv("REBOX_DEBUG_PS_CUT");
+        UINT cut_dwords = 0;
+        if (!solid && cut && !strncmp(cut, lz_id, 16) && cut[16] == ':')
+        {
+            char *end;
+            UINT at = strtoul(cut + 17, &end, 10), rgb[3] = { 0, 0, 0 };
+            if (*end == ':')
+                sscanf(end + 1, "%u,%u,%u", &rgb[0], &rgb[1], &rgb[2]);
+            if (at && at <= req.code_dwords && at + 6 <= ARRAYSIZE(cut_code))
+            {
+                memcpy(cut_code, own, at * 4);
+                cut_code[at] = 0xbf8c0070u;                      /* s_waitcnt vmcnt(0) lgkmcnt(0) */
+                cut_code[at + 1] = 0x7ffe02f2u;                  /* v_mov_b32 v255, 1.0 */
+                cut_code[at + 2] = 0xf800180fu;                  /* exp mrt0 r, g, b, v255 done vm */
+                cut_code[at + 3] = (rgb[0] & 0xff) | (rgb[1] & 0xff) << 8 | (rgb[2] & 0xff) << 16 | 0xffu << 24;
+                cut_code[at + 4] = 0xbf810000u;                  /* s_endpgm */
+                own = cut_code;
+                cut_dwords = at + 5;
+                rebox_log("d3d12_xs: REBOX_DEBUG_PS_CUT: stage %s cut at dword %u, exporting v%u v%u v%u", lz_id, at,
+                          rgb[0], rgb[1], rgb[2]);
+            }
+        }
         struct sa5_pixel_request preq;
         memset(&preq, 0, sizeof(preq));
         preq.code = solid ? replacement : own;
-        preq.code_dwords = solid ? replacement_dwords : req.code_dwords;
+        preq.code_dwords = solid ? replacement_dwords : cut_dwords ? cut_dwords : req.code_dwords;
         preq.code_address = req.code_address;
         preq.wave = req.wave;
         preq.user_data = req.user_data;
