@@ -2724,6 +2724,57 @@ static void test_real_heap_va(void *dev, void *queue)
             if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
             {
                 CHECK(mapped[0] == 0x5ca71e77, "list slot 59 runs ExecuteIndirect, after slots 124, 120 and 121 (%#x)", mapped[0]);
+                mapped[0] = 0;
+                ID3D12Resource_Unmap(buf, 0, NULL);
+            }
+        }
+        /* vkd3d-proton patch 0017: an argument record nobody filled (all ones) or past D3D12's
+         * 65535 groups a dimension runs empty instead of hanging the GPU, a good record after one
+         * still runs, and a count buffer's count is clamped to MaxCommandCount. Without the
+         * clamp the first list never finishes. */
+        if (SUCCEEDED(hr) && SUCCEEDED(hr = ID3D12Resource_Map(args, 0, NULL, (void **)&dispatch)))
+        {
+            dispatch[0] = (D3D12_DISPATCH_ARGUMENTS){ ~0u, ~0u, ~0u };
+            dispatch[1] = (D3D12_DISPATCH_ARGUMENTS){ 1, 1, 1 };
+            dispatch[2] = (D3D12_DISPATCH_ARGUMENTS){ 65536, 1, 1 };
+            ((UINT *)dispatch)[16] = ~0u; /* a count, at byte 64 */
+            ID3D12Resource_Unmap(args, 0, NULL);
+        }
+        for (int pass = 0; pass < 2 && SUCCEEDED(hr); pass++)
+        {
+            UINT64 value = 4 + pass;
+            if (SUCCEEDED(hr = ID3D12CommandAllocator_Reset(alloc)))
+                hr = XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+            if (FAILED(hr))
+                break;
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, pso);
+            XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+            if (!pass)
+            {
+                XSLOT(list, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 0, NULL, 0);
+                XSLOT(list, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 1, args, 24, NULL, 0);
+            }
+            else
+                XSLOT(list, 61, void, void *, UINT, void *, UINT64, void *, UINT64)(list, sig, 2, args, 0, args, 64);
+            hr = XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, value);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
+                Sleep(10);
+            CHECK(ID3D12Fence_GetCompletedValue(fence) >= value, "ExecuteIndirect of %s finishes",
+                  pass ? "a count past MaxCommandCount" : "all-ones and 65536-group records");
+            if (ID3D12Fence_GetCompletedValue(fence) < value)
+                break;
+            if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&mapped)))
+            {
+                if (!pass)
+                    CHECK(mapped[0] == 0, "all-ones and 65536-group ExecuteIndirect records run empty (%#x)", mapped[0]);
+                else
+                    CHECK(mapped[0] == 0x5ca71e77, "ExecuteIndirect runs the good record after an all-ones one, "
+                          "its count clamped (%#x)", mapped[0]);
+                mapped[0] = 0;
                 ID3D12Resource_Unmap(buf, 0, NULL);
             }
         }

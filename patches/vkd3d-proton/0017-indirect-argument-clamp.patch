@@ -1,0 +1,866 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index c3dff3f..6f66d35 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9176,6 +9176,163 @@ static bool d3d12_command_list_emit_multi_dispatch_indirect_count(struct d3d12_c
+     return true;
+ }
+ 
++/* rebox (patch 0017): the GPU counts the records it clamps; logged at 1, 2, 4, ... of them. The
++ * count is read as recording goes on, so it trails the GPU. */
++static void d3d12_device_rebox_log_indirect_clamps(struct d3d12_device *device)
++{
++    struct vkd3d_rebox_indirect_clamp_ops *ops = &device->meta_ops.rebox_indirect_clamp;
++    const volatile uint32_t *stats = ops->stats;
++    uint32_t count, logged;
++
++    count = stats[0];
++    logged = vkd3d_atomic_uint32_load_explicit(&ops->logged_count, vkd3d_memory_order_relaxed);
++    if (count <= logged || (logged && count / 2 < logged) || logged >= (1u << 30))
++        return;
++    if (vkd3d_atomic_uint32_compare_exchange(&ops->logged_count, logged, count,
++            vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed) != logged)
++        return;
++    ERR("rebox: %u ExecuteIndirect argument records past the limits ran empty so far; the last: "
++            "%#x %#x %#x %#x %#x.\n", count, stats[1], stats[2], stats[3], stats[4], stats[5]);
++}
++
++/* rebox (patch 0017): an ExecuteIndirect whose argument buffer was never filled (a console shader
++ * not compiled yet skips the dispatch that writes it) can hold anything, all ones as often as not:
++ * billions of workgroups, and the GPU watchdog resets the device. This copies the records to
++ * scratch and bounds them (cs_rebox_indirect_clamp.comp): a dispatch or mesh dispatch with a
++ * dimension of 65535 or more or more than REBOX_INDIRECT_CLAMP_GROUPS groups, or a draw of more
++ * than REBOX_INDIRECT_CLAMP_VERTICES vertices (or indices) times instances, runs empty. With a
++ * count buffer, the count is clamped to max_command_count and records past it run empty.
++ *
++ * whole_records copies each record whole, at the signature's stride (a state template's other
++ * arguments come along); otherwise only the action's arguments, tightly packed (*out_stride).
++ * Recorded where vkd3d-proton's own argument patching goes: ahead of the list while it has had no
++ * indirect argument barrier, else in place, where it ends the render pass. Returns false when the
++ * arguments are to be used as they are. */
++static bool d3d12_command_list_rebox_clamp_indirect(struct d3d12_command_list *list,
++        const struct d3d12_command_signature *signature, uint32_t max_command_count,
++        VkDeviceAddress arg_va, VkDeviceAddress count_va, bool whole_records,
++        struct vkd3d_scratch_allocation *out_args, struct vkd3d_scratch_allocation *out_count,
++        uint32_t *out_stride)
++{
++    struct vkd3d_rebox_indirect_clamp_ops *ops = &list->device->meta_ops.rebox_indirect_clamp;
++    const D3D12_COMMAND_SIGNATURE_DESC *desc = &signature->desc;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct vkd3d_rebox_indirect_clamp_args args;
++    uint32_t kind, action_words, dst_stride;
++    VkCommandBuffer vk_patch_cmd_buffer;
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++
++    if (!ops->vk_pipeline)
++        return false;
++
++    switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type)
++    {
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
++            kind = VKD3D_REBOX_INDIRECT_CLAMP_DISPATCH;
++            action_words = sizeof(D3D12_DISPATCH_ARGUMENTS) / sizeof(uint32_t);
++            break;
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
++            kind = VKD3D_REBOX_INDIRECT_CLAMP_DRAW;
++            action_words = sizeof(D3D12_DRAW_ARGUMENTS) / sizeof(uint32_t);
++            break;
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
++            kind = VKD3D_REBOX_INDIRECT_CLAMP_DRAW_INDEXED;
++            action_words = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) / sizeof(uint32_t);
++            break;
++        default:
++            return false;
++    }
++
++    d3d12_device_rebox_log_indirect_clamps(list->device);
++
++    dst_stride = whole_records ? desc->ByteStride : action_words * sizeof(uint32_t);
++    /* Unreasonable sizes are left alone rather than given hundreds of MiB of scratch. */
++    if ((uint64_t)dst_stride * max_command_count > (64u << 20))
++    {
++        static unsigned int logged;
++        if (logged++ < 4)
++            ERR("rebox: ExecuteIndirect of up to %u records of %u bytes not clamped: too large.\n",
++                    max_command_count, desc->ByteStride);
++        return false;
++    }
++
++    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
++            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++            (VkDeviceSize)dst_stride * max_command_count, 64, ~0u, out_args))
++        return false;
++
++    if (count_va && !d3d12_command_allocator_allocate_scratch_memory(list->allocator,
++            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, sizeof(uint32_t), sizeof(uint32_t), ~0u, out_count))
++        return false;
++
++    memset(&args, 0, sizeof(args));
++    args.src_va = arg_va;
++    args.count_va = count_va;
++    args.dst_va = out_args->va;
++    args.count_out_va = count_va ? out_count->va : 0;
++    args.stats_va = ops->stats_va;
++    args.src_stride_words = desc->ByteStride / sizeof(uint32_t);
++    args.dst_stride_words = dst_stride / sizeof(uint32_t);
++    args.src_action_word = signature->argument_buffer_offset_for_command / sizeof(uint32_t);
++    /* The action is a record's last argument; the padding after it may be past the buffer's end. */
++    args.copy_words = whole_records ? args.src_action_word + action_words : 0;
++    args.dst_action_word = whole_records ? args.src_action_word : 0;
++    args.kind = kind;
++    args.max_commands = max_command_count;
++    args.max_groups_per_dim = ops->max_groups_per_dim;
++    args.max_groups = ops->max_groups;
++    args.max_count_product = ops->max_count_product;
++
++    d3d12_command_list_end_transfer_batch(list);
++
++    d3d12_command_allocator_allocate_init_post_indirect_command_buffer(list->allocator, list);
++    vk_patch_cmd_buffer = list->cmd.vk_post_indirect_barrier_commands;
++
++    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
++    {
++        d3d12_command_list_end_current_render_pass(list, true);
++        /* The copy must run whatever the predicate says: the command it feeds re-arms predication. */
++        d3d12_command_list_update_conditional_rendering_state(list, true);
++        d3d12_command_list_invalidate_current_pipeline(list, true);
++        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
++    }
++    else
++        list->cmd.indirect_meta->need_compute_to_indirect_barrier = true;
++
++    VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ops->vk_pipeline));
++    VK_CALL(vkCmdPushConstants(vk_patch_cmd_buffer, ops->vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
++            0, sizeof(args), &args));
++    VK_CALL(vkCmdDispatch(vk_patch_cmd_buffer,
++            vkd3d_compute_workgroup_count(max_command_count, vkd3d_meta_get_rebox_indirect_clamp_workgroup_size()),
++            1, 1));
++
++    /* In both places: what reads the copy may be recorded into the same command buffer (the
++     * predication pass, a state template's patch shader or preprocess). */
++    memset(&vk_barrier, 0, sizeof(vk_barrier));
++    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
++    if (list->device->device_info.device_generated_commands_features.deviceGeneratedCommands)
++    {
++        vk_barrier.dstStageMask |= VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
++        vk_barrier.dstAccessMask |= VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT;
++    }
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &vk_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(vk_patch_cmd_buffer, &dep_info));
++
++    VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_PATCH_COMPUTE);
++    *out_stride = dst_stride;
++    return true;
++}
++
+ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list *list,
+         enum vkd3d_predicate_command_type command_type, VkDeviceAddress indirect_args,
+         const union vkd3d_predicate_command_direct_args *direct_args, struct vkd3d_scratch_allocation *scratch)
+@@ -16973,8 +17130,7 @@ enum vkd3d_dgc_mode
+ static void d3d12_command_list_execute_indirect_state_template_dgc(
+         struct d3d12_command_list *list, struct d3d12_command_signature *signature,
+         uint32_t max_command_count,
+-        struct d3d12_resource *arg_buffer, UINT64 arg_buffer_offset,
+-        struct d3d12_resource *count_buffer, UINT64 count_buffer_offset,
++        VkDeviceAddress arg_va, VkDeviceAddress count_va,
+         enum vkd3d_dgc_mode dgc_mode, VkDeviceAddress preprocess_va, VkDeviceSize preprocess_size)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+@@ -17024,17 +17180,14 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+         {
+             union vkd3d_predicate_command_direct_args args;
+             enum vkd3d_predicate_command_type type;
+-            VkDeviceAddress count_va;
+             restart_predication = list->predication.enabled_on_command_buffer;
+ 
+-            if (count_buffer)
++            if (count_va)
+             {
+-                count_va = count_buffer->res.va + count_buffer_offset;
+                 type = VKD3D_PREDICATE_COMMAND_DRAW_INDIRECT_COUNT;
+             }
+             else
+             {
+-                count_va = 0;
+                 type = VKD3D_PREDICATE_COMMAND_DRAW_INDIRECT;
+                 args.draw_count = max_command_count;
+             }
+@@ -17090,10 +17243,8 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+          * matters, it's technically possible to deal with it. */
+         draw->state = list->state;
+         draw->signature = signature;
+-        draw->arg_buffer = arg_buffer;
+-        draw->arg_buffer_offset = arg_buffer_offset;
+-        draw->count_buffer = count_buffer;
+-        draw->count_buffer_offset = count_buffer_offset;
++        draw->arg_va = arg_va;
++        draw->count_va = count_va;
+         draw->max_command_count = max_command_count;
+         draw->dynamic_state = list->dynamic_state;
+         draw->graphics_bindings = list->graphics_bindings;
+@@ -17168,7 +17319,7 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+             return;
+         }
+ 
+-        if (count_buffer)
++        if (count_va)
+         {
+             if (FAILED(hr = d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+                     VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
+@@ -17181,10 +17332,10 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+         }
+ 
+         patch_args.template_va = signature->state_template.dgc.buffer_va;
+-        patch_args.api_buffer_va = arg_buffer->res.va + arg_buffer_offset;
++        patch_args.api_buffer_va = arg_va;
+         patch_args.device_generated_commands_va = stream_allocation.va;
+-        patch_args.indirect_count_va = count_buffer ? count_buffer->res.va + count_buffer_offset : 0;
+-        patch_args.dst_indirect_count_va = count_buffer ? count_allocation.va : 0;
++        patch_args.indirect_count_va = count_va;
++        patch_args.dst_indirect_count_va = count_va ? count_allocation.va : 0;
+         patch_args.api_buffer_word_stride = signature->desc.ByteStride / sizeof(uint32_t);
+         patch_args.device_generated_commands_word_stride = signature->state_template.dgc.stride / sizeof(uint32_t);
+ 
+@@ -17304,12 +17455,12 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+     {
+         generated_ext.sequenceCountAddress = predication_allocation.va;
+     }
+-    else if (count_buffer)
++    else if (count_va)
+     {
+         if (require_patch)
+             generated_ext.sequenceCountAddress = count_allocation.va;
+         else
+-            generated_ext.sequenceCountAddress = count_buffer->res.va + count_buffer_offset;
++            generated_ext.sequenceCountAddress = count_va;
+     }
+ 
+     if (require_patch)
+@@ -17319,7 +17470,7 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+     }
+     else
+     {
+-        generated_ext.indirectAddress = arg_buffer->res.va + arg_buffer_offset;
++        generated_ext.indirectAddress = arg_va;
+         generated_ext.indirectAddressSize = max_command_count * signature->state_template.dgc.stride;
+     }
+ 
+@@ -17351,14 +17502,14 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+     /* Makes RGP captures easier to read. */
+     if (signature->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE)
+     {
+-        if (count_buffer)
++        if (count_va)
+             tag = "EI (compute, indirect count)";
+         else
+             tag = "EI (compute, direct count)";
+     }
+     else
+     {
+-        if (count_buffer)
++        if (count_va)
+             tag = "EI (gfx, indirect count)";
+         else
+             tag = "EI (gfx, direct count)";
+@@ -17459,8 +17610,7 @@ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
+ 
+             d3d12_command_list_execute_indirect_state_template_dgc(list,
+                     draw->signature, draw->max_command_count,
+-                    draw->arg_buffer, draw->arg_buffer_offset,
+-                    draw->count_buffer, draw->count_buffer_offset,
++                    draw->arg_va, draw->count_va,
+                     dgc_mode, draw->preprocess_va, draw->preprocess_size);
+         }
+ 
+@@ -17513,9 +17663,15 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     const D3D12_COMMAND_SIGNATURE_DESC *signature_desc = &sig_impl->desc;
+     const D3D12_INDIRECT_ARGUMENT_DESC *last_arg_desc;
++    struct vkd3d_scratch_allocation clamped_args, clamped_count;
+     struct vkd3d_scratch_allocation scratch;
++    VkDeviceSize arg_vk_offset, count_vk_offset;
++    VkBuffer arg_vk_buffer, count_vk_buffer;
++    VkDeviceAddress arg_va, count_va;
+     uint32_t unrolled_stride;
++    uint32_t arg_stride;
+     unsigned int i;
++    bool clamped;
+ 
+     TRACE("iface %p, command_signature %p, max_command_count %u, arg_buffer %p, "
+             "arg_buffer_offset %#"PRIx64", count_buffer %p, count_buffer_offset %#"PRIx64".\n",
+@@ -17546,10 +17702,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+     if (sig_impl->requires_state_template)
+     {
++        arg_va = arg_impl->res.va + arg_buffer_offset;
++        count_va = count_impl ? count_impl->res.va + count_buffer_offset : 0;
++
++        /* rebox (patch 0017): whole records, so the template reads the copy as it would the
++         * title's buffer. Recorded in place, the copy ends the render pass: draws batched before
++         * it go first. */
++        if (list->device->meta_ops.rebox_indirect_clamp.vk_pipeline &&
++                list->cmd.vk_post_indirect_barrier_commands == list->cmd.vk_command_buffer)
++            d3d12_command_list_flush_dgc_batch(list);
++        if (d3d12_command_list_rebox_clamp_indirect(list, sig_impl, max_command_count,
++                arg_va, count_va, true, &clamped_args, &clamped_count, &arg_stride))
++        {
++            arg_va = clamped_args.va;
++            if (count_va)
++                count_va = clamped_count.va;
++        }
++
+         d3d12_command_list_execute_indirect_state_template_dgc(list, sig_impl,
+-                max_command_count,
+-                arg_impl, arg_buffer_offset,
+-                count_impl, count_buffer_offset, VKD3D_DGC_MODE_APPLICATION_CALL, 0, 0);
++                max_command_count, arg_va, count_va, VKD3D_DGC_MODE_APPLICATION_CALL, 0, 0);
+         VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_TEMPLATE);
+         return;
+     }
+@@ -17576,6 +17747,39 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+         return;
+     }
+ 
++    arg_vk_buffer = arg_impl->res.vk_buffer;
++    arg_vk_offset = arg_impl->mem.offset + arg_buffer_offset;
++    arg_va = arg_impl->res.va + arg_buffer_offset;
++    arg_stride = signature_desc->ByteStride;
++    if (count_impl)
++    {
++        count_vk_buffer = count_impl->res.vk_buffer;
++        count_vk_offset = count_impl->mem.offset + count_buffer_offset;
++        count_va = count_impl->res.va + count_buffer_offset;
++    }
++    else
++    {
++        count_vk_buffer = VK_NULL_HANDLE;
++        count_vk_offset = 0;
++        count_va = 0;
++    }
++
++    /* rebox (patch 0017): what follows reads the bounded copy. */
++    if ((clamped = d3d12_command_list_rebox_clamp_indirect(list, sig_impl, max_command_count,
++            arg_va, count_va, false, &clamped_args, &clamped_count, &arg_stride)))
++    {
++        arg_vk_buffer = clamped_args.buffer;
++        arg_vk_offset = clamped_args.offset;
++        arg_va = clamped_args.va;
++        if (count_va)
++        {
++            count_vk_buffer = clamped_count.buffer;
++            count_vk_offset = clamped_count.offset;
++            count_va = clamped_count.va;
++        }
++    }
++    unrolled_stride = arg_stride;
++
+     if (list->predication.fallback_enabled)
+     {
+         union vkd3d_predicate_command_direct_args args;
+@@ -17589,7 +17793,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+                 if (count_buffer)
+                 {
+                     type = VKD3D_PREDICATE_COMMAND_DRAW_INDIRECT_COUNT;
+-                    indirect_va = count_impl->res.va + count_buffer_offset;
++                    indirect_va = count_va;
+                 }
+                 else
+                 {
+@@ -17602,7 +17806,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+                 type = VKD3D_PREDICATE_COMMAND_DISPATCH_INDIRECT;
+-                indirect_va = arg_impl->res.va + arg_buffer_offset;
++                indirect_va = arg_va;
+                 break;
+ 
+             default:
+@@ -17617,28 +17821,31 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+     {
+         /* Unroll to N normal indirect dispatches, use count buffer to mask dispatches to (0, 0, 0).
+          * Can use this path for indirect trace rays as well since as needed. */
+-        if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
++        if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && clamped)
++        {
++            /* The clamp already emptied the records past the count. */
++            scratch = clamped_args;
++        }
++        else if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
+         {
+             if (!d3d12_command_list_emit_multi_dispatch_indirect_count(list,
+-                    arg_impl->res.va + arg_buffer_offset,
+-                    unrolled_stride, max_command_count,
+-                    count_impl->res.va + count_buffer_offset, &scratch))
++                    arg_va, unrolled_stride, max_command_count, count_va, &scratch))
+                 return;
+ 
+             unrolled_stride = sizeof(VkDispatchIndirectCommand);
+         }
+         else
+         {
+-            scratch.buffer = count_impl->res.vk_buffer;
+-            scratch.offset = count_impl->mem.offset + count_buffer_offset;
+-            scratch.va = count_impl->res.va + count_buffer_offset;
++            scratch.buffer = count_vk_buffer;
++            scratch.offset = count_vk_offset;
++            scratch.va = count_va;
+         }
+     }
+     else
+     {
+-        scratch.buffer = arg_impl->res.vk_buffer;
+-        scratch.offset = arg_impl->mem.offset + arg_buffer_offset;
+-        scratch.va = arg_impl->res.va + arg_buffer_offset;
++        scratch.buffer = arg_vk_buffer;
++        scratch.offset = arg_vk_offset;
++        scratch.va = arg_va;
+     }
+ 
+     d3d12_command_list_end_transfer_batch(list);
+@@ -17653,14 +17860,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+             if (count_buffer || list->predication.fallback_enabled)
+             {
+-                VK_CALL(vkCmdDrawIndirectCount(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+-                        arg_buffer_offset + arg_impl->mem.offset, scratch.buffer, scratch.offset,
+-                        max_command_count, signature_desc->ByteStride));
++                VK_CALL(vkCmdDrawIndirectCount(list->cmd.vk_command_buffer, arg_vk_buffer,
++                        arg_vk_offset, scratch.buffer, scratch.offset,
++                        max_command_count, arg_stride));
+             }
+             else
+             {
+-                VK_CALL(vkCmdDrawIndirect(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+-                        arg_buffer_offset + arg_impl->mem.offset, max_command_count, signature_desc->ByteStride));
++                VK_CALL(vkCmdDrawIndirect(list->cmd.vk_command_buffer, arg_vk_buffer,
++                        arg_vk_offset, max_command_count, arg_stride));
+             }
+             break;
+ 
+@@ -17678,14 +17885,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+             if (count_buffer || list->predication.fallback_enabled)
+             {
+-                VK_CALL(vkCmdDrawIndexedIndirectCount(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+-                        arg_buffer_offset + arg_impl->mem.offset, scratch.buffer, scratch.offset,
+-                        max_command_count, signature_desc->ByteStride));
++                VK_CALL(vkCmdDrawIndexedIndirectCount(list->cmd.vk_command_buffer, arg_vk_buffer,
++                        arg_vk_offset, scratch.buffer, scratch.offset,
++                        max_command_count, arg_stride));
+             }
+             else
+             {
+-                VK_CALL(vkCmdDrawIndexedIndirect(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+-                        arg_buffer_offset + arg_impl->mem.offset, max_command_count, signature_desc->ByteStride));
++                VK_CALL(vkCmdDrawIndexedIndirect(list->cmd.vk_command_buffer, arg_vk_buffer,
++                        arg_vk_offset, max_command_count, arg_stride));
+             }
+             break;
+ 
+@@ -17698,9 +17905,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+             if (count_buffer || list->predication.fallback_enabled)
+             {
+-                VK_CALL(vkCmdDrawMeshTasksIndirectCountEXT(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+-                        arg_buffer_offset + arg_impl->mem.offset, scratch.buffer, scratch.offset,
+-                        max_command_count, signature_desc->ByteStride));
++                VK_CALL(vkCmdDrawMeshTasksIndirectCountEXT(list->cmd.vk_command_buffer, arg_vk_buffer,
++                        arg_vk_offset, scratch.buffer, scratch.offset,
++                        max_command_count, arg_stride));
+             }
+             else
+             {
+@@ -17708,7 +17915,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+                  * Has to work. */
+                 VK_CALL(vkCmdDrawMeshTasksIndirectEXT(list->cmd.vk_command_buffer,
+                         scratch.buffer, scratch.offset,
+-                        max_command_count, signature_desc->ByteStride));
++                        max_command_count, arg_stride));
+             }
+             break;
+ 
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 477b366..d5681ae 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -35,6 +35,7 @@ vkd3d_shaders =[
+   'shaders/cs_execute_indirect_patch.comp',
+   'shaders/cs_execute_indirect_patch_debug_ring.comp',
+   'shaders/cs_execute_indirect_multi_dispatch.comp',
++  'shaders/cs_rebox_indirect_clamp.comp',
+ 
+   'shaders/cs_sampler_feedback_decode_buffer_min_mip.comp',
+   'shaders/fs_sampler_feedback_decode_image_min_mip.frag',
+diff --git a/libs/vkd3d/meta.c b/libs/vkd3d/meta.c
+index 770efda..cbfa502 100644
+--- a/libs/vkd3d/meta.c
++++ b/libs/vkd3d/meta.c
+@@ -1563,6 +1563,95 @@ fail:
+     return hresult_from_vk_result(vr);
+ }
+ 
++static void vkd3d_rebox_indirect_clamp_ops_cleanup(struct vkd3d_rebox_indirect_clamp_ops *ops,
++        struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VK_CALL(vkDestroyPipeline(device->vk_device, ops->vk_pipeline, NULL));
++    VK_CALL(vkDestroyPipelineLayout(device->vk_device, ops->vk_pipeline_layout, NULL));
++    VK_CALL(vkDestroyBuffer(device->vk_device, ops->vk_stats_buffer, NULL));
++    if (ops->stats_memory.vk_memory)
++        vkd3d_free_device_memory(device, &ops->stats_memory);
++    memset(ops, 0, sizeof(*ops));
++}
++
++static uint32_t vkd3d_rebox_env_u32(const char *name, uint32_t fallback)
++{
++    char value[32];
++    char *end;
++    unsigned long v;
++
++    if (!vkd3d_get_env_var(name, value, sizeof(value)))
++        return fallback;
++    v = strtoul(value, &end, 0);
++    return end != value && v && v <= UINT32_MAX ? (uint32_t)v : fallback;
++}
++
++/* rebox (patch 0017). Never fails device creation: without it, ExecuteIndirect runs unbounded as
++ * upstream does. */
++static void vkd3d_rebox_indirect_clamp_ops_init(struct vkd3d_rebox_indirect_clamp_ops *ops,
++        struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkPushConstantRange push_constant_range;
++    void *mapped;
++    char value[8];
++    VkResult vr;
++
++    memset(ops, 0, sizeof(*ops));
++
++    if (vkd3d_get_env_var("REBOX_INDIRECT_CLAMP", value, sizeof(value)) && !strcmp(value, "0"))
++    {
++        INFO("rebox: ExecuteIndirect arguments are not clamped (REBOX_INDIRECT_CLAMP=0).\n");
++        return;
++    }
++
++    /* D3D12 allows 65535 groups a dimension; more, or a total past REBOX_INDIRECT_CLAMP_GROUPS,
++     * is a buffer nobody filled. Draws: vertices (or indices) times instances. */
++    ops->max_groups_per_dim = 65535;
++    ops->max_groups = vkd3d_rebox_env_u32("REBOX_INDIRECT_CLAMP_GROUPS", 1u << 22);
++    ops->max_count_product = vkd3d_rebox_env_u32("REBOX_INDIRECT_CLAMP_VERTICES", 1u << 28);
++
++    if (FAILED(vkd3d_create_buffer_explicit_usage(device,
++            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
++            8 * sizeof(uint32_t), "rebox-indirect-clamp-stats", &ops->vk_stats_buffer)))
++        goto fail;
++
++    if (FAILED(vkd3d_allocate_internal_buffer_memory(device, ops->vk_stats_buffer,
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ops->stats_memory)))
++        goto fail;
++
++    if (VK_CALL(vkMapMemory(device->vk_device, ops->stats_memory.vk_memory, 0, VK_WHOLE_SIZE, 0, &mapped)) < 0)
++        goto fail;
++    memset(mapped, 0, 8 * sizeof(uint32_t));
++    ops->stats = mapped;
++    ops->stats_va = vkd3d_get_buffer_device_address(device, ops->vk_stats_buffer);
++
++    push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    push_constant_range.offset = 0;
++    push_constant_range.size = sizeof(struct vkd3d_rebox_indirect_clamp_args);
++
++    if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL, 1,
++            &push_constant_range, &ops->vk_pipeline_layout)) < 0)
++        goto fail;
++
++    if ((vr = vkd3d_meta_create_compute_pipeline(device,
++            sizeof(cs_rebox_indirect_clamp), cs_rebox_indirect_clamp,
++            ops->vk_pipeline_layout, NULL, true, NULL, &ops->vk_pipeline)) < 0)
++    {
++        ops->vk_pipeline = VK_NULL_HANDLE;
++        goto fail;
++    }
++
++    INFO("rebox: ExecuteIndirect records past %u groups (%u a dimension) or %u vertices run empty.\n",
++            ops->max_groups, ops->max_groups_per_dim, ops->max_count_product);
++    return;
++
++fail:
++    ERR("rebox: no ExecuteIndirect argument clamp: its meta pass could not be made.\n");
++    vkd3d_rebox_indirect_clamp_ops_cleanup(ops, device);
++}
++
+ static void vkd3d_predicate_ops_cleanup(struct vkd3d_predicate_ops *meta_predicate_ops,
+         struct d3d12_device *device)
+ {
+@@ -2259,6 +2348,8 @@ HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device
+     if (FAILED(hr = vkd3d_multi_dispatch_indirect_ops_init(&meta_ops->multi_dispatch_indirect, device)))
+         goto fail_multi_dispatch_indirect_ops;
+ 
++    vkd3d_rebox_indirect_clamp_ops_init(&meta_ops->rebox_indirect_clamp, device);
++
+     if (FAILED(hr = vkd3d_dstorage_ops_init(&meta_ops->dstorage, device)))
+         goto fail_dstorage_ops;
+ 
+@@ -2275,6 +2366,7 @@ fail_workgraphs:
+ fail_sampler_feedback:
+     vkd3d_dstorage_ops_cleanup(&meta_ops->dstorage, device);
+ fail_dstorage_ops:
++    vkd3d_rebox_indirect_clamp_ops_cleanup(&meta_ops->rebox_indirect_clamp, device);
+     vkd3d_multi_dispatch_indirect_ops_cleanup(&meta_ops->multi_dispatch_indirect, device);
+ fail_multi_dispatch_indirect_ops:
+     vkd3d_execute_indirect_ops_cleanup(&meta_ops->execute_indirect, device);
+@@ -2301,6 +2393,7 @@ HRESULT vkd3d_meta_ops_cleanup(struct vkd3d_meta_ops *meta_ops, struct d3d12_dev
+     vkd3d_workgraph_ops_cleanup(&meta_ops->workgraph, device);
+     vkd3d_sampler_feedback_ops_cleanup(&meta_ops->sampler_feedback, device);
+     vkd3d_dstorage_ops_cleanup(&meta_ops->dstorage, device);
++    vkd3d_rebox_indirect_clamp_ops_cleanup(&meta_ops->rebox_indirect_clamp, device);
+     vkd3d_multi_dispatch_indirect_ops_cleanup(&meta_ops->multi_dispatch_indirect, device);
+     vkd3d_execute_indirect_ops_cleanup(&meta_ops->execute_indirect, device);
+     vkd3d_predicate_ops_cleanup(&meta_ops->predicate, device);
+diff --git a/libs/vkd3d/shaders/cs_rebox_indirect_clamp.comp b/libs/vkd3d/shaders/cs_rebox_indirect_clamp.comp
+new file mode 100644
+index 0000000..e0b8759
+--- /dev/null
++++ b/libs/vkd3d/shaders/cs_rebox_indirect_clamp.comp
+@@ -0,0 +1,139 @@
++#version 450
++#extension GL_EXT_buffer_reference : require
++#extension GL_EXT_buffer_reference_uvec2 : require
++
++/* rebox (patch 0017): copies ExecuteIndirect's argument records to scratch, bounding each record's
++ * dispatch, draw or mesh dispatch before the GPU runs it. A record whose group, vertex, index or
++ * instance counts are past the limits (an argument buffer the title never filled holds anything,
++ * often all ones) becomes empty; so does a record past the count buffer's count, which is
++ * clamped to MaxCommandCount. One invocation per record. */
++
++layout(local_size_x = 32) in;
++
++layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Src
++{
++	uint values[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Dst
++{
++	uint values[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Count
++{
++	uint value;
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer CountOut
++{
++	uint value;
++};
++
++/* [0] records clamped so far, [1..5] the last one's words. */
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer Stats
++{
++	uint values[];
++};
++
++#define KIND_DISPATCH 0u
++#define KIND_DRAW 1u
++#define KIND_DRAW_INDEXED 2u
++
++layout(push_constant) uniform Registers
++{
++	Src src;
++	uvec2 count_va;
++	Dst dst;
++	CountOut count_out;
++	uvec2 stats_va;
++	uint src_stride_words;
++	uint dst_stride_words;
++	/* Words of each record copied as they are (a state template's other arguments), else 0. */
++	uint copy_words;
++	uint src_action_word;
++	uint dst_action_word;
++	uint kind;
++	uint max_commands;
++	uint max_groups_per_dim; /* a dimension at or above this is garbage */
++	uint max_groups;
++	uint max_count_product; /* vertex (or index) count times instance count */
++};
++
++bool product_above(uint a, uint b, uint limit)
++{
++	uint hi, lo;
++	umulExtended(a, b, hi, lo);
++	return hi != 0u || lo > limit;
++}
++
++void main()
++{
++	uint i = gl_GlobalInvocationID.x;
++	if (i >= max_commands)
++		return;
++
++	uint n = max_commands;
++	if (any(notEqual(count_va, uvec2(0))))
++	{
++		n = min(Count(count_va).value, max_commands);
++		if (i == 0u)
++			count_out.value = n;
++	}
++
++	uint action_words = kind == KIND_DISPATCH ? 3u : (kind == KIND_DRAW ? 4u : 5u);
++	uint src_base = i * src_stride_words;
++	uint dst_base = i * dst_stride_words;
++	uint w[5] = uint[5](0u, 0u, 0u, 0u, 0u);
++	bool live = i < n;
++	bool clamp = false;
++
++	/* Past the count nothing is read: the title's buffer may end there. */
++	if (live)
++	{
++		for (uint j = 0u; j < copy_words; j++)
++			dst.values[dst_base + j] = src.values[src_base + j];
++
++		for (uint j = 0u; j < action_words; j++)
++			w[j] = src.values[src_base + src_action_word + j];
++
++		if (kind == KIND_DISPATCH)
++		{
++			clamp = any(greaterThanEqual(uvec3(w[0], w[1], w[2]), uvec3(max_groups_per_dim))) ||
++					product_above(w[0], w[1], max_groups) ||
++					product_above(w[0] * w[1], w[2], max_groups);
++		}
++		else
++		{
++			/* Draw: vertex count, instance count; indexed: index count, instance count. */
++			clamp = product_above(w[0], w[1], max_count_product);
++		}
++	}
++
++	if (clamp && any(notEqual(stats_va, uvec2(0))))
++	{
++		Stats stats = Stats(stats_va);
++		atomicAdd(stats.values[0], 1u);
++		for (uint j = 0u; j < 5u; j++)
++			stats.values[1u + j] = w[j];
++	}
++
++	if (!live || clamp)
++	{
++		if (kind == KIND_DISPATCH)
++		{
++			w[0] = 0u;
++			w[1] = 0u;
++			w[2] = 0u;
++		}
++		else
++		{
++			/* No vertices or indices and no instances; the rest is harmless as it is. */
++			w[0] = 0u;
++			w[1] = 0u;
++		}
++	}
++
++	for (uint j = 0u; j < action_words; j++)
++		dst.values[dst_base + dst_action_word + j] = w[j];
++}
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ab539b3..a1e175d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3301,10 +3301,9 @@ struct vkd3d_dgc_batch_draw
+ {
+     struct d3d12_command_signature *signature;
+     uint32_t max_command_count;
+-    struct d3d12_resource *arg_buffer;
+-    UINT64 arg_buffer_offset;
+-    struct d3d12_resource *count_buffer;
+-    UINT64 count_buffer_offset;
++    /* rebox (patch 0017): addresses, which may be of the clamped copy. count_va 0: no count. */
++    VkDeviceAddress arg_va;
++    VkDeviceAddress count_va;
+ 
+     /* Capture state relevant to a DGC draw.
+      * Other state changing breaks the batch. */
+@@ -4899,6 +4898,54 @@ struct vkd3d_multi_dispatch_indirect_ops
+     VkPipeline vk_multi_dispatch_indirect_pipeline;
+ };
+ 
++/* rebox (patch 0017): ExecuteIndirect's argument records copied to scratch and bounded on the GPU
++ * (cs_rebox_indirect_clamp.comp). REBOX_INDIRECT_CLAMP=0 turns it off. */
++enum vkd3d_rebox_indirect_clamp_kind
++{
++    VKD3D_REBOX_INDIRECT_CLAMP_DISPATCH = 0, /* and mesh dispatches */
++    VKD3D_REBOX_INDIRECT_CLAMP_DRAW = 1,
++    VKD3D_REBOX_INDIRECT_CLAMP_DRAW_INDEXED = 2,
++};
++
++struct vkd3d_rebox_indirect_clamp_args
++{
++    VkDeviceAddress src_va;
++    VkDeviceAddress count_va;
++    VkDeviceAddress dst_va;
++    VkDeviceAddress count_out_va;
++    VkDeviceAddress stats_va;
++    uint32_t src_stride_words;
++    uint32_t dst_stride_words;
++    uint32_t copy_words;
++    uint32_t src_action_word;
++    uint32_t dst_action_word;
++    uint32_t kind;
++    uint32_t max_commands;
++    uint32_t max_groups_per_dim;
++    uint32_t max_groups;
++    uint32_t max_count_product;
++};
++
++struct vkd3d_rebox_indirect_clamp_ops
++{
++    VkPipelineLayout vk_pipeline_layout;
++    VkPipeline vk_pipeline; /* VK_NULL_HANDLE: off */
++    VkBuffer vk_stats_buffer;
++    struct vkd3d_device_memory_allocation stats_memory;
++    /* [0] records clamped so far, [1..5] the last one's words; the GPU writes them. */
++    const volatile uint32_t *stats;
++    VkDeviceAddress stats_va;
++    uint32_t max_groups_per_dim;
++    uint32_t max_groups;
++    uint32_t max_count_product;
++    uint32_t logged_count;
++};
++
++static inline uint32_t vkd3d_meta_get_rebox_indirect_clamp_workgroup_size(void)
++{
++    return 32;
++}
++
+ struct vkd3d_execute_indirect_args
+ {
+     VkDeviceAddress template_va;
+@@ -5065,6 +5112,7 @@ struct vkd3d_meta_ops
+     struct vkd3d_predicate_ops predicate;
+     struct vkd3d_execute_indirect_ops execute_indirect;
+     struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
++    struct vkd3d_rebox_indirect_clamp_ops rebox_indirect_clamp;
+     struct vkd3d_dstorage_ops dstorage;
+     struct vkd3d_sampler_feedback_resolve_ops sampler_feedback;
+     struct vkd3d_workgraph_indirect_ops workgraph;
+diff --git a/libs/vkd3d/vkd3d_shaders.h b/libs/vkd3d/vkd3d_shaders.h
+index ded6b46..3621798 100644
+--- a/libs/vkd3d/vkd3d_shaders.h
++++ b/libs/vkd3d/vkd3d_shaders.h
+@@ -50,6 +50,7 @@ enum vkd3d_meta_copy_mode
+ #include <cs_execute_indirect_patch.h>
+ #include <cs_execute_indirect_patch_debug_ring.h>
+ #include <cs_execute_indirect_multi_dispatch.h>
++#include <cs_rebox_indirect_clamp.h>
+ #include <vs_fullscreen_layer.h>
+ #include <vs_fullscreen.h>
+ #include <gs_fullscreen.h>
