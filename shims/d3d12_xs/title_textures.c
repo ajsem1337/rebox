@@ -55,7 +55,90 @@ struct title_texture
     BOOL target;                /* a render target kept in step anyway (small_cpu_filled_target) */
     UINT callback;
     struct title_texture *next;
+    struct title_texture *rnext;  /* in by_resource */
+    struct page_node *pages;      /* in by_page: each 64 KiB page of its GPU and CPU ranges */
+    UINT page_count;
 };
+
+/* Indexes over the textures, under the lock: by resource, and by each 64 KiB page their GPU and
+ * CPU ranges touch. ReboxTitleMemoryWritten (every DirectStorage request) and title_texture_info
+ * (bindings) scanned every texture, tens of thousands once a title's world streams in, the first
+ * under the exclusive lock the DirectStorage threads then queued on. */
+#define INDEX_BUCKETS 65536
+struct page_node { UINT64 page; struct title_texture *t; struct page_node *next; };
+static struct title_texture *by_resource[INDEX_BUCKETS];
+static struct page_node *by_page[INDEX_BUCKETS];
+
+static SIZE_T resource_bucket(const ID3D12Resource *r)
+{
+    return (SIZE_T)(((UINT64)(ULONG_PTR)r >> 4) * 0x9e3779b97f4a7c15ull >> 48);
+}
+
+static SIZE_T page_bucket(UINT64 page)
+{
+    return (SIZE_T)(page * 0x9e3779b97f4a7c15ull >> 48);
+}
+
+/* Under the lock, exclusive. */
+static void index_add(struct title_texture *t)
+{
+    UINT64 g0 = t->address >> 16, g1 = (t->address + t->size - 1) >> 16;
+    UINT64 c0 = (UINT64)(ULONG_PTR)t->cpu >> 16, c1 = ((UINT64)(ULONG_PTR)t->cpu + t->size - 1) >> 16;
+    BOOL cpu = t->cpu && (c0 != g0 || c1 != g1);
+    UINT n = (UINT)(g1 - g0 + 1) + (cpu ? (UINT)(c1 - c0 + 1) : 0), k = 0;
+    SIZE_T b = resource_bucket(t->resource);
+
+    t->rnext = by_resource[b];
+    by_resource[b] = t;
+    if (!t->size || !(t->pages = calloc(n, sizeof(*t->pages))))
+        return;
+    for (UINT64 page = g0; page <= g1; page++)
+        t->pages[k++].page = page;
+    for (UINT64 page = c0; cpu && page <= c1; page++)
+        t->pages[k++].page = page;
+    for (k = 0; k < n; k++)
+    {
+        SIZE_T pb = page_bucket(t->pages[k].page);
+        t->pages[k].t = t;
+        t->pages[k].next = by_page[pb];
+        by_page[pb] = &t->pages[k];
+    }
+    t->page_count = n;
+}
+
+/* Under the lock, exclusive. */
+static void index_remove(struct title_texture *t)
+{
+    struct title_texture **r;
+    for (r = &by_resource[resource_bucket(t->resource)]; *r; r = &(*r)->rnext)
+        if (*r == t)
+        {
+            *r = t->rnext;
+            break;
+        }
+    for (UINT k = 0; k < t->page_count; k++)
+    {
+        struct page_node **at;
+        for (at = &by_page[page_bucket(t->pages[k].page)]; *at; at = &(*at)->next)
+            if (*at == &t->pages[k])
+            {
+                *at = t->pages[k].next;
+                break;
+            }
+    }
+    free(t->pages);
+    t->pages = NULL;
+    t->page_count = 0;
+}
+
+/* Under the lock. */
+static struct title_texture *texture_of(const ID3D12Resource *resource)
+{
+    struct title_texture *t;
+    for (t = by_resource[resource_bucket(resource)]; t && t->resource != resource; t = t->rnext)
+        ;
+    return t;
+}
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static struct title_texture *textures;
@@ -260,6 +343,7 @@ static void WINAPI destroyed(void *data)
         if (*p == t)
         {
             *p = t->next;
+            index_remove(t);
             if (t->dirty)
                 InterlockedDecrement(&dirty_count);
             free(t);
@@ -366,8 +450,7 @@ void title_texture_gpu_written(ID3D12Resource *resource)
     if (!resource || !textures)
         return;
     AcquireSRWLockExclusive(&lock);
-    for (t = textures; t && t->resource != resource; t = t->next)
-        ;
+    t = texture_of(resource);
     if (t && !t->gpu_written)
     {
         static LONG logged;
@@ -403,9 +486,8 @@ BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads
     BOOL found = FALSE;
 
     AcquireSRWLockShared(&lock);
-    for (t = textures; t && !found; t = t->next)
-        if ((found = t->resource == resource))
-            *address = t->address, *uploads = t->uploads;
+    if ((t = texture_of(resource)))
+        *address = t->address, *uploads = t->uploads, found = TRUE;
     ReleaseSRWLockShared(&lock);
     return found;
 }
@@ -506,6 +588,7 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
     AcquireSRWLockExclusive(&lock);
     t->next = textures;
     textures = t;
+    index_add(t);
     if (t->dirty)
         InterlockedIncrement(&dirty_count);
     ReleaseSRWLockExclusive(&lock);
@@ -514,15 +597,20 @@ void title_texture_register(ID3D12Resource *resource, UINT64 address, const D3D1
 /* A range the title's memory changed in, by CPU or GPU address. */
 void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size)
 {
-    if (!textures)
+    if (!textures || !size)
         return;
     AcquireSRWLockExclusive(&lock);
-    for (struct title_texture *t = textures; t; t = t->next)
-        if (!t->dirty && !t->unreadable && ((address < t->address + t->size && t->address < address + size)
-                          || (address < (UINT64)(ULONG_PTR)t->cpu + t->size && (UINT64)(ULONG_PTR)t->cpu < address + size)))
+    for (UINT64 page = address >> 16; page <= (address + size - 1) >> 16; page++)
+        for (struct page_node *n = by_page[page_bucket(page)]; n; n = n->next)
         {
-            t->dirty = TRUE;
-            InterlockedIncrement(&dirty_count);
+            struct title_texture *t = n->t;
+            if (n->page == page && !t->dirty && !t->unreadable
+                    && ((address < t->address + t->size && t->address < address + size)
+                        || (address < (UINT64)(ULONG_PTR)t->cpu + t->size && (UINT64)(ULONG_PTR)t->cpu < address + size)))
+            {
+                t->dirty = TRUE;
+                InterlockedIncrement(&dirty_count);
+            }
         }
     ReleaseSRWLockExclusive(&lock);
 }
