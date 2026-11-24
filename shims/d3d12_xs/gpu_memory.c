@@ -476,9 +476,26 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     AcquireSRWLockShared(&lock);
     for (c = chunks; c && !(address >= c->gpu && end <= c->gpu + c->size); c = c->next)
         ;
+    /* A request that starts in GPU memory and runs past it: only the rest is to be made so (a
+     * resource straddling a chunk's end was refused, and the GPU read its tail unmapped). */
+    if (!c)
+    {
+        BOOL moved;
+        do
+        {
+            moved = FALSE;
+            for (struct chunk *k = chunks; k; k = k->next)
+                if (address >= k->gpu && address < k->gpu + k->size)
+                {
+                    address = k->gpu + k->size;
+                    moved = TRUE;
+                }
+        } while (moved && address < end);
+    }
     ReleaseSRWLockShared(&lock);
-    if (c)
+    if (c || address >= end)
         return TRUE;
+    size = end - address;
     /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
     base = address & ~(ADOPT_GRANULE - 1);
     limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
