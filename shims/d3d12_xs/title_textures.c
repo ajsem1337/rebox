@@ -381,15 +381,21 @@ static const BYTE *cpu_address(UINT64 address, UINT64 size, BOOL *chunk)
     return (const BYTE *)(ULONG_PTR)address;
 }
 
-/* Whether [address, address + size) is committed, readable memory. Not for GPU memory chunks:
- * Wine's VirtualQuery doesn't know the Vulkan driver's mappings and reports them free. */
+/* Whether [address, address + size) is committed, readable memory. Title memory made GPU memory in
+ * place is, without asking: Wine's VirtualQuery doesn't know the Vulkan driver's mappings, and the
+ * walk over them on every submission held the render thread for most of an intro's frame time. */
 static BOOL readable(UINT64 address, UINT64 size)
 {
-    UINT64 at = address, end = address + size;
+    UINT64 at = address, end = address + size, extent;
 
     while (at < end)
     {
         MEMORY_BASIC_INFORMATION mbi;
+        if (gpu_memory_identity_extent(at, &extent))
+        {
+            at = extent;
+            continue;
+        }
         if (!VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
                 || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mbi.Protect)
             return FALSE;
