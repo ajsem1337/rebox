@@ -249,8 +249,9 @@ void console_resolve_late(void)
                 {
                     static LONG shown, watched_shown;
                     ID3D12Resource *r = console_texture_of(w);
-                    if ((console_stage_watched(t->stage) && InterlockedIncrement(&watched_shown) <= 32)
-                            || InterlockedIncrement(&shown) <= 8)
+                    LONG wn = console_stage_watched(t->stage) ? InterlockedIncrement(&watched_shown) : 0;
+                    /* A watched stage's: the first 32, then every 256th (what it samples later on). */
+                    if ((wn && (wn <= 32 || !(wn % 256))) || (!wn && InterlockedIncrement(&shown) <= 8))
                     {
                         D3D12_RESOURCE_DESC rd = { 0 };
                         UINT64 at = 0;
