@@ -1302,6 +1302,14 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(struct proxy *p, I
             pc.Texture2DArray.PlaneSlice = plane;
         desc = &pc;
     }
+    if (resource && resource_desc(resource).Format == DXGI_FORMAT_A8_UNORM)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: a shader view of an A8 texture: %s, format %u, dimension %u, mapping %#x",
+                      desc ? "described" : "default", desc ? desc->Format : 0, desc ? desc->ViewDimension : 0,
+                      desc ? desc->Shader4ComponentMapping : 0);
+    }
     ID3D12Device_CreateShaderResourceView(INNER(p, ID3D12Device), resource, desc, h);
     shadow_write_srv(cpu, resource, desc);
 }
