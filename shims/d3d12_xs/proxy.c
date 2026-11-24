@@ -1128,6 +1128,22 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(struct proxy *p, UIN
 {
     UINT64 done = ID3D12Fence_GetCompletedValue(INNER(p, ID3D12Fence));
 
+    /* Each event handle the title waits on through a fence, once: to name the handles its threads
+     * are seen waiting on. */
+    if (event)
+    {
+        static HANDLE seen[64];
+        static LONG count;
+        BOOL known = FALSE;
+        for (LONG i = 0; i < min(count, (LONG)ARRAYSIZE(seen)) && !known; i++)
+            known = seen[i] == event;
+        if (!known && count < (LONG)ARRAYSIZE(seen))
+        {
+            seen[InterlockedIncrement(&count) - 1] = event;
+            rebox_log("d3d12_xs: fence %p: the title waits with event %p (value %#llx, completed %#llx, thread %#lx)",
+                      (void *)p, event, (unsigned long long)value, (unsigned long long)done, GetCurrentThreadId());
+        }
+    }
     if (done < value && p->fence_signalled < (LONG64)value)
     {
         static LONG logged;
