@@ -1418,6 +1418,31 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         user[5] = 0;
         vreq.code = constant ? constants : replace ? fullscreen : req.code;
         vreq.code_dwords = constant ? ARRAYSIZE(constants) : replace ? ARRAYSIZE(fullscreen) : req.code_dwords;
+        /* REBOX_DEBUG_VS_WHITE=<stage id>,...: the stage's own code, with its param0 export made
+         * (1, 1, 1, 1): v_mov_b32 1.0 into the export's four sources just before it. Whether a
+         * vertex colour it passes through is what blackens a draw. */
+        static UINT32 whitened[4096];
+        const char *white = getenv("REBOX_DEBUG_VS_WHITE");
+        if (!constant && !replace && white && req.code_dwords + 4 <= ARRAYSIZE(whitened))
+        {
+            char id[24];
+            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            if (strstr(white, id))
+                for (UINT k = 0; k + 1 < req.code_dwords; k++)
+                    if ((req.code[k] & 0xfc0003f0u) == 0xf8000200u) /* exp param0 */
+                    {
+                        UINT32 sources = req.code[k + 1];
+                        memcpy(whitened, req.code, k * 4);
+                        for (UINT c = 0; c < 4; c++) /* v_mov_b32 v<src>, 1.0 */
+                            whitened[k + c] = 0x7e0002f2u | ((sources >> (8 * c)) & 0xff) << 17;
+                        memcpy(whitened + k + 4, req.code + k, (req.code_dwords - k) * 4);
+                        vreq.code = whitened;
+                        vreq.code_dwords = req.code_dwords + 4;
+                        rebox_log("d3d12_xs: REBOX_DEBUG_VS_WHITE: stage %s exports param0 = 1 (sources %08x)", id,
+                                  sources);
+                        break;
+                    }
+        }
         vreq.code_address = req.code_address;
         vreq.wave = req.wave;
         vreq.user_data = user;
