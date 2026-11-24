@@ -3357,6 +3357,20 @@ static BOOL draw_rects(struct proxy *p, UINT vertices, UINT instances, UINT firs
     return TRUE;
 }
 
+/* REBOX_DRAW_CENSUS=1: the per-100-presents draw log names draws into every target, not only the
+ * display-sized ones (target -1), to find a stage (a UI text shader) for REBOX_WATCH_STAGE or
+ * REBOX_GRAPHICS_DEBUG=magenta:<id>. */
+static BOOL draw_census(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *v = getenv("REBOX_DRAW_CENSUS");
+        on = v && *v && strcmp(v, "0");
+    }
+    return on;
+}
+
 static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices, UINT instances, UINT first_vertex,
         UINT first_instance)
 {
@@ -3364,7 +3378,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
         return;
-    if (p->display_bound)
+    if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, vertices, p->rect_list, FALSE);
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
@@ -3375,10 +3389,9 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
         INT base_vertex, UINT first_instance)
 {
     if (p->display_bound)
-    {
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
+    if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
-    }
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
     console_display_draw_end();

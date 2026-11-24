@@ -965,7 +965,7 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in)
 /* Which console stages draw into the display-sized targets (proxy.c brackets those draws): each
  * distinct (target, vertex stage, pixel stage, count, rect list) with how often, logged at the first
  * presents, so a draw seen in a frame can be named for REBOX_GRAPHICS_DEBUG=magenta:<id>. */
-static struct display_draw { int target; UINT count; BOOL rect, indexed; UINT64 vs, ps; LONG times; } display_draws[32];
+static struct display_draw { int target; UINT count; BOOL rect, indexed; UINT64 vs, ps; LONG times; } display_draws[160];
 static UINT display_draw_count;
 static SRWLOCK display_draw_lock = SRWLOCK_INIT;
 static __thread struct display_draw current_draw;
@@ -1005,8 +1005,8 @@ void console_display_draws_log(void)
 {
     AcquireSRWLockExclusive(&display_draw_lock);
     for (UINT i = 0; i < display_draw_count; i++)
-        rebox_log("d3d12_xs:   display target %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx",
-                  display_draws[i].target, display_draws[i].times, display_draws[i].indexed ? "indexed draws" : "draws",
+        rebox_log("d3d12_xs:   %s %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx",
+                  display_draws[i].target < 0 ? "other target" : "display target", display_draws[i].target, display_draws[i].times, display_draws[i].indexed ? "indexed draws" : "draws",
                   display_draws[i].count, display_draws[i].rect ? "(rect list)" : "",
                   (unsigned long long)display_draws[i].vs, (unsigned long long)display_draws[i].ps);
     display_draw_count = 0;
