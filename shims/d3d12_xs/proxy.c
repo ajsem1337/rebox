@@ -5303,12 +5303,21 @@ void proxy_frame_presented(void)
             rebox_log("d3d12_xs: since the last present, display-sized RGBA8 targets bound/cleared/drawn:%s", line);
             console_display_draws_log();
         }
-        /* Later, every 100 presents: the distinct draws since the last of these (a frame can change
-         * long after the first presents). */
-        else if (!(logged % 100))
+        /* Later, every 100 presents or 15 seconds: the distinct draws since the last of these (a
+         * frame can change long after the first presents, and a slow scene presents a few a minute). */
+        else
         {
-            rebox_log("d3d12_xs: present %ld: draws into display-sized targets since present %ld:", logged, logged - 100);
-            console_display_draws_log();
+            static ULONGLONG last_at;
+            static LONG last_present;
+            ULONGLONG now = GetTickCount64();
+            if (!(logged % 100) || now - last_at >= 15000)
+            {
+                rebox_log("d3d12_xs: present %ld: draws into display-sized targets since present %ld:", logged,
+                          last_present);
+                console_display_draws_log();
+                last_at = now;
+                last_present = logged;
+            }
         }
     }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
