@@ -96,6 +96,7 @@ struct proxy
     ID3D12Fence *cpu_fence;        /* queues: signalled after submissions that carry CPU writes */
     UINT64 cpu_fence_value;
     ID3D12Fence *timing_fence;     /* queues: signalled after every submission (gpu_latency_note) */
+    struct proxy *signal_queue;    /* fences: the queue that last signalled it */
     UINT64 timing_value;
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
@@ -3154,6 +3155,16 @@ static BOOL value_wait_done(struct pending_value_wait *pw, LONGLONG now, LONGLON
         return TRUE;
     if (!wait_satisfied(&pw->wait) && now - pw->since < timeout)
         return FALSE;
+    if (now - pw->since < timeout)
+    {
+        static LONG logged;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        if ((now - pw->since) * 10 >= f.QuadPart && InterlockedIncrement(&logged) <= 32) /* 100 ms or more */
+            rebox_log("d3d12_xs: a GPU wait for %#llx >= %#llx on queue %p met in memory after %.0f ms; signalled "
+                      "from the CPU", (unsigned long long)pw->wait.address, (unsigned long long)pw->target, pw->queue,
+                      (now - pw->since) * 1000.0 / (double)f.QuadPart);
+    }
     if (now - pw->since >= timeout)
     {
         static LONG logged;
@@ -3496,12 +3507,29 @@ static HRESULT STDMETHODCALLTYPE queue_SignalX(struct proxy *p, ID3D12Fence *fen
 /* Signal and Wait: the fence is the title's proxy. */
 static HRESULT STDMETHODCALLTYPE queue_Signal(struct proxy *p, ID3D12Fence *fence, UINT64 value)
 {
+    if (is_proxy(fence) && ((struct proxy *)fence)->cls == &fence_class)
+        ((struct proxy *)fence)->signal_queue = p;
     fence_note_signal(fence, value);
     return ID3D12CommandQueue_Signal(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
 }
 
 static HRESULT STDMETHODCALLTYPE queue_Wait(struct proxy *p, ID3D12Fence *fence, UINT64 value)
 {
+    /* A wait for a value no queue has been told to signal yet (the CPU may still): which queue
+     * waits, and which signalled the fence last. */
+    if (is_proxy(fence) && ((struct proxy *)fence)->cls == &fence_class
+            && ((struct proxy *)fence)->fence_signalled < (LONG64)value
+            && ID3D12Fence_GetCompletedValue(INNER((struct proxy *)fence, ID3D12Fence)) < value)
+    {
+        static LONG logged;
+        struct proxy *f = (struct proxy *)fence;
+        if (InterlockedIncrement(&logged) <= 64)
+            rebox_log("d3d12_xs: queue %p waits for fence %p >= %#llx before any queue signals it (last signalled "
+                      "%#llx by queue %p, completed %#llx)", (void *)INNER(p, ID3D12CommandQueue), (void *)f,
+                      (unsigned long long)value, (unsigned long long)f->fence_signalled,
+                      f->signal_queue ? (void *)INNER(f->signal_queue, ID3D12CommandQueue) : NULL,
+                      (unsigned long long)ID3D12Fence_GetCompletedValue(INNER(f, ID3D12Fence)));
+    }
     return ID3D12CommandQueue_Wait(INNER(p, ID3D12CommandQueue), proxy_unwrap(fence), value);
 }
 
