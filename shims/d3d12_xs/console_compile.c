@@ -1580,12 +1580,28 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         /* REBOX_DEBUG_PS_LZ=<stage id>,...: those pixel stages' own code with every image_sample made
          * image_sample_lz (level 0, no derivatives): whether implicit-LOD sampling is what fails. */
         static UINT32 lz_code[4096];
-        const char *lz = getenv("REBOX_DEBUG_PS_LZ");
+        /* REBOX_DEBUG_PS_NOWQM=<stage id>,...: the same with the whole-quad-mode prologue (s_mov_b64
+         * s[N:N+1], exec; s_wqm_b64 exec, exec; s_and_b64 exec, exec, s[N:N+1]) made s_nop: whether
+         * the exec mask it leaves is what keeps the stage from writing. */
+        const char *lz = getenv("REBOX_DEBUG_PS_LZ"), *nowqm = getenv("REBOX_DEBUG_PS_NOWQM");
         const UINT32 *own = req.code;
+        char lz_id[24];
+        snprintf(lz_id, sizeof(lz_id), "%016llx", (unsigned long long)stage_id);
+        if (!solid && nowqm && strstr(nowqm, lz_id) && req.code_dwords <= ARRAYSIZE(lz_code))
+        {
+            UINT changed = 0;
+            memcpy(lz_code, req.code, req.code_dwords * 4);
+            for (UINT k = 0; k < req.code_dwords; k++)
+                if ((lz_code[k] & 0xff80ffffu) == 0xbe80047eu      /* s_mov_b64 s[N:N+1], exec */
+                        || lz_code[k] == 0xbefe0a7eu               /* s_wqm_b64 exec, exec */
+                        || (lz_code[k] & 0xffff00ffu) == 0x87fe007eu /* s_and_b64 exec, exec, sN */)
+                    lz_code[k] = 0xbf800000u, changed++;
+            own = lz_code;
+            rebox_log("d3d12_xs: REBOX_DEBUG_PS_NOWQM: stage %s, %u instructions made s_nop", lz_id, changed);
+        }
         if (!solid && lz && req.code_dwords <= ARRAYSIZE(lz_code))
         {
-            char id[24];
-            snprintf(id, sizeof(id), "%016llx", (unsigned long long)stage_id);
+            const char *id = lz_id;
             if (strstr(lz, id))
             {
                 UINT changed = 0;
