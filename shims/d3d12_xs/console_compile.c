@@ -1324,13 +1324,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
 }
 
-/* A background compile lets go of compile_lock while AnyPS5 runs (its caches have their own locks),
- * so several workers compile at once and a draw's compile isn't skipped for one that holds the lock.
- * What the request points at is the caller's or per-thread; the rest of compile_now holds the lock. */
-#define unlocked_compile(background, call) \
-    ((background) ? (ReleaseSRWLockExclusive(&compile_lock), compile_result = (call), \
-                     AcquireSRWLockExclusive(&compile_lock), compile_result) : (call))
-static __thread int compile_result;
+/* Compiles run on any number of threads at once: AnyPS5's caches have their own locks, and so do
+ * the module table, the per-draw ring, host buffers, the page table and the late lists here; what
+ * compile_now keeps between calls is per thread. A lock around it used to make a title's recording
+ * threads skip draws (or, waited for, queue behind background compiles' bookkeeping). */
+#define unlocked_compile(background, call) ((void)(background), (call))
 
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
 {
@@ -1342,11 +1340,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX];
     UINT32 pushed_count = 0;
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
-    static UINT32 indices[MAX_ELEMENTS]; /* under compile_lock */
-    static struct { UINT position; UINT64 source; SIZE_T heap; } pending[64]; /* late T#s of this stage */
+    static __thread UINT32 indices[MAX_ELEMENTS];
+    static __thread struct { UINT position; UINT64 source; SIZE_T heap; } pending[64]; /* late T#s of this stage */
     UINT pending_count = 0, zero_textures = 0, zero_buffers = 0;
     BYTE *block_cpu = NULL;
-    static SRWLOCK compile_lock = SRWLOCK_INIT;
     struct sa5_compute_request req;
     struct sa5_result *result = NULL;
     const void *push;
@@ -1480,7 +1477,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         {
             UINT32 table[64];
             FILE *f;
-            dumped[InterlockedIncrement(&dumped_count) - 1] = stage_id;
+            { LONG k = InterlockedIncrement(&dumped_count) - 1; if (k < 16) dumped[k] = stage_id; }
             snprintf(path, sizeof(path), "%s\\%s.code.bin", getenv("REBOX_DUMP_SPIRV"), id);
             if ((f = fopen(path, "wb")))
             {
@@ -1506,7 +1503,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 6)
         {
             struct sa5_layout layout;
-            static struct sa5_slot slots[64];
+            static __thread struct sa5_slot slots[64];
             char line[512], ignored[64];
             int at = 0;
             InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
@@ -1615,17 +1612,6 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     req.region_count = n;
     req.use_cache = 1;
 
-    /* One compile at a time: AnyPS5's caches are thread-safe, but this keeps the static index
-     * table simple and compiles are rare once warm. The render thread never waits for a background
-     * compile (see ReboxConsoleCompile): if one holds the lock, this call is skipped. */
-    if (background || !async_compiles())
-        AcquireSRWLockExclusive(&compile_lock);
-    else if (!TryAcquireSRWLockExclusive(&compile_lock))
-    {
-        free(code);
-        set_last(E_PENDING, "a background compile holds the compiler", NULL);
-        return E_PENDING;
-    }
     phase_end(&mark, 0 + (graphics ? 0 : 4));
     if (graphics && h->stage == 0x80)
     {
@@ -2489,7 +2475,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     {
         /* The draw block: the per-draw host buffers' addresses, then every remapped binding's heap
          * slots (sa5_finalize_draw); its address follows the stage's push data. */
-        static UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS]; /* under compile_lock */
+        static __thread UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS];
         UINT64 va;
         memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
         memcpy(block, pushed_va, pushed_count * sizeof(UINT64));
@@ -2537,7 +2523,6 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
 
 done:
-    ReleaseSRWLockExclusive(&compile_lock);
     if (started.QuadPart)
     {
         LARGE_INTEGER now;
