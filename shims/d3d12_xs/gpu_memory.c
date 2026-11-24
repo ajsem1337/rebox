@@ -365,6 +365,10 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
  * as ADOPT_GRANULE allows, so neighbouring placements land in one chunk instead of straddling two. */
 #define ADOPT_ALIGN (64ull << 10)
 #define ADOPT_MIN (2ull << 20)
+/* Between chunks: RADV maps a guard page past each allocation, and adopted allocations have their
+ * exact size (the layer), so 64 KiB apart is enough; 2 MiB gaps left a granule's first 2 MiB out of
+ * GPU memory, and a root descriptor there faulted the GPU. */
+#define ADOPT_GAP (64ull << 10)
 #define ADOPT_GRANULE (256ull << 20)
 
 /* The run of committed, writable pages around address: [*start, *end). */
@@ -452,14 +456,13 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
             ReleaseSRWLockExclusive(&lock);
             return TRUE;
         }
-        /* Touching counts: 2 MiB apart, as RADV pads each allocation's VA range (a guard page, and
-         * a range a page past a chunk's end was still refused). */
+        /* Touching counts: ADOPT_GAP apart, as RADV pads each allocation's VA range with a guard page. */
         if (c->gpu <= limit && base <= c->gpu + c->size)
         {
             if (c->gpu + c->size <= address)
-                base = ((c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1)) + ADOPT_MIN;
+                base = ((c->gpu + c->size + ADOPT_ALIGN - 1) & ~(ADOPT_ALIGN - 1)) + ADOPT_GAP;
             else if (c->gpu >= end)
-                limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_MIN;
+                limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_GAP;
             else
                 limit = base; /* the request straddles a chunk: nothing to do */
         }
