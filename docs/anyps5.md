@@ -250,7 +250,8 @@ and images). `REBOX_DUMP_SPIRV=DIR` writes each finalized module.
 its code; `tools/ps09.py` reads the PS09 PSO cache. `sa5_check.exe` compiles shaders through the
 DLL outside a title: a built-in one, a dumped one (`CODE.bin SKIP RSRC1 RSRC2 X,Y,Z`), or the
 vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a built-in mesh
-program (`mesh`). Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
+program (`mesh`). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
+shaders compiled and validated on that many threads at once, with no cache. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
 and finalize with no guest memory (`ms PLAN`, as d3d12_xs compiles them); 619 more need the
 descriptors a draw's memory gives (the SRT walk), and 526 use `v_mad_legacy_f32` with clamp,
 which AnyPS5's decoder refuses ("VOP3 source modifiers are not implemented").
@@ -271,9 +272,20 @@ SPIRV-Headers, SPIRV-Tools, glslang; only the patches' `core/shader/` hunks are 
 guest libc is replaced by an include path and two stream functions, and winpthreads is linked
 statically. `d3d12_xs` loads it in-process; its C API is `anyps5/rebox_anyps5.h`.
 
+**Allocation.** The DLL's `operator new` and `delete` (AnyPS5, SPIRV-Tools and glslang allocate
+through them) are mimalloc's (`anyps5/allocator.cpp`; mimalloc 3, MIT, linked statically from
+nixpkgs' source), with per-thread heaps. With the C runtime's `malloc`, every allocation took the
+process heap's single lock in Wine, and `d3d12_xs`'s compile workers spent their time queued on
+it. `sa5_check bench` on 400 of the target title's pixel shaders, under Wine on 24 cores: 8 threads
+take 5.0 s instead of 11.8 s, 16 threads 3.1 s instead of 11.3 s; one thread is no faster.
+`malloc` itself isn't overridden (the C runtime's own blocks stay on its heap). mimalloc is built
+with `MI_WIN_INIT=FLS`: its default start-up is a TLS callback that the loader calls before
+mcfgthread's (the toolchain's thread runtime), and its first thread-local access there breaks
+mcfgthread for the rest of the process.
+
 **Licence.** AnyPS5 is GPL-2.0-only, and a `d3d12_xs` that loads it in-process, with the
 vkd3d-proton patch that calls it, is a GPL-2 combination: Rebox is GPL-2.0-only for this reason
-([LICENSE](../LICENSE)).
+([LICENSE](../LICENSE)). mimalloc, linked into the DLL, is MIT.
 
 ## The PS09 cache
 
