@@ -831,6 +831,26 @@ static void test_gpu_memory(HMODULE m)
             gfree(cpu2);
         }
     }
+    /* A V# in GPU memory whose records run past it (into title memory that isn't GPU memory) is
+     * cut where that memory ends: the shader reads it at its address, bounded only by its length,
+     * and read the rest unmapped. */
+    {
+        UINT64 (WINAPI *length)(UINT64, UINT64) = (void *)GetProcAddress(m, "ReboxGuestBufferLength");
+        CHECK(length != NULL, "ReboxGuestBufferLength exported");
+        /* Only title addresses (4 GiB to 2^46) are checked; others are vkd3d-proton's own, kept whole. */
+        if (length && gpu >= 0x400000000000ull)
+            CHECK(length(gpu, 1ull << 32) == 1ull << 32, "a V# at a non-title address keeps its length");
+        if (length && gpu_identity && gpu >= 0x100000000ull && gpu + (1ull << 32) <= 0x200000000000ull)
+        {
+            UINT64 whole = length(gpu, 256), cut = length(gpu, 1ull << 32);
+            CHECK(whole == 256, "a V# inside GPU memory keeps its length (%#llx)", (unsigned long long)whole);
+            CHECK(cut >= 1 << 20 && cut < 1ull << 32, "a V# running past GPU memory is cut at its end (%#llx)",
+                  (unsigned long long)cut);
+        }
+        else if (length)
+            printf("skip guest buffer length: GPU memory at %#llx isn't identity-mapped at a title address\n",
+                   (unsigned long long)gpu);
+    }
     gfree(cpu);
 }
 

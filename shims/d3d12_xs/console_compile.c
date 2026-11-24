@@ -218,7 +218,7 @@ static UINT64 hash_words(UINT64 h, const void *data, SIZE_T size)
  * is written at submission instead (console_resolve_late), from the descriptor at its address
  * then. Until resolved, it holds the dummy texture. */
 struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
-static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes);
+static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes);
 static struct late_texture late[4096];
 static UINT late_count;
 /* V#s the same: a guest buffer table entry ({address, length in dwords}) whose V# was empty when the
@@ -250,7 +250,7 @@ void console_resolve_late(void)
                 UINT32 stride = (w[1] >> 16) & 0x3fff;
                 UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
                 static LONG shown;
-                if (!guest_buffer_mappable(&base, bytes))
+                if (!guest_buffer_mappable(&base, &bytes))
                     bytes = 0;
                 t->entry[0] = (UINT32)base;
                 t->entry[1] = (UINT32)(base >> 32);
@@ -1004,19 +1004,21 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
 /* A guest buffer's address as the GPU should read it: a title address (4 GiB to 2^46, outside the
  * GPU window, as proxy.c's ia_adopt) in a GPU-only view of title memory becomes the CPU address
  * behind it, and must be GPU memory there or be made so; FALSE if it can't be. Other addresses are
- * vkd3d-proton's own. */
-static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes)
+ * vkd3d-proton's own. *bytes is cut to the GPU memory that runs on from the address: the shader
+ * reads the buffer at that address directly, bounded only by its length, so a V# whose records
+ * run past that memory (into title memory between two GPU memory ranges) faulted the GPU. */
+static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
 {
     static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
     static volatile LONG resolved;
-    UINT64 address = *base, end;
+    UINT64 address = *base, end, check;
 
-    /* Only its start is checked: V#s with all-ones record counts are raw pointers to memory of
-     * no stated size, and requiring all of that to be GPU memory refused them, which broke the
-     * shaders that use them. */
-    bytes = min(bytes, 0x10000ull);
-    if (!address || !bytes || address < 0x100000000ull || address + bytes > 0x400000000000ull
-            || (address + bytes > 0x200000000000ull && address < 0x210000000000ull))
+    /* Only its start must be GPU memory: V#s with all-ones record counts are raw pointers to
+     * memory of no stated size, and requiring all of that to be GPU memory refused them, which
+     * broke the shaders that use them. */
+    check = min(*bytes, 0x10000ull);
+    if (!address || !check || address < 0x100000000ull || address + check > 0x400000000000ull
+            || (address + check > 0x200000000000ull && address < 0x210000000000ull))
         return TRUE;
     if (!resolved)
     {
@@ -1025,8 +1027,19 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes)
     }
     if (to_cpu)
         address = to_cpu(address);
-    if ((gpu_memory_identity_extent(address, &end) && end >= address + bytes) || gpu_memory_adopt(address, bytes))
+    if ((gpu_memory_identity_extent(address, &end) && end >= address + check) || gpu_memory_adopt(address, check))
     {
+        if (!gpu_memory_identity_run_end(address, &end) || end < address + check)
+            end = address + check;
+        if (*bytes > end - address)
+        {
+            static LONG logged;
+            if (*bytes - (end - address) >= 0x1000 && *bytes < 0x100000000ull && InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx runs past GPU memory at %#llx: cut to %#llx bytes",
+                          (unsigned long long)address, (unsigned long long)*bytes, (unsigned long long)end,
+                          (unsigned long long)(end - address));
+            *bytes = end - address;
+        }
         *base = address;
         return TRUE;
     }
@@ -1034,9 +1047,15 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes)
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx isn't GPU memory and can't be made so: read as empty",
-                      (unsigned long long)*base, (unsigned long long)bytes);
+                      (unsigned long long)*base, (unsigned long long)check);
     }
     return FALSE;
+}
+
+/* The length a guest buffer table gives a V# at address of bytes (0: read as empty), for tests. */
+UINT64 WINAPI ReboxGuestBufferLength(UINT64 address, UINT64 bytes)
+{
+    return guest_buffer_mappable(&address, &bytes) ? bytes : 0;
 }
 
 /* The same for the n-th V# the code loads (s_load_dwordx4). */
@@ -2423,7 +2442,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 /* The shader reads the buffer at this address directly: one in a GPU-only view of
                  * title memory is its CPU address, which must be GPU memory; one that can't be made
                  * so is read as empty (a V# into such memory faulted the GPU). */
-                if (!guest_buffer_mappable(&base, bytes))
+                if (!guest_buffer_mappable(&base, &bytes))
                     bytes = 0;
                 table[e * 4] = (UINT32)base;
                 table[e * 4 + 1] = (UINT32)(base >> 32);

@@ -608,6 +608,27 @@ BOOL gpu_memory_identity_extent(UINT64 address, UINT64 *end)
     return found;
 }
 
+BOOL gpu_memory_identity_run_end(UINT64 address, UINT64 *end)
+{
+    BOOL found = FALSE, moved;
+
+    AcquireSRWLockShared(&lock);
+    do
+    {
+        moved = FALSE;
+        for (struct chunk *c = chunks; c; c = c->next)
+            if ((UINT64)(ULONG_PTR)c->cpu == c->gpu && address >= c->gpu && address < c->gpu + c->size)
+            {
+                address = c->gpu + c->size;
+                found = moved = TRUE;
+            }
+    } while (moved);
+    ReleaseSRWLockShared(&lock);
+    if (found)
+        *end = address;
+    return found;
+}
+
 BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset)
 {
     BOOL found = FALSE;

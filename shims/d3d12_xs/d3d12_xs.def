@@ -22,6 +22,7 @@ EXPORTS
     ReboxConsoleRectStages
     ReboxConsoleLastResult
     ReboxConsoleFaults
+    ReboxGuestBufferLength
     ReboxConsoleFromContainer
     ReboxConsoleFree
     ReboxConsoleGraphicsFromContainer
