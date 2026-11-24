@@ -2514,7 +2514,8 @@ UINT WINAPI ReboxDesktopStreamTypes(const void *stream, SIZE_T size, UINT *types
  * (the target title's minimap: a 24 and a pixel shader) is refused, E_INVALIDARG: xcl (ivall/xcl)
  * found that the title renders nothing from then on when they're made (translated, black every
  * run), and gets to its menus refusing them. REBOX_MESH_PIPELINES=1 makes them, with the console
- * stages renumbered (and fallback shaders where they don't translate). */
+ * stages renumbered: d3d12_xs.c attaches the mesh and pixel shaders to their fallbacks, compiled
+ * through AnyPS5 at each mesh dispatch (docs/anyps5.md). */
 static HRESULT STDMETHODCALLTYPE device_CreatePipelineState(struct proxy *p, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
         REFIID riid, void **out)
 {

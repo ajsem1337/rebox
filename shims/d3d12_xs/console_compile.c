@@ -42,6 +42,9 @@
  * pipeline per draw: a UE5 title's render thread spent its frames compiling). */
 #define GRAPHICS_PUSH_DATA 112u
 #define GRAPHICS_PUSHED_MAX SA5_DRAW_ADDRESSES /* per-draw host buffers: in the draw block */
+/* A mesh stage's push data ends earlier: AnyPS5's mesh path reads its draw parameters from push bytes
+ * 104-127 (sa5_finalize_draw freezes them, so nothing is pushed there). */
+#define MESH_PUSH_DATA 96u
 
 enum role { ROLE_GDS = 3, ROLE_BDA_PAGETABLE = 4, ROLE_FAULT_BUFFER = 5, ROLE_FLATTENED_SRT = 6, ROLE_SHADER_DATA = 7,
             ROLE_IMAGE_TABLE = 8, ROLE_SAMPLER_TABLE = 9, ROLE_IMAGE_TABLE_MAP = 10, ROLE_IMAGE_STORAGE_TABLE = 11 };
@@ -59,6 +62,7 @@ static struct
     int (*compile)(const struct sa5_compute_request *, struct sa5_result **, char *, size_t);
     int (*compile_vertex)(const struct sa5_vertex_request *, struct sa5_result **, char *, size_t);
     int (*compile_pixel)(const struct sa5_pixel_request *, struct sa5_result **, char *, size_t);
+    int (*compile_mesh)(const struct sa5_mesh_request *, struct sa5_result **, char *, size_t);
     UINT32 (*vertex_input_count)(const struct sa5_result *);
     int (*vertex_input)(const struct sa5_result *, UINT32, UINT32 *, UINT32 *, UINT32 *);
     const UINT32 *(*spirv)(const struct sa5_result *, UINT32 *);
@@ -140,6 +144,7 @@ static BOOL CALLBACK load_sa5(INIT_ONCE *once, void *param, void **context)
     GET(compile, "sa5_compile_compute");
     GET(compile_vertex, "sa5_compile_vertex");
     GET(compile_pixel, "sa5_compile_pixel");
+    GET(compile_mesh, "sa5_compile_mesh");
     GET(vertex_input_count, "sa5_result_vertex_input_count");
     GET(vertex_input, "sa5_result_vertex_input");
     GET(spirv, "sa5_result_spirv");
@@ -629,6 +634,8 @@ static UINT nop_flat_scratch_setup(UINT32 *code, UINT32 dwords)
             i += 1 + (((w >> 23) & 0x1f) == 0x15);
         else if (w >> 30 == 2 && op != 0x17f)             /* SOP2 */
             i += 1 + ((w & 0xff) == 0xff || ((w >> 8) & 0xff) == 0xff);
+        else if (w >> 16 == 0xbfa0 || w >> 16 == 0xbf80)  /* s_inst_prefetch (mesh shaders open with it), s_nop */
+            i++;
         else
             break;
     }
@@ -748,6 +755,12 @@ static BOOL stage_failed(UINT64 id)
 
 /* The user SGPR count from RSRC2: graphics stages' USER_SGPR_MSB (bit 27) makes 32 possible
  * (compute's bit 27 is an exception enable). */
+/* A graphics stage's name for the log. */
+static const char *stage_name(UINT32 stage)
+{
+    return stage == 0x10 ? "pixel" : stage == 0x80 ? "mesh" : "vertex";
+}
+
 static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
 {
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
@@ -1132,12 +1145,12 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     if (in_display_draw && in && in->shader && in->shader_size >= sizeof(struct rebox_deferred_shader))
     {
         const struct rebox_deferred_shader *h = in->shader;
-        if (h->version == 2 && (h->stage == 0x1 || h->stage == 0x10) && h->code_offset <= in->shader_size
+        if (h->version == 2 && (h->stage == 0x1 || h->stage == 0x10 || h->stage == 0x80) && h->code_offset <= in->shader_size
                 && h->code_dwords * 4ull <= in->shader_size - h->code_offset)
         {
             UINT64 id = hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
                                    (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
-            if (h->stage == 0x1)
+            if (h->stage != 0x10)
                 current_draw.vs = id;
             else
                 current_draw.ps = id;
@@ -1186,7 +1199,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     char error[1024] = "";
     HRESULT hr = E_FAIL;
     UINT32 *code, nops;
-    UINT32 push_size;
+    UINT32 push_size, stage_push;
 
     const struct rebox_deferred_graphics *g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
     BOOL graphics;
@@ -1198,10 +1211,13 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             || h->size > in->shader_size || h->code_offset % 4 || h->code_offset > h->size
             || h->code_dwords > (h->size - h->code_offset) / 4)
         return E_INVALIDARG;
-    /* Version 2: a vertex (0x1) or pixel (0x10) stage, rebox_deferred_graphics after the header. */
+    /* Version 2: a vertex (0x1), pixel (0x10) or mesh (0x80) stage, rebox_deferred_graphics after the
+     * header. */
     graphics = h->version == 2;
-    if (graphics && ((h->stage != 0x1 && h->stage != 0x10) || h->code_offset < sizeof(*h) + sizeof(*g)))
+    if (graphics && ((h->stage != 0x1 && h->stage != 0x10 && h->stage != 0x80)
+                     || h->code_offset < sizeof(*h) + sizeof(*g)))
         return E_INVALIDARG;
+    stage_push = graphics && h->stage == 0x80 ? MESH_PUSH_DATA : GRAPHICS_PUSH_DATA;
     stage_id = graphics ? hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
                                      (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
     if (graphics)
@@ -1347,7 +1363,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             line[at] = 0;
             rebox_log("d3d12_xs: console %s shader %016llx reads tables through%s; user SGPRs s0-s15: %08x %08x %08x "
                          "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
-                         h->stage == 0x10 ? "pixel" : "vertex", (unsigned long long)stage_id, at ? line : " (none found)",
+                         stage_name(h->stage), (unsigned long long)stage_id, at ? line : " (none found)",
                          in->user_sgprs[0], in->user_sgprs[1], in->user_sgprs[2], in->user_sgprs[3], in->user_sgprs[4],
                          in->user_sgprs[5], in->user_sgprs[6], in->user_sgprs[7], in->user_sgprs[8], in->user_sgprs[9],
                          in->user_sgprs[10], in->user_sgprs[11], in->user_sgprs[12], in->user_sgprs[13],
@@ -1374,9 +1390,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
     InitOnceExecuteOnce(&sa5.once, load_sa5, NULL, NULL);
     poll_faults();
-    if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input || !sa5.finalize_draw)))
+    if (!sa5.compile || (graphics && (!sa5.compile_vertex || !sa5.compile_pixel || !sa5.vertex_input || !sa5.finalize_draw))
+            || (graphics && h->stage == 0x80 && !sa5.compile_mesh))
     {
-        set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable (or too old for graphics stages)", NULL);
+        set_last(E_NOTIMPL, "rebox_anyps5.dll unavailable (or too old for graphics or mesh stages)", NULL);
         return E_NOTIMPL;
     }
     {
@@ -1455,7 +1472,43 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         return E_PENDING;
     }
     phase_end(&mark, 0 + (graphics ? 0 : 4));
-    if (graphics && h->stage == 0x1)
+    if (graphics && h->stage == 0x80)
+    {
+        /* A mesh stage (console_fssm.c): AnyPS5's mesh path with the group's size and limits, user
+         * SGPRs as a vertex stage's (s8 on), push data 0-95 and the draw block's address at 96. */
+        struct sa5_mesh_request mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.code = req.code;
+        mreq.code_dwords = req.code_dwords;
+        mreq.code_address = req.code_address;
+        mreq.wave = req.wave;
+        mreq.user_data = req.user_data;
+        mreq.user_data_count = max(req.user_data_count, 8u);
+        mreq.rsrc1 = h->rsrc1;
+        mreq.threads = g->mesh.threads;
+        mreq.max_vertices = g->mesh.max_vertices;
+        mreq.max_primitives = g->mesh.max_primitives;
+        mreq.group_stride = g->mesh.group_stride;
+        mreq.primitive_vertices = g->mesh.primitive_vertices;
+        mreq.lds_bytes = g->mesh.lds_bytes;
+        mreq.clip_cntl = g->mesh.clip_cntl;
+        mreq.push_offset = in->push_offset;
+        mreq.push_size = MESH_PUSH_DATA;
+        mreq.regions = regions;
+        mreq.region_count = n;
+        mreq.use_cache = 1;
+        if (sa5.compile_mesh(&mreq, &result, error, sizeof(error)))
+        {
+            log_failure(h, "AnyPS5 failed (mesh)", error);
+            {
+                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
+                if (slot < (LONG)ARRAYSIZE(failed_stages))
+                    failed_stages[slot] = stage_id;
+            }
+            goto done;
+        }
+    }
+    else if (graphics && h->stage == 0x1)
     {
         /* The console's fetch call (s_swappc_b64 s[4:5]) becomes Vulkan vertex attributes: input r
          * fills v[4+4r..7+4r]. The V#s only steer AnyPS5's grouping; the attributes' formats and
@@ -1807,7 +1860,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             static LONG shown[2];
             if (console_stage_watched(stage_id) || InterlockedIncrement(&shown[h->stage == 0x10]) <= 32)
                 rebox_log("d3d12_xs: console %s shader %016llx binding %u: role %u kind %u set %u binding %u, "
-                             "%u elements, %u words%s %08x %08x %08x %08x", h->stage == 0x10 ? "pixel" : "vertex",
+                             "%u elements, %u words%s %08x %08x %08x %08x", stage_name(h->stage),
                              (unsigned long long)stage_id, i, b.role, b.kind, b.set, b.binding, b.count, b.word_count,
                              b.word_count ? ":" : "", b.word_count > 0 ? b.words[0] : 0, b.word_count > 1 ? b.words[1] : 0,
                              b.word_count > 2 ? b.words[2] : 0, b.word_count > 3 ? b.words[3] : 0);
@@ -1878,7 +1931,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                         f = (const float *)(ULONG_PTR)base;
                     if (InterlockedIncrement(&shown[h->stage == 0x10]) <= 48)
                         rebox_log("d3d12_xs: console %s shader %016llx buffer %u.%u: base %#llx, stride %u, "
-                                     "%u records%s %g %g %g %g %g %g %g %g", h->stage == 0x10 ? "pixel" : "vertex",
+                                     "%u records%s %g %g %g %g %g %g %g %g", stage_name(h->stage),
                                      (unsigned long long)stage_id, i, e, (unsigned long long)base, stride, w[2],
                                      f ? ";" : " (not readable here)", f ? f[0] : 0, f ? f[1] : 0, f ? f[2] : 0,
                                      f ? f[3] : 0, f ? f[4] : 0, f ? f[5] : 0, f ? f[6] : 0, f ? f[7] : 0);
@@ -1911,7 +1964,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 goto done;
             }
             hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, graphics ? pushed_count : host_count, 0, 1,
-                    graphics ? in->push_offset + GRAPHICS_PUSH_DATA : 0, 0 };
+                    graphics ? in->push_offset + stage_push : 0, 0 };
             pushed_va[pushed_count++] = va;
             key[0] = hash_bytes(key[0], &hosts[host_count], sizeof(hosts[host_count]));
             host_count++;
@@ -1979,7 +2032,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                             rd = ID3D12Resource_GetDesc(res);
                         rebox_log("d3d12_xs: console %s shader %016llx texture %u.%u: T# %08x %08x, resource %p "
                                      "%llux%u format %u flags %#x, %s %#llx, uploaded %u times",
-                                     h->stage == 0x10 ? "pixel" : "vertex", (unsigned long long)stage_id, i, e, w[0],
+                                     stage_name(h->stage), (unsigned long long)stage_id, i, e, w[0],
                                      w[1], (void *)res, (unsigned long long)rd.Width, rd.Height, rd.Format, rd.Flags,
                                      title ? "title memory at" : "not from title memory", (unsigned long long)address,
                                      uploads);
@@ -2198,7 +2251,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     goto done;
                 }
                 hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, pushed_count, bytes / 4, 0,
-                        in->push_offset + GRAPHICS_PUSH_DATA, 0 };
+                        in->push_offset + stage_push, 0 };
                 pushed_va[pushed_count++] = va;
             }
             else
@@ -2217,7 +2270,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     if (!(module = find_module(key)))
     {
         if (graphics ? sa5.finalize_draw(result, remaps, remap_count, hosts, host_count,
-                                         in->push_offset + GRAPHICS_PUSH_DATA, &words, &word_count, error, sizeof(error))
+                                         in->push_offset + stage_push, &words, &word_count, error, sizeof(error))
                      : sa5.finalize(result, remaps, remap_count, hosts, host_count, &words, &word_count, error,
                                     sizeof(error)))
         {
@@ -2252,7 +2305,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     out->subgroup_size = sa5.subgroup_size(result);
     memcpy(out->key, key, sizeof(key));
     push = sa5.push_constants(result, &push_size);
-    memcpy(out->push, push, min(push_size, graphics ? GRAPHICS_PUSH_DATA : 128u));
+    memcpy(out->push, push, min(push_size, graphics ? stage_push : 128u));
     for (UINT32 i = 0; i < host_count && !graphics; i++)
         memcpy(&out->push[32 + 2 * i], &host_va[i], sizeof(UINT64));
     if (graphics)
@@ -2269,7 +2322,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             log_failure(h, "no GPU memory for the draw block", NULL);
             goto done;
         }
-        memcpy(&out->push[GRAPHICS_PUSH_DATA / 4], &va, sizeof(UINT64));
+        memcpy(&out->push[stage_push / 4], &va, sizeof(UINT64));
         if (pending_count && block_cpu)
         {
             AcquireSRWLockExclusive(&late_lock);

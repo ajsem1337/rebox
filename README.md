@@ -104,8 +104,8 @@ nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
    `$WINEPREFIX/xgameruntime.log`), `ConsoleMode`, persistent local storage in the prefix, and
    the package as a shadow directory with our FidelityFX stub.
 3. **Runs the title.** Console compute and graphics shaders compile through AnyPS5 at their first
-   dispatch or draw ([docs/anyps5.md](docs/anyps5.md)); pipelines it doesn't take (mesh,
-   tessellation) get fallback shaders, so those effects are missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
+   dispatch, draw or mesh dispatch ([docs/anyps5.md](docs/anyps5.md)); pipelines it doesn't take
+   (amplification, tessellation) get fallback shaders, so those effects are missing. `D3D12XboxCreateDevice` logs the title's SDK version, which picks the queue layout
    ([docs/d3d12x.md](docs/d3d12x.md)).
 
 The prefix keeps what a run leaves behind: `imports.txt` (the scan), `last-run.log` (everything
@@ -162,7 +162,7 @@ method the title asked for that isn't implemented.
 | `REBOX_SKIP_FAULT=RVA:LENGTH[,...]` | An access violation at that RVA of the exe (hex) skips the faulting instruction (LENGTH bytes, hex) and goes on, logged: for a title's deliberate crash, such as a watchdog writing to address 0, to see what it would do next (bring-up only) |
 | `REBOX_HANG_DUMP=N` | When no frame has been presented for N seconds (default 60, 0 off), log every thread's name and unwound stack once, to see what a stuck title waits on; again after the next frame, three times at most |
 | `VKD3D_CONFIG=breadcrumbs` | vkd3d-proton's breadcrumbs: when the GPU device is lost, log the commands each queue was running. Before a console dispatch or draw they record the variant's key, which d3d12_xs logs with each compile (`compiled a variant ... key K`), so the dump names the console shader. Slower |
-| `REBOX_MESH_PIPELINES=1` | Make mesh pipelines whose console mesh shader is in the amplification slot (a 24 with no 25), renumbered, instead of refusing them (E_INVALIDARG): the target title renders nothing once they exist (xcl) |
+| `REBOX_MESH_PIPELINES=1` | Make mesh pipelines whose console mesh shader is in the amplification slot (a 24 with no 25), renumbered, instead of refusing them (E_INVALIDARG): the target title renders nothing once they exist with fallback shaders (xcl). Their mesh and pixel shaders compile through AnyPS5 at each mesh dispatch ([docs/anyps5.md](docs/anyps5.md)) |
 | `REBOX_NETWORK=1` | Let the title use the network. Off by default: its HTTP connections (WinHTTP, and libHttpClient through it) and sockets fail as with no network, and name lookups other than localhost and the machine's own name fail, so nothing is sent out (a title's crash handler uploads a minidump with the host's details); loopback still works. The Gaming Runtime still reports internet access (`XGR_CONNECTIVITY=none` reports none, which a retail title polls without end). Blocked attempts are logged (`network:`; xmem `import_fixup.c`) |
 | `REBOX_WRITE_WATCH=ADDRESS:LENGTH[,...]` | Who writes a range of memory (hex, absolute): once committed it is made read-only, and each instruction that writes into it is logged once (the first 64, with its thread and target; for a range of 64 bytes or less every write, the first 256, with what was there), then let through. A write by the system into it fails, so only for finding a writer (xmem `probe.c`) |
 | `REBOX_PHYSICAL_TRACE=<address>` | Log every physical-page mapping or unmapping that covers that hex address, the view remaps around it, and every DirectStorage write into the page mapped there, with thread and caller: what happens to data at an address in physical pages. With `REBOX_WRITE_WATCH` set, the same offset at every other address the page is mapped at is watched too |

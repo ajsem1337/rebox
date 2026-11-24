@@ -1,0 +1,152 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8ee48ff..06d22a2 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7604,10 +7604,13 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+         return false;
+     }
+ 
+-    /* Deferred console graphics first; when they don't compile, the PSO's fallback pipeline. */
++    /* Deferred console graphics first; when they don't compile, the PSO's fallback pipeline. A mesh
++     * pipeline's deferred mesh and pixel stages (patch 0013) compile here too, at each DispatchMesh and
++     * mesh ExecuteIndirect. */
+     vk_pipeline = VK_NULL_HANDLE;
+     list->rebox.rect_pipeline = false;
+-    if (pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS && d3d12_pipeline_state_rebox_graphics(list->state))
++    if ((pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
++            && d3d12_pipeline_state_rebox_graphics(list->state))
+         vk_pipeline = d3d12_command_list_rebox_graphics_pipeline(list, &new_active_flags);
+ 
+     /* Try to grab the pipeline we compiled ahead of time. If we cannot do so, fall back. */
+@@ -8433,8 +8436,8 @@ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_comman
+     in.increment[1] = d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+     vkd3d_rebox_bindless_targets(list->device, in.bindless);
+ 
+-    /* A rect list: the stages are kept for ReboxConsoleRectStages. */
+-    rect = list->rebox.rect_list && rect_stages;
++    /* A rect list: the stages are kept for ReboxConsoleRectStages. A mesh pipeline has no topology. */
++    rect = list->rebox.rect_list && rect_stages && state->pipeline_type != VKD3D_PIPELINE_TYPE_MESH_GRAPHICS;
+     in.rect_list = rect;
+     in.shader = (const uint8_t *)g + g->vs_offset;
+     in.shader_size = g->vs_size;
+@@ -17552,6 +17555,17 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+ 
++    /* rebox (patch 0013): an indirect console mesh dispatch reads its group counts on the GPU, so
++     * groups along Y and Z can't be counted along X as DispatchMesh does: they would repeat X's. */
++    if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH && list->state
++            && d3d12_pipeline_state_rebox_graphics(list->state))
++    {
++        static unsigned int logged;
++        if (logged++ < 4)
++            ERR("rebox: indirect console mesh dispatch, up to %u records of %u bytes (groups along Y and Z repeat X's).\n",
++                    max_command_count, signature_desc->ByteStride);
++    }
++
+     /* Temporary workaround, since we cannot parse non-draw arguments yet. Point directly
+      * to the first argument. Should avoid hard crashes for now. */
+     arg_buffer_offset += sig_impl->argument_buffer_offset_for_command;
+@@ -20704,6 +20718,27 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list
+ 
+     d3d12_command_list_flush_dgc_batch(list);
+ 
++    /* rebox (patch 0013): a console mesh stage gets its group as one index (AnyPS5's mesh path makes it
++     * from workgroup X), so the groups are counted along X; the fallback, which draws nothing, doesn't
++     * mind. */
++    if (list->state && list->state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS
++            && d3d12_pipeline_state_rebox_graphics(list->state) && (y > 1 || z > 1))
++    {
++        const VkPhysicalDeviceMeshShaderPropertiesEXT *mesh = &list->device->device_info.mesh_shader_properties;
++        uint64_t groups = (uint64_t)x * y * z;
++        bool fits = groups <= mesh->maxMeshWorkGroupCount[0] && groups <= mesh->maxMeshWorkGroupTotalCount;
++        static unsigned int logged;
++
++        if (logged++ < 4)
++            ERR("rebox: console mesh dispatch of %u x %u x %u groups %s.\n", x, y, z,
++                    fits ? "made one row" : "left as it is: more groups than the device takes along X");
++        if (fits)
++        {
++            x = (UINT)groups;
++            y = z = 1;
++        }
++    }
++
+     if (list->predication.fallback_enabled)
+     {
+         union vkd3d_predicate_command_direct_args args;
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index fb4fde2..ceb4de0 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3487,6 +3487,8 @@ struct vkd3d_rebox_graphics_override
+     uint32_t attribute_count;
+     const VkVertexInputBindingDescription *bindings;
+     uint32_t binding_count;
++    /* patch 0013: the subgroup size a console mesh stage (in vs) was compiled for, if it can be required */
++    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo mesh_subgroup;
+ };
+ static VKD3D_THREAD_LOCAL const struct vkd3d_rebox_graphics_override *rebox_override;
+ 
+@@ -3635,6 +3637,20 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+     }
+     override.attributes = attributes;
+     override.bindings = bindings;
++    /* A mesh pipeline's first stage is its mesh stage: no vertex input, and AnyPS5 lays a wave64
++     * program out for subgroups of 64. */
++    if ((graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && vs->subgroup_size)
++    {
++        const VkPhysicalDeviceVulkan13Properties *properties = &device->device_info.vulkan_1_3_properties;
++        if ((properties->requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT)
++                && vs->subgroup_size >= properties->minSubgroupSize && vs->subgroup_size <= properties->maxSubgroupSize)
++        {
++            override.mesh_subgroup.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
++            override.mesh_subgroup.requiredSubgroupSize = vs->subgroup_size;
++        }
++        else
++            WARN("rebox: console mesh stage wants subgroup size %u, which can't be required.\n", vs->subgroup_size);
++    }
+ 
+     memset(&module_info, 0, sizeof(module_info));
+     module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+@@ -6994,12 +7010,13 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+ 
+     if (rebox_override)
+     {
+-        /* The console stages in place of the PSO's vertex and pixel shaders. */
++        /* The console stages in place of the PSO's vertex (or mesh) and pixel shaders. */
+         if (pipeline_desc.pStages != stages)
+             memcpy(stages, graphics->stages, graphics->stage_count * sizeof(stages[0]));
+         for (i = 0; i < graphics->stage_count; i++)
+         {
+-            VkShaderModule module = stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT ? rebox_override->vs
++            VkShaderModule module = stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT
++                    || stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT ? rebox_override->vs
+                     : stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? rebox_override->ps : VK_NULL_HANDLE;
+             if (!module)
+                 continue;
+@@ -7008,7 +7025,8 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+                 VK_CALL(vkDestroyShaderModule(device->vk_device, stages[i].module, NULL));
+                 stages_module_dup_mask &= ~(1u << i);
+             }
+-            stages[i].pNext = NULL;
++            stages[i].pNext = stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT
++                    && rebox_override->mesh_subgroup.sType ? &rebox_override->mesh_subgroup : NULL;
+             stages[i].flags = 0;
+             stages[i].module = module;
+             stages[i].pName = "main";
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 16689d5..ab539b3 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2337,7 +2337,9 @@ struct vkd3d_rebox_compile_out
+  * it created with fallback shaders, as private data (VKD3D_REBOX_GRAPHICS_GUID): the console
+  * vertex and pixel stages (deferred blobs) and the input layout. At each draw both are compiled by
+  * ReboxConsoleCompile, and the pipeline is the PSO's own with those two modules and vertex input
+- * made from the vertex stage's attributes; if a compile fails, the fallback pipeline draws. */
++ * made from the vertex stage's attributes; if a compile fails, the fallback pipeline draws. A mesh
++ * PSO's (patch 0013) has its mesh stage in place of the vertex stage and no input layout; it
++ * compiles at each DispatchMesh and mesh ExecuteIndirect. */
+ #define VKD3D_REBOX_GRAPHICS_MAGIC 0x47524353u /* "SCRG" */
+ struct vkd3d_rebox_graphics_element
+ {

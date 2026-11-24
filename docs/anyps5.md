@@ -69,7 +69,9 @@ instructions from a wave32 one where the container says.
 
 Graphics FSSMs (the shorter layout) carry less register state: the code at the u32 at 0xC0 plus
 0x28 (its size in bytes at 0xC8), `SPI_SHADER_PGM_RSRC1` at 0x108, the float mode at 0xFC. The
-rest comes from the code:
+target title's (sub-version 6 at +0x10) have the float mode at 0x104 (0xC0 in all its vertex and
+pixel shaders; 0xFC holds a count there) and no `RSRC1`, which is then built as for compute, and
+their code size counts the 24-byte shader ID before the code. The rest comes from the code:
 
 - **vertex**: the first instruction calls the fetch shader (`s_swappc_b64 s[4:5], s[4:5]`) the
   console driver builds from the PSO's input layout, which leaves input r in `v[4+4r..7+4r]`; the
@@ -83,7 +85,9 @@ rest comes from the code:
   `exp paramN` name signature registers numbered by what each shader uses. The FSSM's interface
   tables give them (xcl, GPL-2.0-only: sub-version at +0x10; pixel records at +0x130 with
   `SPI_PS_INPUT_ENA`, vertex records at +0x1D4), and `SPI_PS_INPUT_CNTL_n` is the VS param whose
-  OSG1 register has the semantic of the PS's ISG1 register for attribute n.
+  OSG1 register has the semantic of the PS's ISG1 register for attribute n. A param can hold a
+  packed pair of fp16 values from two registers (the target title's: 3,566 of 8,523 pixel tables
+  and 189 of 1,165 vertex tables); it links by its first.
 
 The `FLAT_SCRATCH` setup many console shaders open with (`s_setreg_imm32_b32` or `s_setreg_b32`
 to `HW_REG_FLAT_SCR_LO/HI`) becomes same-size `s_nop`s before each compile. Only the scalar
@@ -150,8 +154,9 @@ The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
   the fallback shaders, and `d3d12_xs` attaches both stages as `SCRD` version 2 blobs
   (`console_fssm_graphics`) plus the input layout, as private data (`REBOX_GRAPHICS_GUID`,
   `struct rebox_graphics`). PSOs made from pipeline streams (`CreatePipelineState`) get the same
-  when the stream's only stages are a vertex and a pixel shader; mesh and tessellation pipelines
-  keep their fallbacks. `REBOX_CONSOLE_GRAPHICS=0` turns this off.
+  when the stream's only stages are a vertex and a pixel shader, or a mesh and a pixel shader
+  (below); amplification and tessellation pipelines keep their fallbacks.
+  `REBOX_CONSOLE_GRAPHICS=0` turns this off.
 - **Draw** (patch 0006). At the first draw the PSO's private data is read; its vertex buffers
   join the PSO's mask. At each draw both stages compile through `ReboxConsoleCompile`, with user
   SGPRs in the console's graphics layout (root parameters from s8, one SGPR per descriptor
@@ -175,6 +180,48 @@ The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
   pipeline. `REBOX_GRAPHICS_DEBUG` (README) swaps in magenta pixel shaders or full-screen vertex
   shaders to see whether draws reach the image.
 
+### Mesh shaders
+
+A console mesh shader is an NGG program: the hardware GS stage in fast-launch mode, one
+"vertex" per lane. What it gets and does (VIctory's and xcl's notes, checked against the 6,685
+mesh shaders the target title creates, all dumped by `REBOX_DUMP_SHADERS`):
+
+- **Inputs.** User data from s8 (s0-s7 are the merged stage's system SGPRs), laid out as a vertex
+  shader's: root parameters from s8 in the graphics layout. s3 bits 24-27 hold the wave's index in
+  the group; v5 holds `group * stride + lane`, the code reading the first lane's and dividing by
+  the stride, `max(lanes, maximum vertices, maximum primitives)` (128 in every one of the title's:
+  128 lanes, two wave64 waves, up to 128 vertices and 128 triangles).
+- **Outputs.** `s_sendmsg GS_ALLOC_REQ` with m0 = vertices | primitives << 12, then lane n
+  exports vertex n (`exp pos`, `exp param`) and primitive n (`exp prim`: three 10-bit vertex
+  indices, bit 31 culls). No per-primitive outputs in the title.
+- **Container.** The FSSM's mesh record (`console_fssm.c` has the offsets): wave size, float mode,
+  LDS size, the output table (param n's OSG1 register, as a vertex shader's), `PA_CL_VS_OUT_CNTL`,
+  and the group's lanes, maximum vertices and primitives and output topology. The code follows a
+  24-byte shader ID.
+
+AnyPS5's mesh path translates the PS5's primitive shaders, which read an index buffer: each
+workgroup takes `primitivesPerGroup` input primitives, and lane n gets the n-th vertex index in
+v5. `sa5_compile_mesh` uses it on a non-indexed point list with `stride` points per group: lane
+n of workgroup g then gets v5 = g * stride + n, as from the console's fast launch, and each
+Vulkan workgroup is one console group. AnyPS5 reads its draw parameters (index count, base
+vertex, base instance, index format, indirect argument address) from push bytes 104-127;
+`sa5_finalize_draw` freezes them to no index limit and zeros, so the mesh stage's push data is
+AnyPS5's 96 bytes, then its draw block's address, and nothing per dispatch goes there.
+
+- **PSO creation.** A pipeline stream whose stages are a console mesh shader (the desktop's 25,
+  once `proxy.c` has renumbered the console's 24) and a pixel shader gets the mesh fallbacks and
+  both stages attached as for vertex and pixel, the mesh stage (`SCRD` version 2, stage 0x80,
+  `VK_SHADER_STAGE_MESH_BIT_EXT`) where the vertex stage goes and no input layout. The pixel
+  shader's interpolants are linked to the mesh shader's params through its output table and
+  OSG1, as for a vertex shader. Stage 0x40 (`TASK_BIT_EXT`) is kept for amplification shaders,
+  which aren't attached: AnyPS5 has no task stage, and the title has none.
+  `REBOX_MESH_PIPELINES=1` is still needed for `proxy.c` to make the title's mesh pipelines.
+- **Dispatch** (patch 0013). Where patch 0006 compiles a draw's stages, a mesh pipeline's compile
+  at each `DispatchMesh` and each `ExecuteIndirect` with a mesh-dispatch signature (the console's
+  argument type 107, 16-byte records, made desktop `DISPATCH_MESH` by `proxy.c`). `DispatchMesh`
+  counts `x * y * z` groups along X; an indirect dispatch's counts are on the GPU, so groups along
+  its Y and Z would repeat X's (logged; the title's records are taken as X, Y, Z). The mesh stage is required at the subgroup size AnyPS5 compiled it for (64).
+
 ## Tests
 
 The smoke test runs the whole path on lavapipe:
@@ -189,7 +236,11 @@ The smoke test runs the whole path on lavapipe:
   created as an ordinary compute PSO;
 - `test_console_draw`: a console vertex shader that calls the fetch and exports input 0 as the
   position, scaled by a constant buffer read through descriptor table 0 (s8), and a pixel shader
-  exporting red, in real containers, draw a full-screen triangle.
+  exporting red, in real containers, draw a full-screen triangle;
+- `test_console_mesh_compile`: a console mesh shader (three vertices, one triangle) in a container
+  of the target title's FSSM layout becomes a deferred mesh stage and compiles through
+  `ReboxConsoleCompile` and `sa5_finalize_draw`. lavapipe here has no mesh shaders, so no mesh
+  pipeline is made or drawn with.
 
 The dispatch tests also pass on RADV (Radeon 890M), whose bindless sets differ from lavapipe's
 (samplers 0/0, typed views and images 1/1, raw buffers and CBVs 2/0; lavapipe 1/2 for typed views
@@ -198,7 +249,11 @@ and images). `REBOX_DUMP_SPIRV=DIR` writes each finalized module.
 `anyps5/layout.cpp` (behind `sa5_analyse`) infers a shader's descriptor tables and wave size from
 its code; `tools/ps09.py` reads the PS09 PSO cache. `sa5_check.exe` compiles shaders through the
 DLL outside a title: a built-in one, a dumped one (`CODE.bin SKIP RSRC1 RSRC2 X,Y,Z`), or the
-vertex or pixel shaders listed in a plan file (`vs`/`ps PLAN`).
+vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a built-in mesh
+program (`mesh`). Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
+and finalize with no guest memory (`ms PLAN`, as d3d12_xs compiles them); 619 more need the
+descriptors a draw's memory gives (the SRT walk), and 526 use `v_mad_legacy_f32` with clamp,
+which AnyPS5's decoder refuses ("VOP3 source modifiers are not implemented").
 
 ## AnyPS5 patches
 
@@ -264,6 +319,11 @@ Titles that ship a PS09 PSO cache carry the console driver's register state for 
   replace the root-order layout.
 - **Speculated descriptors** are checked through the fault buffer, which is logged; recompiling
   on a mismatch isn't done.
-- **NGG and mesh shaders** may not map cleanly onto AnyPS5's mesh path; mesh pipelines keep their
+- **Mesh shaders** compile but haven't drawn on a GPU yet. Still open: `v_mad_legacy_f32` with
+  clamp in AnyPS5's decoder (8% of the title's mesh shaders); per-primitive outputs (none in the
+  title; such a stage is refused); amplification shaders (no task stage in AnyPS5); the Y and Z
+  group counts of indirect mesh dispatches, and what the console's 16-byte records hold beyond
+  three group counts; root arguments an `ExecuteIndirect` changes per record, which never reach
+  the console stages' user SGPRs (true of draws too). Geometry-shader NGG pipelines keep their
   fallbacks.
 - **`SpirvTarget`** has fixed values; it should come from vkd3d-proton's physical device.

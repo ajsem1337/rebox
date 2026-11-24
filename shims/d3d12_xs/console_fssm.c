@@ -225,6 +225,13 @@ void WINAPI ReboxConsoleFree(void *blob)
     free(blob);
 }
 
+/* For tests: the deferred graphics stage console_fssm_graphics makes (stage 0x1, 0x10 or 0x80), in
+ * memory the caller frees with ReboxConsoleFree. */
+void *WINAPI ReboxConsoleGraphicsFromContainer(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size)
+{
+    return console_fssm_graphics(container, size, stage, blob_size);
+}
+
 /* ------------------------------------------------------------------ graphics stages
  *
  * The older graphics FSSM layout (Unreal Engine 5 titles) carries less register state than compute: the code (at
@@ -329,10 +336,14 @@ static void gfx10_vgprs(const UINT32 *ins, UINT size, UINT64 *read, UINT64 *writ
  * on every cached shader of three titles). Attribute and param numbers name signature registers,
  * numbered by what the code uses, not elements: a UE5 title's Slate pixel shader reads COLOR0 as attr0
  * and TEXCOORD1 as attr1. The tables sit after a sub-version at +0x10 (5 in a UE5 title's GDK, 6 adds
- * 8 bytes). Pixel: 32 records of 8 bytes at +0x130 (kind, register, mask, attribute number, 0, 0,
- * register again, 1 flat / 2 interpolated), the count at +0x100 after them, SPI_PS_INPUT_ENA at
- * +0x110. Vertex: 32 records of 6 bytes at +0x1D4 (kind, register, param number, 0, 0, 0), the
- * count at +0xC0 after them. FALSE if the tables aren't there or don't check out. */
+ * 8 bytes). Pixel: 32 records of 8 bytes at +0x130 (kind, register, mask, attribute number, 0, a
+ * packed pair's second register, the param the console's own linking gives it, flags: bit 0 flat),
+ * the count at +0x100 after them, SPI_PS_INPUT_ENA at +0x110. Vertex: 32 records of 6 bytes at
+ * +0x1D4 (kind, register, param number, a packed pair's second register, 0, flags), the count at
+ * +0xC0 after them. FALSE if the tables aren't there or don't check out. Packed pairs (two fp16
+ * values in one param, flags 3 for a vertex output, 0x1A for a pixel input) and that param number,
+ * which counts pairs once, are in 3,566 of the target title's 8,523 pixel tables and 189 of its
+ * 1,165 vertex tables (VIctory names the fields); a pair links by its first register. */
 static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct rebox_deferred_graphics *g,
                            UINT32 *input_ena)
 {
@@ -355,13 +366,13 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
         for (UINT k = 0; k < n; k++)
         {
             const BYTE *r = fssm + base + 8 * k;
-            if (r[3] != k || r[4] || r[5] || r[6] != r[1])
+            if (r[3] != k || r[4])
                 return FALSE;
         }
         for (UINT k = 0; k < n; k++)
         {
             g->registers[k] = fssm[base + 8 * k + 1];
-            g->flat[k] = fssm[base + 8 * k + 7] == 1;
+            g->flat[k] = fssm[base + 8 * k + 7] & 1;
         }
         *input_ena = u32(fssm + base + 0x110);
     }
@@ -373,7 +384,7 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
         for (UINT k = 0; k < n; k++)
         {
             const BYTE *r = fssm + base + 6 * k;
-            if (r[2] != k || r[3] || r[4] || r[5])
+            if (r[2] != k || r[4])
                 return FALSE;
         }
         for (UINT k = 0; k < n; k++)
@@ -381,6 +392,102 @@ static BOOL fssm_interface(const BYTE *fssm, SIZE_T size, UINT32 stage, struct r
     }
     g->register_count = n;
     return TRUE;
+}
+
+/* ------------------------------------------------------------------ mesh stages
+ *
+ * A mesh shader's FSSM, as all 6,685 of the target title's have it (sub-version 6; the layout
+ * VIctory describes, crates/victory-shader/src/native.rs): after "FSSM", its version (0x101) and a
+ * u64 size, the payload at 0x10 opens with the slot count (6), then a u64 record offset per hardware
+ * stage (payload-relative; 0xDEADBEEF_DEADBEEF for none), the mesh stage's at +0x48. Its record:
+ *   +0x00  u64 code offset (payload-relative) and +0x08 its size: a 24-byte shader ID, then the
+ *          code (every one opens with s_inst_prefetch there)
+ *   +0x14  flags: bit 5 wave32 (clear in all: wave64), bits 16-20 user SGPRs (13-17)
+ *   +0x44  float mode (0xC0 in all), +0x4C LDS bytes (0 in all but 5)
+ * then its stage data, E = record + 0x54:
+ *   E+0xC8   32 outputs of 6 bytes (count at E+0x188): usage, OSG1 register, param, a packed
+ *            pair's second register, 0, flags (3: two fp16 halves); param bit 7 would mark a
+ *            per-primitive output (none in the title)
+ *   E+0x194  PA_CL_VS_OUT_CNTL (clip distances in 1,438)
+ *   E+0x448  u16 lanes per group, u16 maximum vertices, u16 maximum primitives (128 each in all),
+ *            u8 user SGPRs, u8 output topology (2 triangles in all; 1 lines)
+ * The group stride the code divides v5 by is max(lanes, vertices, primitives) (VIctory; xcl's
+ * notes have v5 >> 7 in the retail code for 128). The title's mesh shaders have no amplification
+ * stage. */
+#define FSSM_PAYLOAD 0x10
+#define FSSM_MESH_SLOT 0x48
+#define FSSM_SHADER_ID 24
+#define FSSM_RECORD 0x54
+#define MESH_OUTPUTS 0xc8
+#define MESH_OUTPUT_COUNT 0x188
+#define MESH_CLIP_CNTL 0x194
+#define MESH_INFO 0x448
+
+static UINT64 u64(const BYTE *p)
+{
+    return u32(p) | (UINT64)u32(p + 4) << 32;
+}
+
+static void *fssm_mesh(const BYTE *fssm, SIZE_T size, SIZE_T *blob_size)
+{
+    const BYTE *payload = fssm + FSSM_PAYLOAD, *record, *data, *info;
+    SIZE_T payload_size = size - FSSM_PAYLOAD;
+    struct rebox_deferred_shader *h;
+    struct rebox_deferred_graphics *g;
+    UINT64 at, code_at, code_bytes;
+    UINT32 flags, outputs, topology;
+
+    if (size < FSSM_PAYLOAD + FSSM_MESH_SLOT + 8 || u32(fssm + 4) != 0x101 || u64(payload) != 6
+            || (at = u64(payload + FSSM_MESH_SLOT)) > payload_size || payload_size - at < FSSM_RECORD + MESH_INFO + 8)
+        return NULL;
+    record = payload + at;
+    data = record + FSSM_RECORD;
+    info = data + MESH_INFO;
+    code_at = u64(record) + FSSM_SHADER_ID;
+    code_bytes = u64(record + 8);
+    if (code_bytes <= FSSM_SHADER_ID || code_at > payload_size || code_at % 4)
+        return NULL;
+    code_bytes = min(code_bytes - FSSM_SHADER_ID, payload_size - code_at) & ~(UINT64)3;
+    flags = u32(record + 0x14);
+    outputs = u32(data + MESH_OUTPUT_COUNT);
+    topology = info[7];
+    if (!code_bytes || outputs > 32 || topology < 1 || topology > 2 || !(info[0] | info[1] << 8)
+            || !(info[2] | info[3] << 8) || !(info[4] | info[5] << 8))
+        return NULL;
+    if (!(h = calloc(1, sizeof(*h) + sizeof(*g) + code_bytes)))
+        return NULL;
+    g = (struct rebox_deferred_graphics *)(h + 1);
+    for (UINT k = 0; k < outputs; k++)
+    {
+        const BYTE *r = data + MESH_OUTPUTS + 6 * k;
+        if (r[2] != k || r[4]) /* per-primitive (param bit 7) isn't modelled; the rest not seen */
+        {
+            free(h);
+            return NULL;
+        }
+        g->registers[k] = r[1];
+    }
+    g->register_count = outputs;
+    g->mesh.threads = info[0] | info[1] << 8;
+    g->mesh.max_vertices = info[2] | info[3] << 8;
+    g->mesh.max_primitives = info[4] | info[5] << 8;
+    g->mesh.group_stride = max(g->mesh.threads, max(g->mesh.max_vertices, g->mesh.max_primitives));
+    g->mesh.primitive_vertices = topology + 1;
+    g->mesh.lds_bytes = u32(record + 0x4c);
+    g->mesh.clip_cntl = u32(data + MESH_CLIP_CNTL);
+    h->magic = REBOX_DEFERRED_MAGIC;
+    h->version = 2;
+    h->size = (UINT32)(sizeof(*h) + sizeof(*g) + code_bytes);
+    h->stage = 0x80; /* VK_SHADER_STAGE_MESH_BIT_EXT */
+    h->wave_size = (flags & FSSM_WAVE32) ? 32 : 64;
+    h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(record + 0x44) & 0xff) << 12;
+    h->rsrc2 = 1u << 27; /* USER_SGPR_MSB: 32 user SGPRs, s8 on the root parameters */
+    h->code_offset = sizeof(*h) + sizeof(*g);
+    h->code_dwords = (UINT32)(code_bytes / 4);
+    h->code_address = 0x10000000000ull;
+    memcpy((BYTE *)h + h->code_offset, payload + code_at, code_bytes);
+    *blob_size = h->size;
+    return h;
 }
 
 void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SIZE_T *blob_size)
@@ -394,6 +501,12 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
 
     if (!fssm)
         return NULL;
+    if (stage == 0x80)
+    {
+        h = fssm_mesh(fssm, fssm_size, blob_size);
+        free(fssm);
+        return h;
+    }
     code_offset = u32(fssm + FSSM_CODE_POINTER) + 0x28;
     code_bytes = fssm_size > FSSM_GFX_RSRC1 + 4 ? u32(fssm + FSSM_GFX_CODE_SIZE) : 0;
     if (code_offset % 4 || code_offset >= fssm_size || code_offset < FSSM_GFX_RSRC1 + 4)
@@ -401,6 +514,10 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
         free(fssm);
         return NULL;
     }
+    /* Sub-version 6 (the target title's): the record at 0xC0 (as the mesh record above), its code size
+     * counting the 24-byte shader ID. */
+    if (fssm_size >= 0x14 && u32(fssm + 0x10) == 6 && code_bytes > FSSM_SHADER_ID)
+        code_bytes -= FSSM_SHADER_ID;
     code_bytes = min(code_bytes, fssm_size - code_offset) & ~(SIZE_T)3;
     code = (const UINT32 *)(fssm + code_offset);
     dwords = (UINT)(code_bytes / 4);
@@ -487,6 +604,11 @@ void *console_fssm_graphics(const void *container, SIZE_T size, UINT32 stage, SI
     h->stage = stage;
     h->wave_size = 0;                                     /* inferred from the code (console_compile.c) */
     h->rsrc1 = (u32(fssm + FSSM_GFX_RSRC1) & ~(0xffu << 12)) | (u32(fssm + FSSM_SHORT_FLOAT_MODE) & 0xff) << 12;
+    /* Sub-version 6 has the float mode 8 bytes later, at 0x104 (the record's +0x44, as compute's),
+     * and no RSRC1: 0xFC holds the record's count of resources it uses (0-0x13 in the title's) and
+     * 0x108 zero. Built as for compute. */
+    if (u32(fssm + 0x10) == 6)
+        h->rsrc1 = 0x40000000u | 1u << 21 /* DX10_CLAMP */ | (u32(fssm + FSSM_FLOAT_MODE) & 0xff) << 12;
     h->rsrc2 = (user & 0x1f) << 1 | (user >> 5 & 1) << 27; /* USER_SGPR, USER_SGPR_MSB (32 for vertex shaders) */
     h->code_offset = sizeof(*h) + sizeof(*g);
     h->code_dwords = dwords;

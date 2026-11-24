@@ -100,7 +100,45 @@ struct sa5_vertex_request
     uint32_t push_size;               /* 0: 128 */
 };
 
+/* A console mesh shader: an NGG program (the hardware GS stage in fast-launch mode) that AnyPS5's
+ * mesh path takes as a primitive shader over a point list with no index buffer. The console
+ * launches a group's lanes with v5 = group * group_stride + lane (the code reads v5 of the first
+ * lane and divides), s3 bits 24-27 the wave's index in the group; user data from s8, s0-s7 being
+ * the merged stage's system SGPRs (AnyPS5 fills s2-s7; its index buffer V#, which it reads from
+ * s[4:7] and never uses here, is put there). Each Vulkan workgroup is one console
+ * group: workgroup X is group X. The program allocates its outputs (s_sendmsg GS_ALLOC_REQ) and
+ * exports vertex n and primitive n from lane n.
+ *
+ * AnyPS5 reads its draw parameters from push bytes 104-127 (MeshDrawPushOffsetBytes), so the
+ * stage's push data, with anything sa5_finalize_draw adds, must end by byte 104; sa5_finalize and
+ * sa5_finalize_draw freeze those parameters to such a draw (no index limit, no indirect
+ * arguments), and the push bytes are left free. */
+struct sa5_mesh_request
+{
+    const uint32_t *code;
+    uint32_t code_dwords;
+    uint64_t code_address;
+    uint32_t wave;                    /* 32 or 64 */
+    const uint32_t *user_data;        /* from s0; at least 8 */
+    uint32_t user_data_count;
+    uint32_t rsrc1;                   /* float mode, clamp, IEEE as in SPI_SHADER_PGM_RSRC1_GS */
+    uint32_t threads;                 /* lanes per group */
+    uint32_t max_vertices, max_primitives;
+    uint32_t group_stride;            /* what v5 holds the group times; 0: max(threads, max_vertices, max_primitives) */
+    uint32_t primitive_vertices;      /* output topology: 3 triangles, 2 lines, 1 points */
+    uint32_t lds_bytes;
+    uint32_t clip_cntl;               /* PA_CL_VS_OUT_CNTL: the clip and cull distances pos1+ carry */
+    uint32_t push_offset, push_size;  /* push_size 0: 104 - push_offset */
+    const struct sa5_region *regions;
+    uint32_t region_count;
+    uint32_t use_cache;
+};
+
 struct sa5_result;
+
+/* Returns 0, or -1 and the recompiler's message. AnyPS5 has no amplification (task) stage. */
+SA5_API int sa5_compile_mesh(const struct sa5_mesh_request *request, struct sa5_result **result, char *error,
+                             size_t error_size);
 
 SA5_API int sa5_compile_pixel(const struct sa5_pixel_request *request, struct sa5_result **result,
                               char *error, size_t error_size);
