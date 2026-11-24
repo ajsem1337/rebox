@@ -981,7 +981,7 @@ static void program_set(UINT64 key, enum program_state state)
     ReleaseSRWLockExclusive(&programs_lock);
 }
 
-/* Variants of a program compiled before: by the program and the draw's user SGPRs. A new one
+/* Variants of a graphics program compiled before: by the program and the draw's user SGPRs. A new one
  * compiled in the title's thread took AnyPS5 up to seconds (a translation, or a large one from the
  * disk cache), and a scene bringing in hundreds stalled its frames until the title's GPU watchdog
  * fired. A new variant goes to a worker, ahead of the queue, and the caller waits a few
@@ -1276,6 +1276,11 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
         set_last(E_FAIL, "its background compile failed", NULL);
         return E_FAIL;
     default:
+        /* A compute variant compiles here as before: a skipped dispatch can leave out what the
+         * title reads back (a crash at load, when compute variants were skipped too). */
+        if (in->shader_size < sizeof(struct rebox_deferred_shader)
+                || ((const struct rebox_deferred_shader *)in->shader)->version != 2)
+            return compile_now(in, out, FALSE);
         return compile_variant(key, in, out);
     }
 }
