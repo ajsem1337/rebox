@@ -3364,7 +3364,7 @@ static void log_list_order(struct proxy *p, UINT count, ID3D12CommandList *const
                 at += snprintf(line + at, sizeof(line) - at, " W%llx=%x", (unsigned long long)l->gpu_writes[g].address & 0xfff,
                                l->gpu_writes[g].values[0]);
             if (k < l->wait_count && at < 900)
-                at += snprintf(line + at, sizeof(line) - at, " wait%llx%s%llx", (unsigned long long)l->waits[k].address & 0xfff,
+                at += snprintf(line + at, sizeof(line) - at, " wait%llx%s%llx", (unsigned long long)l->waits[k].address,
                                l->waits[k].comparison == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? ">=" :
                                l->waits[k].comparison == D3D12_COMPARISON_FUNC_GREATER ? ">" : "?",
                                (unsigned long long)l->waits[k].value);
