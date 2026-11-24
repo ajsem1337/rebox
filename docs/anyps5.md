@@ -236,7 +236,11 @@ The smoke test runs the whole path on lavapipe:
   created as an ordinary compute PSO;
 - `test_console_draw`: a console vertex shader that calls the fetch and exports input 0 as the
   position, scaled by a constant buffer read through descriptor table 0 (s8), and a pixel shader
-  exporting red, in real containers, draw a full-screen triangle.
+  exporting red, in real containers, draw a full-screen triangle;
+- `test_console_mesh_compile`: a console mesh shader (three vertices, one triangle) in a container
+  of the target title's FSSM layout becomes a deferred mesh stage and compiles through
+  `ReboxConsoleCompile` and `sa5_finalize_draw`. lavapipe here has no mesh shaders, so no mesh
+  pipeline is made or drawn with.
 
 The dispatch tests also pass on RADV (Radeon 890M), whose bindless sets differ from lavapipe's
 (samplers 0/0, typed views and images 1/1, raw buffers and CBVs 2/0; lavapipe 1/2 for typed views
@@ -245,7 +249,11 @@ and images). `REBOX_DUMP_SPIRV=DIR` writes each finalized module.
 `anyps5/layout.cpp` (behind `sa5_analyse`) infers a shader's descriptor tables and wave size from
 its code; `tools/ps09.py` reads the PS09 PSO cache. `sa5_check.exe` compiles shaders through the
 DLL outside a title: a built-in one, a dumped one (`CODE.bin SKIP RSRC1 RSRC2 X,Y,Z`), or the
-vertex or pixel shaders listed in a plan file (`vs`/`ps PLAN`).
+vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a built-in mesh
+program (`mesh`). Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
+and finalize with no guest memory (`ms PLAN`, as d3d12_xs compiles them); 619 more need the
+descriptors a draw's memory gives (the SRT walk), and 526 use `v_mad_legacy_f32` with clamp,
+which AnyPS5's decoder refuses ("VOP3 source modifiers are not implemented").
 
 ## AnyPS5 patches
 
@@ -311,6 +319,11 @@ Titles that ship a PS09 PSO cache carry the console driver's register state for 
   replace the root-order layout.
 - **Speculated descriptors** are checked through the fault buffer, which is logged; recompiling
   on a mismatch isn't done.
-- **NGG and mesh shaders** may not map cleanly onto AnyPS5's mesh path; mesh pipelines keep their
+- **Mesh shaders** compile but haven't drawn on a GPU yet. Still open: `v_mad_legacy_f32` with
+  clamp in AnyPS5's decoder (8% of the title's mesh shaders); per-primitive outputs (none in the
+  title; such a stage is refused); amplification shaders (no task stage in AnyPS5); the Y and Z
+  group counts of indirect mesh dispatches, and what the console's 16-byte records hold beyond
+  three group counts; root arguments an `ExecuteIndirect` changes per record, which never reach
+  the console stages' user SGPRs (true of draws too). Geometry-shader NGG pipelines keep their
   fallbacks.
 - **`SpirvTarget`** has fixed values; it should come from vkd3d-proton's physical device.
