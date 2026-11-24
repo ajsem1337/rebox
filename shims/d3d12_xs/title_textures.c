@@ -177,12 +177,14 @@ static void watch(void)
     /* Hot textures, ones the CPU has rewritten since they were made (a glyph atlas gains letters
      * as text is laid out, and the frame draws them at once), are checked every submission: the
      * round robin over hundreds of textures came back to them only after the text had been
-     * drawn without its letters. Not render targets: uploading those more often overwrote what
-     * the GPU drew into them (menu text got worse). */
+     * drawn without its letters. Large ones are sampled, which costs little: a video's planes, which
+     * the decoder rewrites every frame and the round robin reached only every few frames, so the
+     * video jumped back to a buffer's older frame. Not render targets: uploading those more often
+     * overwrote what the GPU drew into them (menu text got worse). */
     hashed = 0;
     for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (t->uploads >= 2 && !t->target && full_hash(t) && !t->dirty && !t->gpu_written && !t->unreadable
-                && still_readable(t) && (hashed += t->size, fingerprint(t) != t->fingerprint))
+        if (t->uploads >= 2 && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
+                && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, fingerprint(t) != t->fingerprint))
         {
             t->dirty = TRUE;
             InterlockedIncrement(&dirty_count);
