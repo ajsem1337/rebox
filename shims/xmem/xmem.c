@@ -742,6 +742,7 @@ struct physical_unit
     UINT64 offset;    /* into the section */
     ULONG_PTR mapped; /* the address it was last mapped at, or 0 */
     BOOL copy;        /* mapped there as a copy (no placeholder), not a view */
+    ULONG_PTR copy_at; /* where it is mapped as a copy, or 0: writes go there too */
     UINT size_units;  /* at a page's first unit: its size in 64 KiB units (1 or 64) */
 };
 
@@ -889,6 +890,20 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
     return TRUE;
 }
 
+/* Ranges d3d12_xs made GPU memory in place (ReboxPhysicalAdopted): their pages were replaced by a
+ * GPU heap holding a copy, so pages mapped there are copies from then on, and the memory is never
+ * decommitted or split here. */
+static struct { ULONG_PTR start, end; } adopted[32];
+static UINT adopted_count;
+
+static BOOL in_adopted(ULONG_PTR address)
+{
+    for (UINT i = 0; i < adopted_count; i++)
+        if (address >= adopted[i].start && address < adopted[i].end)
+            return TRUE;
+    return FALSE;
+}
+
 /* The slot of the page mapped at address, or -1. Under physical_lock. */
 static SIZE_T slot_at(ULONG_PTR address)
 {
@@ -901,6 +916,8 @@ static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view
     SIZE_T slot = mapped_slot(address, TRUE);
     units[u].mapped = address;
     units[u].copy = copy;
+    if (copy)
+        units[u].copy_at = address;
     if (slot == (SIZE_T)-1)
         return;
     mapped_at[slot].address = address;
@@ -915,6 +932,8 @@ static void clear_slot(SIZE_T slot)
     ULONG_PTR u = mapped_at[slot].unit;
     if (units[u].mapped == mapped_at[slot].address)
         units[u].mapped = 0;
+    if (units[u].copy_at == mapped_at[slot].address)
+        units[u].copy_at = 0;
     mapped_at[slot].address = 1; /* a tombstone */
 }
 
@@ -924,7 +943,7 @@ static void clear_slot(SIZE_T slot)
 static BOOL place_view(ULONG_PTR address, SIZE_T size, struct page_section *s, UINT64 offset)
 {
     void *p = (void *)address;
-    if (!map_view3)
+    if (!map_view3 || in_adopted(address))
         return FALSE;
     if (map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
         return TRUE;
@@ -942,7 +961,7 @@ static BOOL place_copy(ULONG_PTR address, ULONG_PTR u)
     SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
     static LONG logged, copies;
 
-    if (!VirtualAlloc((void *)address, size, MEM_COMMIT, PAGE_READWRITE)
+    if (!in_adopted(address) && !VirtualAlloc((void *)address, size, MEM_COMMIT, PAGE_READWRITE)
             && !VirtualAlloc((void *)address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
         if (InterlockedIncrement(&logged) <= 8)
@@ -1015,7 +1034,8 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
             SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
             if (units[u].section && !IsBadReadPtr((void *)at, size))
                 memcpy(unit_home(u), (void *)at, size);
-            VirtualFree((void *)at, size, MEM_DECOMMIT);
+            if (!in_adopted(at))
+                VirtualFree((void *)at, size, MEM_DECOMMIT);
             clear_slot(slot);
             continue;
         }
@@ -1123,7 +1143,7 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
             n = 0;
             if (i < count)
             {
-                VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT);
+                if (!in_adopted(at)) VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT);
                 at += PAGE_UNIT;
             }
         }
@@ -1133,11 +1153,45 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
         ok = FALSE;
     else
         for (ULONG_PTR at = start; at < end; at += PAGE_UNIT)
-            VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT); /* ordinary memory there: decommitted, as on unmapping */
+            if (!in_adopted(at)) VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT); /* ordinary memory there: decommitted, as on unmapping */
     ReleaseSRWLockExclusive(&physical_lock);
     return ok;
 }
 
+
+/* d3d12_xs made [address, address + size) GPU memory in place: a GPU heap holding a copy of what
+ * was there replaced the pages. Pages mapped there become copies (a write through
+ * ReboxWritePhysicalPages goes to both), and pages mapped there later are copied in. */
+void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
+{
+    UINT converted = 0;
+
+    AcquireSRWLockExclusive(&physical_lock);
+    if (adopted_count < ARRAYSIZE(adopted))
+    {
+        adopted[adopted_count].start = (ULONG_PTR)address;
+        adopted[adopted_count].end = (ULONG_PTR)(address + size);
+        adopted_count++;
+    }
+    for (ULONG_PTR at = (ULONG_PTR)address & ~(ULONG_PTR)(PAGE_UNIT - 1); mapped_at && at < address + size; at += PAGE_UNIT)
+    {
+        SIZE_T slot = slot_at(at);
+        ULONG_PTR u;
+        if (slot == (SIZE_T)-1 || mapped_at[slot].copy)
+            continue;
+        u = mapped_at[slot].unit;
+        mapped_at[slot].copy = TRUE;
+        mapped_at[slot].view = at;
+        mapped_at[slot].view_bytes = (SIZE_T)units[u].size_units * PAGE_UNIT;
+        units[u].copy_at = at;
+        if (units[u].mapped == at)
+            units[u].copy = TRUE;
+        converted++;
+    }
+    ReleaseSRWLockExclusive(&physical_lock);
+    rebox_log("xmem: %#llx+%#llx is GPU memory in place now: %u physical pages mapped there are copies",
+              (unsigned long long)address, (unsigned long long)size, converted);
+}
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)
@@ -1259,10 +1313,12 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
         }
         n = min(size, page_size - offset);
         memcpy(unit_home(u) + offset, from, n);
-        if (units[u].mapped && units[u].copy)
-            memcpy((BYTE *)units[u].mapped + offset, from, n);
+        if (units[u].copy_at)
+            memcpy((BYTE *)units[u].copy_at + offset, from, n);
         if (units[u].mapped && written)
             written((UINT64)(units[u].mapped + offset), n);
+        if (units[u].copy_at && units[u].copy_at != units[u].mapped && written)
+            written((UINT64)(units[u].copy_at + offset), n);
         from += n;
         size -= n;
         offset = 0;

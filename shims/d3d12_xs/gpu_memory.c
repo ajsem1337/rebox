@@ -485,6 +485,21 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     else if (c) /* mapped elsewhere: the title's pages are untouched */
         chunk_destroy(c);
     ReleaseSRWLockExclusive(&lock);
+    /* Physical pages mapped there are a copy in the heap now, not views of their pages: xmem
+     * writes what DirectStorage puts in those pages here too. */
+    if (ok)
+    {
+        static void (WINAPI *adopted)(ULONGLONG, ULONGLONG);
+        static BOOL resolved;
+        if (!resolved)
+        {
+            HMODULE xmem = GetModuleHandleA("xmem.dll");
+            adopted = xmem ? (void *)GetProcAddress(xmem, "ReboxPhysicalAdopted") : NULL;
+            resolved = TRUE;
+        }
+        if (adopted)
+            adopted(base, bytes);
+    }
     if (InterlockedIncrement(&logged) <= 8)
         rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place (for %#llx+%#llx)",
                   (unsigned long long)base, (unsigned long long)bytes, ok ? "made" : "could not be made",

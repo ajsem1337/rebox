@@ -21,6 +21,7 @@ EXPORTS
     ReboxGpuvaMailbox
     ReboxGpuViewToCpu
     ReboxWritePhysicalPages
+    ReboxPhysicalAdopted
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister
