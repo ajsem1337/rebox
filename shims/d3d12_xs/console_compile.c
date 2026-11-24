@@ -186,6 +186,7 @@ static UINT64 hash_bytes(UINT64 h, const void *data, SIZE_T size)
  * is written at submission instead (console_resolve_late), from the descriptor at its address
  * then. Until resolved, it holds the dummy texture. */
 struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
+static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes);
 static struct late_texture late[4096];
 static UINT late_count;
 /* V#s the same: a guest buffer table entry ({address, length in dwords}) whose V# was empty when the
@@ -217,6 +218,8 @@ void console_resolve_late(void)
                 UINT32 stride = (w[1] >> 16) & 0x3fff;
                 UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
                 static LONG shown;
+                if (!guest_buffer_mappable(&base, bytes))
+                    bytes = 0;
                 t->entry[0] = (UINT32)base;
                 t->entry[1] = (UINT32)(base >> 32);
                 t->entry[2] = (UINT32)min(bytes / 4, 0xffffffffull);
@@ -827,6 +830,40 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
             if (loads[k].sgpr == used[n])
                 return loads[k].address;
     return late_load_source(h, in, n, 3 /* s_load_dwordx8: a T# */);
+}
+
+/* A guest buffer's address as the GPU should read it: a title address (4 GiB to 2^46, outside the
+ * GPU window, as proxy.c's ia_adopt) in a GPU-only view of title memory becomes the CPU address
+ * behind it, and must be GPU memory there or be made so; FALSE if it can't be. Other addresses are
+ * vkd3d-proton's own. */
+static BOOL guest_buffer_mappable(UINT64 *base, UINT64 bytes)
+{
+    static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
+    static volatile LONG resolved;
+    UINT64 address = *base, end;
+
+    if (!address || !bytes || address < 0x100000000ull || address + bytes > 0x400000000000ull
+            || (address + bytes > 0x200000000000ull && address < 0x210000000000ull))
+        return TRUE;
+    if (!resolved)
+    {
+        to_cpu = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "ReboxGpuViewToCpu");
+        resolved = 1;
+    }
+    if (to_cpu)
+        address = to_cpu(address);
+    if ((gpu_memory_identity_extent(address, &end) && end >= address + bytes) || gpu_memory_adopt(address, bytes))
+    {
+        *base = address;
+        return TRUE;
+    }
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx isn't GPU memory and can't be made so: read as empty",
+                      (unsigned long long)*base, (unsigned long long)bytes);
+    }
+    return FALSE;
 }
 
 /* The same for the n-th V# the code loads (s_load_dwordx4). */
@@ -1939,6 +1976,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                   "%llu bytes)", (unsigned long long)stage_id, b.binding, e, w[0], w[1], w[2], w[3],
                                   (unsigned long long)base, (unsigned long long)bytes);
                 }
+                /* The shader reads the buffer at this address directly: one in a GPU-only view of
+                 * title memory is its CPU address, which must be GPU memory; one that can't be made
+                 * so is read as empty (a V# into such memory faulted the GPU). */
+                if (!guest_buffer_mappable(&base, bytes))
+                    bytes = 0;
                 table[e * 4] = (UINT32)base;
                 table[e * 4 + 1] = (UINT32)(base >> 32);
                 table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
