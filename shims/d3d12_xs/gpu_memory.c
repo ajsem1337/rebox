@@ -412,7 +412,16 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     struct gpuva_mailbox *box;
     struct chunk *c;
     BOOL ok = FALSE;
+    static int enabled = -1;
 
+    /* REBOX_ADOPT=0: none, to tell problems of memory replaced in place from others. */
+    if (enabled < 0)
+    {
+        const char *v = getenv("REBOX_ADOPT");
+        enabled = !v || strcmp(v, "0");
+    }
+    if (!enabled)
+        return FALSE;
     if (!get_mailbox)
     {
         HMODULE xmem = GetModuleHandleA("xmem.dll");
