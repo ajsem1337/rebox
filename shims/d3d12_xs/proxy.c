@@ -1327,9 +1327,15 @@ static void note_display_view(const char *what, ID3D12Resource *resource, SIZE_T
                 break;
             }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080
-            && InterlockedIncrement(&logged) <= 24)
-        rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#llx", what, (void *)resource,
-                  (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags, (unsigned long long)cpu);
+            && InterlockedIncrement(&logged) <= 96)
+    {
+        UINT64 at = 0;
+        UINT uploads = 0;
+        BOOL title = title_texture_info(resource, &at, &uploads);
+        rebox_log("d3d12_xs: %s of %p (%llux%u, format %u, flags %#x) at handle %#llx, %s %#llx", what,
+                  (void *)resource, (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags,
+                  (unsigned long long)cpu, title ? "title address" : "not a title texture;", (unsigned long long)at);
+    }
     /* A view on a texture at a title address where another texture is registered too: on the
      * console both are the same memory; here each texture placed in title memory has its own, so
      * what is drawn through one isn't seen through the other. */

@@ -260,9 +260,10 @@ void console_resolve_late(void)
                         if (r)
                             rd = ID3D12Resource_GetDesc(r);
                         rebox_log("d3d12_xs: late T# %08x %08x %08x %08x: heap slot %u, texture %p %llux%u format %u "
-                                  "flags %#x, %s (uploaded %u times)", w[0], w[1], w[2], w[3], index, (void *)r,
+                                  "flags %#x, %s %#llx (uploaded %u times)", w[0], w[1], w[2], w[3], index, (void *)r,
                                   (unsigned long long)rd.Width, rd.Height, rd.Format, (UINT)rd.Flags,
-                                  title ? "from title memory" : "GPU-made or API-filled", uploads);
+                                  title ? "from title memory at" : "GPU-made or API-filled;", (unsigned long long)at,
+                                  uploads);
                     }
                 }
                 *t->slot = index;
