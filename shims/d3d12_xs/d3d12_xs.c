@@ -330,7 +330,11 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
         LONG n = InterlockedIncrement(&refused_other);
         if (!(n & (n - 1)))
             rebox_log("d3d12_xs: graphics PSOs not deferred: %ld without both a %s and a pixel shader, or with "
-                         "tessellation or geometry stages", n, first_name);
+                         "tessellation or geometry stages (this one: %s %zu, pixel %zu, hull %zu, domain %zu, geometry "
+                         "%zu bytes, %u input elements)", n, first_name, first_name, (size_t)desc->VS.BytecodeLength,
+                         (size_t)desc->PS.BytecodeLength, (size_t)desc->HS.BytecodeLength,
+                         (size_t)desc->DS.BytecodeLength, (size_t)desc->GS.BytecodeLength,
+                         desc->InputLayout.NumElements);
         return;
     }
     if (!(vs = console_fssm_graphics(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, first, &vs_size))
