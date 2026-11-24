@@ -107,7 +107,13 @@ void *WINAPI xmem_low_virtual_alloc(void *address, SIZE_T size, DWORD type, DWOR
     NTSTATUS status;
 
     if (!address && (type & MEM_RESERVE))
-        return xmem_low_alloc2(NULL, size, type, protect);
+    {
+        void *p = xmem_low_alloc2(NULL, size, type, protect);
+        static LONG logged;
+        if (size >= (16u << 20) && InterlockedIncrement(&logged) <= 64)
+            rebox_log("xmem: VirtualAlloc reserve of %#zx bytes, type %#lx, protect %#lx -> %p", size, type, protect, p);
+        return p;
+    }
     if (!nt_alloc)
         nt_alloc = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory");
     if ((status = nt_alloc(GetCurrentProcess(), &address, 0, &size, type, protect)))
@@ -658,7 +664,8 @@ void *WINAPI XMemVirtualAlloc(void *address, SIZE_T size, DWORD type, ULONGLONG 
         p = xmem_low_virtual_alloc(address, size, host_type, host_protect);
     note_reservation(p, size, type, protect);
 
-    if (!p ? InterlockedIncrement(&failures) <= 16 : InterlockedIncrement(&calls) <= 4)
+    if (!p ? InterlockedIncrement(&failures) <= 16
+           : InterlockedIncrement(&calls) <= 4 || ((type & MEM_RESERVE) && size >= (16u << 20) && calls <= 256))
         rebox_log("xmem: XMemVirtualAlloc(%p, %#zx, type %#lx, flags %#llx, protect %#lx) -> %p (error %lu)", address,
                      size, type, (unsigned long long)xmem_flags, protect, p, p ? 0 : GetLastError());
     return p;
@@ -812,6 +819,26 @@ static BOOL map_page_at(ULONG_PTR address, ULONG_PTR u)
     static LONG logged;
 
     unmap_page_at(address);
+    {
+        /* Each reservation pages are mapped into, once: where it came from, to make them all
+         * placeholders that can hold views of shared page sections. */
+        static ULONG_PTR seen[64];
+        static UINT seen_count;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (seen_count < ARRAYSIZE(seen) && VirtualQuery((void *)address, &mbi, sizeof(mbi)))
+        {
+            UINT k;
+            for (k = 0; k < seen_count && seen[k] != (ULONG_PTR)mbi.AllocationBase; k++)
+                ;
+            if (k == seen_count)
+            {
+                seen[seen_count++] = (ULONG_PTR)mbi.AllocationBase;
+                rebox_log("xmem: physical pages mapped into the reservation at %p (first at %#llx): state %#lx, type %#lx, "
+                          "protect %#lx", mbi.AllocationBase, (unsigned long long)address, mbi.State, mbi.Type,
+                          mbi.AllocationProtect);
+            }
+        }
+    }
     /* The range is normally reserved already; if not, reserve it too. A placeholder of exactly
      * this size takes no commit, but can be replaced by committed memory. */
     if (!VirtualAlloc((void *)address, size, MEM_COMMIT, PAGE_READWRITE)
