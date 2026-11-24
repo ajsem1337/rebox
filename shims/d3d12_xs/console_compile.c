@@ -319,7 +319,17 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
         return 0;
     }
     if (ring_head + aligned > DRAW_RING)
+    {
+        /* How long a lap takes: under a frame or two, slots are reused while the GPU may still
+         * read them (there is no fence here). */
+        static ULONGLONG lap_start;
+        static LONG laps;
+        ULONGLONG now = GetTickCount64();
+        if (lap_start && (now - lap_start < 2000 || InterlockedIncrement(&laps) <= 4))
+            rebox_log("d3d12_xs: the per-draw ring wrapped after %llu ms", now - lap_start);
+        lap_start = now;
         ring_head = 0;
+    }
     at = ring_head;
     ring_head += aligned;
     memcpy(ring_cpu + at, data, size);
