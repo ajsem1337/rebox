@@ -13,6 +13,7 @@
 #include <dxgi1_6.h>
 #include <xaudio2.h>
 #include <mmdeviceapi.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5859,9 +5860,63 @@ static void test_xaudio2(void)
     IXAudio2_Release(xa);
 }
 
+/* REBOX_BINK_TRACE: a Bink 2 DLL loaded after xmem (build/Bink2Smoke.dll, a stand-in) is traced.
+ * Its exports, looked up by name as a title would, are xmem's wrappers, which pass arguments and
+ * results through. */
+static void test_bink_trace(void)
+{
+    typedef UINT_PTR (*open_fn)(const char *, const void *, UINT32);
+    typedef INT32 (*handle_fn)(UINT_PTR);
+    typedef INT32 (*pause_fn)(UINT_PTR, INT32);
+    typedef void (*goto_fn)(UINT_PTR, UINT32, INT32);
+    HMODULE m = LoadLibraryA("Bink2Smoke.dll");
+    MODULEINFO info = { 0 };
+    open_fn open;
+    handle_fn wait, doframe, next, close_movie;
+    pause_fn pause;
+    goto_fn seek;
+    LONG (*calls)(void);
+    UINT_PTR h;
+    const UINT32 *head;
+
+    CHECK(m != NULL, "load the stand-in Bink2Smoke.dll");
+    if (!m) return;
+    K32GetModuleInformation(GetCurrentProcess(), m, &info, sizeof(info));
+    open = (open_fn)(void *)GetProcAddress(m, "BinkOpenWithOptions");
+    wait = (handle_fn)(void *)GetProcAddress(m, "BinkWait");
+    doframe = (handle_fn)(void *)GetProcAddress(m, "BinkDoFrame");
+    next = (handle_fn)(void *)GetProcAddress(m, "BinkNextFrame");
+    close_movie = (handle_fn)(void *)GetProcAddress(m, "BinkClose");
+    pause = (pause_fn)(void *)GetProcAddress(m, "BinkPause");
+    seek = (goto_fn)(void *)GetProcAddress(m, "BinkGoto");
+    calls = (void *)GetProcAddress(m, "FakeBinkCalls");
+    CHECK(open && wait && doframe && next && close_movie && pause && seek && calls, "the stand-in's exports resolve");
+    if (!(open && wait && doframe && next && close_movie && pause && seek && calls)) return;
+    CHECK((BYTE *)open < (BYTE *)info.lpBaseOfDll || (BYTE *)open >= (BYTE *)info.lpBaseOfDll + info.SizeOfImage,
+          "BinkOpenWithOptions by GetProcAddress is xmem's wrapper (REBOX_BINK_TRACE=1)");
+    CHECK(!open("missing.bk2", NULL, 0), "a failed open passes through as NULL");
+    h = open("movie.bk2", NULL, 0x00100000);
+    head = (const UINT32 *)h;
+    CHECK(h && head[0] == 64 && head[1] == 32 && head[8] == 0x00100000,
+          "an open passes its name and flags through and returns the movie's handle");
+    if (!h) return;
+    CHECK(wait(h) == 1 && doframe(h) == 0 && wait(h) == 0, "BinkWait and BinkDoFrame results pass through");
+    next(h);
+    CHECK(head[3] == 2, "BinkNextFrame reaches the DLL");
+    CHECK(pause(h, 1) == 1 && head[0x11c / 4] == 1 && pause(h, 0) == 0 && !head[0x11c / 4],
+          "BinkPause passes the handle and flag through");
+    seek(h, 7, 0);
+    CHECK(head[3] == 7, "BinkGoto passes its frame through");
+    close_movie(h);
+    CHECK(calls() == 10, "every wrapped call reached the stand-in once (%ld calls)", calls());
+}
+
 int main(int argc, char **argv)
 {
+    /* Before xmem loads: its import fixup reads it then. */
+    SetEnvironmentVariableA("REBOX_BINK_TRACE", "1");
     test_xmem();
+    test_bink_trace();
     /* REBOX_SKIP_ASSERTS: an int3 in the exe is stepped over (xmem crash.c). */
     if (getenv("REBOX_SKIP_ASSERTS"))
     {

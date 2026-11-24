@@ -112,9 +112,15 @@ $(BUILD)/stub/%.dll: $(GEN)/dlls/$$*/stubs.c $(GEN)/dlls/$$*/$$*.def $(COMMON) s
 	$(MINGW_CC) $(CFLAGS) -Ishims/common -o $@ $(GEN)/dlls/$*/stubs.c $(COMMON) $(GEN)/dlls/$*/$*.def $(LDFLAGS)
 
 # Smoke test executable, run under Wine by tests/run-smoke.sh.
-$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h anyps5/rebox_anyps5.h shims/d3d12_xs/console_compile.h
+$(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h anyps5/rebox_anyps5.h shims/d3d12_xs/console_compile.h \
+		$(BUILD)/Bink2Smoke.dll
 	@mkdir -p $(BUILD)
 	$(MINGW_CC) $(CFLAGS) -o $@ $<
+
+# A stand-in Bink 2 DLL next to it, for REBOX_BINK_TRACE's test.
+$(BUILD)/Bink2Smoke.dll: tests/fake_bink.c
+	@mkdir -p $(BUILD)
+	$(MINGW_CC) $(CFLAGS) -shared -static-libgcc -o $@ $<
 
 # Native Linux probe: can the Vulkan driver map memory at the same GPU and CPU
 # address? Run it on the target GPU (see the comment at its top).

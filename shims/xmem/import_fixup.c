@@ -27,6 +27,7 @@
 
 #include "../common/rebox_log.h"
 #include "import_fixup.h"
+#include "bink_trace.h"
 
 /* Wine's loader allocate_stub() on x86_64:
  *   48 b9 <dll>  movabs rcx, dll     48 ba <name>  movabs rdx, name
@@ -720,7 +721,7 @@ static void *replacement(void *target)
     for (UINT i = 0; i < ARRAYSIZE(replacements); i++)
         if (replacements[i].wine && replacements[i].wine == target)
             return replacements[i].ours;
-    return NULL;
+    return bink_trace_replacement(target);
 }
 
 static BOOL is_wine_stub(const void *p)
@@ -858,6 +859,7 @@ static void CALLBACK dll_loaded(ULONG reason, const DLL_LOADED_DATA *data, void 
     if (reason != DLL_NOTIFICATION_LOADED)
         return;
     EnterCriticalSection(&stub_lock);
+    bink_trace_module(data->DllBase);
     fix_module(data->DllBase);
     LeaveCriticalSection(&stub_lock);
 }
@@ -913,6 +915,9 @@ void import_fixup_run(void)
     if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
         return;
     EnterCriticalSection(&stub_lock);
+    /* A Bink DLL first, so the title's imports of it are seen (REBOX_BINK_TRACE). */
+    for (DWORD i = 0; i < bytes / sizeof(*modules) && i < ARRAYSIZE(modules); i++)
+        bink_trace_module(modules[i]);
     for (DWORD i = 0; i < bytes / sizeof(*modules) && i < ARRAYSIZE(modules); i++)
         fix_module(modules[i]);
     LeaveCriticalSection(&stub_lock);
