@@ -1124,6 +1124,25 @@ static UINT64 *STDMETHODCALLTYPE fence_CompletedValueAddressX(struct proxy *p)
     return (UINT64 *)&cell->value;
 }
 
+/* Slot 9: SetEventOnCompletion, passed on. A wait for a value no queue has been told to signal
+ * (and the CPU hasn't) is logged with the fence's state: what a stuck title thread waits for. */
+static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(struct proxy *p, UINT64 value, HANDLE event)
+{
+    UINT64 done = ID3D12Fence_GetCompletedValue(INNER(p, ID3D12Fence));
+
+    if (done < value && p->fence_signalled < (LONG64)value)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 64)
+            rebox_log("d3d12_xs: fence %p: the title waits%s for %#llx, which no queue has been told to signal (last "
+                      "signal %#llx by queue %p, completed %#llx; thread %#lx)", (void *)p, event ? "" : " (blocking)",
+                      (unsigned long long)value, (unsigned long long)p->fence_signalled,
+                      p->signal_queue ? (void *)INNER(p->signal_queue, ID3D12CommandQueue) : NULL,
+                      (unsigned long long)done, GetCurrentThreadId());
+    }
+    return ID3D12Fence_SetEventOnCompletion(INNER(p, ID3D12Fence), value, event);
+}
+
 /* Slot 10: a CPU Signal, which the completed values follow at once. */
 static HRESULT STDMETHODCALLTYPE fence_Signal(struct proxy *p, UINT64 value)
 {
@@ -5307,6 +5326,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     {
         static const struct slot fence_slots[] = {
             FN(7, child_GetDevice),
+            FN(9, fence_SetEventOnCompletion),
             FN(10, fence_Signal),
             FN(12, fence_CompletedValueAddressX),
         };
