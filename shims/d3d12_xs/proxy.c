@@ -85,6 +85,7 @@ struct proxy
     D3D12_VERTEX_BUFFER_VIEW vertex_buffers[8]; /* lists: as bound, for rect lists (list_DrawInstanced) */
     UINT vertex_buffer_mask;
     D3D12_INDEX_BUFFER_VIEW index_buffer;      /* lists: as bound, for REBOX_WATCH_STAGE's vertex log */
+    SIZE_T render_target0;     /* lists: the first bound render target view (REBOX_WATCH_STAGE logs it) */
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
     UINT cpu_write_count, cpu_write_capacity;
     struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
@@ -1364,6 +1365,47 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(struct proxy *p, ID3
 }
 
 /* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
+/* Every render target view's texture size and view format by handle (open addressing; a later view
+ * at the same handle replaces it), so a watched stage's draws can name their target. */
+static struct { volatile SIZE_T cpu; UINT width, height, format; } rtv_info[4096];
+
+static UINT rtv_slot(SIZE_T cpu)
+{
+    return (UINT)((cpu >> 5) * 2654435761u) % ARRAYSIZE(rtv_info);
+}
+
+static void note_rtv(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
+{
+    D3D12_RESOURCE_DESC d;
+    if (!resource || !cpu)
+        return;
+    d = resource_desc(resource);
+    for (UINT n = 0, i = rtv_slot(cpu); n < ARRAYSIZE(rtv_info); n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+    {
+        SIZE_T c = rtv_info[i].cpu;
+        if (c == cpu || (!c && !InterlockedCompareExchangePointer((void *volatile *)&rtv_info[i].cpu, (void *)cpu, NULL)))
+        {
+            rtv_info[i].width = (UINT)d.Width;
+            rtv_info[i].height = d.Height;
+            rtv_info[i].format = desc ? desc->Format : d.Format;
+            return;
+        }
+    }
+}
+
+static BOOL find_rtv(SIZE_T cpu, UINT *width, UINT *height, UINT *format)
+{
+    for (UINT n = 0, i = rtv_slot(cpu); cpu && n < ARRAYSIZE(rtv_info) && rtv_info[i].cpu; n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+        if (rtv_info[i].cpu == cpu)
+        {
+            *width = rtv_info[i].width;
+            *height = rtv_info[i].height;
+            *format = rtv_info[i].format;
+            return TRUE;
+        }
+    return FALSE;
+}
+
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
 {
@@ -1376,6 +1418,7 @@ static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3
         desc = &pc;
     }
     note_display_view("render target view", resource, cpu);
+    note_rtv(resource, desc, cpu);
     ID3D12Device_CreateRenderTargetView(INNER(p, ID3D12Device), resource, desc, h);
 }
 
@@ -3293,6 +3336,7 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT coun
     for (UINT i = 0; rts && i < (single ? 1 : count) && display < 0; i++)
         display = display_rtv(rts[i].ptr);
     p->display_bound = display + 1;
+    p->render_target0 = rts && count ? rts[0].ptr : 0;
     if (display >= 0)
         InterlockedIncrement(&display_binds[display]);
     ID3D12GraphicsCommandList_OMSetRenderTargets(INNER(p, ID3D12GraphicsCommandList), count, rts, single, ds);
@@ -3449,6 +3493,15 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
         if (!IsBadReadPtr(at, wide ? 4 : 2))
             first = wide ? *(const UINT32 *)at : *(const UINT16 *)at;
         log_watched_vertex_buffers(p, base_vertex + first, indices);
+    }
+    if (console_stage_watched(console_last_draw_vs()))
+    {
+        static LONG logged;
+        UINT width = 0, height = 0, format = 0;
+        BOOL known = find_rtv(p->render_target0, &width, &height, &format);
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: watched stage's draw: render target 0 %s %ux%u, format %u", known ? "is" : "unknown;",
+                      width, height, format);
     }
     console_display_draw_end();
 }

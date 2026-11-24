@@ -403,6 +403,14 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
         }
     }
     if (console_stage_watched(console_stage_id(vs, vs_size)))
+    {
+        const D3D12_RENDER_TARGET_BLEND_DESC *b = &desc->BlendState.RenderTarget[0];
+        rebox_log("d3d12_xs: watched stage's PSO: %u render targets, 0 is format %u; blend %u: colour %u*src %u %u*dst, "
+                  "alpha %u*src %u %u*dst, write mask %#x", desc->NumRenderTargets, desc->RTVFormats[0], b->BlendEnable,
+                  b->SrcBlend, b->BlendOp, b->DestBlend, b->SrcBlendAlpha, b->BlendOpAlpha, b->DestBlendAlpha,
+                  b->RenderTargetWriteMask);
+    }
+    if (console_stage_watched(console_stage_id(vs, vs_size)))
         for (UINT r = 0; r < g->element_count; r++)
         {
             const D3D12_INPUT_ELEMENT_DESC *e = NULL;
