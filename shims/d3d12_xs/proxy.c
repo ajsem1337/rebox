@@ -1777,18 +1777,24 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
  * CreatePlacedResourceX does. Only addresses that can be the title's are: between 4 GiB and 2^46
  * (where xmem keeps its memory) and outside the GPU window, whose addresses are vkd3d-proton's own
  * resources. Ranges that can't be are logged, the first few. */
-static void ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+/* Returns the address to give vkd3d-proton: one in a GPU-only view of title memory is the CPU
+ * address behind it (xmem gives the view memory of its own, so the title's data is at the CPU
+ * address, which is what gets made GPU memory). */
+static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
 {
     static LONG logged;
     UINT64 end;
 
     if (!size || address < 0x100000000ull || address + size > 0x400000000000ull
-            || (address + size > 0x200000000000ull && address < 0x210000000000ull)
-            || (gpu_memory_identity_extent(address, &end) && end >= address + size))
-        return;
+            || (address + size > 0x200000000000ull && address < 0x210000000000ull))
+        return address;
+    address = gpu_view_to_cpu(address);
+    if (gpu_memory_identity_extent(address, &end) && end >= address + size)
+        return address;
     if (!gpu_memory_adopt(address, size) && InterlockedIncrement(&logged) <= 8)
         rebox_log("d3d12_xs: %s at %#llx+%#x is not GPU memory and could not be made so: the GPU reads nothing there",
                   what, (unsigned long long)address, size);
+    return address;
 }
 
 /* Slots 41-46: Set{Compute,Graphics}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC
@@ -1799,45 +1805,50 @@ static void ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT s
 
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
     ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 /* Slot 47: IASetIndexBuffer (PC 43). */
 static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12_INDEX_BUFFER_VIEW *view)
 {
+    D3D12_INDEX_BUFFER_VIEW moved;
     if (view)
-        ia_adopt("an index buffer", view->BufferLocation, view->SizeInBytes);
+    {
+        moved = *view;
+        moved.BufferLocation = ia_adopt("an index buffer", view->BufferLocation, view->SizeInBytes);
+        view = &moved;
+    }
     if (view)
         p->index_buffer = *view;
     else
@@ -1849,8 +1860,14 @@ static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12
 static void STDMETHODCALLTYPE list_IASetVertexBuffers(struct proxy *p, UINT start, UINT count,
         const D3D12_VERTEX_BUFFER_VIEW *views)
 {
-    for (UINT i = 0; views && i < count; i++)
-        ia_adopt("a vertex buffer", views[i].BufferLocation, views[i].SizeInBytes);
+    D3D12_VERTEX_BUFFER_VIEW moved[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    for (UINT i = 0; views && i < count && i < ARRAYSIZE(moved); i++)
+    {
+        moved[i] = views[i];
+        moved[i].BufferLocation = ia_adopt("a vertex buffer", views[i].BufferLocation, views[i].SizeInBytes);
+    }
+    if (views && count <= ARRAYSIZE(moved))
+        views = moved;
     for (UINT i = 0; i < count && start + i < ARRAYSIZE(p->vertex_buffers); i++)
         if (views && views[i].BufferLocation)
         {
