@@ -1679,6 +1679,48 @@ static void ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT s
                   what, (unsigned long long)address, size);
 }
 
+/* Slots 41-46: Set{Compute,Graphics}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC
+ * 37-42). A root descriptor is a GPU address too, often in the title's own memory: made GPU memory
+ * in place when bound, as vertex buffers are (ia_adopt). It has no size; adoption takes the
+ * committed run around the address (a compute shader read 0x37640 past one and faulted the GPU). */
+#define ROOT_VIEW_SIZE 0x10000u
+
+static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
+static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
+static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
+static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
+static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
+static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
+{
+    ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
+}
+
 /* Slot 47: IASetIndexBuffer (PC 43). */
 static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12_INDEX_BUFFER_VIEW *view)
 {
@@ -4450,6 +4492,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(90, list_Write32BitValueBottomOfPipeX),    /* Write32BitValueBottomOfShaderX */
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
+        FN(41, list_SetComputeRootConstantBufferView), FN(42, list_SetGraphicsRootConstantBufferView), /* PC 37-42 */
+        FN(43, list_SetComputeRootShaderResourceView), FN(44, list_SetGraphicsRootShaderResourceView),
+        FN(45, list_SetComputeRootUnorderedAccessView), FN(46, list_SetGraphicsRootUnorderedAccessView),
         FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
         FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
         FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
@@ -4491,6 +4536,9 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
         FN(35, list_SetComputeRootDescriptorTable),   /* PC 31 */
+        FN(41, list_SetComputeRootConstantBufferView), FN(42, list_SetGraphicsRootConstantBufferView), /* PC 37-42 */
+        FN(43, list_SetComputeRootShaderResourceView), FN(44, list_SetGraphicsRootShaderResourceView),
+        FN(45, list_SetComputeRootUnorderedAccessView), FN(46, list_SetGraphicsRootUnorderedAccessView),
         FN(36, list_SetGraphicsRootDescriptorTable),  /* PC 32 */
         FN(53, list_ClearUnorderedAccessViewUint),    /* PC 49 */
         FN(54, list_ClearUnorderedAccessViewFloat),   /* PC 50 */
