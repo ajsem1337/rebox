@@ -373,35 +373,32 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
 #define ADOPT_GAP 0ull
 #define ADOPT_GRANULE (256ull << 20)
 
-/* The run of committed, writable pages around address: [*start, *end). */
-static BOOL committed_run(UINT64 address, UINT64 *start, UINT64 *end)
+/* The run of committed, writable pages around address, as far as [lo, hi): [*start, *end). Walked
+ * out from address's region both ways and no further than the window: a title's reservations hold
+ * thousands of physical-page views, and a walk from the allocation's base took thousands of
+ * VirtualQuery calls a draw. */
+static BOOL usable_region(const MEMORY_BASIC_INFORMATION *mbi)
+{
+    return mbi->AllocationBase && mbi->State == MEM_COMMIT
+            && (mbi->Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi->Protect & PAGE_GUARD);
+}
+
+static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, UINT64 *start, UINT64 *end)
 {
     MEMORY_BASIC_INFORMATION mbi;
-    UINT64 at, run_start = 0, run_end = 0;
+    UINT64 run_start, run_end;
 
-    if (!VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) || !mbi.AllocationBase)
+    if (!VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) || !usable_region(&mbi))
         return FALSE;
-    for (at = (UINT64)(ULONG_PTR)mbi.AllocationBase;
-         VirtualQuery((void *)(ULONG_PTR)at, &mbi, sizeof(mbi)) && mbi.AllocationBase;
-         at = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize)
-    {
-        BOOL usable = mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
-                && !(mbi.Protect & PAGE_GUARD);
-        if (!usable)
-        {
-            if (run_end > address)
-                break;
-            run_start = run_end = 0;
-            continue;
-        }
-        if (!run_end)
-            run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+    run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+    run_end = run_start + mbi.RegionSize;
+    while (run_start > lo && VirtualQuery((void *)(ULONG_PTR)(run_start - 1), &mbi, sizeof(mbi))
+           && usable_region(&mbi))
+        run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+    while (run_end < hi && VirtualQuery((void *)(ULONG_PTR)run_end, &mbi, sizeof(mbi)) && usable_region(&mbi))
         run_end = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
-    }
-    if (!run_end || address < run_start || address >= run_end)
-        return FALSE;
-    *start = run_start;
-    *end = run_end;
+    *start = max(run_start, lo);
+    *end = min(run_end, hi);
     return TRUE;
 }
 
@@ -443,8 +440,13 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     ReleaseSRWLockShared(&lock);
     if (c)
         return TRUE;
-    /* A range that couldn't be adopted isn't tried again for a second: committed_run walks every
-     * region of the allocation, thousands in title memory full of physical-page views. */
+    /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
+    base = address & ~(ADOPT_GRANULE - 1);
+    limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
+    if (limit - end < ADOPT_MIN) /* near the granule's end: into the next one too */
+        limit += ADOPT_GRANULE;
+    /* A range that couldn't be adopted isn't tried again for a second: committed_run walks the
+     * regions of the span, hundreds in title memory full of physical-page views. */
     {
         static struct { UINT64 address, end; ULONGLONG at; } failed[64];
         static LONG next;
@@ -452,7 +454,7 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         for (UINT i = 0; i < ARRAYSIZE(failed); i++)
             if (failed[i].address <= address && end <= failed[i].end && now - failed[i].at < 1000)
                 return FALSE;
-        if (!committed_run(address, &run_start, &run_end) || end > run_end)
+        if (!committed_run(address, base, limit, &run_start, &run_end) || end > run_end)
         {
             UINT i = (UINT)InterlockedIncrement(&next) % ARRAYSIZE(failed);
             failed[i].address = address & ~0xffffull;
@@ -461,11 +463,6 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
             return FALSE;
         }
     }
-    /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
-    base = address & ~(ADOPT_GRANULE - 1);
-    limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
-    if (limit - end < ADOPT_MIN) /* near the granule's end: into the next one too */
-        limit += ADOPT_GRANULE;
     if (base < run_start)
         base = run_start;
     if (limit > run_end)
