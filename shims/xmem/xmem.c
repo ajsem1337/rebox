@@ -749,9 +749,10 @@ static SRWLOCK physical_lock = SRWLOCK_INIT;
 static struct physical_unit *units;
 static ULONG_PTR unit_count, unit_capacity;
 
-/* Address -> first unit of the page mapped there: open addressing on 64 KiB-aligned addresses. */
+/* Address -> the page mapped there: open addressing on 64 KiB-aligned addresses. A page mapped as
+ * part of a run shares that run's view (view, view_bytes); a copy is its own. */
 #define MAPPED_SLOTS (1u << 20)
-static struct { ULONG_PTR address, unit; BOOL copy; } *mapped_at;
+static struct { ULONG_PTR address, unit, view; SIZE_T view_bytes; BOOL copy; } *mapped_at;
 
 static SIZE_T mapped_slot(ULONG_PTR address, BOOL insert)
 {
@@ -888,93 +889,197 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
     return TRUE;
 }
 
-/* Unmaps whatever page is mapped at address: a view leaves its placeholder; a copy is written
- * back to the page and decommitted. Returns the bytes it covered, or 0 if none was. Under
- * physical_lock. */
-static SIZE_T unmap_page_at(ULONG_PTR address)
+/* The slot of the page mapped at address, or -1. Under physical_lock. */
+static SIZE_T slot_at(ULONG_PTR address)
 {
     SIZE_T slot = mapped_at ? mapped_slot(address, FALSE) : (SIZE_T)-1;
-    ULONG_PTR u;
-    SIZE_T size;
-    BOOL copy;
-
-    if (slot == (SIZE_T)-1 || mapped_at[slot].address != address)
-        return 0;
-    u = mapped_at[slot].unit;
-    copy = mapped_at[slot].copy;
-    mapped_at[slot].address = 1; /* a tombstone */
-    size = (SIZE_T)units[u].size_units * PAGE_UNIT;
-    if (copy)
-    {
-        if (units[u].section && !IsBadReadPtr((void *)address, size))
-            memcpy(unit_home(u), (void *)address, size);
-        VirtualFree((void *)address, size, MEM_DECOMMIT);
-    }
-    else if (!unmap_view2 || !unmap_view2(GetCurrentProcess(), (void *)address, MEM_PRESERVE_PLACEHOLDER))
-    {
-        static LONG logged;
-        if (InterlockedIncrement(&logged) <= 8)
-            rebox_log("xmem: unmapping the physical page view at %#llx failed (error %lu)",
-                      (unsigned long long)address, GetLastError());
-    }
-    if (units[u].mapped == address)
-        units[u].mapped = 0;
-    return size;
+    return slot != (SIZE_T)-1 && mapped_at[slot].address == address ? slot : (SIZE_T)-1;
 }
 
-/* Maps page unit u at address: a view of its section in the placeholder there, split to the
- * page's size first; else ordinary memory with a copy. Under physical_lock. */
-static BOOL map_page_at(ULONG_PTR address, ULONG_PTR u)
+static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view_bytes, BOOL copy)
 {
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT, slot;
-    struct page_section *s = units[u].section;
-    BOOL copy = FALSE;
-    void *view = NULL;
-    static LONG logged, copies;
-
-    InitOnceExecuteOnce(&once, find_views, NULL, NULL);
-    unmap_page_at(address);
-    if (map_view3)
-    {
-        view = map_view3(s->handle, GetCurrentProcess(), (void *)address, units[u].offset, size,
-                         MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-        /* Part of a larger placeholder: split this page's size off, then map. */
-        if (!view && VirtualFree((void *)address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-            view = map_view3(s->handle, GetCurrentProcess(), (void *)address, units[u].offset, size,
-                             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-    }
-    if (!view)
-    {
-        /* No placeholder here: ordinary memory, normally reserved already; else reserved too. */
-        if (!VirtualAlloc((void *)address, size, MEM_COMMIT, PAGE_READWRITE)
-                && !VirtualAlloc((void *)address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
-        {
-            if (InterlockedIncrement(&logged) <= 8)
-                rebox_log("xmem: mapping a physical page of %lu KiB at %#llx failed (error %lu)",
-                          (unsigned long)(size >> 10), (unsigned long long)address, GetLastError());
-            return FALSE;
-        }
-        memcpy((void *)address, unit_home(u), size);
-        copy = TRUE;
-        if (InterlockedIncrement(&copies) <= 8)
-            rebox_log("xmem: physical page %#llx at %#llx is a copy: no placeholder there",
-                      (unsigned long long)((u + 1) << 4), (unsigned long long)address);
-    }
+    SIZE_T slot = mapped_slot(address, TRUE);
     units[u].mapped = address;
     units[u].copy = copy;
-    if ((slot = mapped_slot(address, TRUE)) != (SIZE_T)-1)
+    if (slot == (SIZE_T)-1)
+        return;
+    mapped_at[slot].address = address;
+    mapped_at[slot].unit = u;
+    mapped_at[slot].view = view;
+    mapped_at[slot].view_bytes = view_bytes;
+    mapped_at[slot].copy = copy;
+}
+
+static void clear_slot(SIZE_T slot)
+{
+    ULONG_PTR u = mapped_at[slot].unit;
+    if (units[u].mapped == mapped_at[slot].address)
+        units[u].mapped = 0;
+    mapped_at[slot].address = 1; /* a tombstone */
+}
+
+/* A view of size bytes of section s at offset, at address: in the placeholder there, split off a
+ * larger one, or made of adjacent ones coalesced. Each step is a wineserver call under Wine, so
+ * the plain map is tried first. */
+static BOOL place_view(ULONG_PTR address, SIZE_T size, struct page_section *s, UINT64 offset)
+{
+    void *p = (void *)address;
+    if (!map_view3)
+        return FALSE;
+    if (map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
+        return TRUE;
+    if (VirtualFree(p, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+            && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
+        return TRUE;
+    return VirtualFree(p, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)
+            && map_view3(s->handle, GetCurrentProcess(), p, offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
+}
+
+/* Page unit u at address as ordinary memory with a copy of its contents: where there's no
+ * placeholder. */
+static BOOL place_copy(ULONG_PTR address, ULONG_PTR u)
+{
+    SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
+    static LONG logged, copies;
+
+    if (!VirtualAlloc((void *)address, size, MEM_COMMIT, PAGE_READWRITE)
+            && !VirtualAlloc((void *)address, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
-        mapped_at[slot].address = address;
-        mapped_at[slot].unit = u;
-        mapped_at[slot].copy = copy;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("xmem: mapping a physical page of %lu KiB at %#llx failed (error %lu)",
+                      (unsigned long)(size >> 10), (unsigned long long)address, GetLastError());
+        return FALSE;
     }
+    memcpy((void *)address, unit_home(u), size);
+    if (InterlockedIncrement(&copies) <= 8)
+        rebox_log("xmem: physical page %#llx at %#llx is a copy: no placeholder there",
+                  (unsigned long long)((u + 1) << 4), (unsigned long long)address);
+    set_slot(address, u, address, size, TRUE);
     return TRUE;
+}
+
+/* Maps n page units at consecutive addresses from at, where nothing is mapped: runs of pages that
+ * follow each other in one section as one view each; a run that can't be one view page by page;
+ * a page with no placeholder as a copy. Under physical_lock. */
+static BOOL map_units(ULONG_PTR at, const ULONG_PTR *us, ULONG_PTR n)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL ok = TRUE;
+
+    InitOnceExecuteOnce(&once, find_views, NULL, NULL);
+    for (ULONG_PTR i = 0, j; i < n; i = j)
+    {
+        struct page_section *s = units[us[i]].section;
+        SIZE_T bytes = (SIZE_T)units[us[i]].size_units * PAGE_UNIT;
+
+        for (j = i + 1; j < n && units[us[j]].section == s
+                && units[us[j]].offset == units[us[i]].offset + bytes; j++)
+            bytes += (SIZE_T)units[us[j]].size_units * PAGE_UNIT;
+        if (place_view(at, bytes, s, units[us[i]].offset))
+        {
+            for (ULONG_PTR k = i, a = at; k < j; a += (SIZE_T)units[us[k]].size_units * PAGE_UNIT, k++)
+                set_slot(a, us[k], at, bytes, FALSE);
+            at += bytes;
+            continue;
+        }
+        for (ULONG_PTR k = i; k < j; k++)
+        {
+            SIZE_T size = (SIZE_T)units[us[k]].size_units * PAGE_UNIT;
+            if (j - i > 1 && place_view(at, size, s, units[us[k]].offset))
+                set_slot(at, us[k], at, size, FALSE);
+            else
+                ok &= place_copy(at, us[k]);
+            at += size;
+        }
+    }
+    return ok;
+}
+
+/* Unmaps every page mapped in [start, end): a copy is written back to its page and decommitted; a
+ * view leaves its placeholder, and pages of it outside the range are mapped again. Under
+ * physical_lock. */
+static void unmap_range(ULONG_PTR start, ULONG_PTR end)
+{
+    for (ULONG_PTR at = start; at < end; at += PAGE_UNIT)
+    {
+        SIZE_T slot = slot_at(at);
+        ULONG_PTR u, view, keep_at[2] = { 0, 0 }, *keep = NULL;
+        ULONG_PTR keep_count[2] = { 0, 0 };
+        SIZE_T view_bytes;
+
+        if (slot == (SIZE_T)-1)
+            continue;
+        u = mapped_at[slot].unit;
+        if (mapped_at[slot].copy)
+        {
+            SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
+            if (units[u].section && !IsBadReadPtr((void *)at, size))
+                memcpy(unit_home(u), (void *)at, size);
+            VirtualFree((void *)at, size, MEM_DECOMMIT);
+            clear_slot(slot);
+            continue;
+        }
+        view = mapped_at[slot].view;
+        view_bytes = mapped_at[slot].view_bytes;
+        /* The pages of the view before and after the range stay mapped: remembered, then mapped
+         * again once the view is gone. */
+        if (view < start || view + view_bytes > end)
+            keep = malloc((view_bytes / PAGE_UNIT) * sizeof(*keep));
+        for (ULONG_PTR a = view; a < view + view_bytes; a += PAGE_UNIT)
+        {
+            SIZE_T s = slot_at(a);
+            if (s == (SIZE_T)-1)
+                continue;
+            if (keep && (a < start || a >= end))
+            {
+                UINT side = a >= end;
+                if (!keep_count[side])
+                    keep_at[side] = a;
+                keep[(side ? (start - view) / PAGE_UNIT : 0) + keep_count[side]++] = mapped_at[s].unit;
+            }
+            clear_slot(s);
+        }
+        if (!unmap_view2 || !unmap_view2(GetCurrentProcess(), (void *)view, MEM_PRESERVE_PLACEHOLDER))
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("xmem: unmapping the physical page view at %#llx failed (error %lu)",
+                          (unsigned long long)view, GetLastError());
+        }
+        if (keep)
+        {
+            if (keep_count[0])
+                map_units(keep_at[0], keep, keep_count[0]);
+            if (keep_count[1])
+                map_units(keep_at[1], keep + (start - view) / PAGE_UNIT, keep_count[1]);
+            free(keep);
+        }
+    }
+}
+
+/* The address just past what count entries of a page list cover from at: a page's size each, and
+ * for an empty entry the size of the page mapped there (64 KiB if none). -1 for a page number this
+ * process didn't allocate. Under physical_lock. */
+static ULONG_PTR list_end(ULONG_PTR at, ULONG_PTR count, const ULONG_PTR *pages)
+{
+    for (ULONG_PTR i = 0; i < count; i++)
+    {
+        ULONG_PTR u = pages && pages[i] ? page_unit(pages[i]) : (ULONG_PTR)-1;
+        SIZE_T slot;
+        if (pages && pages[i] && u == (ULONG_PTR)-1)
+            return (ULONG_PTR)-1;
+        if (u != (ULONG_PTR)-1)
+            at += (SIZE_T)units[u].size_units * PAGE_UNIT;
+        else
+            at += (slot = slot_at(at)) != (SIZE_T)-1 ? (SIZE_T)units[mapped_at[slot].unit].size_units * PAGE_UNIT
+                                                     : PAGE_UNIT;
+    }
+    return at;
 }
 
 BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *pages)
 {
-    ULONG_PTR at = (ULONG_PTR)address;
+    ULONG_PTR start = (ULONG_PTR)address, end, *us;
     BOOL ok = TRUE;
 
     if (!address || !count)
@@ -983,37 +1088,56 @@ BOOL WINAPI XMemMapPhysicalPages(void *address, ULONG_PTR count, ULONG_PTR *page
         return FALSE;
     }
     AcquireSRWLockExclusive(&physical_lock);
-    for (ULONG_PTR i = 0; i < count; i++)
+    if (!mapped_at)
     {
-        ULONG_PTR u = pages ? page_unit(pages[i]) : (ULONG_PTR)-1;
-        if (!pages || !pages[i])
+        ReleaseSRWLockExclusive(&physical_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if ((end = list_end(start, count, pages)) == (ULONG_PTR)-1)
+    {
+        static LONG logged;
+        ReleaseSRWLockExclusive(&physical_lock);
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("xmem: XMemMapPhysicalPages(%p): a page number this process didn't allocate", address);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    unmap_range(start, end);
+    /* Then the pages, a stretch of non-empty entries at a time. */
+    if (pages && (us = malloc(count * sizeof(*us))))
+    {
+        ULONG_PTR at = start, n = 0, run_at = start;
+        for (ULONG_PTR i = 0; i <= count; i++)
         {
-            /* Unmapping: the size is the page's that was there (64 KiB if none). */
-            SIZE_T size = unmap_page_at(at);
-            if (!size)
+            if (i < count && pages[i])
+            {
+                if (!n)
+                    run_at = at;
+                us[n++] = page_unit(pages[i]);
+                at += (SIZE_T)units[us[n - 1]].size_units * PAGE_UNIT;
+                continue;
+            }
+            if (n)
+                ok &= map_units(run_at, us, n);
+            n = 0;
+            if (i < count)
             {
                 VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT);
-                size = PAGE_UNIT;
+                at += PAGE_UNIT;
             }
-            at += size;
-            continue;
         }
-        if (u == (ULONG_PTR)-1)
-        {
-            static LONG logged;
-            if (InterlockedIncrement(&logged) <= 8)
-                rebox_log("xmem: XMemMapPhysicalPages(%p): %#llx isn't a page number this process allocated",
-                          address, (unsigned long long)pages[i]);
-            SetLastError(ERROR_INVALID_PARAMETER);
-            ok = FALSE;
-            break;
-        }
-        ok &= map_page_at(at, u);
-        at += (SIZE_T)units[u].size_units * PAGE_UNIT;
+        free(us);
     }
+    else if (pages)
+        ok = FALSE;
+    else
+        for (ULONG_PTR at = start; at < end; at += PAGE_UNIT)
+            VirtualFree((void *)at, PAGE_UNIT, MEM_DECOMMIT); /* ordinary memory there: decommitted, as on unmapping */
     ReleaseSRWLockExclusive(&physical_lock);
     return ok;
 }
+
 /* XMemMapPhysicalPages for scattered addresses, as Windows' MapUserPhysicalPagesScatter: page i
  * goes to addresses[i] (a null pages array, or a zero page, unmaps). */
 BOOL WINAPI XMemMapPhysicalPagesScatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages)
@@ -1079,12 +1203,12 @@ static BOOL release_physical_range(void *base)
             physical_ranges[i].size = 0;
             break;
         }
+    if (end)
+        unmap_range(start, end); /* views leave placeholders: released below */
     for (ULONG_PTR at = start; at < end;)
     {
         MEMORY_BASIC_INFORMATION mbi;
         SIZE_T size;
-        if (mapped_at && (size = unmap_page_at(at)))
-            continue; /* now a placeholder: released below */
         if (!VirtualQuery((void *)at, &mbi, sizeof(mbi)) || !mbi.RegionSize)
             break;
         size = min(mbi.RegionSize, end - at);

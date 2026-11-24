@@ -470,6 +470,18 @@ static void test_xmem(void)
                     shared = r3[(3 << 16) + 7] == 0x3c && r3[9] == 0xc3;
                 }
                 CHECK(shared, "a physical page mapped at two addresses is the same memory at both");
+                /* Four pages in a row (one view), the middle two unmapped: the outer two stay. */
+                if (shared)
+                {
+                    shared = pmap(r3, 4, NULL) && pmap(r3, 4, pages + 4);
+                    if (shared)
+                    {
+                        r3[5] = 0x11;
+                        r3[(3 << 16) + 5] = 0x33;
+                        shared = pmap(r3 + (1 << 16), 2, NULL) && r3[5] == 0x11 && r3[(3 << 16) + 5] == 0x33;
+                    }
+                    CHECK(shared, "unmapping the middle of four pages mapped together keeps the outer two");
+                }
                 CHECK(r3 && pmap(r3, 4, NULL) && vfree && vfree(r3, 0, MEM_RELEASE),
                       "a range reserved for physical pages unmaps and releases");
             }
