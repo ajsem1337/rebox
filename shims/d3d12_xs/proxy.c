@@ -3490,8 +3490,12 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
             made = NULL;
         if (made && own == OWN_VIEW_TEXTURE)
         {
+            /* What it takes of title memory: its console layout's size. The PC allocation's is rounded
+             * to 64 KiB, and small textures the title places 4 KiB apart retired each other in a
+             * chain (the loading screen's art drew empty). */
             D3D12_RESOURCE_DESC storage;
-            end = address + max(title_texture_size(desc), allocation_size(p, pc_desc(desc, &storage)));
+            UINT64 size = title_texture_size(desc);
+            end = address + (size ? size : allocation_size(p, pc_desc(desc, &storage)));
         }
         AcquireSRWLockExclusive(&memory_view_lock);
         if (!(found = memory_view_find(address, &key, hash)) && made)
