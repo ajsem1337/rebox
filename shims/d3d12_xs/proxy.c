@@ -3380,6 +3380,15 @@ static void memory_view_add(UINT64 address, const D3D12_RESOURCE_DESC *key, ID3D
                 if (n->page == page && n->v->address < end && n->v->end > address
                         && !view_stays(n->v, address, end, key))
                 {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 48)
+                        rebox_log("d3d12_xs: view texture %#llx-%#llx (%llux%u, %u deep, %u mips, format %u, dim %u) retired "
+                                  "by %#llx-%#llx (%llux%u, %u deep, %u mips, format %u, dim %u)",
+                                  (unsigned long long)n->v->address, (unsigned long long)n->v->end,
+                                  (unsigned long long)n->v->desc.Width, n->v->desc.Height, n->v->desc.DepthOrArraySize,
+                                  n->v->desc.MipLevels, n->v->desc.Format, n->v->desc.Dimension,
+                                  (unsigned long long)address, (unsigned long long)end, (unsigned long long)key->Width,
+                                  key->Height, key->DepthOrArraySize, key->MipLevels, key->Format, key->Dimension);
                     memory_view_retire(n->v, now.QuadPart);
                     goto again;
                 }
