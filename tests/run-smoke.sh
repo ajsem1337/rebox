@@ -72,6 +72,8 @@ export REBOX_CONSOLE_ASYNC=0
 # View textures are evicted only when smoke.c asks (test_view_texture_evict), so other checks of
 # view textures alive aren't raced by the periodic pass.
 export REBOX_VIEW_IDLE_S=0 REBOX_VIEW_TEXTURE_BUDGET_MB=0
+# View buffers nothing writes share a zeroed heap (opt-in), so test_view_buffer_retire checks it.
+export REBOX_VIEW_BUFFER_SHARE=1
 # AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
 if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
     install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/
@@ -91,6 +93,18 @@ for f in fake.bin console.dxbc translated.dxbc; do
     "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\$f"
 done
 [[ -n ${SMOKE_ONLY:-} ]] && exit 0
+
+# The GPU VA layer's memory report (layers/gpuva_identity.c), every second here: the Linux side's
+# resident memory, glibc's heap, device memory and the pipelines made through it.
+if [[ -f $here/build/librebox_gpuva_identity.so ]]; then
+    echo "== translated.dxbc, GPU VA layer's memory report"
+    out=$(VK_ADD_LAYER_PATH="$here/build" VK_INSTANCE_LAYERS=VK_LAYER_REBOX_gpuva_identity REBOX_GPUVA_MEMORY_S=1 \
+          "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\translated.dxbc" 2>&1) || { echo "$out" | tail -40; exit 1; }
+    grep -E "^\[rebox gpuva\] memory: resident [1-9][0-9]* MiB .*glibc malloc [0-9]+ MiB in use.*pipelines [0-9]+ alive \([1-9][0-9]* made" <<<"$out" | tail -1
+    grep -Eq "^\[rebox gpuva\] memory: resident [1-9][0-9]* MiB .*pipelines [0-9]+ alive \([1-9][0-9]* made" <<<"$out" \
+        || { echo "FAIL the GPU VA layer reported no memory, or no pipelines made"; grep "rebox gpuva" <<<"$out" | head; exit 1; }
+    echo "ok   the GPU VA layer reports the Linux side's memory and the pipelines made through it"
+fi
 
 # Negative control: same shader with the cache entry gone must fail when
 # fallback shaders are off...

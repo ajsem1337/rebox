@@ -5036,6 +5036,25 @@ static void test_view_buffer_retire(void *dev, void *queue)
             if (alloc) ID3D12CommandAllocator_Release(alloc);
             ID3D12Resource_Release(rb);
         }
+        /* An unordered access view over the first: made again with memory of its own (the GPU may
+         * write it), and a shader resource view of it then finds that one. */
+        {
+            struct { D3D12_UNORDERED_ACCESS_VIEW_DESC v; UINT64 address, counter; } uav = { { DXGI_FORMAT_R32_UINT,
+                    D3D12_UAV_DIMENSION_BUFFER } };
+            ID3D12Resource *u, *again;
+            uav.v.Buffer.NumElements = 1024;
+            uav.address = (UINT64)(ULONG_PTR)(memory + (1 << 16));
+            view_buffers(&alive0, &bytes0, &evicted0, &superseded0);
+            XSLOT(dev, 71, void, const void *, const void *, SIZE_T)(dev, console_desc, &uav, start + 2 * inc);
+            u = slot_resource(start + 2 * inc);
+            view.address = uav.address;
+            XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 3 * inc);
+            again = slot_resource(start + 3 * inc);
+            view_buffers(&alive, &bytes, &evicted, &superseded);
+            CHECK(u && u != z1 && again == u && bytes - bytes0 >= 4096 && superseded - superseded0 == 1,
+                  "an unordered access view over a buffer in the zeroed heap makes it again with memory of its own "
+                  "(%llu bytes more)", (unsigned long long)(bytes - bytes0));
+        }
     }
     if (gpu_cpu)
     {

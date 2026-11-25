@@ -3325,9 +3325,12 @@ static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D1
  * view), so each read what its fresh memory held, zeros. A world's streaming kept 40,000 of them in
  * descriptor slots for good (3 GiB). So they are all placed at the start of one zeroed heap, the
  * largest one needs (a larger one made when a buffer needs more; the old one lives on while
- * buffers placed in it do): the same zeros, no memory of their own. REBOX_VIEW_BUFFER_SHARE=0
- * gives each memory of its own, as before. Ones with unordered access keep their own: the GPU
- * may write them and read back what it wrote. */
+ * buffers placed in it do): the same zeros, no memory of their own. Ones with unordered access keep
+ * their own: the GPU may write them and read back what it wrote. A resource's flags don't say
+ * whether it gets unordered access views, though (vkd3d-proton makes every buffer storage-capable),
+ * and on by default the GPU hung within minutes of loading a world: so an unordered access view
+ * asked for over a buffer in the zeroed heap makes it again with memory of its own, and the
+ * sharing is opt-in, REBOX_VIEW_BUFFER_SHARE=1. */
 static SRWLOCK zeroed_lock = SRWLOCK_INIT;
 static ID3D12Heap *zeroed_heap;
 static UINT64 zeroed_heap_size;
@@ -3338,7 +3341,7 @@ static BOOL view_buffer_share_enabled(void)
     if (setting < 0)
     {
         char *v = rebox_getenv("REBOX_VIEW_BUFFER_SHARE");
-        setting = !(v && v[0] == '0');
+        setting = v && v[0] == '1';
         free(v);
     }
     return setting;
@@ -3495,7 +3498,7 @@ static HRESULT placed_resource_x(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS addr
                      : why == 1 ? "not in GPU memory" : "the heap refused the placement");
     hr = E_FAIL;
     /* A view buffer nothing can write: in the zeroed heap. */
-    if (why != 0 && view && !(d->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && view_buffer_share_enabled()
+    if (why != 0 && view == 1 && !(d->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && view_buffer_share_enabled()
             && SUCCEEDED(place_zeroed_buffer(p, d, pc_state(desc, state), riid, out)) && *out)
     {
         own_note(*out, OWN_ZEROED_BUFFER, 0, FALSE);
@@ -3786,7 +3789,7 @@ static BOOL view_buffer_superseded(struct memory_view *v)
 
 /* Under memory_view_lock (shared or exclusive): the resource of a view kept (not a dormant one),
  * noted as asked for now. An own buffer whose memory is GPU memory now isn't found (superseded). */
-static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DESC *key, SIZE_T hash)
+static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DESC *key, SIZE_T hash, BOOL uav)
 {
     if (!memory_view_bucket_count)
         return NULL;
@@ -3794,6 +3797,9 @@ static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DES
         if (v->res && v->address == address && !memcmp(&v->desc, key, sizeof(*key)))
         {
             if (v->own_buffer && v->buffer_kind != VIEW_BUFFER_PLACED && view_buffer_superseded(v))
+                continue;
+            /* An unordered access view: the GPU may write it, so not one in the zeroed heap. */
+            if (uav && v->own_buffer && v->buffer_kind == VIEW_BUFFER_ZEROED)
                 continue;
             if (v->own || v->own_buffer)
             {
@@ -4330,7 +4336,8 @@ UINT WINAPI ReboxViewEvict(UINT idle_ms, UINT64 budget)
     return memory_views_evict(idle_ms, budget);
 }
 
-static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address)
+/* uav: for an unordered access view (never one in the zeroed heap). */
+static ID3D12Resource *resource_at_for(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address, BOOL uav)
 {
     D3D12_RESOURCE_DESC key;
     ID3D12Resource *res;
@@ -4341,7 +4348,7 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
     memory_view_key(desc, &key);
     hash = memory_view_hash(address, &key);
     AcquireSRWLockShared(&memory_view_lock);
-    res = memory_view_find(address, &key, hash);
+    res = memory_view_find(address, &key, hash, uav);
     ReleaseSRWLockShared(&memory_view_lock);
     if (res)
         return res;
@@ -4354,7 +4361,7 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
         enum own_kind own = OWN_KINDS;
         UINT64 end = address, bytes = 0;
         if (FAILED(placed_resource_x(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
-                                     (void **)&made, TRUE, &own, &bytes)))
+                                     (void **)&made, uav ? 2 : 1, &own, &bytes)))
             made = NULL;
         if (made && own == OWN_VIEW_TEXTURE)
         {
@@ -4366,7 +4373,7 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
             end = address + (size ? size : allocation_size(p, pc_desc(desc, &storage)));
         }
         AcquireSRWLockExclusive(&memory_view_lock);
-        if (!(found = memory_view_find(address, &key, hash)) && made)
+        if (!(found = memory_view_find(address, &key, hash, uav)) && made)
             memory_view_add(address, &key, made, hash, own == OWN_VIEW_TEXTURE,
                             own == OWN_VIEW_BUFFER ? VIEW_BUFFER_OWN : own == OWN_ZEROED_BUFFER ? VIEW_BUFFER_ZEROED
                             : own == OWN_KINDS && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? VIEW_BUFFER_PLACED : 0,
@@ -4380,6 +4387,11 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
         }
         return made;
     }
+}
+
+static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address)
+{
+    return resource_at_for(p, desc, address, FALSE);
 }
 
 /* An evicted view texture whose memory is at cpu (a T# the title wrote itself names it): made again,
@@ -4440,7 +4452,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessViewAtX(struct proxy *
     if (!view || IsBadReadPtr(view, 0x38))
         return;
     memcpy(&v, view, sizeof(v));
-    res = resource_at(p, rdesc, *(const UINT64 *)(view + 0x28));
+    res = resource_at_for(p, rdesc, *(const UINT64 *)(view + 0x28), TRUE);
     device_CreateUnorderedAccessView(p, res, NULL, res ? &v : NULL, cpu);
 }
 

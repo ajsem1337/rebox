@@ -20,6 +20,7 @@
 
 #define _GNU_SOURCE
 #include <inttypes.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -39,6 +40,8 @@
 #include "gpuva_mailbox.h"
 
 static struct gpuva_mailbox *mailbox_get(void);
+struct device_data;
+static void memory_report_start(VkDevice device, struct device_data *d);
 
 #define LAYER_NAME "VK_LAYER_REBOX_gpuva_identity"
 #define EXPORT __attribute__((visibility("default")))
@@ -568,6 +571,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(VkPhysicalDevice phys, 
     data->next = devices;
     devices = data;
     pthread_mutex_unlock(&global_lock);
+    memory_report_start(*device, data);
     return VK_SUCCESS;
 }
 
@@ -683,7 +687,7 @@ static uint64_t mailbox_request(uint64_t size)
     return address;
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
+static VKAPI_ATTR VkResult VKAPI_CALL allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
         const VkAllocationCallbacks *alloc, VkDeviceMemory *memory)
 {
     struct device_data *d = get_device(device);
@@ -878,7 +882,7 @@ static void unmap_identity(struct device_data *d, struct memory *m)
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
 }
 
-static VKAPI_ATTR void VKAPI_CALL layer_FreeMemory(VkDevice device, VkDeviceMemory memory,
+static VKAPI_ATTR void VKAPI_CALL free_memory(VkDevice device, VkDeviceMemory memory,
         const VkAllocationCallbacks *alloc)
 {
     struct device_data *d = get_device(device);
@@ -1046,6 +1050,329 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_UnmapMemory2(VkDevice device, const 
     return VK_SUCCESS;
 }
 
+
+/* ------------------------------------------------------------ memory report */
+
+/* What the process's Linux side holds, every REBOX_GPUVA_MEMORY_S seconds (default 10; 0 off):
+ * Wine's counters (d3d12_xs's memory log) don't see the native driver's heap, nor what it keeps
+ * for pipelines. Logged: resident memory from /proc/self/status (anonymous, file, shared); glibc
+ * malloc's arenas (the driver's and winevulkan's heap: in use, free inside them, mmapped); device
+ * memory allocated, host-visible and not; pipelines alive and made (libraries apart), the SPIR-V
+ * they were made from; shader modules alive; pipeline caches and the data they were made with (with
+ * REBOX_GPUVA_CACHE_SIZES=1, every minute, the size of their data now).
+ * REBOX_GPUVA_PIPELINE_CACHE=0 makes pipelines without the caller's pipeline cache, so the driver
+ * keeps no shaders for it (RADV's own in-memory cache holds them only while pipelines do).
+ * REBOX_GPUVA_MALLOC_TRIM=1 gives free glibc heap back to the system after each report. */
+#define TRACK_BUCKETS 4096
+struct tracked_object { uint64_t handle, size; int kind; struct tracked_object *next; };
+enum { TRACK_MEMORY_HOST, TRACK_MEMORY_DEVICE, TRACK_MODULE, TRACK_CACHE, TRACK_KINDS };
+static struct tracked_object *tracked_objects[TRACK_BUCKETS];
+static pthread_mutex_t tracked_lock = PTHREAD_MUTEX_INITIALIZER;
+static int64_t tracked_count[TRACK_KINDS], tracked_bytes[TRACK_KINDS];
+static int64_t pipelines_alive, pipelines_made, libraries_made, pipeline_spirv_bytes;
+static uint64_t cache_data_bytes;
+static VkDevice report_device;
+static PFN_vkGetPipelineCacheData report_cache_data;
+
+static unsigned tracked_bucket(uint64_t handle)
+{
+    return (unsigned)((handle * 0x9e3779b97f4a7c15ull) >> 52) % TRACK_BUCKETS;
+}
+
+static void track_add(uint64_t handle, uint64_t size, int kind)
+{
+    struct tracked_object *t = malloc(sizeof(*t));
+    if (!t || !handle)
+    {
+        free(t);
+        return;
+    }
+    t->handle = handle;
+    t->size = size;
+    t->kind = kind;
+    pthread_mutex_lock(&tracked_lock);
+    t->next = tracked_objects[tracked_bucket(handle)];
+    tracked_objects[tracked_bucket(handle)] = t;
+    tracked_count[kind]++;
+    tracked_bytes[kind] += size;
+    pthread_mutex_unlock(&tracked_lock);
+}
+
+/* The size it was tracked with, or 0. */
+static uint64_t track_remove(uint64_t handle, int kind_a, int kind_b)
+{
+    struct tracked_object **p, *t = NULL;
+    uint64_t size = 0;
+    if (!handle)
+        return 0;
+    pthread_mutex_lock(&tracked_lock);
+    for (p = &tracked_objects[tracked_bucket(handle)]; *p; p = &(*p)->next)
+        if ((*p)->handle == handle && ((*p)->kind == kind_a || (*p)->kind == kind_b))
+        {
+            t = *p;
+            *p = t->next;
+            tracked_count[t->kind]--;
+            tracked_bytes[t->kind] -= t->size;
+            size = t->size;
+            break;
+        }
+    pthread_mutex_unlock(&tracked_lock);
+    free(t);
+    return size;
+}
+
+static uint64_t track_size(uint64_t handle, int kind)
+{
+    uint64_t size = 0;
+    pthread_mutex_lock(&tracked_lock);
+    for (struct tracked_object *t = tracked_objects[tracked_bucket(handle)]; t; t = t->next)
+        if (t->handle == handle && t->kind == kind)
+        {
+            size = t->size;
+            break;
+        }
+    pthread_mutex_unlock(&tracked_lock);
+    return size;
+}
+
+static unsigned report_seconds(void)
+{
+    static int seconds = -1;
+    if (seconds < 0)
+    {
+        const char *v = getenv("REBOX_GPUVA_MEMORY_S");
+        seconds = v && *v ? atoi(v) : 10;
+        if (seconds < 0)
+            seconds = 0;
+    }
+    return (unsigned)seconds;
+}
+
+static int env_is(const char *name, const char *value)
+{
+    const char *v = getenv(name);
+    return v && !strcmp(v, value);
+}
+
+/* KiB from /proc/self/status for each field asked for (0 if missing). */
+static void proc_status(const char *const *fields, uint64_t *kib, unsigned n)
+{
+    char line[256];
+    FILE *f = fopen("/proc/self/status", "r");
+    for (unsigned i = 0; i < n; i++)
+        kib[i] = 0;
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f))
+        for (unsigned i = 0; i < n; i++)
+            if (!strncmp(line, fields[i], strlen(fields[i])))
+                kib[i] = strtoull(line + strlen(fields[i]), NULL, 10);
+    fclose(f);
+}
+
+/* Every pipeline cache's data size: the driver's serialization of what it holds. */
+static uint64_t pipeline_caches_bytes(void)
+{
+    uint64_t handles[1024], total = 0;
+    unsigned n = 0;
+    if (!report_device || !report_cache_data)
+        return 0;
+    pthread_mutex_lock(&tracked_lock);
+    for (unsigned b = 0; b < TRACK_BUCKETS && n < 1024; b++)
+        for (struct tracked_object *t = tracked_objects[b]; t && n < 1024; t = t->next)
+            if (t->kind == TRACK_CACHE)
+                handles[n++] = t->handle;
+    pthread_mutex_unlock(&tracked_lock);
+    /* Racy against a cache destroyed meanwhile, so only asked for (REBOX_GPUVA_CACHE_SIZES=1). */
+    for (unsigned i = 0; i < n; i++)
+    {
+        size_t size = 0;
+        if (report_cache_data(report_device, (VkPipelineCache)(uintptr_t)handles[i], &size, NULL) == VK_SUCCESS)
+            total += size;
+    }
+    return total;
+}
+
+static void *memory_report_thread(void *arg)
+{
+    static const char *const fields[] = { "VmRSS:", "RssAnon:", "RssFile:", "RssShmem:", "VmSwap:" };
+    unsigned seconds = report_seconds(), round = 0;
+    int trim = env_is("REBOX_GPUVA_MALLOC_TRIM", "1"), cache_sizes = env_is("REBOX_GPUVA_CACHE_SIZES", "1");
+
+    for (;;)
+    {
+        uint64_t kib[5];
+        struct mallinfo2 mi;
+        int64_t count[TRACK_KINDS], bytes[TRACK_KINDS];
+
+        sleep(seconds);
+        proc_status(fields, kib, 5);
+        mi = mallinfo2();
+        pthread_mutex_lock(&tracked_lock);
+        memcpy(count, tracked_count, sizeof(count));
+        memcpy(bytes, tracked_bytes, sizeof(bytes));
+        pthread_mutex_unlock(&tracked_lock);
+        if (cache_sizes && round++ % 6 == 0)
+            cache_data_bytes = pipeline_caches_bytes();
+        layer_log("memory: resident %" PRIu64 " MiB (anonymous %" PRIu64 ", file %" PRIu64 ", shared %" PRIu64
+                  ", swapped %" PRIu64 "); glibc malloc %zu MiB in use, %zu MiB free in its arenas, %zu MiB mmapped; "
+                  "device memory %" PRId64 " MiB host-visible (%" PRId64 "), %" PRId64 " MiB not (%" PRId64 "); "
+                  "pipelines %" PRId64 " alive (%" PRId64 " made, %" PRId64 " libraries), %" PRId64 " MiB SPIR-V "
+                  "made into pipelines in all; shader modules %" PRId64 " (%" PRId64 " MiB); pipeline caches %" PRId64
+                  " (%" PRId64 " MiB given them at creation, %" PRIu64 " MiB of data last asked)",
+                  kib[0] >> 10, kib[1] >> 10, kib[2] >> 10, kib[3] >> 10, kib[4] >> 10, (mi.uordblks + mi.hblkhd) >> 20,
+                  mi.fordblks >> 20, mi.hblkhd >> 20, bytes[TRACK_MEMORY_HOST] >> 20, count[TRACK_MEMORY_HOST],
+                  bytes[TRACK_MEMORY_DEVICE] >> 20, count[TRACK_MEMORY_DEVICE],
+                  __atomic_load_n(&pipelines_alive, __ATOMIC_RELAXED), __atomic_load_n(&pipelines_made, __ATOMIC_RELAXED),
+                  __atomic_load_n(&libraries_made, __ATOMIC_RELAXED),
+                  __atomic_load_n(&pipeline_spirv_bytes, __ATOMIC_RELAXED) >> 20, count[TRACK_MODULE],
+                  bytes[TRACK_MODULE] >> 20, count[TRACK_CACHE], bytes[TRACK_CACHE] >> 20, cache_data_bytes >> 20);
+        if (trim)
+            malloc_trim(0);
+    }
+    return NULL;
+}
+
+static void memory_report_start(VkDevice device, struct device_data *d)
+{
+    static int started;
+    pthread_t thread;
+    if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL) || !report_seconds())
+        return;
+    report_device = device;
+    report_cache_data = (PFN_vkGetPipelineCacheData)d->gdpa(device, "vkGetPipelineCacheData");
+    if (!pthread_create(&thread, NULL, memory_report_thread, NULL))
+        pthread_detach(thread);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
+        const VkAllocationCallbacks *alloc, VkDeviceMemory *memory)
+{
+    struct device_data *d = get_device(device);
+    VkResult vr = allocate_memory(device, info, alloc, memory);
+    if (vr == VK_SUCCESS && report_seconds())
+        track_add((uint64_t)(uintptr_t)*memory, info->allocationSize,
+                  d && (d->host_visible_types & (1u << info->memoryTypeIndex)) ? TRACK_MEMORY_HOST : TRACK_MEMORY_DEVICE);
+    return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_FreeMemory(VkDevice device, VkDeviceMemory memory,
+        const VkAllocationCallbacks *alloc)
+{
+    if (report_seconds())
+        track_remove((uint64_t)(uintptr_t)memory, TRACK_MEMORY_HOST, TRACK_MEMORY_DEVICE);
+    free_memory(device, memory, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
+        const VkAllocationCallbacks *alloc, VkShaderModule *module)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkCreateShaderModule create = (PFN_vkCreateShaderModule)d->gdpa(device, "vkCreateShaderModule");
+    VkResult vr = create(device, info, alloc, module);
+    if (vr == VK_SUCCESS)
+        track_add((uint64_t)*module, info->codeSize, TRACK_MODULE);
+    return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyShaderModule(VkDevice device, VkShaderModule module,
+        const VkAllocationCallbacks *alloc)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkDestroyShaderModule destroy = (PFN_vkDestroyShaderModule)d->gdpa(device, "vkDestroyShaderModule");
+    track_remove((uint64_t)module, TRACK_MODULE, TRACK_MODULE);
+    destroy(device, module, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo *info,
+        const VkAllocationCallbacks *alloc, VkPipelineCache *cache)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkCreatePipelineCache create = (PFN_vkCreatePipelineCache)d->gdpa(device, "vkCreatePipelineCache");
+    VkResult vr = create(device, info, alloc, cache);
+    if (vr == VK_SUCCESS)
+        track_add((uint64_t)*cache, info->initialDataSize, TRACK_CACHE);
+    return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyPipelineCache(VkDevice device, VkPipelineCache cache,
+        const VkAllocationCallbacks *alloc)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkDestroyPipelineCache destroy = (PFN_vkDestroyPipelineCache)d->gdpa(device, "vkDestroyPipelineCache");
+    track_remove((uint64_t)cache, TRACK_CACHE, TRACK_CACHE);
+    destroy(device, cache, alloc);
+}
+
+/* The SPIR-V a stage is made from: its module's, or one given inline. */
+static uint64_t stage_spirv(const VkPipelineShaderStageCreateInfo *stage)
+{
+    const VkShaderModuleCreateInfo *inline_module;
+    if (stage->module)
+        return track_size((uint64_t)stage->module, TRACK_MODULE);
+    inline_module = (const void *)find_struct(stage->pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+    return inline_module ? inline_module->codeSize : 0;
+}
+
+static void note_pipelines(uint32_t count, const VkPipeline *pipelines, VkPipelineCreateFlags flags, uint64_t spirv)
+{
+    for (uint32_t i = 0; i < count; i++)
+        if (pipelines[i])
+        {
+            __atomic_add_fetch(&pipelines_alive, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR ? &libraries_made : &pipelines_made, 1,
+                               __ATOMIC_RELAXED);
+        }
+    __atomic_add_fetch(&pipeline_spirv_bytes, (int64_t)spirv, __ATOMIC_RELAXED);
+}
+
+static VkPipelineCache pipeline_cache(VkPipelineCache cache)
+{
+    static int keep = -1;
+    if (keep < 0)
+        keep = !env_is("REBOX_GPUVA_PIPELINE_CACHE", "0");
+    return keep ? cache : VK_NULL_HANDLE;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache,
+        uint32_t count, const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *alloc,
+        VkPipeline *pipelines)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkCreateGraphicsPipelines create = (PFN_vkCreateGraphicsPipelines)d->gdpa(device, "vkCreateGraphicsPipelines");
+    VkResult vr = create(device, pipeline_cache(cache), count, infos, alloc, pipelines);
+    for (uint32_t i = 0; i < count && vr >= VK_SUCCESS; i++)
+    {
+        uint64_t spirv = 0;
+        for (uint32_t k = 0; k < infos[i].stageCount; k++)
+            spirv += stage_spirv(&infos[i].pStages[k]);
+        note_pipelines(1, &pipelines[i], infos[i].flags, spirv);
+    }
+    return vr;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(VkDevice device, VkPipelineCache cache,
+        uint32_t count, const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *alloc,
+        VkPipeline *pipelines)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkCreateComputePipelines create = (PFN_vkCreateComputePipelines)d->gdpa(device, "vkCreateComputePipelines");
+    VkResult vr = create(device, pipeline_cache(cache), count, infos, alloc, pipelines);
+    for (uint32_t i = 0; i < count && vr >= VK_SUCCESS; i++)
+        note_pipelines(1, &pipelines[i], infos[i].flags, stage_spirv(&infos[i].stage));
+    return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyPipeline(VkDevice device, VkPipeline pipeline,
+        const VkAllocationCallbacks *alloc)
+{
+    struct device_data *d = get_device(device);
+    PFN_vkDestroyPipeline destroy = (PFN_vkDestroyPipeline)d->gdpa(device, "vkDestroyPipeline");
+    if (pipeline)
+        __atomic_sub_fetch(&pipelines_alive, 1, __ATOMIC_RELAXED);
+    destroy(device, pipeline, alloc);
+}
+
 /* ---------------------------------------------------------- proc address */
 
 static PFN_vkVoidFunction device_hook(const char *name)
@@ -1060,6 +1387,13 @@ static PFN_vkVoidFunction device_hook(const char *name)
         { "vkMapMemory2KHR", (PFN_vkVoidFunction)layer_MapMemory2 },
         { "vkUnmapMemory2", (PFN_vkVoidFunction)layer_UnmapMemory2 },
         { "vkUnmapMemory2KHR", (PFN_vkVoidFunction)layer_UnmapMemory2 },
+        { "vkCreateShaderModule", (PFN_vkVoidFunction)layer_CreateShaderModule },
+        { "vkDestroyShaderModule", (PFN_vkVoidFunction)layer_DestroyShaderModule },
+        { "vkCreatePipelineCache", (PFN_vkVoidFunction)layer_CreatePipelineCache },
+        { "vkDestroyPipelineCache", (PFN_vkVoidFunction)layer_DestroyPipelineCache },
+        { "vkCreateGraphicsPipelines", (PFN_vkVoidFunction)layer_CreateGraphicsPipelines },
+        { "vkCreateComputePipelines", (PFN_vkVoidFunction)layer_CreateComputePipelines },
+        { "vkDestroyPipeline", (PFN_vkVoidFunction)layer_DestroyPipeline },
     };
     for (unsigned i = 0; i < sizeof(hooks) / sizeof(*hooks); i++)
         if (!strcmp(name, hooks[i].name))
