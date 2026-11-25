@@ -19,6 +19,7 @@
 #                         DLLs, then ~/.config/rebox/bcpack-tables.bin
 #   REBOX_CONSOLE_MODE ConsoleMode registry value the title reads (default 0x64, Series X)
 #   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
+#   REBOX_FOSSILIZE_DB  record pipelines there; REBOX_FOSSILIZE_REPLAY=N replays earlier ones first
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
 #                         unless VK_ICD_FILENAMES is already set or REBOX_STOCK_VULKAN=1
 #   REBOX_PRESENT_WAIT=1  let vkd3d-proton use VK_KHR_present_wait(2); off by default (see below)
@@ -372,6 +373,38 @@ if [[ -z ${VK_ICD_FILENAMES:-} && -n ${REBOX_RADV_ICD:-} && ${REBOX_STOCK_VULKAN
     && grep -qs 0x1002 /sys/class/drm/card*/device/vendor; then
     export VK_ICD_FILENAMES=$REBOX_RADV_ICD
     echo "rebox-run: using patched RADV ($REBOX_RADV_ICD)" >&2
+fi
+
+# REBOX_FOSSILIZE_DB=DIR: the Fossilize layer records every pipeline the run creates into DIR
+# (written as they're made, so a crash keeps them). With REBOX_FOSSILIZE_REPLAY=N, what earlier
+# runs recorded is first merged into DIR/merged.foz and built again on N threads by
+# fossilize-replay, which fills the driver's disk cache (MESA_SHADER_CACHE_DIR): the run then
+# finds those pipelines there instead of compiling them, with the time and memory that took.
+# REBOX_FOSSILIZE_REPLAY_S bounds the replay (default 900 s).
+if [[ -n ${REBOX_FOSSILIZE_DB:-} && -n ${REBOX_FOSSILIZE_DIR:-} ]]; then
+    mkdir -p "$REBOX_FOSSILIZE_DB"
+    if [[ ${REBOX_FOSSILIZE_REPLAY:-0} != 0 ]]; then
+        shopt -s nullglob
+        parts=("$REBOX_FOSSILIZE_DB"/rebox.*.foz)
+        shopt -u nullglob
+        merged="$REBOX_FOSSILIZE_DB/merged.foz"
+        if ((${#parts[@]})); then
+            inputs=("${parts[@]}")
+            [[ -f $merged ]] && inputs+=("$merged")
+            if "$REBOX_FOSSILIZE_DIR/bin/fossilize-merge-db" "$merged.new" "${inputs[@]}" >&2; then
+                mv -f "$merged.new" "$merged" && rm -f "${parts[@]}"
+            fi
+        fi
+        if [[ -f $merged ]]; then
+            echo "rebox-run: replaying recorded pipelines ($merged) on $REBOX_FOSSILIZE_REPLAY threads" >&2
+            start=$SECONDS
+            timeout "${REBOX_FOSSILIZE_REPLAY_S:-900}" "$REBOX_FOSSILIZE_DIR/bin/fossilize-replay" \
+                --num-threads "$REBOX_FOSSILIZE_REPLAY" --progress "$merged" >&2 || true
+            echo "rebox-run: replay took $((SECONDS - start)) s" >&2
+        fi
+    fi
+    export VK_ADD_IMPLICIT_LAYER_PATH="$REBOX_FOSSILIZE_DIR/share/vulkan/rebox_layer.d${VK_ADD_IMPLICIT_LAYER_PATH:+:$VK_ADD_IMPLICIT_LAYER_PATH}"
+    export FOSSILIZE=1 FOSSILIZE_DUMP_PATH="$REBOX_FOSSILIZE_DB/rebox"
 fi
 
 echo "rebox-run: $exe (title $title_id), prefix $WINEPREFIX, shader cache $cache" >&2

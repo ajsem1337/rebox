@@ -123,6 +123,30 @@
           '';
         };
 
+        # Valve's Fossilize: its layer records every pipeline a run creates, and fossilize-replay
+        # builds them again with no title running, filling the driver's disk cache (bin/rebox-run,
+        # REBOX_FOSSILIZE_DB). Not in nixpkgs; its own manifest names the library by a doubled
+        # store path, so the layer gets a manifest of ours.
+        fossilize = pkgs.stdenv.mkDerivation {
+          pname = "fossilize";
+          version = "556da9f";
+          src = pkgs.fetchFromGitHub {
+            owner = "ValveSoftware";
+            repo = "Fossilize";
+            rev = "556da9ff7d7616704dda515756219ab1dab693ec";
+            fetchSubmodules = true;
+            hash = "sha256-7u/aepE5YGbEy5nF9PnxDr+ljNmrE/6iwS/z8cdIcBM=";
+          };
+          nativeBuildInputs = [ pkgs.cmake pkgs.python3 ];
+          cmakeFlags = [ "-DFOSSILIZE_VULKAN_LAYER=ON" "-DFOSSILIZE_TESTS=OFF" "-DCMAKE_BUILD_TYPE=Release" ];
+          postInstall = ''
+            mkdir -p $out/share/vulkan/rebox_layer.d
+            sed "s|\"library_path\": \".*\"|\"library_path\": \"$out/lib/libVkLayer_fossilize.so\"|" \
+              $out/share/vulkan/implicit_layer.d/VkLayer_fossilize.json \
+              > $out/share/vulkan/rebox_layer.d/VkLayer_fossilize.json
+          '';
+        };
+
         radv-rebox = (pkgs.mesa.override {
           galliumDrivers = [ "llvmpipe" "radeonsi" ];
           vulkanDrivers = [ "amd" "swrast" ];
@@ -252,6 +276,7 @@
           export PATH=$PATH:${lib.makeBinPath [ mingwCC pkgs.gnumake pkgs.python3 pkgs.findutils ]}
           export REBOX_GPUVA_LAYER_DIR=''${REBOX_GPUVA_LAYER_DIR:-${gpuva-layer}/share/vulkan/explicit_layer.d}
           export REBOX_RADV_ICD=''${REBOX_RADV_ICD:-${radv-rebox}/share/vulkan/icd.d/radeon_icd.x86_64.json}
+          export REBOX_FOSSILIZE_DIR=''${REBOX_FOSSILIZE_DIR:-${fossilize}}
           exec ${pkgs.bash}/bin/bash ${./bin/rebox-run} "$@"
         '';
 
