@@ -372,7 +372,19 @@ static LONG CALLBACK hold_busy_writes(EXCEPTION_POINTERS *ep)
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
-    return track_fault((ULONG_PTR)address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    if (track_fault((ULONG_PTR)address))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    /* Writable by now: the page changed under the write (an armed page made GPU memory in place,
+     * made writable while track_fault waited for the physical lock and then found it a copy, not
+     * armed). The write is retried; a crash there killed the title in loading. */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT
+                && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))
+                && !(mbi.Protect & PAGE_GUARD))
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* The mailbox for making title memory GPU-visible (layers/gpuva_mailbox.h), or NULL. */
