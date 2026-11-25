@@ -62,6 +62,9 @@ struct shadow_heap
     UINT64 title_va, gpu_va;       /* title_va 0 for heaps that aren't shader-visible */
     UINT reserved, reserved_used;  /* hidden slots after count in vkd3d-proton's heap */
     UINT32 (*reserved_words)[4];   /* the S# each used one holds */
+    ID3D12Resource **res;          /* CBV/SRV/UAV: count entries, the resource each slot's view is of
+                                    * (not referenced), made on the first view of one */
+    ID3D12Resource **reserved_res; /* the same for the reserved tail (shadow_reserve_srv) */
     struct shadow_heap *next;
 };
 
@@ -85,6 +88,148 @@ struct entry
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static struct shadow_heap *heaps;
+
+/* Resources whose views in descriptor slots are counted (shadow_track): a texture made for views
+ * of memory is retired when the title puts another texture over its memory (proxy.c), and released
+ * only once no slot holds a view of it. Released while a slot still did, a shader that read that
+ * slot faulted the GPU. An open-addressed table under the lock: NULL empty, TOMBSTONE removed. */
+#define TOMBSTONE ((ID3D12Resource *)1)
+static struct tracked { ID3D12Resource *res; LONG refs; } *tracked;
+static SIZE_T tracked_capacity, tracked_count, tracked_used;
+static struct shadow_heap *heap_for_cpu(SIZE_T cpu, UINT *index);
+
+static SIZE_T tracked_hash(const ID3D12Resource *res)
+{
+    return (SIZE_T)(((UINT64)(ULONG_PTR)res >> 4) * 0x9e3779b97f4a7c15ull >> 20);
+}
+
+/* Under the lock. */
+static struct tracked *tracked_find(const ID3D12Resource *res)
+{
+    if (!tracked_count || !res)
+        return NULL;
+    for (SIZE_T i = tracked_hash(res) & (tracked_capacity - 1), n = 0; n < tracked_capacity;
+            i = (i + 1) & (tracked_capacity - 1), n++)
+        if (tracked[i].res == res)
+            return &tracked[i];
+        else if (!tracked[i].res)
+            return NULL;
+    return NULL;
+}
+
+/* Under the lock, exclusive: a slot's view is of res now, not old. */
+static void ref_change(ID3D12Resource *old, ID3D12Resource *res)
+{
+    struct tracked *t;
+    if (old == res || !tracked_count)
+        return;
+    if ((t = tracked_find(old)))
+        t->refs--;
+    if ((t = tracked_find(res)))
+        t->refs++;
+}
+
+/* Under the lock, exclusive. */
+static void slot_set_res(struct shadow_heap *h, UINT index, ID3D12Resource *res)
+{
+    ID3D12Resource *old = h->res ? h->res[index] : NULL;
+    if (old == res || h->type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        return;
+    if (!h->res && !(h->res = calloc(h->count, sizeof(*h->res))))
+        return;
+    ref_change(old, res);
+    h->res[index] = res;
+}
+
+void shadow_track(ID3D12Resource *res)
+{
+    if (!res)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    if ((tracked_used + 1) * 2 > tracked_capacity)
+    {
+        SIZE_T n = tracked_capacity ? tracked_capacity : 1024;
+        struct tracked *grown, *old = tracked;
+        while ((tracked_count + 1) * 4 > n)
+            n *= 2;
+        if ((grown = calloc(n, sizeof(*grown))))
+        {
+            SIZE_T old_capacity = tracked_capacity;
+            tracked = grown;
+            tracked_capacity = n;
+            tracked_used = tracked_count;
+            for (SIZE_T i = 0; i < old_capacity; i++)
+                if (old[i].res && old[i].res != TOMBSTONE)
+                {
+                    SIZE_T j = tracked_hash(old[i].res) & (n - 1);
+                    while (tracked[j].res)
+                        j = (j + 1) & (n - 1);
+                    tracked[j] = old[i];
+                }
+            free(old);
+        }
+    }
+    if (tracked_capacity && !tracked_find(res) && tracked_used < tracked_capacity - 1)
+    {
+        SIZE_T i = tracked_hash(res) & (tracked_capacity - 1);
+        while (tracked[i].res && tracked[i].res != TOMBSTONE)
+            i = (i + 1) & (tracked_capacity - 1);
+        if (!tracked[i].res)
+            tracked_used++;
+        tracked[i].res = res;
+        tracked[i].refs = 0;
+        tracked_count++;
+        /* Views of it written before it was tracked (none: proxy.c tracks it as it is made). */
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+BOOL shadow_untrack_unreferenced(ID3D12Resource *res)
+{
+    struct tracked *t;
+    BOOL done = TRUE;
+
+    AcquireSRWLockExclusive(&lock);
+    if ((t = tracked_find(res)))
+    {
+        if (t->refs > 0)
+            done = FALSE;
+        else
+        {
+            t->res = TOMBSTONE;
+            tracked_count--;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return done;
+}
+
+LONG shadow_view_refs(ID3D12Resource *res)
+{
+    struct tracked *t;
+    LONG refs = -1;
+
+    AcquireSRWLockShared(&lock);
+    if ((t = tracked_find(res)))
+        refs = t->refs;
+    ReleaseSRWLockShared(&lock);
+    return refs;
+}
+
+/* For tests: the resource the view in the slot at cpu is of. */
+ID3D12Resource *WINAPI ReboxShadowSlotResource(SIZE_T cpu)
+{
+    ID3D12Resource *res = NULL;
+    struct shadow_heap *h;
+    UINT index;
+
+    cpu = shadow_cpu_to_inner(cpu);
+    AcquireSRWLockShared(&lock);
+    if ((h = heap_for_cpu(cpu, &index)) && h->res)
+        res = h->res[index];
+    ReleaseSRWLockShared(&lock);
+    return res;
+}
 static struct entry *buckets[INDEXES][BUCKETS];
 static UINT64 next_title_va = TITLE_BASE;
 
@@ -243,6 +388,12 @@ static void heap_free(struct shadow_heap *h)
     InterlockedIncrement(&regions_generation);
     for (UINT i = 0; i < h->count; i++)
         unindex(h, i);
+    for (UINT i = 0; h->res && i < h->count; i++)
+        ref_change(h->res[i], NULL);
+    for (UINT i = 0; h->reserved_res && i < h->reserved_used; i++)
+        ref_change(h->reserved_res[i], NULL);
+    free(h->res);
+    free(h->reserved_res);
     if (h->mirror)
         ReboxGpuFree(h->mirror);
     if (h->data_in_title)
@@ -627,7 +778,7 @@ static void note_visible_write(const struct shadow_heap *h, UINT index, const ch
                      ((const UINT32 *)(h->data + (SIZE_T)index * h->stride))[3]);
 }
 
-static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_view view)
+static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_view view, ID3D12Resource *res)
 {
     struct shadow_heap *h;
     UINT index;
@@ -639,6 +790,7 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
         memset(h->data + (SIZE_T)index * h->stride, 0, h->stride);
         memcpy(h->data + (SIZE_T)index * h->stride, words, size < h->stride ? size : h->stride);
         h->views[index] = view;
+        slot_set_res(h, index, res);
         index_slot(h, index);
         note_visible_write(h, index, "view");
     }
@@ -667,7 +819,7 @@ void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
     if (desc && desc->BufferLocation && buffer_range_mappable(desc->BufferLocation, desc->SizeInBytes))
         note_buffer_range(desc->BufferLocation, desc->SizeInBytes);
     console_encode_cbv(desc, w);
-    write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE);
+    write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE, NULL);
 }
 
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
@@ -677,7 +829,8 @@ void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOUR
     console_encode_srv(res, desc, w);
     write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER : -1,
                desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER
-               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) : 0, FALSE));
+               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) : 0, FALSE),
+               res);
 }
 
 void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
@@ -700,7 +853,8 @@ void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACC
     console_encode_uav(res, desc, w);
     write_slot(cpu, w, sizeof(w), view_kind(res, desc ? desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER : -1,
                desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER
-               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) : 0, TRUE));
+               ? (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) : 0, TRUE),
+               res);
 }
 
 void shadow_write_sampler(SIZE_T cpu, const D3D12_SAMPLER_DESC *desc)
@@ -709,7 +863,7 @@ void shadow_write_sampler(SIZE_T cpu, const D3D12_SAMPLER_DESC *desc)
     if (!desc)
         return;
     console_encode_sampler(desc, w);
-    write_slot(cpu, w, sizeof(w), SHADOW_VIEW_SAMPLER);
+    write_slot(cpu, w, sizeof(w), SHADOW_VIEW_SAMPLER, NULL);
 }
 
 void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
@@ -730,11 +884,13 @@ void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
         {
             memcpy(d->data + (SIZE_T)di * d->stride, s->data + (SIZE_T)si * s->stride, d->stride);
             d->views[di] = s->views[si];
+            slot_set_res(d, di, s->res ? s->res[si] : NULL);
         }
         else
         {
             memset(d->data + (SIZE_T)di * d->stride, 0, d->stride);
             d->views[di] = SHADOW_VIEW_NONE;
+            slot_set_res(d, di, NULL);
         }
         index_slot(d, di);
         note_visible_write(d, di, "copy");
@@ -1137,11 +1293,41 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
             *index = heap->count + i;
             cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
             ID3D12Device_CreateShaderResourceView(device, res, &srv, cpu);
+            if (heap->reserved_res || (heap->reserved_res = calloc(heap->reserved, sizeof(*heap->reserved_res))))
+            {
+                heap->reserved_res[i] = res;
+                ref_change(NULL, res);
+            }
             found = TRUE;
         }
     }
     ReleaseSRWLockExclusive(&lock);
     return found;
+}
+
+/* res is going: its views in reserved tails (shadow_reserve_srv) become null ones and aren't found
+ * again, so a resource made later at its address doesn't get them. */
+void shadow_forget_reserved(ID3D12Resource *res)
+{
+    ID3D12Device *device = rebox_shared_device();
+
+    if (!res || !device)
+        return;
+    AcquireSRWLockExclusive(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        for (UINT i = 0; h->reserved_res && i < h->reserved_used; i++)
+            if (h->reserved_res[i] == res)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu = { h->cpu_start + (SIZE_T)(h->count + i) * h->stride };
+                srv.Texture2D.MipLevels = 1;
+                ID3D12Device_CreateShaderResourceView(device, NULL, &srv, cpu);
+                memset(h->reserved_words[i], 0xff, 16);
+                ref_change(res, NULL);
+                h->reserved_res[i] = NULL;
+            }
+    ReleaseSRWLockExclusive(&lock);
 }
 
 /* A view of a 1x1 zeroed dummy texture (SRV, or UAV for a storage image) in the heap's reserved

@@ -33,6 +33,7 @@
 #include "gpu_memory.h"
 #include "shadow.h"
 #include "console_compile.h"
+#include "console_desc.h"
 #include "pacing.h"
 #include "present.h"
 #include "proxy.h"
@@ -3191,8 +3192,11 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct pr
  * every texture kept their memory grew without end (tens of GiB in a few minutes, until the host
  * killed the process). Views of the same memory in the same shape, another format (sRGB and
  * linear), stay, and so does a texture with the new one wholly inside it, not at its start (that
- * may be a view of one of its mips or slices). A retired one stops being filled from title memory and is released once the GPU
- * has finished everything submitted before it was retired, and at least VIEW_RETIRE_MS later.
+ * may be a view of one of its mips or slices). A retired one stops being filled from title memory
+ * and found at its address, and is released once the GPU has finished everything submitted before
+ * it was retired, at least VIEW_RETIRE_MS later, and once no descriptor slot holds a view of it
+ * (shadow_track counts them). Released while a slot in the title's heaps still did, a shader that
+ * read that slot faulted the GPU (a GPUVM fault in vkd3d-proton's memory, a minute into loading).
  * REBOX_VIEW_RETIRE=0 keeps every one, as before. */
 #define VIEW_RETIRE_MS 2000
 #define VIEW_PAGE_BUCKETS 65536
@@ -3213,6 +3217,7 @@ static struct view_page *view_pages[VIEW_PAGE_BUCKETS];
 static struct retired_view { ID3D12Resource *res; LONG64 at; } *views_retired;
 static SIZE_T views_retired_count, views_retired_capacity;
 static LONG64 views_retired_total, views_released_total;
+static SIZE_T views_held; /* retired ones past the GPU that descriptor slots still hold */
 static SRWLOCK memory_view_lock = SRWLOCK_INIT;
 
 /* The description as a key: the PC's padding after Dimension zeroed (a console desc's bytes there
@@ -3293,8 +3298,10 @@ static void memory_view_retire(struct memory_view *v, LONG64 now)
     }
     if (views_retired_count < views_retired_capacity)
     {
-        /* Its contents are the old texture's: title memory isn't, from now on. */
-        title_texture_gpu_written(v->res);
+        /* Its contents are the old texture's: title memory isn't, from now on, nor is it found
+         * at the address; views of it made for T#s the title wrote itself become null ones. */
+        title_texture_unregister(v->res);
+        shadow_forget_reserved(v->res);
         views_retired[views_retired_count++] = (struct retired_view){ v->res, now };
         views_retired_total++;
     }
@@ -3345,6 +3352,7 @@ static void memory_view_add(UINT64 address, const D3D12_RESOURCE_DESC *key, ID3D
     v->res = res;
     if (own && end > address && view_retire_enabled())
     {
+        shadow_track(res); /* before any view of it is written: resource_at's caller writes one */
         UINT64 p0 = address >> 16, p1 = (end - 1) >> 16;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
@@ -3385,22 +3393,35 @@ static void memory_views_reap(LONG64 before)
     ID3D12Resource *stack[256];
     UINT n = 0;
 
-    if (!views_retired_count)
+    static ULONGLONG last;
+    ULONGLONG now = GetTickCount64();
+    SIZE_T held = 0;
+
+    /* Four times a second: the held ones are asked about each time. */
+    if (!views_retired_count || now - last < 250)
         return;
+    last = now;
     AcquireSRWLockExclusive(&memory_view_lock);
     for (SIZE_T i = 0; i < views_retired_count && n < ARRAYSIZE(stack); )
-        if (views_retired[i].at < before)
+        if (views_retired[i].at >= before)
+            i++;
+        else if (!shadow_untrack_unreferenced(views_retired[i].res))
+        {
+            held++;
+            i++;
+        }
+        else
         {
             stack[n++] = views_retired[i].res;
             views_retired[i] = views_retired[--views_retired_count];
         }
-        else
-            i++;
     views_released_total += n;
+    views_held = held;
     ReleaseSRWLockExclusive(&memory_view_lock);
     while (n)
     {
         ID3D12Resource *res = stack[--n]; /* the macro names its argument twice */
+        console_texture_forget(res);
         ID3D12Resource_Release(res);
     }
 }
@@ -4010,7 +4031,7 @@ static void memory_log(void)
     int at = 0;
     UINT heaps;
     UINT64 heap_bytes, heaps_made;
-    SIZE_T views, retired;
+    SIZE_T views, retired, held;
     LONG64 retired_total, released_total;
 
     K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof(pm));
@@ -4032,19 +4053,21 @@ static void memory_log(void)
     AcquireSRWLockShared(&memory_view_lock);
     views = memory_view_count;
     retired = views_retired_count;
+    held = views_held;
     retired_total = views_retired_total;
     released_total = views_released_total;
     ReleaseSRWLockShared(&memory_view_lock);
     title_textures_stats(&tt);
     rebox_log("d3d12_xs: memory: private %llu MiB, working set %llu MiB; GPU memory chunks %llu MiB, "
               "%llu MiB of them title memory in place; host %llu of %llu MiB free; own memory: %s; alias heaps %u "
-              "(%llu MiB, +%llu); memory views %llu, %llu retired waiting (%lld retired, %lld released in all); "
+              "(%llu MiB, +%llu); memory views %llu, %llu retired waiting, %llu of them held by descriptors (%lld retired, "
+              "%lld released in all); "
               "title textures %u (%u dirty), uploads in flight %u (%llu MiB)",
               (unsigned long long)pm.PrivateUsage >> 20, (unsigned long long)pm.WorkingSetSize >> 20,
               (unsigned long long)ReboxGpuBytesInUse() >> 20, (unsigned long long)gpu_memory_adopted_bytes() >> 20,
               (unsigned long long)host.ullAvailPhys >> 20, (unsigned long long)host.ullTotalPhys >> 20, own, heaps,
               (unsigned long long)heap_bytes >> 20, (unsigned long long)heaps_made, (unsigned long long)views,
-              (unsigned long long)retired, (long long)retired_total, (long long)released_total, tt.textures, tt.dirty,
+              (unsigned long long)retired, (unsigned long long)held, (long long)retired_total, (long long)released_total, tt.textures, tt.dirty,
               tt.uploads, (unsigned long long)tt.upload_bytes >> 20);
 }
 

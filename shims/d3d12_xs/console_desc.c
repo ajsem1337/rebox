@@ -168,6 +168,23 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
     return va;
 }
 
+/* res is being released: a resource made later at its pointer gets an address of its own, so T#s
+ * of the old one aren't taken for the new one's. */
+void console_texture_forget(ID3D12Resource *res)
+{
+    struct texture_id **p, *t;
+
+    AcquireSRWLockExclusive(&texture_lock);
+    for (p = &texture_ids[((ULONG_PTR)res >> 4) & 255]; (t = *p); p = &t->next)
+        if (t->res == res)
+        {
+            *p = t->next;
+            free(t);
+            break;
+        }
+    ReleaseSRWLockExclusive(&texture_lock);
+}
+
 /* For tests: console_texture_of. */
 ID3D12Resource *WINAPI ReboxConsoleTextureOf(const UINT32 words[2])
 {

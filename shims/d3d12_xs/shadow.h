@@ -71,3 +71,12 @@ LONG shadow_buffer_ranges_generation(void);
 /* A shader resource view of res in the heap's reserved tail (made once per resource), for a T# the
  * title wrote itself; its index in *index. */
 BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index);
+
+/* Views counted per resource (shadow.c): shadow_track starts counting the descriptor slots holding a
+ * view of res; shadow_untrack_unreferenced stops, if none does (TRUE), else returns FALSE;
+ * shadow_view_refs gives the count (-1 untracked). shadow_forget_reserved makes res's views in the
+ * reserved tails null ones. */
+void shadow_track(ID3D12Resource *res);
+BOOL shadow_untrack_unreferenced(ID3D12Resource *res);
+LONG shadow_view_refs(ID3D12Resource *res);
+void shadow_forget_reserved(ID3D12Resource *res);

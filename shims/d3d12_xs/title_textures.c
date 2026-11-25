@@ -875,6 +875,34 @@ void title_texture_gpu_written(ID3D12Resource *resource)
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* resource is the title's no longer (a retired view texture, proxy.c): not filled from title
+ * memory, and not found at its address, from now on. */
+void title_texture_unregister(ID3D12Resource *resource)
+{
+    struct title_texture *t, **p;
+    ID3DDestructionNotifier *notifier;
+
+    AcquireSRWLockExclusive(&lock);
+    if ((t = texture_of(resource)))
+    {
+        for (p = &textures; *p && *p != t; p = &(*p)->next)
+            ;
+        if (*p)
+            *p = t->next;
+        index_remove(t);
+        if (t->dirty)
+            InterlockedDecrement(&dirty_count);
+        if (SUCCEEDED(ID3D12Resource_QueryInterface(resource, &IID_ID3DDestructionNotifier, (void **)&notifier)))
+        {
+            ID3DDestructionNotifier_UnregisterDestructionCallback(notifier, t->callback);
+            ID3DDestructionNotifier_Release(notifier);
+            free(t);
+        }
+        /* else its callback still names it: left allocated */
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
 ID3D12Resource *title_texture_at(UINT64 address)
 {
     struct title_texture *t;

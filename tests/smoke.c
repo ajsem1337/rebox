@@ -4394,6 +4394,99 @@ static void test_view_texture_retire(void *dev, void *queue)
     /* The memory stays: the views kept still name it. */
 }
 
+/* A retired view texture (test_view_texture_retire) whose view is still in a descriptor slot is
+ * kept while any slot holds it: a copy of the view in another heap counts too. Once both slots are
+ * rewritten it is released, and no slot names it. */
+static void test_view_texture_held(void *dev, void *queue)
+{
+    void (WINAPI *view_memory)(UINT64 *, UINT64 *, UINT64 *, UINT64 *) =
+            (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxViewMemory");
+    ID3D12Resource *(WINAPI *slot_resource)(SIZE_T) =
+            (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxShadowSlotResource");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC cd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+    D3D12_SHADER_RESOURCE_VIEW_DESC null = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+    BYTE console_a[0x40] = { 0 }, console_b[0x40] = { 0 };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    UINT64 views0, retired0, textures0, bytes0, views, retired, textures, bytes;
+    ID3D12Resource *a = NULL, *b = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    void *heap = NULL, *cpu_heap = NULL, *list = NULL, *memory;
+    SIZE_T start, cpu_start;
+    UINT inc;
+
+    if (!view_memory || !slot_resource
+            || !(memory = VirtualAlloc(NULL, 4 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+        return;
+    if (FAILED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap))
+            || FAILED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cd,
+            &IID_ID3D12DescriptorHeap, &cpu_heap)))
+        goto done;
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    start = XSLOT(heap, 9, SIZE_T)(heap);
+    cpu_start = XSLOT(cpu_heap, 9, SIZE_T)(cpu_heap);
+    view.v.Texture2D.MipLevels = null.Texture2D.MipLevels = 1;
+    view.address = (UINT64)(ULONG_PTR)memory;
+    memcpy(console_a, &td, sizeof(td));
+    td.Width = 128;
+    memcpy(console_b, &td, sizeof(td));
+    view_memory(&views0, &retired0, &textures0, &bytes0);
+
+    /* A in slot 0, copied into the CPU heap; B over the same memory in slot 1 retires A. */
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_a, &view, start);
+    a = slot_resource(start);
+    XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, 1, cpu_start, start,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_b, &view, start + inc);
+    b = slot_resource(start + inc);
+    if (SUCCEEDED(XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&alloc))
+            && SUCCEEDED(XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *,
+                               ID3D12PipelineState *, REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                               NULL, &IID_ID3D12GraphicsCommandList, &list)))
+    {
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    }
+    Sleep(3500);
+    view_memory(&views, &retired, &textures, &bytes);
+    CHECK(a && b && a != b && slot_resource(cpu_start) == a && textures - textures0 == 2 && retired - retired0 == 1,
+          "views of memory: a retired texture whose view is in two slots is kept past the GPU (%llu alive, %llu "
+          "waiting)", (unsigned long long)(textures - textures0), (unsigned long long)(retired - retired0));
+
+    /* Slot 0 gets B's view: the copy still holds A. */
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_b, &view, start);
+    Sleep(1000);
+    view_memory(&views, &retired, &textures, &bytes);
+    CHECK(slot_resource(start) == b && textures - textures0 == 2 && retired - retired0 == 1,
+          "views of memory: rewriting one slot leaves the retired texture held by the copy (%llu alive)",
+          (unsigned long long)(textures - textures0));
+
+    /* The copy is rewritten with a null view: A goes, and no slot names it. */
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, NULL, &null, cpu_start);
+    for (int i = 0; i < 40; i++)
+    {
+        view_memory(&views, &retired, &textures, &bytes);
+        if (textures - textures0 <= 1)
+            break;
+        Sleep(100);
+    }
+    CHECK(textures - textures0 == 1 && retired == retired0 && slot_resource(cpu_start) != a
+          && slot_resource(start) == b && slot_resource(start + inc) == b,
+          "views of memory: once no slot holds it, the retired texture is released (%llu alive, %llu waiting)",
+          (unsigned long long)(textures - textures0), (unsigned long long)(retired - retired0));
+done:
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (cpu_heap) XSLOT(cpu_heap, 2, ULONG)(cpu_heap);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_placed_texture_late(void *dev, void *queue)
 {
     struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
@@ -5600,6 +5693,7 @@ static void test_xbox(void)
     test_placed_texture_array(dev, queue);
     test_placed_texture_late(dev, queue);
     test_view_texture_retire(dev, queue);
+    test_view_texture_held(dev, queue);
     test_placed_texture_written(dev, queue);
     test_placed_texture_tracked(dev, queue);
     test_list_queries(dev, queue);
