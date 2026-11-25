@@ -137,9 +137,14 @@
             fetchSubmodules = true;
             hash = "sha256-7u/aepE5YGbEy5nF9PnxDr+ljNmrE/6iwS/z8cdIcBM=";
           };
-          nativeBuildInputs = [ pkgs.cmake pkgs.python3 ];
+          nativeBuildInputs = [ pkgs.cmake pkgs.python3 pkgs.makeWrapper ];
           cmakeFlags = [ "-DFOSSILIZE_VULKAN_LAYER=ON" "-DFOSSILIZE_TESTS=OFF" "-DCMAKE_BUILD_TYPE=Release" ];
+          # The tools load libvulkan at run time (volk): without the loader on their path every
+          # replay worker failed at once ("volkInitialize failed").
           postInstall = ''
+            for f in $out/bin/*; do
+              wrapProgram "$f" --prefix LD_LIBRARY_PATH : ${pkgs.vulkan-loader}/lib
+            done
             mkdir -p $out/share/vulkan/rebox_layer.d
             sed "s|\"library_path\": \".*\"|\"library_path\": \"$out/lib/libVkLayer_fossilize.so\"|" \
               $out/share/vulkan/implicit_layer.d/VkLayer_fossilize.json \
