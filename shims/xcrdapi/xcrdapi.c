@@ -7,17 +7,27 @@
  * MIT samples): 3 EnqueueRequest, 4 EnqueueStatus, 5 EnqueueSetEvent (PC's EnqueueSignal sits
  * there; a fence is told from an event handle and signalled), 6 Submit, 7-11 CancelRequestsWithTag,
  * Close, GetErrorEvent, RetrieveErrorRecord, Query, then X1's EnqueueSignal (12) and X2's Query1,
- * SetAutoSubmitDisabled and GetAutoSubmitDisabled (13-15). Auto-submit is on unless the title turns
- * it off: everything enqueued runs without waiting for Submit, as on the console (a UE5 title never
+ * SetAutoSubmitDisabled and GetAutoSubmitDisabled (13-15). Other slots log their first calls and
+ * return 0.
+ *
+ * What is enqueued waits for Submit, or until half the queue's capacity is waiting, as xcl and
+ * VIctory have it (facts only). A title may finish a request's destination between enqueueing it
+ * and Submit: one fills its page table (the page arrays its requests point into) for the whole
+ * batch just before EnqueueStatus and Submit, so a request run at enqueue found page numbers still
+ * 0, or the page that slot held before, which may be another resource's by then. A UE5 title never
  * calls Submit, and its streaming textures stayed pending until garbage collection gave up on
- * them). Other slots log their first calls and return 0.
+ * them: a queue that has never been submitted submits by itself once something has waited
+ * REBOX_DSTORAGE_SUBMIT_MS (default 20). SetAutoSubmitDisabled(FALSE), or
+ * REBOX_DSTORAGE_SUBMIT=enqueue for every queue, runs requests as they are enqueued.
  *
  * Requests run in order on one worker thread per queue, reading from host files or memory.
  * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests go to
  * helpers/bcpack, a separate process running Leonida's GPLv3 decoder (rebox-run starts it and
  * sets REBOX_BCPACK_PORT), over a localhost connection per worker thread. A destination in physical
  * pages (options bit 21: an array of 64 KiB page numbers, the offset into the first at +0x10) is
- * decoded into a buffer and written through the pages (xmem ReboxWritePhysicalPages). Swizzled
+ * decoded into a buffer and written through the pages (xmem ReboxWritePhysicalPages). The page
+ * numbers are read as the request runs, unless the array is on the enqueuing thread's stack (xcl:
+ * titles pass those too), which is copied at enqueue. Swizzled
  * destinations and physical-page sources aren't supported, nor is BCPack without the helper:
  * those requests fail with E_NOTIMPL and are logged, and the next status entry reports it. */
 
@@ -301,6 +311,7 @@ struct entry
     HANDLE event;               /* ENTRY_EVENT: duplicated, closed once set */
     ULONG_PTR *pages;           /* a physical-page destination's page numbers, as at enqueue */
     UINT32 page_count;
+    BOOL pages_live;            /* the array isn't on the enqueuing stack: read again as it runs */
     BOOL traced;                /* its destination covers REBOX_PHYSICAL_TRACE */
 };
 
@@ -315,7 +326,9 @@ struct queue
     UINT32 pending_count, pending_size, submitted_count, submitted_size, submitted_head;
     HANDLE worker;
     BOOL stop;
-    BOOL manual_submit;         /* SetAutoSubmitDisabled(TRUE) */
+    int auto_submit;            /* SetAutoSubmitDisabled: -1 never called, 0 disabled, 1 enabled */
+    BOOL title_submits;         /* Submit has been called: it never submits by itself after a wait */
+    ULONGLONG pending_since;    /* when the oldest unsubmitted entry was enqueued (GetTickCount64) */
     HRESULT first_failure; /* since the last status entry; worker only */
 };
 
@@ -519,9 +532,25 @@ static BOOL CALLBACK find_write_pages(INIT_ONCE *once, void *param, void **out)
     return TRUE;
 }
 
-/* Writes a decoded request into its destination pages. A page number still 0 in the snapshot is
- * read again from the title's array now: a title can fill an entry after enqueueing the request
- * (xcl, ivall/xcl, GPL-2.0-only, dstorage.rs: a retail title's streaming requests). */
+/* A request's page numbers as it runs: an array that isn't on the enqueuing thread's stack is read
+ * again now, all of it (a title's page table, filled for the batch before Submit; an entry may have
+ * held another page at enqueue). A stack array keeps its snapshot, but an entry still 0 there is
+ * read again (xcl, ivall/xcl, GPL-2.0-only, dstorage.rs). */
+static void resolve_pages(const struct entry *e)
+{
+    const ULONG_PTR *array = e->request.destination;
+
+    if (!e->pages)
+        return;
+    if (e->pages_live && !IsBadReadPtr(array, e->page_count * sizeof(*array)))
+        memcpy(e->pages, array, e->page_count * sizeof(*array));
+    else
+        for (UINT32 i = 0; i < e->page_count; i++)
+            if (!e->pages[i] && !IsBadReadPtr(array + i, sizeof(*array)))
+                e->pages[i] = array[i];
+}
+
+/* Writes a decoded request into its destination pages (resolve_pages has read them). */
 static HRESULT write_pages(const struct entry *e, const BYTE *data, UINT32 size)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -531,9 +560,6 @@ static HRESULT write_pages(const struct entry *e, const BYTE *data, UINT32 size)
     InitOnceExecuteOnce(&once, find_write_pages, NULL, (void **)&write);
     if (!write)
         return E_NOTIMPL;
-    for (UINT32 i = 0; i < e->page_count; i++)
-        if (!e->pages[i] && !IsBadReadPtr(array + i, sizeof(*array)))
-            e->pages[i] = array[i];
     if (!write(e->pages, e->page_count, (SIZE_T)e->request.destination_page_offset, data, size))
     {
         static LONG logged;
@@ -569,6 +595,8 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     BOOL to_pages = !!(r->options & OPT_DEST_PHYSICAL);
     DSTORAGE_REQUEST paged;
 
+    if (to_pages)
+        resolve_pages(e);
     {
         /* REBOX_PHYSICAL_TRACE: a request writing the physical page mapped at the traced address,
          * through any address of it or as a physical-page destination. */
@@ -741,6 +769,56 @@ static void release_entry(const struct entry *e)
     free(e->pages);
 }
 
+/* REBOX_DSTORAGE_SUBMIT=enqueue: every queue runs what is enqueued at once (as Rebox did before). */
+static BOOL submit_on_enqueue(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *v = getenv("REBOX_DSTORAGE_SUBMIT");
+        on = v && !strcmp(v, "enqueue");
+    }
+    return on;
+}
+
+/* REBOX_DSTORAGE_SUBMIT_MS: how long an entry waits in a queue never submitted (default 20). */
+static DWORD submit_delay(void)
+{
+    static LONG ms = -1;
+    if (ms < 0)
+    {
+        const char *v = getenv("REBOX_DSTORAGE_SUBMIT_MS");
+        ms = v && *v ? atoi(v) : 20;
+        if (ms < 0)
+            ms = 20;
+    }
+    return (DWORD)ms;
+}
+
+/* Caller holds q->cs. */
+static BOOL runs_on_enqueue(const struct queue *q)
+{
+    return q->auto_submit == 1 || (q->auto_submit < 0 && submit_on_enqueue());
+}
+
+/* Caller holds q->cs: a queue never submitted (UE5's), not set to wait for Submit. */
+static BOOL submits_after_wait(const struct queue *q)
+{
+    return !q->title_submits && q->auto_submit != 0;
+}
+
+static DWORD WINAPI queue_worker(void *param);
+
+/* Caller holds q->cs. */
+static void wake_worker(struct queue *q)
+{
+    if (!q->worker)
+        q->worker = CreateThread(NULL, 0, queue_worker, q, 0, NULL);
+    WakeConditionVariable(&q->wake);
+}
+
+static void submit_locked(struct queue *q);
+
 static DWORD WINAPI queue_worker(void *param)
 {
     struct queue *q = param;
@@ -751,7 +829,24 @@ static DWORD WINAPI queue_worker(void *param)
         struct entry e;
 
         while (!q->stop && q->submitted_head == q->submitted_count)
-            SleepConditionVariableCS(&q->wake, &q->cs, INFINITE);
+        {
+            DWORD wait = INFINITE;
+            if (q->pending_count && submits_after_wait(q))
+            {
+                ULONGLONG waited = GetTickCount64() - q->pending_since;
+                if (waited >= submit_delay())
+                {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged) <= 4)
+                        rebox_log("xcrdapi: queue %p, never submitted, submits %u entries by itself after %llu ms",
+                                  (void *)q, q->pending_count, waited);
+                    submit_locked(q);
+                    continue;
+                }
+                wait = (DWORD)(submit_delay() - waited);
+            }
+            SleepConditionVariableCS(&q->wake, &q->cs, wait);
+        }
         if (q->stop)
             break;
         e = q->submitted[q->submitted_head++];
@@ -816,18 +911,21 @@ static void submit_locked(struct queue *q)
     for (UINT32 i = 0; i < q->pending_count; i++)
         push(&q->submitted, &q->submitted_count, &q->submitted_size, &q->pending[i]);
     q->pending_count = 0;
-    if (!q->worker)
-        q->worker = CreateThread(NULL, 0, queue_worker, q, 0, NULL);
-    WakeConditionVariable(&q->wake);
+    wake_worker(q);
 }
 
-/* Caller holds q->cs. The console submits by itself once more than half the queue is waiting. */
+/* Caller holds q->cs. The console submits by itself once more than half the queue is waiting; a
+ * queue never submitted also after a short wait (worker), and one set to auto-submit at once. */
 static void enqueue_locked(struct queue *q, const struct entry *e)
 {
     InterlockedIncrement64(&stats.enqueued[e->kind]);
     push(&q->pending, &q->pending_count, &q->pending_size, e);
-    if (!q->manual_submit || q->pending_count * 2 > q->capacity)
+    if (q->pending_count == 1)
+        q->pending_since = GetTickCount64();
+    if (runs_on_enqueue(q) || q->pending_count * 2 > q->capacity)
         submit_locked(q);
+    else if (q->pending_count == 1 && submits_after_wait(q))
+        wake_worker(q); /* to time the wait */
 }
 
 static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST *request)
@@ -883,11 +981,15 @@ static void WINAPI queue_EnqueueRequest(struct queue *q, const DSTORAGE_REQUEST 
             }
         }
     }
-    /* A page array is copied now: titles also pass arrays on the stack (xcl). Pages are 64 KiB. */
+    /* A page array is copied now, for one on the stack (xcl: titles pass those too); any other is
+     * read again as the request runs (resolve_pages). Pages are 64 KiB. */
     if ((request->options & OPT_DEST_PHYSICAL) && request->destination && request->destination_size)
     {
         UINT64 span = request->destination_page_offset + (UINT64)request->destination_size;
+        NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+        ULONG_PTR at = (ULONG_PTR)request->destination;
         e.page_count = (UINT32)((span + 0xffff) >> 16);
+        e.pages_live = !(at >= (ULONG_PTR)tib->StackLimit && at < (ULONG_PTR)tib->StackBase);
         if ((e.pages = calloc(e.page_count, sizeof(*e.pages)))
                 && !IsBadReadPtr(request->destination, e.page_count * sizeof(*e.pages)))
             memcpy(e.pages, request->destination, e.page_count * sizeof(*e.pages));
@@ -955,23 +1057,36 @@ static void WINAPI queue_EnqueueSetEvent(struct queue *q, void *handle, UINT64 v
     LeaveCriticalSection(&q->cs);
 }
 
-/* X2: SetAutoSubmitDisabled(bool) and GetAutoSubmitDisabled(). */
+/* X2: SetAutoSubmitDisabled(bool) and GetAutoSubmitDisabled(). Enabled: what is enqueued runs at
+ * once; disabled: it waits for Submit (or half the queue), with no submitting after a wait. */
 static HRESULT WINAPI queue_SetAutoSubmitDisabled(struct queue *q, BOOL disabled)
 {
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 4)
+        rebox_log("xcrdapi: queue %p: SetAutoSubmitDisabled(%d)", (void *)q, (BYTE)disabled != 0);
     EnterCriticalSection(&q->cs);
-    q->manual_submit = (BYTE)disabled != 0;
+    q->auto_submit = (BYTE)disabled == 0;
+    if (q->auto_submit && q->pending_count)
+        submit_locked(q);
     LeaveCriticalSection(&q->cs);
     return S_OK;
 }
 
 static BOOL WINAPI queue_GetAutoSubmitDisabled(struct queue *q)
 {
-    return q->manual_submit;
+    return q->auto_submit == 0;
 }
 
 static void WINAPI queue_Submit(struct queue *q)
 {
     EnterCriticalSection(&q->cs);
+    if (!q->title_submits)
+    {
+        static LONG logged;
+        q->title_submits = TRUE;
+        if (InterlockedIncrement(&logged) <= 4)
+            rebox_log("xcrdapi: queue %p submitted by the title: what it enqueues waits for Submit", (void *)q);
+    }
     submit_locked(q);
     LeaveCriticalSection(&q->cs);
 }
@@ -1023,6 +1138,7 @@ static HRESULT WINAPI factory_CreateQueue(struct object *self, const DSTORAGE_QU
     q->obj = (struct object){ queue_vtbl, 1, queue_destroy };
     q->source_type = desc->source_type;
     q->capacity = desc->capacity < 0x80 ? 0x80 : desc->capacity > 0x2000 ? 0x2000 : desc->capacity;
+    q->auto_submit = -1;
     InitializeCriticalSection(&q->cs);
     InitializeConditionVariable(&q->wake);
     *out = q;
