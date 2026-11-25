@@ -69,7 +69,14 @@ static FILE *trace_file(void)
     return f;
 }
 
+static void trace_handle(char kind, uint64_t address, uint64_t size, unsigned type, uint64_t handle);
+
 static void trace(char kind, uint64_t address, uint64_t size, unsigned type)
+{
+    trace_handle(kind, address, size, type, 0);
+}
+
+static void trace_handle(char kind, uint64_t address, uint64_t size, unsigned type, uint64_t handle)
 {
     FILE *f = trace_file();
     struct timespec ts;
@@ -78,8 +85,8 @@ static void trace(char kind, uint64_t address, uint64_t size, unsigned type)
         return;
     clock_gettime(CLOCK_REALTIME, &ts);
     localtime_r(&ts.tv_sec, &tm);
-    fprintf(f, "%02d:%02d:%02d.%03ld %c %#" PRIx64 " %#" PRIx64 " %u\n", tm.tm_hour, tm.tm_min, tm.tm_sec,
-            ts.tv_nsec / 1000000, kind, address, size, type);
+    fprintf(f, "%02d:%02d:%02d.%03ld %c %#" PRIx64 " %#" PRIx64 " %u %#" PRIx64 "\n", tm.tm_hour, tm.tm_min,
+            tm.tm_sec, ts.tv_nsec / 1000000, kind, address, size, type, handle);
 }
 
 /* ------------------------------------------------------------------ window */
@@ -678,7 +685,42 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, cons
     VkResult vr;
 
     if (!wants_identity(d, info))
-        return d->allocate(device, info, alloc, memory);
+    {
+        vr = d->allocate(device, info, alloc, memory);
+        /* Traced: memory the driver placed itself ("D"), at the device address of a buffer bound
+         * at its start, where a buffer can be bound there; its free is "d", by handle. */
+        if (vr == VK_SUCCESS && trace_file())
+        {
+            PFN_vkCreateBuffer create = (void *)d->gdpa(device, "vkCreateBuffer");
+            PFN_vkDestroyBuffer destroy = (void *)d->gdpa(device, "vkDestroyBuffer");
+            PFN_vkGetBufferMemoryRequirements reqs = (void *)d->gdpa(device, "vkGetBufferMemoryRequirements");
+            PFN_vkBindBufferMemory bind = (void *)d->gdpa(device, "vkBindBufferMemory");
+            PFN_vkGetBufferDeviceAddress bda = (void *)d->gdpa(device, "vkGetBufferDeviceAddress");
+            uint64_t va = 0;
+            VkMemoryAllocateFlagsInfo *fl = (void *)find_struct(info->pNext, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+            if (create && destroy && reqs && bind && bda && fl && (fl->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT))
+            {
+                VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .size = info->allocationSize < 65536 ? info->allocationSize : 65536,
+                    .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
+                VkBuffer b;
+                VkMemoryRequirements mr;
+                if (create(device, &bi, NULL, &b) == VK_SUCCESS)
+                {
+                    reqs(device, b, &mr);
+                    if ((mr.memoryTypeBits & (1u << info->memoryTypeIndex)) && mr.size <= info->allocationSize
+                            && bind(device, b, *memory, 0) == VK_SUCCESS)
+                    {
+                        VkBufferDeviceAddressInfo ai2 = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b };
+                        va = bda(device, &ai2);
+                    }
+                    destroy(device, b, NULL);
+                }
+            }
+            trace_handle('D', va, info->allocationSize, info->memoryTypeIndex, (uint64_t)(uintptr_t)*memory);
+        }
+        return vr;
+    }
     adopt = mailbox_request(info->allocationSize);
 
     /* Placed maps cover whole allocations, so round sizes to the alignment
@@ -842,6 +884,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_FreeMemory(VkDevice device, VkDeviceMemo
         pthread_mutex_unlock(&d->lock);
     }
     d->free(device, memory, alloc);
+    if (!m && memory)
+        trace_handle('d', 0, 0, 0, (uint64_t)(uintptr_t)memory);
     if (m)
     {
         trace(m->adopted ? 'f' : 'F', m->address, m->size, 0);
