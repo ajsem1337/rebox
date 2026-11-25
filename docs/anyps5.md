@@ -192,7 +192,11 @@ A console mesh shader is an NGG program: the hardware GS stage in fast-launch mo
 mesh shaders the target title creates, all dumped by `REBOX_DUMP_SHADERS`):
 
 - **Inputs.** User data from s8 (s0-s7 are the merged stage's system SGPRs), laid out as a vertex
-  shader's: root parameters from s8 in the graphics layout. s3 bits 24-27 hold the wave's index in
+  shader's user data, so its root parameters are from s16, not s8: user-data dword i is s(8 + i)
+  (the FSSM's root layout names the same dwords as a vertex or pixel stage's, VIctory's
+  `HwStage::user_sgpr`; the title's mesh code reads its tables through s16 and s17).
+  `d3d12_xs` shifts the call's user SGPRs by 8 for a mesh stage (`mesh_user_sgprs`);
+  `REBOX_MESH_USER_DATA_S8=1` doesn't. s3 bits 24-27 hold the wave's index in
   the group; v5 holds `group * stride + lane`, the code reading the first lane's and dividing by
   the stride, `max(lanes, maximum vertices, maximum primitives)` (128 in every one of the title's:
   128 lanes, two wave64 waves, up to 128 vertices and 128 triangles).

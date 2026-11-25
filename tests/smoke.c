@@ -2336,6 +2336,40 @@ static void test_guest_buffer_entry(void)
  * AnyPS5's mesh path, then sa5_finalize_draw with the draw block's address at push byte 96. No
  * pipeline is made (lavapipe has no mesh shaders here). The program: three vertices and one
  * triangle, lane n at (n, 0, 0, 1) with param0 = 1. */
+/* The target title's FSSM layout around a console mesh program (see test_console_mesh_compile). */
+static BYTE *mesh_container(const UINT32 *code, UINT code_size, SIZE_T *size)
+{
+    /* Payload at 0x10: the slot count, 12 record offsets, the mesh record (0x54 bytes) at 0x68, its
+     * stage data to the info at 0x448, then the shader ID and code at 0x45c. */
+    const UINT payload = 0x10, record = 0x68, data = record + 0x54, code_at = data + 0x45c;
+    UINT fssm_size = payload + code_at + 24 + code_size;
+    BYTE *fssm = calloc(1, fssm_size), *container;
+
+    if (!fssm)
+        return NULL;
+    memcpy(fssm, "FSSM", 4);
+    *(UINT32 *)(fssm + 4) = 0x101;
+    *(UINT64 *)(fssm + 8) = fssm_size - payload;
+    *(UINT64 *)(fssm + payload) = 6;
+    for (UINT at = 0x08; at < 0x68; at += 8)
+        *(UINT64 *)(fssm + payload + at) = at == 0x48 ? record : 0xdeadbeefdeadbeefull;
+    *(UINT64 *)(fssm + payload + record) = code_at;
+    *(UINT64 *)(fssm + payload + record + 8) = 24 + code_size;
+    *(UINT32 *)(fssm + payload + record + 0x14) = 17u << 16;        /* wave64, 17 user SGPRs */
+    *(UINT32 *)(fssm + payload + record + 0x44) = 0xc0;             /* float mode */
+    fssm[payload + data + 0xc8 + 1] = 1;                            /* param0 writes OSG1 register 1 */
+    *(UINT32 *)(fssm + payload + data + 0x188) = 1;
+    *(UINT16 *)(fssm + payload + data + 0x448) = 128;               /* lanes */
+    *(UINT16 *)(fssm + payload + data + 0x44a) = 128;               /* vertices */
+    *(UINT16 *)(fssm + payload + data + 0x44c) = 128;               /* primitives */
+    fssm[payload + data + 0x44e] = 17;
+    fssm[payload + data + 0x44f] = 2;                               /* triangles */
+    memset(fssm + payload + code_at, 0x5a, 24);                     /* the shader ID */
+    memcpy(fssm + payload + code_at + 24, code, code_size);
+    container = console_container_around(fssm, fssm_size, NULL, NULL, 0, size);
+    return container;
+}
+
 static void test_console_mesh_compile(void)
 {
     static const UINT32 code[] = {
@@ -2363,11 +2397,7 @@ static void test_console_mesh_compile(void)
     HRESULT (WINAPI *compile)(const struct rebox_compile_in *, struct rebox_compile_out *) = (void *)GetProcAddress(m,
             "ReboxConsoleCompile");
     void (WINAPI *release)(void *) = (void *)GetProcAddress(m, "ReboxConsoleFree");
-    /* Payload at 0x10: the slot count, 12 record offsets, the mesh record (0x54 bytes) at 0x68, its
-     * stage data to the info at 0x448, then the shader ID and code at 0x45c. */
-    const UINT payload = 0x10, record = 0x68, data = record + 0x54, code_at = data + 0x45c;
-    UINT fssm_size = payload + code_at + 24 + sizeof(code);
-    BYTE *fssm = calloc(1, fssm_size), *container;
+    BYTE *container;
     const struct rebox_deferred_shader *h;
     const struct rebox_deferred_graphics *g;
     struct rebox_compile_in in;
@@ -2377,31 +2407,8 @@ static void test_console_mesh_compile(void)
     HRESULT hr;
 
     CHECK(from_container && compile && release, "d3d12_xs exports ReboxConsoleGraphicsFromContainer");
-    if (!from_container || !compile || !release || !fssm)
-    {
-        free(fssm);
+    if (!from_container || !compile || !release || !(container = mesh_container(code, sizeof(code), &size)))
         return;
-    }
-    memcpy(fssm, "FSSM", 4);
-    *(UINT32 *)(fssm + 4) = 0x101;
-    *(UINT64 *)(fssm + 8) = fssm_size - payload;
-    *(UINT64 *)(fssm + payload) = 6;
-    for (UINT at = 0x08; at < 0x68; at += 8)
-        *(UINT64 *)(fssm + payload + at) = at == 0x48 ? record : 0xdeadbeefdeadbeefull;
-    *(UINT64 *)(fssm + payload + record) = code_at;
-    *(UINT64 *)(fssm + payload + record + 8) = 24 + sizeof(code);
-    *(UINT32 *)(fssm + payload + record + 0x14) = 17u << 16;        /* wave64, 17 user SGPRs */
-    *(UINT32 *)(fssm + payload + record + 0x44) = 0xc0;             /* float mode */
-    fssm[payload + data + 0xc8 + 1] = 1;                            /* param0 writes OSG1 register 1 */
-    *(UINT32 *)(fssm + payload + data + 0x188) = 1;
-    *(UINT16 *)(fssm + payload + data + 0x448) = 128;               /* lanes */
-    *(UINT16 *)(fssm + payload + data + 0x44a) = 128;               /* vertices */
-    *(UINT16 *)(fssm + payload + data + 0x44c) = 128;               /* primitives */
-    fssm[payload + data + 0x44e] = 17;
-    fssm[payload + data + 0x44f] = 2;                               /* triangles */
-    memset(fssm + payload + code_at, 0x5a, 24);                     /* the shader ID */
-    memcpy(fssm + payload + code_at + 24, code, sizeof(code));
-    container = console_container_around(fssm, fssm_size, NULL, NULL, 0, &size);
 
     h = from_container(container, size, 0x80, &blob_size);
     g = h ? (const struct rebox_deferred_graphics *)(h + 1) : NULL;
@@ -2426,6 +2433,62 @@ static void test_console_mesh_compile(void)
         release((void *)h);
     }
     free(container);
+
+    /* A mesh stage's root parameters are from s16 (8 system SGPRs, then user data as a vertex stage's):
+     * the same program, its param from a V# in the table its first root parameter (s8 of the call)
+     * points at, read through s[16:17]. With them at s8, s16 held 0 (or the sampler heap's address)
+     * and the table walk read memory no region holds. */
+    {
+        static const UINT32 table_code[] = {
+            0xbfa00003,                         /* s_inst_prefetch 3 */
+            0xf4080508, 0xfa000000,             /* s_load_dwordx4 s[20:23], s[16:17], 0x0 */
+            0xbf8cc07f,                         /* s_waitcnt lgkmcnt(0) */
+            0xf420060a, 0xfa000000,             /* s_buffer_load_dword s24, s[20:23], 0x0 */
+            0xbf8cc07f,                         /* s_waitcnt lgkmcnt(0) */
+            0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xb07c1003, 0xbf900009, 0x7d880083, 0xbefe046a,
+            0x7e020d00, 0x7e040280,
+            0x7e060218,                         /* v_mov_b32 v3, s24 */
+            0xf80008cf, 0x03020201, 0xf800020f, 0x03030303, 0x7d840080, 0xbefe046a, 0x7e0802ff, 0x00200400,
+            0xf8000941, 0x00000004, 0xbf810000,
+        };
+        HRESULT (WINAPI *galloc)(SIZE_T, SIZE_T, void **, UINT64 *) = (void *)GetProcAddress(m, "ReboxGpuAlloc");
+        void (WINAPI *gfree)(void *) = (void *)GetProcAddress(m, "ReboxGpuFree");
+        UINT32 *mem = NULL;
+        UINT64 mem_gpu = 0;
+
+        if (!galloc || FAILED(galloc(256, 256, (void **)&mem, &mem_gpu)) || !(container = mesh_container(table_code,
+                sizeof(table_code), &size)))
+        {
+            CHECK(0, "GPU memory and a container for the mesh table test");
+            return;
+        }
+        /* The table: a V# of the 16 bytes of constants after it. */
+        mem[0] = (UINT32)(mem_gpu + 0x80);
+        mem[1] = (UINT32)((mem_gpu + 0x80) >> 32) & 0xffff;
+        mem[2] = 16;
+        mem[3] = (77u << 12) | 0xfac;
+        mem[0x20] = 0x3f800000;
+        if ((h = from_container(container, size, 0x80, &blob_size)))
+        {
+            memset(&in, 0, sizeof(in));
+            memset(&out, 0, sizeof(out));
+            memset(in.bindless, 0xff, sizeof(in.bindless));
+            memset(sgprs, 0, sizeof(sgprs));
+            sgprs[8] = (UINT32)mem_gpu;
+            sgprs[9] = (UINT32)(mem_gpu >> 32);
+            in.shader = h;
+            in.shader_size = (UINT32)blob_size;
+            in.user_sgpr_count = 32;
+            in.user_sgprs = sgprs;
+            hr = compile(&in, &out);
+            CHECK(SUCCEEDED(hr) && out.spirv_words, "a mesh stage reads its first root parameter's table through "
+                  "s[16:17] (%#lx, %u SPIR-V words)", hr, out.spirv_words);
+            release((void *)h);
+        }
+        free(container);
+        if (gfree)
+            gfree(mem);
+    }
 }
 
 static void test_xbox_root_flags(void *dev)

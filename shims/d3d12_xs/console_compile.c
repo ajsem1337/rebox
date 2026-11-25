@@ -1039,11 +1039,19 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
     return ((h->rsrc2 >> 1) & 0x1f) | (graphics ? ((h->rsrc2 >> 27) & 1) << 5 : 0);
 }
 
-/* The address of the n-th T# a graphics stage loads from its descriptor tables, or 0. The code is scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode
- * 3) from an SGPR pair whose low register is a table pointer (user SGPRs 8-15, the console's
- * graphics layout, used as {sN, 0}): the address is that SGPR plus the load's offset. */
+/* The address of the n-th T# a graphics stage loads from its descriptor tables, or 0. The code is
+ * scanned for GFX10 scalar loads of 8 dwords (s_load_dwordx8: SMEM, opcode 3) from an SGPR pair whose
+ * low register is a table pointer (user SGPRs 8-15, a mesh stage's 16-23: the console's graphics
+ * layout, used as {sN, 0}): the address is that SGPR plus the load's offset. */
 static UINT64 late_load_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n,
                                UINT32 opcode);
+
+/* The first SGPR of a graphics stage's root parameters, whose first 8 the late T#s and V#s are
+ * traced through: s8, or a mesh stage's s16 (mesh_user_sgprs). */
+static UINT table_sgprs(const struct rebox_deferred_shader *h)
+{
+    return h->stage == 0x80 ? 16 : 8;
+}
 
 /* Whether the guest memory at address holds a T# (dwords 8: an image type, 8-15, in word 3's top
  * nibble) or a V# (dwords 4: type 0 in word 3's top two bits, and an address or a size), or can't be
@@ -1079,7 +1087,7 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
         if (w0 >> 26 == 0x3d) /* SMEM */
         {
             UINT32 op = (w0 >> 18) & 0xff, sbase = (w0 & 0x3f) * 2;
-            if (op == 3 && sbase >= 8 && sbase <= 15 && in->user_sgprs[sbase] && (w1 >> 25) == 0x7d
+            if (op == 3 && sbase >= table_sgprs(h) && sbase < table_sgprs(h) + 8 && in->user_sgprs[sbase] && (w1 >> 25) == 0x7d
                     && load_count < ARRAYSIZE(loads))
             {
                 loads[load_count].sgpr = (w0 >> 6) & 0x7f;
@@ -1241,7 +1249,8 @@ static UINT64 late_load_source(const struct rebox_deferred_shader *h, const stru
             op = (w0 >> 18) & 0xff;
             sbase = (w0 & 0x3f) * 2;
             i++; /* SMEM is two dwords */
-            if (op != opcode || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
+            if (op != opcode || sbase < table_sgprs(h) || sbase >= table_sgprs(h) + 8 || !in->user_sgprs[sbase]
+                    || (w1 >> 25) != 0x7d /* no SOFFSET */)
                 continue;
             address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
             /* In a shadow heap, whatever it holds now: AnyPS5 may have read it empty a moment before. */
@@ -2106,9 +2115,32 @@ static UINT guest_regions(struct sa5_region *regions)
  * threads skip draws (or, waited for, queue behind background compiles' bookkeeping). */
 #define unlocked_compile(background, call) ((void)(background), (call))
 
+/* A mesh stage's user SGPRs: the hardware stage it runs as (NGG, a merged GS) has 8 system SGPRs
+ * before its user data, so user-data dword i is s(8 + i), and the root parameters a vertex or pixel
+ * stage gets from s8 are from s16 (the FSSM's root layout names the same user-data dwords for both;
+ * VIctory's HwStage::user_sgpr; every one of the target title's refused mesh stages read its first
+ * table through s16, where the root order put the sampler heap). Shifts in's SGPRs into mesh_sgprs
+ * and returns a copy of in that points at them. */
+#define MESH_SYSTEM_SGPRS 8
+static const struct rebox_compile_in *mesh_user_sgprs(const struct rebox_compile_in *in, struct rebox_compile_in *copy,
+                                                       UINT32 mesh_sgprs[64])
+{
+    UINT count = min(in->user_sgpr_count, 64u - MESH_SYSTEM_SGPRS);
+
+    memset(mesh_sgprs, 0, 64 * sizeof(*mesh_sgprs));
+    if (in->user_sgprs)
+        memcpy(mesh_sgprs + MESH_SYSTEM_SGPRS, in->user_sgprs, count * sizeof(*mesh_sgprs));
+    *copy = *in;
+    copy->user_sgprs = mesh_sgprs;
+    copy->user_sgpr_count = count + MESH_SYSTEM_SGPRS;
+    return copy;
+}
+
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
+    struct rebox_compile_in mesh_in;
+    static __thread UINT32 mesh_sgprs[64];
     static __thread struct sa5_region regions[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
@@ -2145,6 +2177,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                      || h->code_offset < sizeof(*h) + sizeof(*g)))
         return E_INVALIDARG;
     stage_push = graphics && h->stage == 0x80 ? MESH_PUSH_DATA : GRAPHICS_PUSH_DATA;
+    if (graphics && h->stage == 0x80 && !getenv("REBOX_MESH_USER_DATA_S8"))
+        in = mesh_user_sgprs(in, &mesh_in, mesh_sgprs);
     stage_id = graphics ? hash_bytes(hash_bytes(0xcbf29ce484222325ull, &h->stage, sizeof(h->stage)),
                                      (const BYTE *)h + h->code_offset, h->code_dwords * 4u) : 0;
     /* Counts for the log, at powers of two of each kind's compiles: what they took, for title threads
@@ -2387,7 +2421,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         mreq.code_address = req.code_address;
         mreq.wave = req.wave;
         mreq.user_data = req.user_data;
-        mreq.user_data_count = max(req.user_data_count, 8u);
+        mreq.user_data_count = max(in->user_sgpr_count, 8u);
         mreq.rsrc1 = h->rsrc1;
         mreq.threads = g->mesh.threads;
         mreq.max_vertices = g->mesh.max_vertices;
