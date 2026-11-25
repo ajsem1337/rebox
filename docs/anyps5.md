@@ -259,7 +259,8 @@ vertex, pixel or mesh shaders listed in a plan file (`vs`/`ps`/`ms PLAN`), or a 
 program (`mesh`). `tools/ms-plan.py DUMP_DIR OUT_DIR` writes a mesh plan from the `*.ms.bin` containers
 `REBOX_DUMP_SHADERS` dumps (each FSSM to `OUT_DIR`, its `FLAT_SCRATCH` setup made `s_nop`s as
 `console_compile.c` does), and `SA5_DUMP_SPIRV=DIR` writes each mesh module `ms` finalizes, as it does
-for `cs`. `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
+for `cs`. `ms` and `vs` take a draw's user SGPRs from `SA5_USER=v0,v1,...` (hex, from s0) and guest
+memory from `SA5_MEMORY=ADDRESS:w0,w1,...` or `SA5_MEMORY=ADDRESS+BYTES` (that many zero bytes). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
 shaders compiled and validated on that many threads at once. Compute shaders, `ps` and `bench`
 compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the disk cache
 included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
@@ -298,7 +299,13 @@ the shadow heaps or GPU memory chunks change (generation counters in `shadow.c` 
 call meets again (more descriptor elements or host buffers than `d3d12_xs` binds, a binding kind it
 doesn't handle, a module it can't fit) is skipped without asking AnyPS5, except at every 64th call;
 the target title's bindless compute shaders reach 24,000 table elements, and each of their
-dispatches captured them all before being refused.
+dispatches captured them all before being refused. A stage binds up to 32,768 guest descriptors
+in all (the target title's image tables reach 23,725 T#s). A graphics stage AnyPS5 refuses for its code (an
+instruction it doesn't handle) is remembered for the run; one refused for what its tables held at
+that call (an SRT walk through memory outside the regions it was given, a descriptor that isn't
+one) is retried at every 64th call instead, as a binding failure is. The regions are the shadow
+heaps and up to 1,024 GPU memory chunks in all: with 64, the target title's world passed the
+limit, and its mesh stages' user-data tables in the chunks left out were unreadable.
 
 ## AnyPS5 patches
 

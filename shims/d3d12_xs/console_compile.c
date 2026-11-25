@@ -34,7 +34,10 @@
 #include "title_textures.h"
 
 #define TITLE_BASE 0x10000000ull
-#define MAX_REGIONS 64
+/* Shadow heaps and GPU memory chunks handed to AnyPS5 and mapped in its BDA page table. A world in
+ * the target title passed 64 chunks; those left out made user-data pointers into them unreadable
+ * (mesh stages refused by the SRT walk, compute reads of "inaccessible" memory). */
+#define MAX_REGIONS 1024
 
 /* A region list that came back full may have left regions out: logged once per list. */
 static void note_regions_full(const char *what, UINT n, UINT max)
@@ -45,7 +48,10 @@ static void note_regions_full(const char *what, UINT n, UINT max)
         rebox_log("AnyPS5 regions: %s filled all %u entries; later ones are left out", what, max);
 }
 #define MAX_BINDINGS 64
-#define MAX_ELEMENTS 4096
+/* Guest descriptors a stage binds, all bindings together (each element's heap slot goes in the draw
+ * block). The target title's bindless compute and pixel stages index image tables of up to 23,725
+ * T#s. */
+#define MAX_ELEMENTS 32768
 /* Graphics stages share the push block, 128 bytes each: AnyPS5's push data, then the addresses of
  * up to two host buffers whose contents change per draw (baked addresses made a module and a
  * pipeline per draw: a UE5 title's render thread spent its frames compiling). */
@@ -456,8 +462,8 @@ static UINT64 page_table(UINT32 *bytes)
     static LONG table_key[3];
     static ULONGLONG table_built;
     static BYTE *table_cpu;
-    struct shadow_region regions[MAX_REGIONS];
-    struct gpu_memory_region chunks[MAX_REGIONS];
+    static struct shadow_region regions[MAX_REGIONS]; /* used only under table_lock, held exclusively */
+    static struct gpu_memory_region chunks[MAX_REGIONS];
     UINT64 (*buffers)[2];
     UINT n, nchunks, nbuffers, count = 0, merged = 0;
     /* What it maps changes only with these (read before what they cover). */
@@ -869,9 +875,9 @@ static void log_failure(const struct rebox_deferred_shader *h, const char *what,
                      (unsigned long long)id, what, detail ? ": " : "", detail ? detail : "");
 }
 
-/* Graphics stages AnyPS5 refused (their code and stage): not retried at every draw, which falls back
- * at once. AnyPS5's refusals there come from the code (an instruction it doesn't handle); the
- * descriptors don't change them. */
+/* Graphics stages AnyPS5 refused for their code (their code and stage): not retried at every draw,
+ * which falls back at once. Refusals that come from what the descriptors held are retried instead
+ * (graphics_refused). */
 static UINT64 failed_stages[256];
 static LONG failed_stage_count;
 
@@ -964,6 +970,36 @@ static BOOL stage_failed(UINT64 id)
         if (failed_stages[i] == id)
             return TRUE;
     return FALSE;
+}
+
+/* AnyPS5 refusals that come from what a stage's descriptors and tables held at that call, not from
+ * its code: an SRT walk through memory the request didn't hold, or a descriptor read there that
+ * isn't one (often a table the title has since written over). */
+static BOOL runtime_refusal(const char *error)
+{
+    static const char *const reasons[] = { "SrtWalker::", "runtime image descriptor is invalid",
+            "buffer descriptor uses an unsupported type", "is incompatible with the static runtime image interface" };
+    for (UINT i = 0; error && i < ARRAYSIZE(reasons); i++)
+        if (strstr(error, reasons[i]))
+            return TRUE;
+    return FALSE;
+}
+
+/* A graphics stage AnyPS5 refused: a refusal from its code is remembered for the run (stage_failed);
+ * one from what it read at this call is retried at every BINDING_RETRY-th call, as a binding failure
+ * is (the target title's mesh stages walked user-data tables outside the regions they were given). */
+static void graphics_refused(UINT64 stage_id, const char *error)
+{
+    LONG slot;
+
+    if (runtime_refusal(error))
+    {
+        binding_failure_note(stage_id);
+        return;
+    }
+    slot = InterlockedIncrement(&failed_stage_count) - 1;
+    if (slot < (LONG)ARRAYSIZE(failed_stages))
+        failed_stages[slot] = stage_id;
 }
 
 /* The user SGPR count from RSRC2: graphics stages' USER_SGPR_MSB (bit 27) makes 32 possible
@@ -1925,8 +1961,8 @@ static UINT guest_regions(struct sa5_region *regions)
     static LONG cached_key[2];
     static BOOL cached_valid;
     const LONG key[2] = { shadow_regions_generation(), gpu_memory_generation() };
-    struct shadow_region shadows[MAX_REGIONS];
-    struct gpu_memory_region chunks[MAX_REGIONS];
+    struct shadow_region *shadows;
+    struct gpu_memory_region *chunks;
     UINT n, count, shadow_count;
 
     AcquireSRWLockShared(&cache_lock);
@@ -1939,6 +1975,14 @@ static UINT guest_regions(struct sa5_region *regions)
     }
     ReleaseSRWLockShared(&cache_lock);
 
+    shadows = malloc(MAX_REGIONS * sizeof(*shadows));
+    chunks = malloc(MAX_REGIONS * sizeof(*chunks));
+    if (!shadows || !chunks)
+    {
+        free(shadows);
+        free(chunks);
+        return 0;
+    }
     n = shadow_regions(shadows, MAX_REGIONS);
     for (UINT i = 0; i < n; i++)
         regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
@@ -1955,6 +1999,8 @@ static UINT guest_regions(struct sa5_region *regions)
         if (!overlaps && chunks[i].size)
             regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
     }
+    free(shadows);
+    free(chunks);
 
     /* Kept under the generations read before it was made: a change since makes the next call
      * make it again. */
@@ -1976,7 +2022,7 @@ static UINT guest_regions(struct sa5_region *regions)
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background)
 {
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
-    struct sa5_region regions[MAX_REGIONS];
+    static __thread struct sa5_region regions[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
     UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX];
@@ -2271,11 +2317,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         if (unlocked_compile(background, sa5.compile_mesh(&mreq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (mesh)", error);
-            {
-                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
-                if (slot < (LONG)ARRAYSIZE(failed_stages))
-                    failed_stages[slot] = stage_id;
-            }
+            graphics_refused(stage_id, error);
             goto done;
         }
     }
@@ -2388,11 +2430,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         if (unlocked_compile(background, sa5.compile_vertex(&vreq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (vertex)", error);
-            {
-                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
-                if (slot < (LONG)ARRAYSIZE(failed_stages))
-                    failed_stages[slot] = stage_id;
-            }
+            graphics_refused(stage_id, error);
             goto done;
         }
     }
@@ -2615,11 +2653,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         if (unlocked_compile(background, sa5.compile_pixel(&preq, &result, error, sizeof(error))))
         {
             log_failure(h, "AnyPS5 failed (pixel)", error);
-            {
-                LONG slot = InterlockedIncrement(&failed_stage_count) - 1;
-                if (slot < (LONG)ARRAYSIZE(failed_stages))
-                    failed_stages[slot] = stage_id;
-            }
+            graphics_refused(stage_id, error);
             goto done;
         }
     }

@@ -15,7 +15,7 @@
  *   sa5_check mesh                             a built-in console mesh program (one triangle),
  *                                              compiled and finalized as d3d12_xs does
  *   sa5_check ms PLAN [FIRST [COUNT]]          the mesh shaders in PLAN (format: mesh_sweep), the
- *                                              same way, no guest memory
+ *                                              same way; SA5_USER, SA5_MEMORY as for vs
  *   sa5_check bench THREADS PLAN [FIRST [COUNT]]  compile throughput: the pixel shaders in PLAN (format:
  *                                              pixel_sweep), compiled and validated on THREADS
  *                                              threads at once
@@ -551,10 +551,58 @@ static int memo_bench(const char *plan, const char *wanted, int iterations)
     return 0;
 }
 
+/* SA5_USER=v0,v1,... (hex, from s0): user SGPRs, all but SKIP and SKIP + 1 (a fetch address the
+ * caller keeps; -1 for none). */
+static void env_user_data(uint32_t *user, unsigned count, int skip)
+{
+    const char *p = getenv("SA5_USER");
+
+    for (unsigned i = 0; p && i < count && *p; i++)
+    {
+        char *end;
+        uint32_t v = (uint32_t)strtoul(p, &end, 16);
+        if ((int)i != skip && (int)i != skip + 1)
+            user[i] = v;
+        p = *end == ',' ? end + 1 : end;
+        if (end == p && *end != ',')
+            break;
+    }
+}
+
+/* SA5_MEMORY=ADDRESS:w0,w1,... (hex): guest memory, up to max words, as one region; or
+ * SA5_MEMORY=ADDRESS+BYTES (hex): that many bytes of zeros there. Returns the region count (0 or 1). */
+static uint32_t env_memory(struct sa5_region *region, uint32_t *memory, uint32_t max)
+{
+    const char *p = getenv("SA5_MEMORY");
+    static void *zeros;
+    uint64_t address;
+    uint32_t words = 0;
+    char *end;
+
+    if (!p)
+        return 0;
+    address = strtoull(p, &end, 16);
+    if (*end == '+')
+    {
+        size_t bytes = (size_t)strtoull(end + 1, NULL, 16);
+        if (!zeros)
+            zeros = calloc(1, bytes);
+        *region = (struct sa5_region){ address, zeros, zeros ? bytes : 0 };
+        return 1;
+    }
+    for (p = *end == ':' ? end + 1 : end; *p && words < max; p = *end == ',' ? end + 1 : end)
+    {
+        memory[words++] = (uint32_t)strtoul(p, &end, 16);
+        if (end == p)
+            break;
+    }
+    *region = (struct sa5_region){ address, memory, words * 4u };
+    return 1;
+}
+
 /* Vertex shaders: plan lines NAME CODE SKIP RSRC1 USER_SGPRS INPUTS, one shader per line. Each
  * input r gets a synthetic RGBA32F vertex buffer (stride 16) and v[4+4r..7+4r]. */
-static uint32_t memory[64], memory_words;
-static uint64_t memory_address;
+static uint32_t memory[64];
 static struct sa5_region region;
 
 static int vertex_sweep(const char *plan, int first, int count)
@@ -616,33 +664,9 @@ static int vertex_sweep(const char *plan, int first, int count)
         /* SA5_USER=v0,v1,... (hex, from s0; s[4:5] stays the fetch address) and
          * SA5_MEMORY=ADDRESS:w0,w1,... (hex): a draw's user SGPRs and guest memory, as d3d12_xs logs
          * them, to follow the descriptors a shader resolves. */
-        if (getenv("SA5_USER"))
+        env_user_data(user_data, 32, 4);
+        if (env_memory(&region, memory, 64))
         {
-            const char *p = getenv("SA5_USER");
-            for (unsigned i = 0; i < 32 && *p; i++)
-            {
-                char *end;
-                uint32_t v = (uint32_t)strtoul(p, &end, 16);
-                if (i != 4 && i != 5)
-                    user_data[i] = v;
-                p = *end == ',' ? end + 1 : end;
-                if (end == p && *end != ',')
-                    break;
-            }
-        }
-        if (getenv("SA5_MEMORY"))
-        {
-            const char *p = getenv("SA5_MEMORY");
-            char *end;
-            memory_address = strtoull(p, &end, 16);
-            memory_words = 0;
-            for (p = *end == ':' ? end + 1 : end; *p && memory_words < 64; p = *end == ',' ? end + 1 : end)
-            {
-                memory[memory_words++] = (uint32_t)strtoul(p, &end, 16);
-                if (end == p)
-                    break;
-            }
-            region = (struct sa5_region){ memory_address, memory, memory_words * 4u };
             req.regions = &region;
             req.region_count = 1;
         }
@@ -832,7 +856,8 @@ static int mesh_sweep(const char *plan, int first, int count)
         char name[64], path[1024], winpath[1100], detail[700];
         unsigned skip, dwords, wave, threads, maxv, maxp, verts, lds, clip, rsrc1;
         struct sa5_mesh_request req = { 0 };
-        uint32_t user[32] = { 0 };
+        uint32_t user[32] = { 0 }, memory[64];
+        struct sa5_region region;
         uint8_t *data;
         long size;
 
@@ -841,6 +866,7 @@ static int mesh_sweep(const char *plan, int first, int count)
             continue;
         if (index++ < first)
             continue;
+        env_user_data(user, 32, -1);
         snprintf(winpath, sizeof(winpath), "%s%s", path[0] == '/' ? "Z:" : "", path);
         for (char *p = winpath; *p; p++)
             if (*p == '/') *p = '\\';
@@ -866,6 +892,8 @@ static int mesh_sweep(const char *plan, int first, int count)
         req.clip_cntl = clip;
         req.push_size = 96;
         req.use_cache = 1;
+        req.region_count = env_memory(&region, memory, 64);
+        req.regions = req.region_count ? &region : NULL;
         if (mesh_compile(&req, name, detail, sizeof(detail)))
             failed++;
         else

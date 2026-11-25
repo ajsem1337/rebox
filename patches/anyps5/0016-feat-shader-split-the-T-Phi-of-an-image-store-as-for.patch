@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 06:43:05 +0000
+Subject: [PATCH 16/17] feat(shader): split the T# Phi of an image store as for
+ reads
+
+An image_store whose T# came from one of two s_load_dwordx8 on either
+side of a branch stopped with "GetImageResource dword 0 is not a valid
+runtime value; chain: Phi(ReadConst(GetSrtResource), ReadConst(...))".
+Reads through such a Phi are split into one read per incoming T# and a
+select of their results; stores were not candidates, since running every
+copy would store through every T#.
+
+A store is now split the same way, and each copy stores only in the
+lanes whose edge picked its T#: the copy's EXEC operand is ANDed with
+that arm's condition and the negation of every earlier arm's. Atomics
+through such a T# are still refused.
+
+Tested: tests/DescriptorSelectionTests.cpp compiles a store through a
+T# picked by s_cbranch_vccnz between two table slots; it stops with the
+old error without the change, and with it the module validates and holds
+two OpImageWrite. With the previous commit, 11 of the 12 compute shaders
+of a retail title that stopped so now compile and validate (offline, no
+guest memory).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Optimization/src/ResourceTracker.cpp      | 32 ++++++++++++++++++-
+ .../tests/DescriptorSelectionTests.cpp        | 23 +++++++++++++
+ .../changes/feat-shader-split-image-stores.md |  5 +++
+ 3 files changed, 59 insertions(+), 1 deletion(-)
+ create mode 100644 docs/dev/debt/changes/feat-shader-split-image-stores.md
+
+diff --git a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+index ab5024364f..fda9844608 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+@@ -1178,6 +1178,10 @@ private:
+     static constexpr std::uint32_t phiSearchDepth = 8u;
+     static constexpr std::uint32_t firstLaneMultipleDepth = 32u;
+ 
++    static bool SplittableImageWrite(const IrValue& inst) {
++        return inst.Opcode() == IrOpcode::ImageWrite && inst.ArgumentCount() == 4u;
++    }
++
+     static bool SplittableImageRead(const IrValue& inst) {
+         switch (inst.Opcode()) {
+             case IrOpcode::ImageSampleRaw:
+@@ -1500,8 +1504,29 @@ private:
+         }
+         std::vector<std::array<IrValue*, 3>> armWords;
+         const auto memory = m_program.Resources().memoryInfo.at(flags.index);
++        const bool write = inst.Type() == IrType::Void;
++        std::vector<IrValue*> taken;
++        if (write) {
++            IrValue* untaken = nullptr;
++            for (std::uint32_t arm = 0; arm <= conditions.size(); arm++) {
++                if (arm == conditions.size()) {
++                    taken.push_back(untaken);
++                    break;
++                }
++                const std::array<IrValue*, 2> both {untaken, conditions[arm]};
++                taken.push_back(untaken == nullptr ? conditions[arm] : EmitBefore(inst, IrOpcode::LogicalAnd, IrType::Bool, both));
++                const std::array<IrValue*, 1> negated {conditions[arm]};
++                IrValue* other = EmitBefore(inst, IrOpcode::LogicalNot, IrType::Bool, negated);
++                const std::array<IrValue*, 2> rest {untaken, other};
++                untaken = untaken == nullptr ? other : EmitBefore(inst, IrOpcode::LogicalAnd, IrType::Bool, rest);
++            }
++        }
+         for (std::uint32_t arm = 0; arm <= conditions.size(); arm++) {
+             std::vector<IrValue*> arguments(inst.Arguments().begin(), inst.Arguments().end());
++            if (write && taken[arm] != nullptr) {
++                const std::array<IrValue*, 2> active {arguments.back(), taken[arm]};
++                arguments.back() = EmitBefore(inst, IrOpcode::LogicalAnd, IrType::Bool, active);
++            }
+             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+                 if (!split[slot]) {
+                     continue;
+@@ -1536,6 +1561,11 @@ private:
+             EmitDescriptorFault(inst, UndefinedImageWords(inst, selected), *selected[0], *selected[1]);
+         }
+ 
++        if (write) {
++            inst.Invalidate();
++            inst.Parent()->RemoveInstruction(&inst);
++            return;
++        }
+         IrValue* result = copies.back();
+         if (copies.size() > 1u) {
+             std::array<IrValue*, 4> components {};
+@@ -1876,7 +1906,7 @@ private:
+         std::vector<IrValue*> candidates;
+         for (auto& block : m_program.Blocks()) {
+             for (IrValue* inst : block->Instructions()) {
+-                if (SplittableImageRead(*inst)) {
++                if (SplittableImageRead(*inst) || SplittableImageWrite(*inst)) {
+                     candidates.push_back(inst);
+                 }
+             }
+diff --git a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+index 9a7267b985..a8ce0ab8b0 100644
+--- a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
++++ b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+@@ -37,6 +37,11 @@ constexpr std::array<std::uint32_t, 20> WaterfallShader{
+     0xbefe0306u, 0xbf8c3f70u, 0xe0701000u, 0x80040200u, 0xbf810000u,
+ };
+ 
++constexpr std::array<std::uint32_t, 14> BranchStoreShader{
++    0xbe850380u, 0x7d840080u, 0xbf870003u, 0xf40c0202u, 0xfa000040u, 0xbf820002u, 0xf40c0202u, 0xfa000060u,
++    0x7e0202f2u, 0x7e040280u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
+ std::array<std::uint32_t, 8> ImageDescriptor(std::uint32_t entry) {
+     std::array<std::uint32_t, 8> words{};
+     words[0] = (0x40000000u + entry * 0x10000u) >> 8u;
+@@ -101,6 +106,17 @@ std::vector<std::uint32_t> ValidWords(const RecompileResult& result, const char*
+     return words;
+ }
+ 
++std::size_t CountOps(std::span<const std::uint32_t> words, spv::Op op) {
++    std::size_t count = 0;
++    for (std::size_t index = 5; index < words.size();) {
++        const auto length = words[index] >> 16u;
++        Require(length != 0u && index + length <= words.size(), "the module's instructions are well formed");
++        count += static_cast<spv::Op>(words[index] & 0xffffu) == op;
++        index += length;
++    }
++    return count;
++}
++
+ void TestWaterfallReadsAnImageTable() {
+     const auto result = Compile(WaterfallShader, TableAddress);
+     ValidWords(result, "the waterfall module validates");
+@@ -108,11 +124,18 @@ void TestWaterfallReadsAnImageTable() {
+             "a T# loaded at a first-lane offset inside a waterfall loop is read through an image table");
+ }
+ 
++void TestBranchSelectedStoreIsSplit() {
++    const auto result = Compile(BranchStoreShader, TableAddress);
++    const auto words = ValidWords(result, "the branch-selected store module validates");
++    Require(CountOps(words, spv::OpImageWrite) == 2u, "a store through a branch-selected T# becomes one store per T#");
++}
++
+ }
+ 
+ int main() {
+     try {
+         TestWaterfallReadsAnImageTable();
++        TestBranchSelectedStoreIsSplit();
+     } catch (const std::exception& error) {
+         std::fprintf(stderr, "%s\n", error.what());
+         return 1;
+diff --git a/docs/dev/debt/changes/feat-shader-split-image-stores.md b/docs/dev/debt/changes/feat-shader-split-image-stores.md
+new file mode 100644
+index 0000000000..e8fb747baa
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-split-image-stores.md
+@@ -0,0 +1,5 @@
++# shader
++
++## add Functional
++
++- [Branch-selected image stores](../../../core/shader/recompiler/Optimization/src/ResourceTracker.cpp) (shader recompiler) - an `image_store` whose T# is a Phi of descriptors (each branch of a uniform or divergent branch loads its own) is split as reads are: one store per T#, each made only by the lanes whose branch picked that T#. Atomics through such a T# are still refused (`is not a valid runtime value`). Synthetic programs only; not measured on hardware.
+-- 
+2.55.0
+
