@@ -3244,9 +3244,24 @@ static SIZE_T view_page_bucket(UINT64 page)
 
 /* The same memory in the same shape: only the format (of the same size) or the flags differ. Or
  * [address, end) is a part of v's memory past its start: maybe a view of one of its mips. */
+/* Whether small's size is one of big's mip levels: a view of some of a texture's mips or slices
+ * (mip 0 or slice 0 starting where the texture does), not another texture in its memory. */
+static BOOL view_is_part(const D3D12_RESOURCE_DESC *big, const D3D12_RESOURCE_DESC *small)
+{
+    for (UINT m = 0; m < 16; m++)
+        if (max(1ull, big->Width >> m) == small->Width && max(1u, big->Height >> m) == small->Height)
+            return TRUE;
+    return FALSE;
+}
+
 static BOOL view_stays(const struct memory_view *v, UINT64 address, UINT64 end, const D3D12_RESOURCE_DESC *d)
 {
     if (address > v->address && end <= v->end)
+        return TRUE;
+    /* A view of part of it, or it of part of the new one: both stay (the loading screen's art was
+     * retired by its own mip-0 views, and drew empty). */
+    if ((address >= v->address && end <= v->end && view_is_part(&v->desc, d))
+            || (v->address >= address && v->end <= end && view_is_part(d, &v->desc)))
         return TRUE;
     return v->address == address && v->end == end && v->desc.Dimension == d->Dimension
             && v->desc.Width == d->Width && v->desc.Height == d->Height
