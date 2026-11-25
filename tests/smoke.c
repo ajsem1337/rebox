@@ -4897,8 +4897,9 @@ static void test_view_buffer_retire(void *dev, void *queue)
             D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
     D3D12_SHADER_RESOURCE_VIEW_DESC null = { DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_BUFFER,
                                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+    /* With unordered access: the GPU may write them, so each has memory of its own. */
     D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
-                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
     BYTE console_desc[0x40] = { 0 };
     UINT64 alive0, bytes0, evicted0, superseded0, alive, bytes, evicted, superseded;
     ID3D12Resource *a, *b, *a2, *b2;
@@ -4965,6 +4966,77 @@ static void test_view_buffer_retire(void *dev, void *queue)
     view_buffers(&alive, &bytes, &evicted, &superseded);
     CHECK(a2 == a && b2 && alive - alive0 == 2, "view buffers: one retired is made anew when asked for again (%llu alive)",
           (unsigned long long)(alive - alive0));
+    /* Without unordered access: nothing writes them, so they share one zeroed heap, no memory of their own,
+     * and read zeros. */
+    {
+        D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+        D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                                   D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+        ID3D12Resource *z1, *z2, *rb = NULL;
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        memcpy(console_desc, &bd, sizeof(bd));
+        view_buffers(&alive0, &bytes0, &evicted0, &superseded0);
+        view.address = (UINT64)(ULONG_PTR)(memory + (1 << 16));
+        XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 2 * inc);
+        z1 = slot_resource(start + 2 * inc);
+        view.address = (UINT64)(ULONG_PTR)(memory + (3 << 16));
+        XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 3 * inc);
+        z2 = slot_resource(start + 3 * inc);
+        view_buffers(&alive, &bytes, &evicted, &superseded);
+        CHECK(z1 && z2 && z1 != z2 && alive - alive0 == 2 && bytes == bytes0,
+              "view buffers without unordered access share the zeroed heap (%llu more, %llu bytes more)",
+              (unsigned long long)(alive - alive0), (unsigned long long)(bytes - bytes0));
+        if (z1 && SUCCEEDED(XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS,
+                const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev,
+                &readback, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+                (void **)&rb)))
+        {
+            ID3D12CommandAllocator *alloc = NULL;
+            ID3D12Fence *fence = NULL;
+            void *list = NULL;
+            UINT32 *out = NULL;
+            BOOL zero = FALSE;
+            if (SUCCEEDED(XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&alloc))
+                    && SUCCEEDED(XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0,
+                    D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence))
+                    && SUCCEEDED(XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *,
+                    ID3D12PipelineState *, REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                    &IID_ID3D12GraphicsCommandList, &list)))
+            {
+                XSLOT(list, 15, void, ID3D12Resource *, UINT64, ID3D12Resource *, UINT64, UINT64)(list, rb, 0, z1, 0, 4096);
+                XSLOT(list, 9, HRESULT)(list);
+                XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+                XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, 1);
+                for (int k = 0; k < 500 && ID3D12Fence_GetCompletedValue(fence) < 1; k++)
+                    Sleep(10);
+                if (SUCCEEDED(ID3D12Resource_Map(rb, 0, NULL, (void **)&out)))
+                {
+                    zero = TRUE;
+                    for (int i = 0; i < 1024; i++)
+                        zero &= !out[i];
+                    ID3D12Resource_Unmap(rb, 0, NULL);
+                }
+            }
+            CHECK(zero, "a view buffer in the zeroed heap reads zeros");
+            {
+                HMODULE a = GetModuleHandleA("rebox_anyps5.dll");
+                void (*plan_stats)(UINT64 *, UINT64 *, UINT64 *, UINT64 *, UINT64 *) =
+                        a ? (void *)GetProcAddress(a, "sa5_plan_stats") : NULL;
+                UINT64 held = 0, plans = 0, ev = 0, re = 0, budget = 0;
+                if (plan_stats)
+                {
+                    plan_stats(&held, &plans, &ev, &re, &budget);
+                    CHECK(budget == 1024ull << 20, "AnyPS5's resource plans are bounded by default (%llu MiB, %llu held)",
+                          (unsigned long long)budget >> 20, (unsigned long long)held);
+                }
+            }
+            if (list) XSLOT(list, 2, ULONG)(list);
+            if (fence) ID3D12Fence_Release(fence);
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+            ID3D12Resource_Release(rb);
+        }
+    }
     if (gpu_cpu)
     {
         void (WINAPI *gpu_free)(void *) = (void *)GetProcAddress(m, "ReboxGpuFree");

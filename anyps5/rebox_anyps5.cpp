@@ -10,8 +10,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <spirv/unified1/spirv.hpp>
@@ -29,9 +31,35 @@ namespace {
 // data patched in (buffer tables, the flattened SRT, shader data), instead of materializing and
 // emitting the variant again (a UE5 title draws the same shaders with new descriptor tables every
 // draw).
+// AnyPS5's resource plans are kept for every shader source unless APS5_RESOURCE_PLAN_MB bounds them
+// (0, the default: unbounded), and a world's thousands of shaders took 12 GiB. Rebox bounds them by
+// default: REBOX_APS5_PLAN_MB (default 1024; 0 unbounded), set through SetResourcePlanBudget so the
+// disk cache's key (which APS5_RESOURCE_PLAN_MB is part of) stays as it is. Over the budget AnyPS5
+// drops the least recently used plans that its disk cache holds, and loads them again when needed.
+// APS5_RESOURCE_PLAN_MB, if set, is AnyPS5's own and wins.
+std::uint64_t PlanBudgetBytes()
+{
+    static const std::uint64_t bytes = [] {
+        if (const char* own = std::getenv("APS5_RESOURCE_PLAN_MB"); own && *own) return std::uint64_t{0};
+        const char* value = std::getenv("REBOX_APS5_PLAN_MB");
+        const std::uint64_t megabytes = value && *value ? std::strtoull(value, nullptr, 10) : 1024u;
+        return megabytes << 20u;
+    }();
+    return bytes;
+}
+
+void ApplyPlanBudget()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (const auto bytes = PlanBudgetBytes()) SetResourcePlanBudget(bytes);
+    });
+}
+
 std::shared_ptr<const RecompileResult> RecompileMemoized(const RecompileRequest& request,
                                                          const std::vector<MemoryRegion>& regions)
 {
+    ApplyPlanBudget();
     if (!request.useCache) return std::make_shared<const RecompileResult>(Recompile(request));
     RequestMemoryView memory{std::span<const MemoryRegion>(regions)};
     const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
@@ -418,6 +446,19 @@ SA5_API void sa5_memory_stats(std::uint64_t* memo_bytes, std::uint64_t* plan_byt
 {
     *memo_bytes = ResultMemoBytes();
     *plan_bytes = ResourcePlanTotals().heldBytes;
+}
+
+// AnyPS5's resource plans: bytes and plans held, evicted and loaded again in all, and the budget
+// Rebox set (0: none set by Rebox).
+SA5_API void sa5_plan_stats(std::uint64_t* held_bytes, std::uint64_t* plans, std::uint64_t* evictions,
+                            std::uint64_t* reloads, std::uint64_t* budget)
+{
+    const auto totals = ResourcePlanTotals();
+    *held_bytes = totals.heldBytes;
+    *plans = totals.heldPlans;
+    *evictions = totals.evictions;
+    *reloads = totals.reloads;
+    *budget = PlanBudgetBytes();
 }
 
 SA5_API void sa5_result_free(sa5_result* result)

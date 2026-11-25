@@ -165,6 +165,10 @@ SA5_API uint32_t sa5_gds_bytes(void);
 SA5_API void sa5_result_free(struct sa5_result *result);
 /* Bytes AnyPS5 holds: its result memo (APS5_RESULT_MEMO_MB bounds it) and its resource plans. */
 SA5_API void sa5_memory_stats(uint64_t *memo_bytes, uint64_t *plan_bytes);
+/* AnyPS5's resource plans: bytes and plans held, evicted and loaded again in all, and the budget
+ * Rebox set (REBOX_APS5_PLAN_MB, default 1024 MiB; 0 when none). */
+SA5_API void sa5_plan_stats(uint64_t *held_bytes, uint64_t *plans, uint64_t *evictions, uint64_t *reloads,
+                            uint64_t *budget);
 /* The tessellation control and evaluation stages that draw a console rect list with these vertex
  * and pixel results (AnyPS5's rect-list shaders): each 3-vertex patch is a rectangle, its fourth
  * corner made after the vertex shader. The control stage binds AnyPS5's fault buffer (sa5_finalize
