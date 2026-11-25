@@ -342,7 +342,9 @@ void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
     const std::uint32_t storageClass = varDef[3];
     const Inst ptrType = m.Def(varDef[1]);
     const Inst arrType = m.Def(ptrType[3]);
-    if (Op(arrType) != OpTypeArray) Fail("binding " + std::to_string(remap.binding) + " is not a descriptor array");
+    // AnyPS5 declares an image table that can grow (binding 261) as T[] already.
+    if (Op(arrType) != OpTypeArray && Op(arrType) != OpTypeRuntimeArray)
+        Fail("binding " + std::to_string(remap.binding) + " is not a descriptor array");
     const std::uint32_t uintType = m.UintType();
     const auto heapIndex = [&](std::uint32_t i) {
         if (i >= remap.count) Fail("descriptor index " + std::to_string(i) + " out of range for binding " + std::to_string(remap.binding));
