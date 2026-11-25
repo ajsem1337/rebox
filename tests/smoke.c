@@ -4566,6 +4566,178 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* View textures nothing can read are evicted (proxy.c, memory_views_evict): many made, each in a
+ * descriptor slot that is then rewritten; once not asked for a while they go, past the GPU, all but
+ * the one a slot still holds. A view of one asked for again makes it anew, filled from title memory,
+ * and so does a T# the title wrote itself with another's address. Over a budget, ones no slot holds
+ * go even if lately asked for. (run-smoke.sh turns the periodic passes off; these are called.) */
+static void test_view_texture_evict(void *dev, void *queue)
+{
+    enum { COUNT = 32 };
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void (WINAPI *view_memory)(UINT64 *, UINT64 *, UINT64 *, UINT64 *) = (void *)GetProcAddress(m, "ReboxViewMemory");
+    UINT (WINAPI *evict)(UINT, UINT64) = (void *)GetProcAddress(m, "ReboxViewEvict");
+    ID3D12Resource *(WINAPI *slot_resource)(SIZE_T) = (void *)GetProcAddress(m, "ReboxShadowSlotResource");
+    void *(WINAPI *texture_of)(const UINT32 *) = (void *)GetProcAddress(m, "ReboxConsoleTextureOf");
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(m, "ReboxTile");
+    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
+            { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE, FALSE };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+    D3D12_SHADER_RESOURCE_VIEW_DESC null = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256 * 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    static UINT32 linear[64 * 64];
+    ID3D12Resource *made[COUNT], *again = NULL, *revived = NULL, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    BYTE console_desc[0x40] = { 0 };
+    UINT64 views, retired, textures0, peak, textures, bytes;
+    void *heap = NULL, *list = NULL;
+    UINT32 *out = NULL;
+    BYTE *memory;
+    SIZE_T start;
+    UINT inc, gone = 0, value = 0;
+    HRESULT hr;
+
+    if (!view_memory || !evict || !slot_resource || !texture_of || !tile
+            || !(memory = VirtualAlloc(NULL, (COUNT + 8) << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+        return;
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (FAILED(hr))
+        goto done;
+    XSLOT(list, 9, HRESULT)(list);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    start = XSLOT(heap, 9, SIZE_T)(heap);
+    view.v.Texture2D.MipLevels = null.Texture2D.MipLevels = 1;
+    memcpy(console_desc, &td, sizeof(td));
+    for (int i = 0; i < 64 * 64; i++)
+        linear[i] = i * 2246822519u + 5;
+    tile(&surface, memory + (5 << 16), 0, 0, linear, 256, 256 * 64);
+
+    /* Texture 0 stays in slot 0; the others pass through slot 1, which is then emptied. */
+    view_memory(&views, &retired, &textures0, &bytes);
+    for (int i = 0; i < COUNT; i++)
+    {
+        view.address = (UINT64)(ULONG_PTR)(memory + ((SIZE_T)i << 16));
+        XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + (i ? inc : 0));
+        made[i] = slot_resource(start + (i ? inc : 0));
+    }
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, NULL, &null, start + inc);
+    view_memory(&views, &retired, &peak, &bytes);
+    {
+        BOOL distinct = TRUE;
+        for (int i = 0; i < COUNT; i++)
+            distinct &= made[i] && (!i || made[i] != made[i - 1]);
+        CHECK(distinct && peak - textures0 <= COUNT && peak - textures0 >= COUNT - 2,
+              "view textures: %d made at %d addresses (%llu more alive)", COUNT, COUNT,
+              (unsigned long long)(peak - textures0));
+    }
+    /* Lately asked for: none of them goes (older tests' may). */
+    evict(10000, 0);
+    view.address = (UINT64)(ULONG_PTR)(memory + (1 << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 2 * inc);
+    CHECK(slot_resource(start + 2 * inc) == made[1], "view textures: none is evicted while lately asked for");
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, NULL, &null,
+            start + 2 * inc);
+    view_memory(&views, &retired, &peak, &bytes);
+    Sleep(1200);
+    gone = evict(1000, 0);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    for (int i = 0; i < 100; i++)
+    {
+        view_memory(&views, &retired, &textures, &bytes);
+        if (peak - textures >= COUNT - 1)
+            break;
+        Sleep(100);
+    }
+    CHECK(gone >= COUNT - 1 && peak - textures >= COUNT - 1 && slot_resource(start) == made[0],
+          "view textures: the %d no slot holds are evicted and released past the GPU, the one in a slot stays "
+          "(%u evicted, %llu released)", COUNT - 1, gone, (unsigned long long)(peak - textures));
+    /* Texture 0 is still the one its view finds. */
+    view.address = (UINT64)(ULONG_PTR)memory;
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 2 * inc);
+    CHECK(slot_resource(start + 2 * inc) == made[0], "view textures: the one a slot holds is found again, not made anew");
+
+    /* Texture 5's view again: made anew, filled from its memory. */
+    view.address = (UINT64)(ULONG_PTR)(memory + (5 << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + inc);
+    again = slot_resource(start + inc);
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    if (again)
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { again, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+        D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                            { .PlacedFootprint = { 0, { DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 } } } };
+        XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+              const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+    for (int i = 0; i < 500 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
+        Sleep(10);
+    ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+    view_memory(&views, &retired, &textures, &bytes);
+    CHECK(again && again != made[5] && out && !memcmp(out, linear, sizeof(linear)),
+          "view textures: an evicted one asked for again is made anew and filled from title memory (%p, was %p)",
+          (void *)again, (void *)made[5]);
+    if (out)
+        ID3D12Resource_Unmap(buf, 0, NULL);
+
+    /* A T# the title wrote itself with texture 6's address: made anew too, and its view then finds that one. */
+    {
+        UINT64 at = (UINT64)(ULONG_PTR)(memory + (6 << 16));
+        UINT32 t[2] = { (UINT32)(at >> 8), (UINT32)(at >> 40) & 0xff };
+        revived = texture_of(t);
+        view.address = at;
+        XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 3 * inc);
+        CHECK(revived && revived != made[6] && slot_resource(start + 3 * inc) == revived,
+              "view textures: a T# of an evicted one's address makes it anew (%p, was %p)", (void *)revived,
+              (void *)made[6]);
+    }
+
+    /* Over a budget: the ones no slot holds go, even lately asked for; those in slots stay. */
+    view.address = (UINT64)(ULONG_PTR)(memory + ((SIZE_T)(COUNT + 1) << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + inc);
+    view.address = (UINT64)(ULONG_PTR)(memory + ((SIZE_T)(COUNT + 2) << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + inc);
+    Sleep(1200);
+    gone = evict(0, 1);
+    CHECK(gone >= 1 && slot_resource(start) == made[0] && slot_resource(start + inc)
+          && slot_resource(start + 3 * inc) == revived,
+          "view textures: over the budget the ones no slot holds are evicted, those in slots stay (%u went)", gone);
+done:
+    CHECK(SUCCEEDED(hr), "view texture eviction test set up (%#lx)", hr);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+    /* The memory stays: the views kept still name it. */
+}
+
 static void test_placed_texture_late(void *dev, void *queue)
 {
     struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
@@ -5868,6 +6040,7 @@ static void test_xbox(void)
     test_placed_texture_late(dev, queue);
     test_view_texture_retire(dev, queue);
     test_view_texture_held(dev, queue);
+    test_view_texture_evict(dev, queue);
     test_placed_texture_written(dev, queue);
     test_placed_texture_tracked(dev, queue);
     test_placed_atlas_behind_hot(dev, queue);

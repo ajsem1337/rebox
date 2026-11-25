@@ -1014,6 +1014,25 @@ BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads
     return found;
 }
 
+/* Whether the texture can be released and made again from title memory alone (a view texture
+ * nothing names, proxy.c): registered, never written by the GPU, and not holding contents its
+ * memory no longer has (uploaded, then the memory went). *filled: uploaded at least once. */
+BOOL title_texture_refillable(ID3D12Resource *resource, BOOL *filled)
+{
+    struct title_texture *t;
+    BOOL refillable = FALSE;
+
+    *filled = FALSE;
+    AcquireSRWLockShared(&lock);
+    if ((t = texture_of(resource)))
+    {
+        *filled = t->uploads > 0;
+        refillable = !t->gpu_written && !t->target && !(t->unreadable && t->uploads);
+    }
+    ReleaseSRWLockShared(&lock);
+    return refillable;
+}
+
 /* The bytes a texture takes in console memory (0 if it isn't uploaded). */
 UINT64 title_texture_size(const D3D12_RESOURCE_DESC *desc)
 {

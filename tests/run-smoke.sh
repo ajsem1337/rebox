@@ -59,6 +59,9 @@ export REBOX_CONSOLE_COMPUTE_LAYOUT=pairs
 # Its checks read a dispatch's results at once: compiles in the calling thread (one test turns
 # background compiles on itself).
 export REBOX_CONSOLE_ASYNC=0
+# View textures are evicted only when smoke.c asks (test_view_texture_evict), so other checks of
+# view textures alive aren't raced by the periodic pass.
+export REBOX_VIEW_IDLE_S=0 REBOX_VIEW_TEXTURE_BUDGET_MB=0
 # AnyPS5's recompiler (docs/anyps5.md): compiles a built-in compute shader.
 if [ -n "${REBOX_ANYPS5_DIR:-}" ]; then
     install -m 644 "$REBOX_ANYPS5_DIR"/rebox_anyps5.dll "$sys32"/

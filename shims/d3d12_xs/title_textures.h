@@ -16,6 +16,8 @@ BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads
 /* The texture registered at this title address, or NULL. */
 ID3D12Resource *title_texture_at(UINT64 address);
 void title_texture_unregister(ID3D12Resource *resource);
+/* Whether it can be released and made again from title memory alone; *filled: uploaded yet. */
+BOOL title_texture_refillable(ID3D12Resource *resource, BOOL *filled);
 void WINAPI ReboxTitleMemoryWritten(UINT64 address, UINT64 size);
 /* Whether textures in physical-page views are write-tracked (REBOX_TEXTURE_TRACKING, default on). */
 BOOL title_textures_tracking(void);
