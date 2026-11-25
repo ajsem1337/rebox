@@ -2258,6 +2258,36 @@ static void test_console_mesh_stream(void)
     }
 }
 
+/* Guest buffer table entries ({address, length in dwords}), which translated shaders read with a
+ * bounds check on the length only: a V# with records but no base (or a base in the first 64 KiB)
+ * must be empty, or every load through it reads address 0 (the GPU page fault of the first
+ * indirect mesh draws). */
+static void test_guest_buffer_entry(void)
+{
+    void (WINAPI *entry_of)(const UINT32 *, UINT32 *) =
+            (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGuestBufferEntry");
+    static const UINT32 no_base[4] = { 0, 16u << 16, 64, 0x1104dfac };
+    static const UINT32 first_page[4] = { 0x40, 0, 256, 0x1104dfac };
+    static const UINT32 empty[4] = { 0 };
+    static const UINT32 raw[4] = { 0x1000, 0x2000, 256, 0x1104dfac };
+    UINT32 e[4];
+
+    CHECK(entry_of != NULL, "d3d12_xs exports ReboxGuestBufferEntry");
+    if (!entry_of)
+        return;
+    memset(e, 0xff, sizeof(e));
+    entry_of(no_base, e);
+    CHECK(e[0] == 0 && e[1] == 0 && e[2] == 0, "a V# with 64 records of 16 bytes and no base is empty (%u dwords)", e[2]);
+    entry_of(first_page, e);
+    CHECK(e[2] == 0, "a V# whose base is in the first page is empty (%u dwords)", e[2]);
+    entry_of(empty, e);
+    CHECK(e[2] == 0 && e[3] == 0, "an all-zero V# is empty (%u dwords)", e[2]);
+    /* 0x200000001000: a range guest_buffer_mappable takes as it is. */
+    entry_of(raw, e);
+    CHECK(e[0] == 0x1000 && e[1] == 0x2000 && e[2] == 64, "a raw V# of 256 bytes at %#x%08x is 64 dwords (%u)",
+          e[1], e[0], e[2]);
+}
+
 /* A console mesh shader in its container, as the target title's FSSMs have it (console_fssm.c: the
  * slot table at 0x10, the mesh record and stage data, a 24-byte shader ID before the code), made a
  * deferred mesh stage and compiled through ReboxConsoleCompile as at a mesh dispatch (patch 0013):
@@ -5781,6 +5811,7 @@ static void test_xbox(void)
     test_depth_uav_texture(dev);
     test_console_mesh_stream();
     test_console_mesh_compile();
+    test_guest_buffer_entry();
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_NONE);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);

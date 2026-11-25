@@ -219,6 +219,35 @@ static UINT64 hash_words(UINT64 h, const void *data, SIZE_T size)
  * then. Until resolved, it holds the dummy texture. */
 struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
 static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes);
+
+/* A guest buffer table entry ({address, length in dwords, 0, 0}) for a V#: the module reads the
+ * buffer at that address directly, in bounds of that length. One in a GPU-only view of title
+ * memory is its CPU address, which must be GPU memory; one that can't be made so is read as empty
+ * (a V# into such memory faulted the GPU). So is one whose base is 0 or in the first 64 KiB, which
+ * nothing maps: AnyPS5 takes a V# with no base as absent, but the table has only the length to say
+ * so, and a V# with records and no base (its address not written yet, or not a V#) made every load
+ * through it a scalar read of address 0, a GPU page fault (the first indirect mesh draws). */
+void WINAPI ReboxGuestBufferEntry(const UINT32 w[4], UINT32 entry[4])
+{
+    UINT64 base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
+    UINT32 stride = (w[1] >> 16) & 0x3fff;
+    UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
+
+    if (base < 0x10000)
+    {
+        static LONG logged;
+        if (bytes && InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: V# %08x %08x %08x %08x has %llu bytes at %#llx: read as empty", w[0], w[1], w[2],
+                      w[3], (unsigned long long)bytes, (unsigned long long)base);
+        bytes = 0;
+    }
+    else if (!guest_buffer_mappable(&base, &bytes))
+        bytes = 0;
+    entry[0] = (UINT32)base;
+    entry[1] = (UINT32)(base >> 32);
+    entry[2] = (UINT32)min(bytes / 4, 0xffffffffull);
+    entry[3] = 0;
+}
 static struct late_texture late[4096];
 static UINT late_count;
 /* V#s the same: a guest buffer table entry ({address, length in dwords}) whose V# was empty when the
@@ -246,15 +275,11 @@ void console_resolve_late(void)
             UINT32 w[4] = { 0 };
             if (ReboxShadowRead(t->source, w, sizeof(w)) && (w[0] || w[1]))
             {
-                UINT64 base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
-                UINT32 stride = (w[1] >> 16) & 0x3fff;
-                UINT64 bytes = stride ? (UINT64)w[2] * stride : w[2];
+                UINT64 base, bytes;
                 static LONG shown;
-                if (!guest_buffer_mappable(&base, &bytes))
-                    bytes = 0;
-                t->entry[0] = (UINT32)base;
-                t->entry[1] = (UINT32)(base >> 32);
-                t->entry[2] = (UINT32)min(bytes / 4, 0xffffffffull);
+                ReboxGuestBufferEntry(w, t->entry);
+                base = t->entry[0] | (UINT64)t->entry[1] << 32;
+                bytes = (UINT64)t->entry[2] * 4;
                 if ((console_stage_watched(t->stage) && InterlockedIncrement(&shown) <= 16)
                         || InterlockedIncrement(&shown) <= 4)
                     rebox_log("d3d12_xs: late V# %08x %08x %08x %08x of stage %016llx: buffer at %#llx, %llu bytes",
@@ -2439,14 +2464,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                   "%llu bytes)", (unsigned long long)stage_id, b.binding, e, w[0], w[1], w[2], w[3],
                                   (unsigned long long)base, (unsigned long long)bytes);
                 }
-                /* The shader reads the buffer at this address directly: one in a GPU-only view of
-                 * title memory is its CPU address, which must be GPU memory; one that can't be made
-                 * so is read as empty (a V# into such memory faulted the GPU). */
-                if (!guest_buffer_mappable(&base, &bytes))
-                    bytes = 0;
-                table[e * 4] = (UINT32)base;
-                table[e * 4 + 1] = (UINT32)(base >> 32);
-                table[e * 4 + 2] = (UINT32)min(bytes / 4, 0xffffffffull);
+                ReboxGuestBufferEntry(w, table + e * 4);
                 /* An empty V# of a graphics stage: maybe one the title writes before it submits. */
                 if (graphics && !(w[0] | w[1] | w[2] | w[3]) && empty_count < ARRAYSIZE(empty_sources))
                 {
