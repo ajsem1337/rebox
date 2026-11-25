@@ -3810,17 +3810,38 @@ static void test_xcrdapi(void)
               "DirectStorage memory copy");
         CHECK(XSLOT(status, 3, BOOL, UINT32)(status, 3), "an unused status entry reads complete");
 
-        /* The console submits on its own (a UE5 title never calls Submit): a request and an event
-         * through slot 5 (EnqueueSetEvent), with no Submit. */
+        /* A queue never submitted submits on its own after a short wait (a UE5 title never calls
+         * Submit): a request and an event through slot 5 (EnqueueSetEvent), with no Submit. */
         {
             BYTE again[16] = { 0 };
             struct req r4 = { 1ull << 22, again, 0, sizeof(again), 0, (void *)"fedcba9876543210", 0, 16 };
             HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+            void *uq = NULL;
 
-            XSLOT(mq, 3, void, const struct req *)(mq, &r4);
-            XSLOT(mq, 5, void, HANDLE, UINT64)(mq, done, 0);
-            CHECK(WaitForSingleObject(done, 5000) == WAIT_OBJECT_0 && !memcmp(again, "fedcba9876543210", 16),
+            if (SUCCEEDED(XSLOT(factory, 3, HRESULT, const void *, REFIID, void **)(factory, &mdesc, &IID_IUnknown, &uq)))
+            {
+                XSLOT(uq, 3, void, const struct req *)(uq, &r4);
+                XSLOT(uq, 5, void, HANDLE, UINT64)(uq, done, 0);
+            }
+            CHECK(uq && WaitForSingleObject(done, 5000) == WAIT_OBJECT_0 && !memcmp(again, "fedcba9876543210", 16),
                   "DirectStorage runs requests without Submit and sets an event from slot 5 (EnqueueSetEvent)");
+            CloseHandle(done);
+            if (uq) XSLOT(uq, 2, ULONG)(uq);
+        }
+
+        /* A queue the title submits keeps what it enqueues until Submit. */
+        {
+            BYTE later[16] = { 0 };
+            struct req r6 = { 1ull << 22, later, 0, sizeof(later), 0, (void *)"waits for Submit", 0, 16 };
+            HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+            BOOL waited;
+
+            XSLOT(mq, 3, void, const struct req *)(mq, &r6);
+            XSLOT(mq, 5, void, HANDLE, UINT64)(mq, done, 0);
+            waited = WaitForSingleObject(done, 200) == WAIT_TIMEOUT && !later[0];
+            XSLOT(mq, 6, void)(mq);
+            CHECK(waited && WaitForSingleObject(done, 5000) == WAIT_OBJECT_0 && !memcmp(later, "waits for Submit", 16),
+                  "DirectStorage runs a submitted queue's requests at Submit, not at enqueue");
             CloseHandle(done);
         }
 
@@ -3849,6 +3870,34 @@ static void test_xcrdapi(void)
             }
             CHECK(paged_ok, "DirectStorage zlib read into two physical pages");
             CloseHandle(done);
+
+            /* A title's page table, filled for the batch between enqueue and Submit: the entry held
+             * another page at enqueue (one that slot had before), which must stay untouched. */
+            {
+                ULONG_PTR two[2], n = 2, *table = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*table));
+                BYTE *old_view = VirtualAlloc(NULL, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
+                BYTE *new_view = VirtualAlloc(NULL, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
+                BOOL table_ok = alloc_pages && map_pages && table && old_view && new_view && alloc_pages(0, &n, two)
+                                && map_pages(old_view, 1, &two[0]) && map_pages(new_view, 1, &two[1]);
+
+                done = CreateEventA(NULL, TRUE, FALSE, NULL);
+                if (table_ok)
+                {
+                    struct req r7 = { 1 | 1ull << 21, table, 0, 280, 0, file, 64, sizeof(zlib_data) };
+                    table[0] = two[0];
+                    XSLOT(fq, 3, void, const struct req *)(fq, &r7);
+                    XSLOT(fq, 5, void, HANDLE, UINT64)(fq, done, 0);
+                    Sleep(50);
+                    table[0] = two[1];
+                    XSLOT(fq, 6, void)(fq);
+                    table_ok = WaitForSingleObject(done, 5000) == WAIT_OBJECT_0;
+                    for (int i = 0; table_ok && i < 280; i++)
+                        table_ok &= new_view[i] == (BYTE)unit[i % (sizeof(unit) - 1)] && !old_view[i];
+                }
+                CHECK(table_ok, "DirectStorage reads a page table filled after enqueue as the request runs");
+                CloseHandle(done);
+                HeapFree(GetProcessHeap(), 0, table);
+            }
         }
     }
     if (file) XSLOT(file, 2, ULONG)(file);
