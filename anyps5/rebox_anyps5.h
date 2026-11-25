@@ -163,6 +163,8 @@ SA5_API void sa5_result_identity(const struct sa5_result *result, uint64_t ident
 SA5_API uint32_t sa5_fault_buffer_bytes(void);
 SA5_API uint32_t sa5_gds_bytes(void);
 SA5_API void sa5_result_free(struct sa5_result *result);
+/* Bytes AnyPS5 holds: its result memo (APS5_RESULT_MEMO_MB bounds it) and its resource plans. */
+SA5_API void sa5_memory_stats(uint64_t *memo_bytes, uint64_t *plan_bytes);
 /* The tessellation control and evaluation stages that draw a console rect list with these vertex
  * and pixel results (AnyPS5's rect-list shaders): each 3-vertex patch is a rectangle, its fourth
  * corner made after the vertex shader. The control stage binds AnyPS5's fault buffer (sa5_finalize

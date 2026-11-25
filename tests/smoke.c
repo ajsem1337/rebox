@@ -499,6 +499,48 @@ static void test_xmem(void)
                     CHECK(kept, "unmapping a copy of a physical page keeps what was written through its view");
                     if (plain) VirtualFree(plain, 0, MEM_RELEASE);
                 }
+                /* A copy's snapshot is a hash per 128 bytes (REBOX_COPY_SNAPSHOT), not a copy of
+                 * its 64 KiB: a write into the page (ReboxWritePhysicalPages) part way into a block
+                 * and one through the copy beside it both reach the page; one through the copy and
+                 * one through a view into the same block are a conflict, and the page's stays. */
+                if (r3)
+                {
+                    void (WINAPI *stats)(UINT64 *, UINT64 *, UINT64 *, UINT64 *) =
+                            (void *)GetProcAddress(m, "ReboxPhysicalMemoryStats");
+                    BOOL (WINAPI *pwrite)(const ULONG_PTR *, ULONG_PTR, SIZE_T, const void *, SIZE_T) =
+                            (void *)GetProcAddress(m, "ReboxWritePhysicalPages");
+                    BYTE *plain = VirtualAlloc(NULL, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
+                    UINT64 allocated = 0, copies = 0, before = 0, during = 0, conflicts0 = 0, conflicts = 0, x;
+                    static const BYTE ds[3] = { 0xd1, 0xd2, 0xd3 };
+                    BOOL ok = stats && pwrite && plain && pmap(r3, 4, NULL);
+                    if (ok)
+                        stats(&allocated, &copies, &before, &conflicts0);
+                    ok = ok && pmap(plain, 1, pages + 9) && pmap(r3, 1, pages + 9);
+                    if (ok)
+                    {
+                        stats(&allocated, &copies, &during, &x);
+                        ok = copies >= 1 && during - before == (64 << 10) / 128 * 8 && allocated >= 16 << 16;
+                        CHECK(ok, "a copy of a 64 KiB physical page keeps a 4 KiB snapshot (%llu bytes more, %llu copies, "
+                              "%llu allocated)", (unsigned long long)(during - before), (unsigned long long)copies,
+                              (unsigned long long)allocated);
+                        /* Bytes 0x404-0x406 written into the page (and its copy), 0x410 through the
+                         * copy: one block. 0x500 through the copy, 0x508 through the view: another. */
+                        ok = pwrite(pages + 9, 1, 0x404, ds, sizeof(ds));
+                        plain[0x410] = 0x41;
+                        plain[0x500] = 0x50;
+                        r3[0x508] = 0x58;
+                        ok = ok && pmap(plain, 1, NULL);
+                        stats(&allocated, &copies, &x, &conflicts);
+                        CHECK(ok && r3[0x404] == 0xd1 && r3[0x406] == 0xd3 && r3[0x410] == 0x41,
+                              "a write into a copied page and one through the copy beside it both reach the page");
+                        CHECK(ok && r3[0x508] == 0x58 && r3[0x500] != 0x50 && conflicts == conflicts0 + 1 && x == before,
+                              "a block written through the copy and the page's view keeps the page's (%llu conflicts)",
+                              (unsigned long long)(conflicts - conflicts0));
+                    }
+                    else
+                        CHECK(ok, "a physical page mapped as a copy and a view for the snapshot test");
+                    if (plain) VirtualFree(plain, 0, MEM_RELEASE);
+                }
                 /* CopyPageMappingsBatchX's mapping (ReboxMapPhysicalAlias): the pages at a pool
                  * address mapped at another as well, the same memory at both. */
                 {
@@ -4838,6 +4880,228 @@ done:
     /* The memory stays: the views kept still name it. */
 }
 
+/* View buffers with memory of their own (a buffer view of title memory that isn't GPU memory):
+ * one no slot holds and not asked for a while is retired (proxy.c, view_buffer_retire_enabled),
+ * one a slot holds stays, and one asked for again is made anew. A change in GPU memory elsewhere
+ * leaves them be: only one whose own memory became GPU memory is made again there. */
+static void test_view_buffer_retire(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void (WINAPI *view_buffers)(UINT64 *, UINT64 *, UINT64 *, UINT64 *) = (void *)GetProcAddress(m, "ReboxViewBuffers");
+    UINT (WINAPI *evict)(UINT, UINT64) = (void *)GetProcAddress(m, "ReboxViewEvict");
+    ID3D12Resource *(WINAPI *slot_resource)(SIZE_T) = (void *)GetProcAddress(m, "ReboxShadowSlotResource");
+    HRESULT (WINAPI *gpu_alloc)(SIZE_T, SIZE_T, void **, UINT64 *) =
+            (void *)GetProcAddress(m, "ReboxGpuAlloc");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R32_UINT,
+            D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+    D3D12_SHADER_RESOURCE_VIEW_DESC null = { DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_BUFFER,
+                                             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    BYTE console_desc[0x40] = { 0 };
+    UINT64 alive0, bytes0, evicted0, superseded0, alive, bytes, evicted, superseded;
+    ID3D12Resource *a, *b, *a2, *b2;
+    void *heap = NULL, *gpu_cpu = NULL;
+    UINT64 gpu_va;
+    BYTE *memory;
+    SIZE_T start;
+    UINT inc;
+
+    if (!view_buffers || !evict || !slot_resource
+            || !(memory = VirtualAlloc(NULL, 4 << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+        return;
+    if (FAILED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap)))
+        return;
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    start = XSLOT(heap, 9, SIZE_T)(heap);
+    view.v.Buffer.NumElements = null.Buffer.NumElements = 1024;
+    memcpy(console_desc, &bd, sizeof(bd));
+    view_buffers(&alive0, &bytes0, &evicted0, &superseded0);
+    /* A in slot 0, B in slot 1, which is then emptied. */
+    view.address = (UINT64)(ULONG_PTR)memory;
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    a = slot_resource(start);
+    view.address = (UINT64)(ULONG_PTR)(memory + (2 << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + inc);
+    b = slot_resource(start + inc);
+    view_buffers(&alive, &bytes, &evicted, &superseded);
+    if (alive - alive0 != 2)
+    {
+        /* This memory became GPU memory in place (the GPU VA identity layer is there): no own buffers. */
+        printf("info view buffers: plain memory is GPU memory here (%llu own made), retiring not tested\n",
+               (unsigned long long)(alive - alive0));
+        XSLOT(heap, 2, ULONG)(heap);
+        return;
+    }
+    CHECK(a && b && a != b && bytes - bytes0 >= 8192, "view buffers: two with memory of their own (%llu bytes)",
+          (unsigned long long)(bytes - bytes0));
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, NULL, &null, start + inc);
+    /* GPU memory made elsewhere: neither is made again. */
+    if (gpu_alloc)
+        gpu_alloc(32 << 20, 1 << 16, &gpu_cpu, &gpu_va);
+    view.address = (UINT64)(ULONG_PTR)memory;
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 2 * inc);
+    CHECK(slot_resource(start + 2 * inc) == a, "view buffers: one is found again after GPU memory is made elsewhere");
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, NULL, &null,
+            start + 2 * inc);
+    evict(10000, 0);
+    view_buffers(&alive, &bytes, &evicted, &superseded);
+    CHECK(alive - alive0 == 2 && evicted == evicted0, "view buffers: none is retired while lately asked for");
+    Sleep(1200);
+    evict(1000, 0);
+    view_buffers(&alive, &bytes, &evicted, &superseded);
+    CHECK(alive - alive0 == 1 && evicted - evicted0 == 1 && slot_resource(start) == a && superseded == superseded0,
+          "view buffers: the one no slot holds is retired once not asked for, the one in a slot stays (%llu alive, "
+          "%llu retired)", (unsigned long long)(alive - alive0), (unsigned long long)(evicted - evicted0));
+    /* Both asked for again: A is the same, B made anew. */
+    view.address = (UINT64)(ULONG_PTR)memory;
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 2 * inc);
+    a2 = slot_resource(start + 2 * inc);
+    view.address = (UINT64)(ULONG_PTR)(memory + (2 << 16));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + 3 * inc);
+    b2 = slot_resource(start + 3 * inc);
+    view_buffers(&alive, &bytes, &evicted, &superseded);
+    CHECK(a2 == a && b2 && alive - alive0 == 2, "view buffers: one retired is made anew when asked for again (%llu alive)",
+          (unsigned long long)(alive - alive0));
+    if (gpu_cpu)
+    {
+        void (WINAPI *gpu_free)(void *) = (void *)GetProcAddress(m, "ReboxGpuFree");
+        if (gpu_free)
+            gpu_free(gpu_cpu);
+    }
+    XSLOT(heap, 2, ULONG)(heap);
+}
+
+/* View textures given memory late (REBOX_VIEW_TEXTURE_DEFER, turned on here): one over memory not
+ * committed yet is made without memory; once its memory is committed and written, its upload gives
+ * it memory and fills it. Retired while a slot still holds it, it gives its memory back once the GPU
+ * is past it, and the slot still names it. */
+static void test_view_texture_defer(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void (WINAPI *defer)(BOOL) = (void *)GetProcAddress(m, "ReboxViewTextureDefer");
+    int (WINAPI *memory_of)(ID3D12Resource *) = (void *)GetProcAddress(m, "ReboxViewTextureMemory");
+    ID3D12Resource *(WINAPI *slot_resource)(SIZE_T) = (void *)GetProcAddress(m, "ReboxShadowSlotResource");
+    typedef BOOL (WINAPI *tile_fn)(const void *, void *, UINT, UINT, const void *, UINT64, UINT64);
+    tile_fn tile = (tile_fn)(void *)GetProcAddress(m, "ReboxTile");
+    struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
+            { 1 /* SW_4KB_S */, DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, FALSE, FALSE };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256 * 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    static UINT32 linear[64 * 64];
+    BYTE console_desc[0x40] = { 0 };
+    ID3D12Resource *res = NULL, *other = NULL, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *heap = NULL, *list = NULL;
+    UINT32 *out = NULL;
+    UINT64 value = 0;
+    BYTE *memory;
+    SIZE_T start;
+    UINT inc;
+    int state = -1;
+    HRESULT hr;
+
+    if (!defer || !memory_of || !slot_resource || !tile
+            || !(memory = VirtualAlloc(NULL, 4 << 16, MEM_RESERVE, PAGE_READWRITE)))
+        return;
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (FAILED(hr))
+        goto done;
+    XSLOT(list, 9, HRESULT)(list);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    start = XSLOT(heap, 9, SIZE_T)(heap);
+    view.v.Texture2D.MipLevels = 1;
+    view.address = (UINT64)(ULONG_PTR)memory;
+    memcpy(console_desc, &td, sizeof(td));
+
+    defer(TRUE);
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    res = slot_resource(start);
+    state = res ? memory_of(res) : -2;
+    if (state == -1)
+    {
+        printf("info view textures given memory late: not made reserved here (no sparse images?), not tested\n");
+        goto done;
+    }
+    CHECK(state == 0, "view textures: one over memory not committed yet is made without memory (%d)", state);
+    /* Its memory committed and written: submissions find it readable, and its upload gives it memory. */
+    for (int i = 0; i < 64 * 64; i++)
+        linear[i] = i * 2654435761u + 7;
+    VirtualAlloc(memory, 4 << 16, MEM_COMMIT, PAGE_READWRITE);
+    tile(&surface, memory, 0, 0, linear, 256, 256 * 64);
+    for (int i = 0; i < 12 && memory_of(res) == 0; i++)
+    {
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+        for (int k = 0; k < 500 && ID3D12Fence_GetCompletedValue(fence) < value; k++)
+            Sleep(10);
+    }
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+        D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                            { .PlacedFootprint = { 0, { DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 } } } };
+        XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+              const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+    for (int k = 0; k < 500 && ID3D12Fence_GetCompletedValue(fence) < value; k++)
+        Sleep(10);
+    ID3D12Resource_Map(buf, 0, NULL, (void **)&out);
+    CHECK(memory_of(res) == 1 && out && !memcmp(out, linear, sizeof(linear)),
+          "view textures: one made without memory gets it at its first upload and is filled (%d)", memory_of(res));
+    if (out)
+        ID3D12Resource_Unmap(buf, 0, NULL);
+
+    /* Another shape over its memory retires it; slot 0 still holds it. Past the GPU, its memory goes. */
+    td.Width = 128;
+    memcpy(console_desc, &td, sizeof(td));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start + inc);
+    other = slot_resource(start + inc);
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    for (int i = 0; i < 60 && memory_of(res) != 2; i++)
+        Sleep(100);
+    CHECK(other && other != res && memory_of(res) == 2 && slot_resource(start) == res,
+          "view textures: a retired one a slot still holds gives its memory back past the GPU (%d)", memory_of(res));
+done:
+    defer(FALSE);
+    CHECK(SUCCEEDED(hr), "view texture deferral test set up (%#lx)", hr);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 static void test_placed_texture_late(void *dev, void *queue)
 {
     struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
@@ -6141,6 +6405,8 @@ static void test_xbox(void)
     test_view_texture_retire(dev, queue);
     test_view_texture_held(dev, queue);
     test_view_texture_evict(dev, queue);
+    test_view_buffer_retire(dev, queue);
+    test_view_texture_defer(dev, queue);
     test_placed_texture_written(dev, queue);
     test_placed_texture_tracked(dev, queue);
     test_placed_atlas_behind_hot(dev, queue);

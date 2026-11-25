@@ -682,6 +682,8 @@ static SRWLOCK modules_lock = SRWLOCK_INIT;
 /* result: a graphics stage's AnyPS5 result, kept when it was compiled for a rect-list draw
  * (ReboxConsoleRectStages builds that draw's tessellation stages from it). */
 static struct module { UINT64 key[2]; UINT32 *words, count; struct sa5_result *result; struct module *next; } *modules[256];
+static UINT module_count;
+static UINT64 module_bytes;
 
 static struct module *find_module(const UINT64 key[2])
 {
@@ -765,9 +767,20 @@ static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT3
     {
         m->next = modules[key[0] & 255];
         modules[key[0] & 255] = m;
+        module_count++;
+        module_bytes += (UINT64)count * sizeof(*words);
     }
     ReleaseSRWLockExclusive(&modules_lock);
     return m;
+}
+
+/* For the memory log: the finalized modules kept, and their SPIR-V's bytes. */
+void console_compile_module_stats(UINT *count, UINT64 *bytes)
+{
+    AcquireSRWLockShared(&modules_lock);
+    *count = module_count;
+    *bytes = module_bytes;
+    ReleaseSRWLockShared(&modules_lock);
 }
 
 /* -------------------------------------------------------------- compiling */
