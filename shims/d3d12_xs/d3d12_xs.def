@@ -33,6 +33,8 @@ EXPORTS
     ReboxViewMemory
     ReboxViewEvict
     ReboxViewBuffers
+    ReboxViewTextureDefer
+    ReboxViewTextureMemory
     ReboxShadowSlotResource
     D3D12XboxSetProcessDebugFlags
     D3D12ConfigureVirtualMemoryX

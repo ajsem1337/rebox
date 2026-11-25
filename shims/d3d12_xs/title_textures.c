@@ -46,6 +46,7 @@
 #include "detile.h"
 #include "gpu_memory.h"
 #include "title_textures.h"
+#include "proxy.h"
 
 struct title_texture
 {
@@ -881,6 +882,16 @@ static BOOL readable(UINT64 address, UINT64 size)
     return TRUE;
 }
 
+/* Whether a texture of size bytes at title GPU address address has memory that can't be read yet
+ * (not in GPU memory, not committed): proxy.c gives such a view texture memory only when it has
+ * something to hold (REBOX_VIEW_TEXTURE_DEFER). */
+BOOL title_texture_memory_unreadable(UINT64 address, UINT64 size)
+{
+    BOOL chunk;
+    const BYTE *cpu = cpu_address(address, size, &chunk);
+    return size && !chunk && !readable((UINT64)(ULONG_PTR)cpu, size);
+}
+
 /* The console surface for a texture: its shape from the PC desc, its swizzle mode from the setting,
  * the console layout or the shape. FALSE for what isn't uploaded (buffers, MSAA, unknown formats). */
 static BOOL console_surface(const D3D12_RESOURCE_DESC *console_desc, const D3D12_RESOURCE_DESC *desc,
@@ -1482,6 +1493,9 @@ void title_textures_upload(ID3D12CommandQueue *queue)
              * A tracked one's is taken from what the upload reads. */
             if (!t->watched && !t->tracked)
                 t->fingerprint = fingerprint(t);
+            /* One made without memory gets it first, mapped on this queue ahead of the copy. */
+            if (!proxy_texture_memory(queue, t->resource))
+                continue;
             if ((b->buffers[b->count] = record_upload(device, b->list, t)))
             {
                 D3D12_RESOURCE_DESC bd = ID3D12Resource_GetDesc(b->buffers[b->count]);

@@ -25,3 +25,5 @@ BOOL title_textures_tracking(void);
 /* For the memory log: textures registered (dirty ones), and uploads in flight (buffers, bytes). */
 struct title_texture_stats { UINT textures, dirty, uploads; UINT64 upload_bytes; };
 void title_textures_stats(struct title_texture_stats *s);
+/* Whether a texture's title memory (GPU address, console size) can't be read yet. */
+BOOL title_texture_memory_unreadable(UINT64 address, UINT64 size);
