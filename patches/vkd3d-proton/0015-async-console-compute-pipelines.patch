@@ -214,8 +214,8 @@ index 1f4d4fd..2a712d6 100644
 +    pthread_mutex_lock(&rebox_pipeline_jobs.lock);
 +    *rebox_pipeline_jobs.tail = job;
 +    rebox_pipeline_jobs.tail = &job->next;
-+    /* Half the CPUs, at most 8, as d3d12_xs's AnyPS5 workers. */
-+    want = rebox_cpu_count() / 2;
++    /* Half the CPUs, at most 8, as d3d12_xs's AnyPS5 workers; REBOX_PIPELINE_THREADS sets it (a world's pipelines take GBs each to build). */
++    { char v[16]; want = vkd3d_get_env_var("REBOX_PIPELINE_THREADS", v, sizeof(v)) && atoi(v) > 0 ? atoi(v) : rebox_cpu_count() / 2; }
 +    want = want < 1 ? 1 : want > 8 ? 8 : want;
 +    while (rebox_pipeline_jobs.threads < want)
 +    {
