@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
@@ -49,6 +50,36 @@ static void layer_log(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+/* REBOX_GPUVA_TRACE=<file>: one line per identity allocation ("A") and free ("F"), with the wall
+ * time, address and size, so a GPU fault's address in the window can be traced to what owned it
+ * (and whether it was freed). */
+static FILE *trace_file(void)
+{
+    static FILE *f;
+    static int init;
+    if (!__atomic_load_n(&init, __ATOMIC_ACQUIRE))
+    {
+        const char *path = getenv("REBOX_GPUVA_TRACE");
+        if (path && *path && (f = fopen(path, "a")))
+            setvbuf(f, NULL, _IOLBF, 0);
+        __atomic_store_n(&init, 1, __ATOMIC_RELEASE);
+    }
+    return f;
+}
+
+static void trace(char kind, uint64_t address, uint64_t size, unsigned type)
+{
+    FILE *f = trace_file();
+    struct timespec ts;
+    struct tm tm;
+    if (!f)
+        return;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "%02d:%02d:%02d.%03ld %c %#" PRIx64 " %#" PRIx64 " %u\n", tm.tm_hour, tm.tm_min, tm.tm_sec,
+            ts.tv_nsec / 1000000, kind, address, size, type);
 }
 
 /* ------------------------------------------------------------------ window */
@@ -762,6 +793,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(VkDevice device, cons
             layer_log("first identity allocation at %#" PRIx64 " (%#" PRIx64 " bytes, type %u)",
                       address, size, info->memoryTypeIndex);
     }
+    trace('A', address, size, info->memoryTypeIndex);
     m = calloc(1, sizeof(*m));
     m->handle = *memory;
     m->address = address;
@@ -812,6 +844,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_FreeMemory(VkDevice device, VkDeviceMemo
     d->free(device, memory, alloc);
     if (m)
     {
+        trace(m->adopted ? 'f' : 'F', m->address, m->size, 0);
         if (!m->adopted)
             window_free(m->address, m->reserved);
         free(m);

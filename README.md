@@ -201,6 +201,7 @@ with `E_NOTIMPL` (zlib and plain reads still work), and textures that need BCPac
 | `REBOX_SLOT_STATS=N` | Count calls per D3D12.X proxy slot and log them every N presents and at exit (`c` = our code, `T` = trap, unmarked = forwarded to the PC slot) |
 | `REBOX_LOG=/path` | Also append shim logs to this file |
 | `REBOX_GPUVA_WINDOW` | `BASE:SIZE` (hex) for identity-mapped GPU memory; default `200000000000:10000000000`; `off` stops xmem reserving it |
+| `REBOX_GPUVA_TRACE=FILE` | The identity layer appends a line per allocation (`A`) and free (`F`; `f` for title memory made GPU memory) in its window: wall time, address, size, memory type. Traces a GPU fault address in the window to what owned it |
 | `REBOX_GPU_MEMORY=0` | Give GPU-visible `XMemAlloc` types plain `VirtualAlloc` memory instead of D3D12 heaps |
 | `REBOX_DIRTY_PAGES=0` | Don't reserve title memory (`XMemVirtualAlloc`, `XMemAlloc` pages) with `MEM_WRITE_WATCH`: placed textures there are found changed by fingerprints, as in GPU memory, instead of by the pages written before each submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
 | `REBOX_TEXTURE_TRACKING=0` | Don't write-track placed textures in physical-page views (their pages read-only, the first write to each 64 KiB page noted): they are found changed by fingerprints again, the hot ones every submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
