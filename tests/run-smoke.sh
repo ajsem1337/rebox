@@ -91,7 +91,7 @@ REBOX_SHADER_FALLBACK=0 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.
 # ...and succeed through the fallback shaders by default.
 echo "== fake.bin, no cache entry, fallback shaders"
 # This run also counts proxy slot calls (REBOX_SLOT_STATS).
-out=$(REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 REBOX_STACK_SAMPLE=1,3 REBOX_WRITE_WATCH=7e0000008:8 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
+out=$(REBOX_FRAME_TRACE=0-1000 REBOX_SLOT_STATS=1 REBOX_SKIP_ASSERTS=1 REBOX_STACK_SAMPLE=1,3 REBOX_WRITE_WATCH=7e0000008:8 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out"; exit 1; }
 echo "$out"
 grep -q "uses fallback shaders" <<<"$out" || { echo "FAIL fallback shaders were not used"; exit 1; }
 grep -Eq "slot stats GraphicsCommandList:.* 12c?=" <<<"$out" || { echo "FAIL slot stats lack the draw (list slot 12)"; exit 1; }
@@ -110,6 +110,13 @@ echo "ok   views of a D16S8 depth buffer: depth and stencil plane formats, a nul
 grep -q "ok   an assertion (int3) in the exe was stepped over" <<<"$out" && grep -q "assertion 1 skipped at smoke.exe+" <<<"$out" \
     || { echo "FAIL REBOX_SKIP_ASSERTS did not step over the exe's int3"; exit 1; }
 echo "ok   REBOX_SKIP_ASSERTS steps over the exe's assertions and logs them"
+# REBOX_FRAME_TRACE: a line per console stage compile, naming the dispatch or draw that asked; and
+# the census's count of what each kind of stage came to.
+grep -Eq "d3d12_xs: trace [0-9]+ #[0-9]+ \[[0-9a-f]+\] compute [0-9a-f]{16} stage 0{16}: ok \| dispatch " <<<"$out" \
+    && grep -Eq "d3d12_xs: trace [0-9]+ #[0-9]+ \[[0-9a-f]+\] (vertex|pixel) [0-9a-f]{16} stage [0-9a-f]{16}: ok \| (draw|indexed) [0-9]+ [0-9]+ 0 rt [0-9]+x[0-9]+ f[0-9]+" <<<"$out" \
+    && grep -Eq "console compiles since the last census: compute: ok [0-9]+" <<<"$out" \
+    || { echo "FAIL REBOX_FRAME_TRACE traced no dispatch and draw, or the census counted no compiles"; exit 1; }
+echo "ok   REBOX_FRAME_TRACE traces each stage compile with its dispatch or draw"
 # Ray tracing list methods are ours, not forwarded: a state object that isn't vkd3d-proton's must
 # never reach it (SetPipelineState1/DispatchRays at 120/121, and 122/123 from SDK 0x20004), and
 # acceleration structure copies (119, 121) are skipped.

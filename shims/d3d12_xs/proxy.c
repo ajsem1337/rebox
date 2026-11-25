@@ -1562,6 +1562,25 @@ static BOOL find_rtv(SIZE_T cpu, UINT *width, UINT *height, UINT *format)
     return FALSE;
 }
 
+/* REBOX_FRAME_TRACE: names the draw, ExecuteIndirect or dispatch whose stages compile next, with its
+ * first render target's size and format for a draw (console_compile.c traces each compile). */
+static BOOL trace_begin(struct proxy *p, BOOL graphics, const char *op, UINT a, UINT b, UINT c)
+{
+    UINT width = 0, height = 0, format = 0;
+    if (!console_trace_active())
+        return FALSE;
+    if (graphics && p->render_target0)
+        find_rtv(p->render_target0, &width, &height, &format);
+    console_trace_op(op, a, b, c, width, height, format);
+    return TRUE;
+}
+
+static void trace_end(BOOL traced)
+{
+    if (traced)
+        console_trace_op(NULL, 0, 0, 0, 0, 0, 0);
+}
+
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
 {
@@ -1924,6 +1943,8 @@ static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12
 static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
         void *count_buffer, UINT64 count_offset)
 {
+    BOOL traced;
+
     if (!signature || !is_command_signature(signature))
     {
         static LONG logged;
@@ -1939,8 +1960,10 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
             rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
         return;
     }
+    traced = trace_begin(p, TRUE, count_buffer ? "indirect-counted" : "indirect", count, 0, 0);
     ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
             p->inner, signature, count, args, offset, count_buffer, count_offset);
+    trace_end(traced);
 }
 
 /* List slot 61. The two measurements disagree: Leonida (the retail FSR DLL) calls it with
@@ -1950,6 +1973,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
 static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, void *c, UINT64 d, void *e, UINT64 f)
 {
     static LONG logged;
+    BOOL traced;
 
     if (a && is_command_signature(a))
     {
@@ -1962,8 +1986,10 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         }
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
+        traced = trace_begin(p, TRUE, e ? "indirect-counted" : "indirect", (UINT)b, 0, 0);
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
                 p->inner, a, (UINT)b, c, d, e, f);
+        trace_end(traced);
         return;
     }
     ((void (STDMETHODCALLTYPE *)(void *, UINT_PTR, void *, UINT_PTR))PC_SLOT(p->inner, 57))(p->inner, (UINT_PTR)a,
@@ -5306,14 +5332,18 @@ static BOOL draw_census(void)
 static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices, UINT instances, UINT first_vertex,
         UINT first_instance)
 {
+    BOOL traced;
+
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
         return;
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, vertices, p->rect_list, FALSE);
+    traced = trace_begin(p, TRUE, p->rect_list ? "draw-rect" : "draw", vertices, instances, 0);
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
+    trace_end(traced);
     console_display_draw_end();
     log_watched_vertex_buffers(p, first_vertex, vertices);
 }
@@ -5321,12 +5351,16 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT indices, UINT instances, UINT first_index,
         INT base_vertex, UINT first_instance)
 {
+    BOOL traced;
+
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
+    traced = trace_begin(p, TRUE, "indexed", indices, instances, 0);
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
+    trace_end(traced);
     if (console_stage_watched(console_last_draw_vs()) && p->index_buffer.BufferLocation)
     {
         /* The vertices from the draw's first index on (a quad batch's indices run in order). */
@@ -5781,6 +5815,21 @@ static void STDMETHODCALLTYPE list_CopyMemoryToMemoryX(struct proxy *p, UINT64 d
         p->cpu_write_capacity = capacity;
     }
     p->cpu_writes[p->cpu_write_count++] = (struct cpu_write){ destination, { 0, 0 }, 0, source, size };
+}
+
+/* Slot 14 (Dispatch, in place) and DispatchMesh (PC 79): forwarded, named for REBOX_FRAME_TRACE. */
+static void STDMETHODCALLTYPE list_Dispatch(struct proxy *p, UINT x, UINT y, UINT z)
+{
+    BOOL traced = trace_begin(p, FALSE, "dispatch", x, y, z);
+    ID3D12GraphicsCommandList_Dispatch(INNER(p, ID3D12GraphicsCommandList), x, y, z);
+    trace_end(traced);
+}
+
+static void STDMETHODCALLTYPE list_DispatchMesh(struct proxy *p, UINT x, UINT y, UINT z)
+{
+    BOOL traced = trace_begin(p, TRUE, "mesh", x, y, z);
+    ((void (STDMETHODCALLTYPE *)(void *, UINT, UINT, UINT))PC_SLOT(p->inner, 79))(p->inner, x, y, z);
+    trace_end(traced);
 }
 
 /* DispatchX(x, y, z, flags), slot 80 (78 on the older layout): Dispatch with console flags (VIctory,
@@ -6340,7 +6389,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * DispatchX (78) and CopyResourceX (84) as Dispatch and CopyResource with a flags argument,
      * PC 60-76 at 105-121, and the shading rate methods and DispatchMesh at 124, 125 and 127
      * (a UE5 title calls 124 as RSSetShadingRate(1x1, combiners)). 60 and 62 are console methods. */
-    static struct slot list_slots[96] = {
+    static struct slot list_slots[112] = {
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(20, list_IASetPrimitiveTopology),
@@ -6351,7 +6400,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(120, list_SetPipelineState1),              /* PC 75 (Unreal 5: 54 calls in a run) */
         FN(121, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
-        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
+        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced), FN(14, list_Dispatch),
         FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),
         FWD(28, 52), FWD(29, 53), FWD(30, 54), FWD(31, 55), /* BeginQuery .. SetPredication */
@@ -6390,7 +6439,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
      * 124/125 shading rate, 127 DispatchMesh. A newer title's own DLLs fit this layout: FSR's
      * ExecuteIndirect at 61, the BVH builder's write/wait calls at 71, 73 and 90, and 141-148
      * past the end of the older table. docs/d3d12x.md. */
-    static struct slot list_v4_slots[96] = {
+    static struct slot list_v4_slots[112] = {
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(20, list_IASetPrimitiveTopology),
@@ -6413,7 +6462,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(101, list_DriverHintX),                    /* the older 99 */
         FN(123, list_DispatchRays),                   /* PC 76 */
         FN(10, list_Reset),
-        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced),
+        FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced), FN(14, list_Dispatch),
         FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),
         FN(32, list_SetDescriptorHeaps),
@@ -6471,7 +6520,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     }
     list_slots[n++] = (struct slot)FWD(124, 77); /* RSSetShadingRate */
     list_slots[n++] = (struct slot)FWD(125, 78); /* RSSetShadingRateImage */
-    list_slots[n++] = (struct slot)FWD(127, 79); /* DispatchMesh */
+    list_slots[n++] = (struct slot)FN(127, list_DispatchMesh); /* DispatchMesh (PC 79) */
 
     build(&device_class, 44, device_slots, ARRAYSIZE(device_slots));
     build(&queue_class, 18, queue_slots, ARRAYSIZE(queue_slots));
@@ -6500,7 +6549,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
     }
     list_v4_slots[n++] = (struct slot)FWD(126, 77); /* RSSetShadingRate */
     list_v4_slots[n++] = (struct slot)FWD(127, 78); /* RSSetShadingRateImage */
-    list_v4_slots[n++] = (struct slot)FWD(129, 79); /* DispatchMesh */
+    list_v4_slots[n++] = (struct slot)FN(129, list_DispatchMesh); /* DispatchMesh (PC 79) */
     build(&list_v4_class, 27, list_v4_slots, n);
     build(&copy_list_class, 11, copy_slots, ARRAYSIZE(copy_slots));
     build(&heap_class, 9, heap_slots, ARRAYSIZE(heap_slots));

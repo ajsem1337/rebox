@@ -1201,7 +1201,7 @@ static BOOL async_compiles(void)
 
 enum program_state { PROGRAM_COLD, PROGRAM_PENDING, PROGRAM_WARM, PROGRAM_FAILED };
 #define PROGRAMS 16384
-static struct { UINT64 key; LONG state; } programs[PROGRAMS];
+static struct { UINT64 key; LONG state; UINT calls, retries; } programs[PROGRAMS];
 static SRWLOCK programs_lock = SRWLOCK_INIT;
 
 /* The state of a program (by its blob's hash), claiming it as pending if it was cold. */
@@ -1225,6 +1225,7 @@ static enum program_state program_claim(UINT64 key, BOOL claim)
             {
                 programs[at].key = key;
                 programs[at].state = PROGRAM_PENDING;
+                programs[at].calls = programs[at].retries = 0;
             }
             break;
         }
@@ -1249,9 +1250,45 @@ static void program_set(UINT64 key, enum program_state state)
     ReleaseSRWLockExclusive(&programs_lock);
 }
 
+/* A program whose background compile failed: that compile ran on a worker, at a world's start
+ * minutes after the call that queued it, with that call's user SGPRs pointing at constants and
+ * tables the title had since written over (T#s that are floats, a UAV slot holding an SRV), and the
+ * program was then refused at every call for the rest of the run. Its calls are counted, and at its
+ * 64th failing call, then its 128th, 256th and so on (at most PROGRAM_RETRIES times), it's compiled
+ * again in the background with that call's inputs; the caller still skips. Returns whether this
+ * call is the retry (the program is pending again). */
+#define PROGRAM_RETRIES 10
+static BOOL program_retry(UINT64 key, UINT *retry)
+{
+    UINT slot = (UINT)(key % PROGRAMS);
+    BOOL due = FALSE;
+
+    AcquireSRWLockExclusive(&programs_lock);
+    for (UINT i = 0; i < 64; i++)
+    {
+        UINT at = (slot + i) % PROGRAMS;
+        if (programs[at].state == PROGRAM_COLD)
+            break;
+        if (programs[at].key != key)
+            continue;
+        if (programs[at].state == PROGRAM_FAILED && programs[at].retries < PROGRAM_RETRIES
+                && ++programs[at].calls >= 64u << programs[at].retries)
+        {
+            programs[at].calls = 0;
+            *retry = ++programs[at].retries;
+            programs[at].state = PROGRAM_PENDING;
+            due = TRUE;
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&programs_lock);
+    return due;
+}
+
 struct compile_job
 {
     struct compile_job *next;
+    UINT retry; /* 0, or which retry of a failed program this is (program_retry) */
     UINT64 key;
     struct rebox_compile_in in;
     UINT32 user_sgprs[64];
@@ -1284,6 +1321,15 @@ static DWORD WINAPI compile_worker(void *unused)
         memset(&out, 0, sizeof(out));
         hr = compile_now(&job->in, &out, TRUE);
         program_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        if (job->retry)
+        {
+            static volatile LONG retried, recovered;
+            LONG n = InterlockedIncrement(&retried), r = SUCCEEDED(hr) ? InterlockedIncrement(&recovered) : recovered;
+            if (SUCCEEDED(hr) || !(n & (n - 1)))
+                rebox_log("d3d12_xs: console shaders: program %016llx %s at retry %u (%ld of %ld retries of failed "
+                          "programs compiled)", (unsigned long long)job->key, SUCCEEDED(hr) ? "compiled" : "failed again",
+                          job->retry, r, n);
+        }
         done = InterlockedIncrement(&jobs_done);
         if (!(done & (done - 1)))
             rebox_log("d3d12_xs: console shaders: %ld background compiles done of %ld queued", done, jobs_queued);
@@ -1292,7 +1338,7 @@ static DWORD WINAPI compile_worker(void *unused)
     return 0;
 }
 
-static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL front)
+static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL front, UINT retry)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     BOOL pending;
@@ -1305,6 +1351,7 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL fr
     }
     memset(job, 0, sizeof(*job));
     job->key = key;
+    job->retry = retry;
     job->in = *in;
     memcpy(job->shader, in->shader, in->shader_size);
     job->in.shader = job->shader;
@@ -1390,8 +1437,52 @@ void console_display_draw_end(void)
     ReleaseSRWLockExclusive(&display_draw_lock);
 }
 
+/* What each ReboxConsoleCompile call came to, by stage kind, since the last census: a draw or
+ * dispatch whose stage isn't "ok" is skipped (vkd3d-proton draws nothing, or logs "Failed to update
+ * compute state"). The census only names DrawInstanced and DrawIndexedInstanced; these count every
+ * draw, mesh draw, ExecuteIndirect and dispatch. */
+enum { OUTCOME_OK, OUTCOME_BUDGET, OUTCOME_QUEUED, OUTCOME_WAIT, OUTCOME_PROGRAM_FAILED, OUTCOME_FAILED, OUTCOMES };
+static const char *const outcome_names[OUTCOMES] = { "ok", "past the frame's budget", "compiling in the background",
+                                                     "past their wait", "program failed before", "failed" };
+static volatile LONG outcomes[4][OUTCOMES]; /* [compute, vertex, pixel, mesh] */
+static __thread UINT call_outcome;
+
+static UINT outcome_kind(const struct rebox_deferred_shader *h, SIZE_T size)
+{
+    if (!h || size < sizeof(*h) || h->version != 2)
+        return 0;
+    return h->stage == 0x10 ? 2 : h->stage == 0x80 ? 3 : 1;
+}
+
+static void outcomes_log(void)
+{
+    static const char *const kinds[4] = { "compute", "vertex", "pixel", "mesh" };
+    char line[2048]; /* at most about 1100 */
+    int at = 0;
+    LONG total = 0;
+    for (UINT k = 0; k < 4; k++)
+    {
+        int start = at;
+        at += snprintf(line + at, sizeof(line) - at, "%s%s:", at ? "; " : "", kinds[k]);
+        for (UINT o = 0; o < OUTCOMES; o++)
+        {
+            LONG n = InterlockedExchange(&outcomes[k][o], 0);
+            total += n;
+            if (n && at < (int)sizeof(line) - 64)
+                at += snprintf(line + at, sizeof(line) - at, " %s %ld,", outcome_names[o], n);
+        }
+        if (line[at - 1] == ',')
+            line[--at] = 0;
+        else
+            line[at = start] = 0; /* none of this kind */
+    }
+    if (total)
+        rebox_log("d3d12_xs:   console compiles since the last census: %s", line);
+}
+
 void console_display_draws_log(void)
 {
+    outcomes_log();
     AcquireSRWLockExclusive(&display_draw_lock);
     for (UINT i = 0; i < display_draw_count; i++)
         rebox_log("d3d12_xs:   %s %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx",
@@ -1436,7 +1527,14 @@ UINT64 console_last_draw_vs(void)
  * (default 150; 0: no budget), graphics stages are skipped for the rest of the frame, their draws
  * left out as while a program first compiles; the next frame goes on from there (VIctory, GPL-3.0,
  * facts: a 500 ms budget a frame for pipelines, after which draws are dropped). Compute dispatches
- * aren't skipped: what they write can be read back by the title. */
+ * aren't skipped: what they write can be read back by the title.
+ *
+ * Only slow calls count against it: those that took REBOX_FRAME_COMPILE_SLOW_MS (default 10; 0
+ * counts every call) or more, a new variant or a wait that ran out. Every call used to count, and in
+ * a world those that hit the memo still take 1 to 3 ms each (most of it making bindings): a frame's
+ * first hundred or so dispatches spent the budget, and every later scene draw, mesh draw and
+ * ExecuteIndirect of every frame was skipped (G-buffer, shadows, lighting, tone mapping), while the
+ * display-sized targets' draws, exempt, drew the UI over black. */
 static volatile LONG compile_frame;
 static volatile LONG64 frame_compile_ticks;
 static volatile LONG budget_frame, budget_skips;
@@ -1444,6 +1542,99 @@ static volatile LONG budget_frame, budget_skips;
 void console_frame_presented(void)
 {
     InterlockedIncrement(&compile_frame);
+}
+
+static LONG64 slow_compile_ticks(void)
+{
+    static LONG64 slow = -1;
+    if (slow < 0)
+    {
+        char v[16];
+        DWORD n = GetEnvironmentVariableA("REBOX_FRAME_COMPILE_SLOW_MS", v, sizeof(v));
+        LONG ms = n && n < sizeof(v) ? atol(v) : 10;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        slow = ms > 0 ? f.QuadPart * ms / 1000 : 0;
+    }
+    return slow;
+}
+
+/* REBOX_FRAME_TRACE=<present>[-<present>][,...] (at most 8 ranges): during those presents (counted
+ * as the census counts them), a line for every ReboxConsoleCompile call, in order, with the stage,
+ * what came of it and the draw, ExecuteIndirect or dispatch that asked (proxy.c names those, with
+ * its first render target), to set a frame's passes beside a reference trace. */
+static LONG trace_ranges[8][2];
+static UINT trace_range_count;
+static __thread struct { const char *op; UINT a, b, c, width, height, format; } trace_op;
+
+static BOOL CALLBACK trace_parse(INIT_ONCE *once, void *param, void **ctx)
+{
+    const char *v = getenv("REBOX_FRAME_TRACE");
+    while (v && *v && trace_range_count < ARRAYSIZE(trace_ranges))
+    {
+        char *end;
+        LONG from = strtol(v, &end, 10), to = from;
+        if (end == v)
+            break;
+        if (*end == '-')
+            to = strtol(end + 1, &end, 10);
+        trace_ranges[trace_range_count][0] = from;
+        trace_ranges[trace_range_count++][1] = to;
+        v = *end == ',' ? end + 1 : end;
+        if (*end != ',')
+            break;
+    }
+    if (trace_range_count)
+        rebox_log("d3d12_xs: REBOX_FRAME_TRACE: tracing %u range(s) of presents from %ld", trace_range_count,
+                  trace_ranges[0][0]);
+    return TRUE;
+}
+
+BOOL console_trace_active(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    LONG frame = compile_frame;
+    InitOnceExecuteOnce(&once, trace_parse, NULL, NULL);
+    for (UINT i = 0; i < trace_range_count; i++)
+        if (frame >= trace_ranges[i][0] && frame <= trace_ranges[i][1])
+            return TRUE;
+    return FALSE;
+}
+
+void console_trace_op(const char *op, UINT a, UINT b, UINT c, UINT width, UINT height, UINT format)
+{
+    trace_op.op = op;
+    trace_op.a = a;
+    trace_op.b = b;
+    trace_op.c = c;
+    trace_op.width = width;
+    trace_op.height = height;
+    trace_op.format = format;
+}
+
+static void trace_call(const struct rebox_compile_in *in, HRESULT hr)
+{
+    static const char *const kinds[4] = { "compute", "vertex", "pixel", "mesh" };
+    static volatile LONG seq;
+    const struct rebox_deferred_shader *h = in ? in->shader : NULL;
+    UINT64 code = 0, stage = 0;
+    char message[512] = "", op[128] = "";
+
+    if (h && in->shader_size >= sizeof(*h) && h->code_offset <= in->shader_size
+            && h->code_dwords * 4ull <= in->shader_size - h->code_offset)
+    {
+        code = hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+        stage = console_stage_id(in->shader, in->shader_size);
+    }
+    if (FAILED(hr))
+        ReboxConsoleLastResult(message, sizeof(message));
+    if (trace_op.op)
+        snprintf(op, sizeof(op), " | %s %u %u %u rt %ux%u f%u", trace_op.op, trace_op.a, trace_op.b, trace_op.c,
+                 trace_op.width, trace_op.height, trace_op.format);
+    rebox_log("d3d12_xs: trace %ld #%ld [%04lx] %s %016llx stage %016llx: %s%s%s%s%s", compile_frame,
+              InterlockedIncrement(&seq), GetCurrentThreadId(), kinds[outcome_kind(h, in ? in->shader_size : 0)],
+              (unsigned long long)code, (unsigned long long)stage, outcome_names[min(call_outcome, OUTCOMES - 1)],
+              *message ? " (" : "", message, *message ? ")" : "", op);
 }
 
 static LONG64 frame_budget_ticks(void)
@@ -1586,7 +1777,7 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
 {
     const struct rebox_deferred_shader *h = in->shader;
     BOOL graphics = in->shader_size >= sizeof(*h) && h->version == 2;
-    LONG64 budget = frame_budget_ticks(), started;
+    LONG64 budget = frame_budget_ticks(), started, elapsed;
     LONG frame = compile_frame;
     HRESULT hr;
 
@@ -1601,6 +1792,7 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
         if (!(n & (n - 1)) && n >= 64)
             rebox_log("d3d12_xs: console shaders: %ld graphics stages skipped past their frame's compile budget", n);
         set_last(E_PENDING, "past this frame's compile budget", NULL);
+        call_outcome = OUTCOME_BUDGET;
         return E_PENDING;
     }
     started = ticks_now();
@@ -1611,7 +1803,10 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
         hr = compile_now(in, out, FALSE);
     else
         hr = bounded_compile(in, out, graphics);
-    InterlockedAdd64(&frame_compile_ticks, ticks_now() - started);
+    call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr == E_PENDING ? OUTCOME_WAIT : OUTCOME_FAILED;
+    elapsed = ticks_now() - started;
+    if (elapsed >= slow_compile_ticks())
+        InterlockedAdd64(&frame_compile_ticks, elapsed);
     return hr;
 }
 
@@ -1635,7 +1830,11 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
     }
 
     if (!async_compiles() || !in || !in->shader || !in->shader_size || !out)
-        return compile_now(in, out, FALSE);
+    {
+        HRESULT hr = compile_now(in, out, FALSE);
+        call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : OUTCOME_FAILED;
+        return hr;
+    }
     key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
     switch (program_claim(key, TRUE))
     {
@@ -1643,26 +1842,43 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
         /* Ahead of the rest: a stage drawing into a display-sized target (the UI, text, the final
          * composite). A scene queues hundreds of programs at once, and the intro's title card's
          * text waited behind them until the run ended. */
-        queue_compile(key, in, in_display_draw && current_draw.target >= 0);
+        queue_compile(key, in, in_display_draw && current_draw.target >= 0, 0);
         set_last(E_PENDING, "compiling in the background", NULL);
+        call_outcome = OUTCOME_QUEUED;
         return E_PENDING;
     case PROGRAM_PENDING:
         set_last(E_PENDING, "compiling in the background", NULL);
+        call_outcome = OUTCOME_QUEUED;
         return E_PENDING;
     case PROGRAM_FAILED:
-        set_last(E_FAIL, "its background compile failed", NULL);
+    {
+        UINT retry = 0;
+        /* Ahead of the rest, so it runs while this call's tables still hold what they hold now. */
+        if (program_retry(key, &retry))
+            queue_compile(key, in, TRUE, retry);
+        set_last(E_FAIL, retry ? "its background compile failed; compiling it again in the background"
+                               : "its background compile failed", NULL);
+        call_outcome = OUTCOME_PROGRAM_FAILED;
         return E_FAIL;
+    }
     default:
         return compile_within_budget(in, out);
     }
 }
 
 /* With REBOX_WATCH_STAGE naming a graphics stage, each of its compiles' results is logged (the first
- * 64): whether its draws are skipped, and why. */
+ * 64): whether its draws are skipped, and why. Each call's outcome is counted for the census, and
+ * traced under REBOX_FRAME_TRACE. */
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
-    HRESULT hr = console_compile(in, out);
+    HRESULT hr;
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
+
+    call_outcome = OUTCOME_FAILED;
+    hr = console_compile(in, out);
+    InterlockedIncrement(&outcomes[outcome_kind(h, in ? in->shader_size : 0)][min(call_outcome, OUTCOMES - 1)]);
+    if (console_trace_active())
+        trace_call(in, hr);
 
     if (getenv("REBOX_WATCH_STAGE") && h && in->shader_size >= sizeof(*h) && h->version == 2
             && h->code_offset <= in->shader_size && h->code_dwords * 4ull <= in->shader_size - h->code_offset)

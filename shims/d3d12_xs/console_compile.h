@@ -118,6 +118,10 @@ void console_display_draw_end(void);
 void console_display_draws_log(void);
 /* A present: the next frame's compile budget starts (console_compile.c). */
 void console_frame_presented(void);
+/* REBOX_FRAME_TRACE: whether this present is traced, and the draw, ExecuteIndirect or dispatch about
+ * to compile its stages (op NULL: none), with its first render target (console_compile.c). */
+BOOL console_trace_active(void);
+void console_trace_op(const char *op, UINT a, UINT b, UINT c, UINT width, UINT height, UINT format);
 
 UINT64 console_stage_id(const void *shader, SIZE_T size);
 BOOL console_stage_watched(UINT64 id);
