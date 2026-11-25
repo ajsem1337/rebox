@@ -23,6 +23,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d12.h>
+#include <psapi.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3778,6 +3779,18 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
                           finished ? total * ms / finished : 0.0, longest * ms, gpu_latency_head - gpu_latency_tail,
                           oldest * ms, gpu_latency_tail != gpu_latency_head
                           ? gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].queue : NULL);
+            /* Memory, every 10 s: a run killed for using too much (a host OOM watcher) left no other trace. */
+            {
+                PROCESS_MEMORY_COUNTERS_EX pm = { sizeof(pm) };
+                MEMORYSTATUSEX host = { sizeof(host) };
+                K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof(pm));
+                GlobalMemoryStatusEx(&host);
+                rebox_log("d3d12_xs: memory: private %llu MiB, working set %llu MiB; GPU memory chunks %llu MiB, "
+                          "%llu MiB of them title memory in place; host %llu of %llu MiB free",
+                          (unsigned long long)pm.PrivateUsage >> 20, (unsigned long long)pm.WorkingSetSize >> 20,
+                          (unsigned long long)ReboxGpuBytesInUse() >> 20, (unsigned long long)gpu_memory_adopted_bytes() >> 20,
+                          (unsigned long long)host.ullAvailPhys >> 20, (unsigned long long)host.ullTotalPhys >> 20);
+            }
             total = longest = finished = 0;
             last_log = now.QuadPart;
         }

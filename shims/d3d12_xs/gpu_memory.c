@@ -343,6 +343,19 @@ BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size)
     return found;
 }
 
+/* Bytes of title memory made GPU memory in place: the title's own pages stay behind them. */
+UINT64 gpu_memory_adopted_bytes(void)
+{
+    UINT64 n = 0;
+
+    AcquireSRWLockShared(&lock);
+    for (struct chunk *c = chunks; c; c = c->next)
+        if (c->adopted)
+            n += c->size;
+    ReleaseSRWLockShared(&lock);
+    return n;
+}
+
 UINT64 WINAPI ReboxGpuBytesInUse(void)
 {
     UINT64 n;
