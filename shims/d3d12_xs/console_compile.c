@@ -1106,8 +1106,23 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
         }
         return FALSE;
     }
-    if (!address || !check || address + check > 0x400000000000ull
-            || (address + check > 0x200000000000ull && address < 0x210000000000ull))
+    /* In the identity window (vkd3d-proton's host-visible heaps): not title memory, and no
+     * allocation there passes 256 MiB. A V# with an all-ones record count there (a raw pointer of
+     * no stated size) kept its 4 GiB-times-stride length, and a garbage index read 160 GiB past
+     * the window's last allocation: a GPU fault, the same address every run. */
+    if (address + check > 0x200000000000ull && address < 0x210000000000ull)
+    {
+        if (*bytes > (256ull << 20))
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx in the GPU memory window: cut to 256 MiB",
+                          (unsigned long long)address, (unsigned long long)*bytes);
+            *bytes = 256ull << 20;
+        }
+        return TRUE;
+    }
+    if (!address || !check || address + check > 0x400000000000ull)
         return TRUE;
     if (!resolved)
     {
