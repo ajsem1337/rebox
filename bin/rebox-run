@@ -132,7 +132,7 @@ if [[ -n $console_sys ]]; then
         found=$(find "$console_sys" -maxdepth 1 -iname "$name" -print -quit)
         if [[ -n $found ]]; then
             install -m 644 "$found" "$console_dlls/$name"
-            echo "rebox-run: using the console's own $name from the dump's system partition" >&2
+            echo "rebox-run: using $name from an external provider: $found" >&2
         fi
     done
 fi
