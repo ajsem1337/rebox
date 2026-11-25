@@ -163,7 +163,9 @@ static UINT submissions;
 #define WATCH_BUDGET 512                   /* textures fingerprinted per submission */
 #define FULL_HASH_MAX (4u << 20)           /* textures this size or smaller are hashed whole */
 #define FULL_HASH_BUDGET (4u << 20)        /* bytes hashed whole per submission */
-#define HOT_BUDGET (32u << 20)             /* bytes of hot textures checked every submission (a movie's planes; 8 MiB left some out) */
+#define HOT_BUDGET (32u << 20)             /* bytes of rewritten textures checked every submission (a movie's planes; 8 MiB left some out) */
+#define BYTE_HOT_BUDGET (8u << 20)         /* and of 1-byte presumed-hot ones (A8 glyph atlases, R8 planes), in turn */
+#define OTHER_HOT_BUDGET (4u << 20)        /* and of the other presumed-hot ones, in turn */
 #define SAFETY_MS 4000                     /* a write-tracked texture is fingerprinted at most this often */
 
 static BOOL full_hash(const struct title_texture *t)
@@ -363,6 +365,24 @@ static BOOL hot(const struct title_texture *t)
     return t->uploads >= 2
             || (t->uploads == 1 && t->surface.mips == 1 && detile_element(t->surface.format, &block) && block == 1);
 }
+
+/* Hot textures by how sure: rewritten (uploaded again since made), or presumed so (one upload,
+ * one mip, uncompressed) with 1-byte texels (glyph atlases, video planes) or others. 0: not hot. */
+enum { HOT_REWRITTEN = 1, HOT_BYTE, HOT_OTHER };
+
+static int hot_tier(const struct title_texture *t)
+{
+    UINT block = 0;
+    if (!hot(t))
+        return 0;
+    if (t->uploads >= 2)
+        return HOT_REWRITTEN;
+    return detile_element(t->surface.format, &block) == 1 ? HOT_BYTE : HOT_OTHER;
+}
+
+/* Where each presumed-hot tier's turn got to (its textures counted in list order), and how many
+ * submissions its last full turn took (for the stats log). */
+static UINT hot_cursor[HOT_OTHER + 1], hot_turn[HOT_OTHER + 1], hot_turn_start[HOT_OTHER + 1];
 
 /* Write-watched title memory, under the lock: xmem's watched reservations (ReboxWatchedMemory),
  * each with the span its watched textures lie in (only that is asked about), and the GPU memory
@@ -635,6 +655,20 @@ static BOOL safety_due(struct title_texture *t, ULONGLONG now)
     return TRUE;
 }
 
+/* Under the lock: a hot texture's fingerprint compared, its bytes counted in *hashed if hashed
+ * whole; TRUE if it changed (made dirty). */
+static BOOL hot_check(struct title_texture *t, UINT64 *hashed)
+{
+    if (t->watched || t->tracked || t->target || t->dirty || t->gpu_written || t->unreadable || !still_readable(t))
+        return FALSE;
+    *hashed += full_hash(t) ? t->size : 0;
+    if (fingerprint(t) == t->fingerprint)
+        return FALSE;
+    t->dirty = TRUE;
+    InterlockedIncrement(&dirty_count);
+    return TRUE;
+}
+
 /* Called with the lock held. */
 static void watch(void)
 {
@@ -689,15 +723,67 @@ static void watch(void)
      * the decoder rewrites every frame and the round robin reached only every few frames, so the
      * video jumped back to a buffer's older frame. Not render targets: uploading those more often
      * overwrote what the GPU drew into them (menu text got worse). */
-    hashed = 0;
-    for (t = textures; sample && t && hashed < HOT_BUDGET; t = t->next)
-        if (hot(t) && !t->watched && !t->tracked && !t->target && !t->dirty && !t->gpu_written && !t->unreadable
-                && still_readable(t) && (hashed += full_hash(t) ? t->size : 0, fingerprint(t) != t->fingerprint))
+    /* The rewritten ones first, from the newest, within HOT_BUDGET; then the presumed-hot ones of
+     * each tier in turn, from where the last submission's turn stopped, within the tier's budget
+     * and what the rewritten ones left. From the newest only, the budget went to the textures a
+     * streaming world had made since: a credits sequence's glyph atlas, made early, was never
+     * reached, nor (being presumed hot) by the round robin's budget soon enough, and its new
+     * letters were missing. Large ones are sampled at no cost to a budget, all of them. */
+    if (sample)
+    {
+        UINT64 left = HOT_BUDGET;
+        hashed = 0;
+        for (t = textures; t; t = t->next)
+            if (hot_tier(t) == HOT_REWRITTEN && hashed < HOT_BUDGET && hot_check(t, &hashed))
+                changed++;
+        left = hashed < HOT_BUDGET ? HOT_BUDGET - hashed : 0;
+        for (int tier = HOT_BYTE; tier <= HOT_OTHER; tier++)
         {
-            t->dirty = TRUE;
-            InterlockedIncrement(&dirty_count);
-            changed++;
+            UINT64 budget = (tier == HOT_BYTE ? BYTE_HOT_BUDGET : OTHER_HOT_BUDGET) + left;
+            UINT index = 0, next = 0, count = 0;
+            BOOL stopped = FALSE;
+            hashed = 0;
+            /* From the cursor to the end, then from the start up to it. */
+            for (int pass = 0; pass < 2; pass++)
+            {
+                index = 0;
+                for (t = textures; t; t = t->next)
+                {
+                    if (hot_tier(t) != tier)
+                        continue;
+                    index++;
+                    if (pass == 0)
+                        count++;
+                    if ((pass == 0) != (index > hot_cursor[tier]))
+                        continue;
+                    if (!full_hash(t))
+                    {
+                        if (hot_check(t, &hashed))
+                            changed++;
+                        continue;
+                    }
+                    if (stopped)
+                        continue;
+                    if (hashed >= budget)
+                    {
+                        stopped = TRUE;
+                        next = index - 1;
+                        continue;
+                    }
+                    if (hot_check(t, &hashed))
+                        changed++;
+                }
+            }
+            if (!stopped || next >= count)
+            {
+                next = 0;
+                hot_turn[tier] = submissions - hot_turn_start[tier];
+                hot_turn_start[tier] = submissions;
+            }
+            hot_cursor[tier] = next;
+            left = hashed < budget ? budget - hashed : 0;
         }
+    }
     if (changed)
     {
         static LONG logged;
@@ -1302,6 +1388,8 @@ static void upload_stats_log(void)
               upload_stats.objects * ms, upload_stats.record * ms, upload_stats.submit * ms, upload_stats.uploads,
               upload_stats.bytes / 1048576.0);
     memset(&upload_stats, 0, sizeof(upload_stats));
+    rebox_log("d3d12_xs: presumed-hot textures' last full turns took %u submissions (1-byte texels) and %u (others)",
+              hot_turn[HOT_BYTE], hot_turn[HOT_OTHER]);
     if (tracked_dirty)
     {
         UINT count = 0, tracked = 0;
