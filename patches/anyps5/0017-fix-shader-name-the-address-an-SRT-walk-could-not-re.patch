@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 06:43:26 +0000
+Subject: [PATCH 17/17] fix(shader): name the address an SRT walk could not
+ read through user data
+
+A descriptor read through a user-data pointer to memory the request does
+not hold is refused at record time ("descriptor source N dword 0:
+ReadConst(GetSrtResource, ...) where slot M = LoadAddressU32(
+GetAddressResource(GetUserData, ...))"), but the error did not say which
+pointer or address: a host that left a region out of the request (a
+title's mesh stages read their tables through user SGPRs into GPU memory
+a host had not listed) could not tell which.
+
+The refusal now ends with "it reads 0x... through user data word N,
+which the request's memory does not hold" (or "through a computed
+pointer"). Nothing else changes: such a read is still refused.
+
+Tested: tests/DescriptorSelectionTests.cpp loads a V# through a
+user-data pointer to unmapped memory and checks the message names the
+word and the address; without the change it names neither.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Optimization/SrtWalker/SrtEvaluator.hpp    |  8 ++++++++
+ .../src/SrtWalker/SrtDescriptorEvaluation.cpp  |  6 ++++++
+ .../src/SrtWalker/SrtEvaluator.cpp             | 12 ++++++++++++
+ .../tests/DescriptorSelectionTests.cpp         | 18 ++++++++++++++++++
+ .../fix-shader-unreadable-root-message.md      |  5 +++++
+ 5 files changed, 49 insertions(+)
+ create mode 100644 docs/dev/debt/changes/fix-shader-unreadable-root-message.md
+
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtEvaluator.hpp b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtEvaluator.hpp
+index 83084fad44..f511984e59 100644
+--- a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtEvaluator.hpp
++++ b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtEvaluator.hpp
+@@ -14,6 +14,14 @@
+ 
+ namespace ShaderRecompiler::Detail {
+ 
++struct UnreadableRead {
++    std::uint64_t address = 0;
++    std::int32_t userDataWord = -1;
++    bool recorded = false;
++};
++
++UnreadableRead& LastUnreadableRead();
++
+ class EvaluatedValues {
+ public:
+     bool Find(const IrValue* key, std::uint64_t& value) const {
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
+index c7ab511132..07e4926ccd 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
+@@ -146,6 +146,7 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
+                 const auto remainingBytes = source->dwordCount > 1u ? static_cast<std::size_t>(source->dwordCount - index) * sizeof(std::uint32_t) : 0u;
+                 evaluator.SetDescriptorBytes(remainingBytes);
+                 cleanEvaluator.SetDescriptorBytes(remainingBytes);
++                LastUnreadableRead() = {};
+                 const bool evaluatedDword = evaluator.Evaluate(TNode::SourceDword(program, sourceIndex, index), value.dwords[index]);
+                 evaluator.SetDescriptorBytes(0u);
+                 cleanEvaluator.SetDescriptorBytes(0u);
+@@ -162,6 +163,11 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
+                         const auto slot = dword->Argument(1)->Resolve()->ImmediateU32();
+                         if (slot < program.srtReads.size()) detail += " where slot " + std::to_string(slot) + " = " + DescribeValue(program.srtReads[slot].value, 8);
+                     }
++                    if (const auto unreadable = LastUnreadableRead(); unreadable.recorded) {
++                        char address[32];
++                        std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(unreadable.address));
++                        detail += std::string("; it reads ") + address + (unreadable.userDataWord >= 0 ? " through user data word " + std::to_string(unreadable.userDataWord) : std::string(" through a computed pointer")) + ", which the request's memory does not hold";
++                    }
+                     return Fail("descriptor source " + std::to_string(sourceIndex) + " dword " + std::to_string(index) + ": " + detail);
+                 }
+             }
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
+index e4f352391e..df807f2e08 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
+@@ -23,6 +23,11 @@
+ 
+ namespace ShaderRecompiler::Detail {
+ 
++UnreadableRead& LastUnreadableRead() {
++    struct UnreadableReadStorage {};
++    return HostThreadLocal<UnreadableRead, UnreadableReadStorage>();
++}
++
+ namespace {
+ 
+ struct DenseValuePool {
+@@ -277,6 +282,13 @@ bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& re
+         const bool ok = _runtime.readMemory(_runtime.userContext, address, &word);
+         if (scoped) static_cast<void>(_runtime.descriptorScope(_runtime.userContext, 0u));
+         if (!ok) {
++            std::int32_t userDataWord = -1;
++            const TNode source = handle.Argument(0);
++            if (!source.HasImmediate() && source.Opcode() == IrOpcode::GetUserData) {
++                const auto reg = RegIndex(static_cast<ScalarReg>(source.Argument(0).RegisterIndex()));
++                if (reg >= _program.userDataBase) userDataWord = static_cast<std::int32_t>(reg - _program.userDataBase);
++            }
++            LastUnreadableRead() = {address, userDataWord, true};
+             return false;
+         }
+     } else {
+diff --git a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+index a8ce0ab8b0..7f5f5e7219 100644
+--- a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
++++ b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+@@ -29,6 +29,7 @@ void Require(bool condition, const char* message) {
+ 
+ constexpr std::uint32_t TableAddress = 0x20000000u;
+ constexpr std::uint32_t OutputAddress = 0x30000000u;
++constexpr std::uint32_t UnmappedAddress = 0x50000000u;
+ constexpr std::uint32_t TableEntries = 64u;
+ 
+ constexpr std::array<std::uint32_t, 20> WaterfallShader{
+@@ -42,6 +43,10 @@ constexpr std::array<std::uint32_t, 14> BranchStoreShader{
+     0x7e0202f2u, 0x7e040280u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
+ };
+ 
++constexpr std::array<std::uint32_t, 7> TableBufferShader{
++    0xbe850380u, 0xf4080202u, 0xfa000010u, 0xbf8cc07fu, 0xe0701000u, 0x80020000u, 0xbf810000u,
++};
++
+ std::array<std::uint32_t, 8> ImageDescriptor(std::uint32_t entry) {
+     std::array<std::uint32_t, 8> words{};
+     words[0] = (0x40000000u + entry * 0x10000u) >> 8u;
+@@ -130,12 +135,25 @@ void TestBranchSelectedStoreIsSplit() {
+     Require(CountOps(words, spv::OpImageWrite) == 2u, "a store through a branch-selected T# becomes one store per T#");
+ }
+ 
++void TestUnreadableUserDataRootIsNamed() {
++    try {
++        static_cast<void>(Compile(TableBufferShader, UnmappedAddress));
++    } catch (const std::exception& error) {
++        const std::string_view message(error.what());
++        Require(message.find("through user data word 4") != std::string_view::npos, "the refusal names the user-data word the walk started from");
++        Require(message.find("0x50000010") != std::string_view::npos, "the refusal names the address it could not read");
++        return;
++    }
++    Require(false, "a V# read through a user-data pointer to memory the request does not hold is refused");
++}
++
+ }
+ 
+ int main() {
+     try {
+         TestWaterfallReadsAnImageTable();
+         TestBranchSelectedStoreIsSplit();
++        TestUnreadableUserDataRootIsNamed();
+     } catch (const std::exception& error) {
+         std::fprintf(stderr, "%s\n", error.what());
+         return 1;
+diff --git a/docs/dev/debt/changes/fix-shader-unreadable-root-message.md b/docs/dev/debt/changes/fix-shader-unreadable-root-message.md
+new file mode 100644
+index 0000000000..98259b0673
+--- /dev/null
++++ b/docs/dev/debt/changes/fix-shader-unreadable-root-message.md
+@@ -0,0 +1,5 @@
++# shader
++
++## change [uniform fill or table base]
++
++- A value read through a null or unmapped pointer still throws at record time if a [uniform fill or table base](../../../core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp) needs it, or if the pointer comes from user data and is not null, even if the console skips the read. The error names the address and the user-data word it was read through (`it reads 0x... through user data word N, which the request's memory does not hold`).
+-- 
+2.55.0
+

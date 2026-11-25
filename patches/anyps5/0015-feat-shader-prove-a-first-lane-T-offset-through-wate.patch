@@ -1,0 +1,654 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 06:42:48 +0000
+Subject: [PATCH 15/17] feat(shader): prove a first-lane T# offset through
+ waterfall loop masks
+
+A T# loaded with s_load_dwordx8 from a user-data table at an offset taken
+from v_readfirstlane inside a waterfall loop stopped with "GetImageResource
+dword 0 is not a valid runtime value". The offset is the first active lane
+of a VGPR the shader set only in some lanes, so its value is a select of
+the lane's index and an old value, and the table column reads it as the
+index only when the read's active mask implies the select's condition.
+That proof followed LogicalAnd and nothing else; a waterfall loop's mask
+is a Phi of the entry mask and the lanes still to do, and a mask restored
+from a saved EXEC is the lane's bit of a ballot.
+
+ActiveMaskSelects, now used wherever a select under a first-lane mask is
+resolved to its active arm (table columns, the SRT validator, evaluator
+and tape), also proves the implication through:
+
+- LogicalAnd, LogicalOr, LogicalNot and SelectU1 on either side, and Phis
+  and selects whose selector is a constant;
+- mask Phis, by induction over their loop, used only when the condition
+  is defined before the loop;
+- the lane bit of a saved EXEC or VCC word made of ballots, ANDs, ORs and
+  complements (wave32, and both halves of wave64), and the condition's
+  own lane bit of the same word.
+
+Each query memoizes its steps and gives up after 2^20 of them or 24 Phis
+deep. ActiveMaskImplies, which the evaluators ask of every Bool value
+under a mask, keeps its LogicalAnd-only proof: the full one there made a
+compile take minutes.
+
+Offline (no guest memory, under Wine), 100 of the 128 compute shaders of
+a retail title that stopped so now compile, and all 100 validate. The
+other 28 still stop there; those looked at need a lane mask loaded from
+memory, or a proof that relates a mask and a condition edge by edge
+across a merge (pairing the Phis of one block was tried: it did not
+settle them, and made some compiles take minutes). The largest of the
+100 take up to two minutes each.
+
+Tested: tests/DescriptorSelectionTests.cpp compiles a waterfall loop that
+loads a T# per lane from a user-data table; it stops with the old error
+without the change and binds an image table with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  16 +
+ .../SrtWalker/SrtInstructionPredicates.hpp    |  19 ++
+ .../Optimization/src/ResourceTracker.cpp      |   6 +-
+ .../src/SrtWalker/SrtEvaluator.cpp            |   4 +-
+ .../SrtWalker/SrtInstructionPredicates.cpp    | 284 ++++++++++++++++++
+ .../src/SrtWalker/SrtRuntimeValidator.cpp     |   2 +-
+ .../Optimization/src/SrtWalker/SrtTape.cpp    |   2 +-
+ .../tests/DescriptorSelectionTests.cpp        | 122 ++++++++
+ .../feat-shader-waterfall-mask-proof.md       |   5 +
+ 9 files changed, 453 insertions(+), 7 deletions(-)
+ create mode 100644 core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+ create mode 100644 docs/dev/debt/changes/feat-shader-waterfall-mask-proof.md
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index 6b717a9c8f..1bba058631 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -484,6 +484,22 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET descriptor_selection_tests)
++        add_test_executable(descriptor_selection_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DescriptorSelectionTests.cpp")
++        target_link_libraries(descriptor_selection_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-opt SPIRV-Tools-static)
++        target_include_directories(descriptor_selection_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(descriptor_selection_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(descriptor_selection_tests)
++        add_test(NAME descriptor_selection COMMAND descriptor_selection_tests)
++        set_tests_properties(descriptor_selection PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(descriptor_selection_tests PRIVATE libc)
++            set_tests_properties(descriptor_selection PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND NOT TARGET loop_guard_stage_tests)
+         add_test_executable(loop_guard_stage_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardStageTests.cpp")
+         target_link_libraries(loop_guard_stage_tests PRIVATE ${target} ${runtimeTarget})
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtInstructionPredicates.hpp b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtInstructionPredicates.hpp
+index 0fee012b22..2d25066066 100644
+--- a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtInstructionPredicates.hpp
++++ b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker/SrtInstructionPredicates.hpp
+@@ -18,6 +18,7 @@ bool IsRuntimeUniformOp(IrOpcode opcode);
+ bool HoldsFoldableValue(IrValue* value, std::uint32_t depth);
+ 
+ bool ActiveMaskImplies(const IrResourcePlan& program, const IrValue* mask, const IrValue* condition);
++bool ActiveMaskSelects(const IrResourcePlan& program, const IrValue* mask, const IrValue* condition);
+ 
+ inline bool ActiveMaskImplies(const IrResourcePlan& program, IrValue* mask, IrValue* condition) {
+     return ActiveMaskImplies(program, static_cast<const IrValue*>(mask), static_cast<const IrValue*>(condition));
+@@ -37,6 +38,24 @@ bool ActiveMaskImplies(const IrResourcePlan& program, const TNode& mask, const T
+     return ActiveMaskImplies(program, mask.Value(), condition.Value());
+ }
+ 
++inline bool ActiveMaskSelects(const IrResourcePlan& program, IrValue* mask, IrValue* condition) {
++    return ActiveMaskSelects(program, static_cast<const IrValue*>(mask), static_cast<const IrValue*>(condition));
++}
++
++inline bool ActiveMaskSelects(const IrResourcePlan& program, const IrValue* mask, IrValue* condition) {
++    return ActiveMaskSelects(program, mask, static_cast<const IrValue*>(condition));
++}
++
++inline bool ActiveMaskSelects(const IrResourcePlan& program, IrValue* mask, const IrValue* condition) {
++    return ActiveMaskSelects(program, static_cast<const IrValue*>(mask), condition);
++}
++
++template<typename TNode>
++requires (!std::is_pointer_v<std::decay_t<TNode>>)
++bool ActiveMaskSelects(const IrResourcePlan& program, const TNode& mask, const TNode& condition) {
++    return ActiveMaskSelects(program, mask.Value(), condition.Value());
++}
++
+ }
+ 
+ #endif
+diff --git a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+index 50ada76e7b..ab5024364f 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+@@ -571,7 +571,7 @@ private:
+         if (value->Opcode() == IrOpcode::ReadFirstLane && value->ArgumentCount() == 2u) {
+             const auto* activeMask = value->Argument(1)->Resolve();
+             value = value->Argument(0)->Resolve();
+-            while (value->Opcode() == IrOpcode::SelectU32 && value->ArgumentCount() == 3u && Detail::ActiveMaskImplies(m_program.Resources(), activeMask, value->Argument(0))) {
++            while (value->Opcode() == IrOpcode::SelectU32 && value->ArgumentCount() == 3u && Detail::ActiveMaskSelects(m_program.Resources(), activeMask, value->Argument(0))) {
+                 value = value->Argument(1)->Resolve();
+             }
+         }
+@@ -606,7 +606,7 @@ private:
+ 
+     IrValue* ActiveLaneValue(IrValue* value, const IrValue* mask) const {
+         value = value->Resolve();
+-        while (mask != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u && Detail::ActiveMaskImplies(m_program.Resources(), mask, value->Argument(0))) {
++        while (mask != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u && Detail::ActiveMaskSelects(m_program.Resources(), mask, value->Argument(0))) {
+             value = value->Argument(1)->Resolve();
+         }
+         return value;
+@@ -783,7 +783,7 @@ private:
+     bool ParseFirstLaneOffset(IrValue* value, const IrValue* mask, FirstLaneOffset& form, std::uint32_t depth) const {
+         std::uint32_t addend = 0;
+         value = SplitImmediateAddend(value, addend);
+-        while (mask != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u && Detail::ActiveMaskImplies(m_program.Resources(), mask, value->Argument(0))) {
++        while (mask != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u && Detail::ActiveMaskSelects(m_program.Resources(), mask, value->Argument(0))) {
+             value = SplitImmediateAddend(value->Argument(1), addend);
+         }
+         std::uint32_t shift = 0;
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
+index 0a70e30924..e4f352391e 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtEvaluator.cpp
+@@ -91,7 +91,7 @@ bool BasicEvaluator<TNode>::EvaluateWide(TNode value, std::uint64_t& result) {
+         result = 1u;
+         return true;
+     }
+-    if (_masked && IsRuntimeSelect(inst.Opcode()) && inst.ArgumentCount() == 3 && ActiveMaskImplies(_program, _activeMask, inst.Argument(0))) {
++    if (_masked && IsRuntimeSelect(inst.Opcode()) && inst.ArgumentCount() == 3 && ActiveMaskSelects(_program, _activeMask, inst.Argument(0))) {
+         return EvaluateWide(inst.Argument(1), result);
+     }
+     if (inst.Id() < _dense.Size()) {
+@@ -408,7 +408,7 @@ bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue*
+     std::pmr::monotonic_buffer_resource arena(scratch.data(), scratch.size());
+     std::pmr::unordered_map<const IrValue*, bool> known(&arena);
+     const auto takesActiveArm = [activeMask, &program](const IrValue* current) {
+-        return activeMask != nullptr && IsRuntimeSelect(current->Opcode()) && current->ArgumentCount() == 3 && ActiveMaskImplies(program, activeMask, current->Argument(0));
++        return activeMask != nullptr && IsRuntimeSelect(current->Opcode()) && current->ArgumentCount() == 3 && ActiveMaskSelects(program, activeMask, current->Argument(0));
+     };
+     std::pmr::vector<IrValue*> required(&arena);
+     const auto requirements = [&program, &takesActiveArm, &required](IrValue* current) {
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp
+index 4be45ba7e9..5b971eab26 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp
+@@ -1,6 +1,10 @@
+ #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+ 
+ #include <algorithm>
++#include <array>
++#include <map>
++#include <optional>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace ShaderRecompiler::Detail {
+@@ -55,6 +59,281 @@ bool IsRuntimeSelect(IrOpcode opcode) {
+     return opcode == IrOpcode::SelectU1 || opcode == IrOpcode::SelectU32 || opcode == IrOpcode::SelectF32;
+ }
+ 
++namespace {
++
++class MaskProof {
++public:
++    explicit MaskProof(const IrResourcePlan& program) : m_program(program) {}
++
++    bool Implies(const IrValue* mask, const IrValue* condition, std::uint32_t depth) {
++        if (mask == nullptr || condition == nullptr) return false;
++        return Memo(mask->Resolve(), condition->Resolve(), Mode::Implies, 0u, depth, [&] { return ImpliesUncached(mask, condition, depth); });
++    }
++
++    bool Excludes(const IrValue* mask, const IrValue* condition, std::uint32_t depth) {
++        if (mask == nullptr || condition == nullptr) return false;
++        return Memo(mask->Resolve(), condition->Resolve(), Mode::Excludes, 0u, depth, [&] { return ExcludesUncached(mask, condition, depth); });
++    }
++
++private:
++    bool ImpliesUncached(const IrValue* mask, const IrValue* condition, std::uint32_t depth) {
++        if (!Step()) return false;
++        mask = mask->Resolve();
++        condition = condition->Resolve();
++        if (const auto known = KnownBool(condition); known.has_value()) return *known || KnownBool(mask) == std::optional<bool>(false);
++        if (mask == condition || EquivalentValue(m_program, mask, condition)) return true;
++        if (Binary(condition, IrOpcode::LogicalAnd)) return Implies(mask, condition->Argument(0), depth) && Implies(mask, condition->Argument(1), depth);
++        if (Binary(condition, IrOpcode::LogicalOr) && (Implies(mask, condition->Argument(0), depth) || Implies(mask, condition->Argument(1), depth))) return true;
++        if (condition->Opcode() == IrOpcode::LogicalNot && condition->ArgumentCount() == 1u) return Excludes(mask, condition->Argument(0), depth);
++        if (const IrValue* arm = KnownArm(condition); arm != nullptr) return Implies(mask, arm, depth);
++        if (Select(condition) && Implies(mask, condition->Argument(1), depth) && Implies(mask, condition->Argument(2), depth)) return true;
++        if (ConditionLaneBit(mask, condition, depth, true)) return true;
++        return MaskSide(mask, condition, depth, Mode::Implies);
++    }
++
++    bool ExcludesUncached(const IrValue* mask, const IrValue* condition, std::uint32_t depth) {
++        if (!Step()) return false;
++        mask = mask->Resolve();
++        condition = condition->Resolve();
++        if (const auto known = KnownBool(condition); known.has_value()) return !*known || KnownBool(mask) == std::optional<bool>(false);
++        if (condition->Opcode() == IrOpcode::LogicalNot && condition->ArgumentCount() == 1u) return Implies(mask, condition->Argument(0), depth);
++        if (Binary(condition, IrOpcode::LogicalOr)) return Excludes(mask, condition->Argument(0), depth) && Excludes(mask, condition->Argument(1), depth);
++        if (Binary(condition, IrOpcode::LogicalAnd) && (Excludes(mask, condition->Argument(0), depth) || Excludes(mask, condition->Argument(1), depth))) return true;
++        if (const IrValue* arm = KnownArm(condition); arm != nullptr) return Excludes(mask, arm, depth);
++        if (Select(condition) && Excludes(mask, condition->Argument(1), depth) && Excludes(mask, condition->Argument(2), depth)) return true;
++        if (ConditionLaneBit(mask, condition, depth, false)) return true;
++        if (mask->Opcode() == IrOpcode::LogicalNot && mask->ArgumentCount() == 1u && Implies(condition, mask->Argument(0), depth)) return true;
++        return MaskSide(mask, condition, depth, Mode::Excludes);
++    }
++
++    enum class Mode : std::uint8_t { Implies, Excludes, BitImplies, BitExcludes, BitSet, BitClear };
++
++    struct Assumption {
++        const IrValue* node = nullptr;
++        const IrValue* target = nullptr;
++        Mode mode = Mode::Implies;
++        std::uint32_t component = 0;
++        bool invariant = false;
++        bool checked = false;
++    };
++
++    struct MemoKey {
++        const IrValue* first = nullptr;
++        const IrValue* second = nullptr;
++        Mode mode = Mode::Implies;
++        std::uint32_t component = 0;
++        std::uint32_t depth = 0;
++        bool operator==(const MemoKey&) const = default;
++    };
++
++    struct MemoHash {
++        std::size_t operator()(const MemoKey& key) const {
++            std::size_t hash = std::hash<const void*>{}(key.first);
++            hash = hash * 31u + std::hash<const void*>{}(key.second);
++            return hash * 31u + (static_cast<std::size_t>(key.mode) << 16u | key.component << 8u | key.depth);
++        }
++    };
++
++    static constexpr std::uint32_t stepBudget = 1u << 20;
++
++    template<typename Compute>
++    bool Memo(const IrValue* first, const IrValue* second, Mode mode, std::uint32_t component, std::uint32_t depth, Compute compute) {
++        const MemoKey key{first, second, mode, component, depth};
++        if (const auto found = m_memo.find(key); found != m_memo.end()) return found->second;
++        const auto hitsBefore = m_assumptionHits;
++        const bool result = compute();
++        if (m_steps <= stepBudget && (!result || m_assumptionHits == hitsBefore)) m_memo.emplace(key, result);
++        return result;
++    }
++
++    bool Step() {
++        return ++m_steps <= stepBudget;
++    }
++
++    static bool Binary(const IrValue* value, IrOpcode opcode) {
++        return value->Opcode() == opcode && value->ArgumentCount() == 2u;
++    }
++
++    static bool Select(const IrValue* value) {
++        return value->Opcode() == IrOpcode::SelectU1 && value->ArgumentCount() == 3u;
++    }
++
++    static std::optional<bool> KnownBool(const IrValue* value, std::uint32_t depth = 8u) {
++        value = value->Resolve();
++        if (value->HasImmediate() && value->Type() == IrType::Bool) return value->ImmediateU32() != 0u;
++        if (!value->IsPhi() || value->ArgumentCount() == 0u || depth == 0u) return std::nullopt;
++        std::optional<bool> known;
++        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
++            const IrValue* incoming = value->Argument(index)->Resolve();
++            if (incoming == value) continue;
++            const auto bit = KnownBool(incoming, depth - 1u);
++            if (!bit.has_value() || (known.has_value() && *known != *bit)) return std::nullopt;
++            known = bit;
++        }
++        return known;
++    }
++
++    static const IrValue* KnownArm(const IrValue* value) {
++        if (!Select(value)) return nullptr;
++        const auto known = KnownBool(value->Argument(0));
++        if (!known.has_value()) return nullptr;
++        return value->Argument(*known ? 1u : 2u)->Resolve();
++    }
++
++    static bool IsImmediate(const IrValue* value, std::uint32_t immediate) {
++        value = value->Resolve();
++        return value->HasImmediate() && value->Type() == IrType::U32 && value->ImmediateU32() == immediate;
++    }
++
++    static const IrValue* OtherOperand(const IrValue* value, IrOpcode opcode, std::uint32_t immediate) {
++        if (!Binary(value, opcode)) return nullptr;
++        if (IsImmediate(value->Argument(1), immediate)) return value->Argument(0)->Resolve();
++        if (IsImmediate(value->Argument(0), immediate)) return value->Argument(1)->Resolve();
++        return nullptr;
++    }
++
++    static bool IsLaneId(const IrValue* value) {
++        return value != nullptr && value->Resolve()->Opcode() == IrOpcode::LaneId;
++    }
++
++    template<typename Proof>
++    bool Coinductive(const IrValue* node, const IrValue* target, Mode mode, std::uint32_t component, std::uint32_t depth, Proof proof) {
++        if (!node->IsPhi() || node->ArgumentCount() == 0u) return false;
++        const auto same = [&](const Assumption& entry) { return entry.node == node && entry.target == target && entry.mode == mode && entry.component == component; };
++        if (const auto found = std::ranges::find_if(m_assumed, same); found != m_assumed.end()) {
++            if (!found->checked) {
++                found->invariant = Invariant(target, node);
++                found->checked = true;
++            }
++            if (!found->invariant) return false;
++            ++m_assumptionHits;
++            return true;
++        }
++        if (depth == 0u) return false;
++        m_assumed.push_back({node, target, mode, component});
++        bool proved = true;
++        for (std::size_t index = 0; index < node->ArgumentCount() && proved; ++index) proved = proof(node->Argument(index), depth - 1u);
++        m_assumed.pop_back();
++        return proved;
++    }
++
++    bool Invariant(const IrValue* target, const IrValue* phi) {
++        const IrBlock* definition = target->Resolve()->Parent();
++        const IrBlock* header = phi->Parent();
++        if (definition == nullptr) return true;
++        if (header == nullptr || definition == header) return false;
++        const auto key = std::pair{definition, header};
++        if (const auto found = m_dominance.find(key); found != m_dominance.end()) return found->second;
++        std::vector<const IrBlock*> pending{header};
++        std::vector<const IrBlock*> visited{header};
++        bool dominates = true;
++        while (!pending.empty() && dominates) {
++            const IrBlock* block = pending.back();
++            pending.pop_back();
++            if (block->Predecessors().empty()) dominates = false;
++            for (const IrBlock* predecessor : block->Predecessors()) {
++                if (predecessor == definition || std::ranges::find(visited, predecessor) != visited.end()) continue;
++                visited.push_back(predecessor);
++                pending.push_back(predecessor);
++            }
++        }
++        m_dominance.emplace(key, dominates);
++        return dominates;
++    }
++
++    bool MaskSide(const IrValue* mask, const IrValue* condition, std::uint32_t depth, Mode mode) {
++        const auto recurse = [&](const IrValue* next, std::uint32_t nextDepth) { return mode == Mode::Implies ? Implies(next, condition, nextDepth) : Excludes(next, condition, nextDepth); };
++        if (Binary(mask, IrOpcode::LogicalAnd)) return recurse(mask->Argument(0), depth) || recurse(mask->Argument(1), depth);
++        if (const IrValue* arm = KnownArm(mask); arm != nullptr) return recurse(arm, depth);
++        if (Select(mask)) return recurse(mask->Argument(1), depth) && recurse(mask->Argument(2), depth);
++        if (mask->Opcode() == IrOpcode::INotEqual32) return OwnLaneBit(mask, condition, depth, mode == Mode::Implies);
++        return Coinductive(mask, condition, mode, 0u, depth, recurse);
++    }
++
++    static bool LaneWords(const IrValue* test, std::array<const IrValue*, 2>& words) {
++        const IrValue* bit = OtherOperand(test, IrOpcode::INotEqual32, 0u);
++        const IrValue* shifted = bit != nullptr ? OtherOperand(bit, IrOpcode::BitwiseAnd32, 1u) : nullptr;
++        if (shifted == nullptr || !Binary(shifted, IrOpcode::ShiftRightLogical32)) return false;
++        if (!IsLaneId(OtherOperand(shifted->Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 31u))) return false;
++        const IrValue* word = shifted->Argument(0)->Resolve();
++        words = {word, nullptr};
++        if (word->Opcode() == IrOpcode::SelectU32 && word->ArgumentCount() == 3u) {
++            const IrValue* half = word->Argument(0)->Resolve();
++            if (!Binary(half, IrOpcode::ULessThan32) || !IsLaneId(half->Argument(0)) || !IsImmediate(half->Argument(1), 32u)) return false;
++            words = {word->Argument(1)->Resolve(), word->Argument(2)->Resolve()};
++        }
++        return true;
++    }
++
++    bool OwnLaneBit(const IrValue* mask, const IrValue* condition, std::uint32_t depth, bool positive) {
++        std::array<const IrValue*, 2> words{};
++        if (!LaneWords(mask, words)) return false;
++        return LaneBit(words[0], 0u, condition, depth, positive) && (words[1] == nullptr || LaneBit(words[1], 1u, condition, depth, positive));
++    }
++
++    bool ConditionLaneBit(const IrValue* mask, const IrValue* condition, std::uint32_t depth, bool set) {
++        std::array<const IrValue*, 2> words{};
++        if (condition->Opcode() != IrOpcode::INotEqual32 || !LaneWords(condition, words)) return false;
++        return WordBit(mask, words[0], 0u, depth, set) && (words[1] == nullptr || WordBit(mask, words[1], 1u, depth, set));
++    }
++
++    const IrValue* BallotLanes(const IrValue* extract, std::uint32_t component) const {
++        extract = extract->Resolve();
++        if (extract->Opcode() != IrOpcode::CompositeExtractU32x4 || extract->ArgumentCount() != 2u || !IsImmediate(extract->Argument(1), component)) return nullptr;
++        const IrValue* ballot = extract->Argument(0)->Resolve();
++        return ballot->Opcode() == IrOpcode::Ballot && ballot->ArgumentCount() == 1u ? ballot->Argument(0)->Resolve() : nullptr;
++    }
++
++    bool WordBit(const IrValue* mask, const IrValue* word, std::uint32_t component, std::uint32_t depth, bool set) {
++        return Memo(mask->Resolve(), word->Resolve(), set ? Mode::BitSet : Mode::BitClear, component, depth, [&] { return WordBitUncached(mask->Resolve(), word->Resolve(), component, depth, set); });
++    }
++
++    bool WordBitUncached(const IrValue* mask, const IrValue* word, std::uint32_t component, std::uint32_t depth, bool set) {
++        if (!Step()) return false;
++        if (word->HasImmediate()) return word->Type() == IrType::U32 && word->ImmediateU32() == (set ? 0xffffffffu : 0u);
++        if (const IrValue* lanes = BallotLanes(word, component); lanes != nullptr) return set ? Implies(mask, lanes, depth) : Excludes(mask, lanes, depth);
++        if (word->Opcode() == IrOpcode::BitwiseNot32 && word->ArgumentCount() == 1u) return WordBit(mask, word->Argument(0), component, depth, !set);
++        if (Binary(word, IrOpcode::BitwiseAnd32)) {
++            return set ? WordBit(mask, word->Argument(0), component, depth, true) && WordBit(mask, word->Argument(1), component, depth, true)
++                       : WordBit(mask, word->Argument(0), component, depth, false) || WordBit(mask, word->Argument(1), component, depth, false);
++        }
++        if (Binary(word, IrOpcode::BitwiseOr32)) {
++            return set ? WordBit(mask, word->Argument(0), component, depth, true) || WordBit(mask, word->Argument(1), component, depth, true)
++                       : WordBit(mask, word->Argument(0), component, depth, false) && WordBit(mask, word->Argument(1), component, depth, false);
++        }
++        return Coinductive(word, mask, set ? Mode::BitSet : Mode::BitClear, component, depth, [&](const IrValue* next, std::uint32_t nextDepth) { return WordBit(mask, next, component, nextDepth, set); });
++    }
++
++    bool LaneBit(const IrValue* word, std::uint32_t component, const IrValue* condition, std::uint32_t depth, bool positive) {
++        return Memo(word->Resolve(), condition->Resolve(), positive ? Mode::BitImplies : Mode::BitExcludes, component, depth, [&] { return LaneBitUncached(word->Resolve(), component, condition->Resolve(), depth, positive); });
++    }
++
++    bool LaneBitUncached(const IrValue* word, std::uint32_t component, const IrValue* condition, std::uint32_t depth, bool positive) {
++        if (!Step()) return false;
++        std::array<const IrValue*, 2> tested{};
++        if (positive && condition->Opcode() == IrOpcode::INotEqual32 && LaneWords(condition, tested)) {
++            const IrValue* same = tested[component] != nullptr ? tested[component] : (tested[1] == nullptr && component == 0u ? tested[0] : nullptr);
++            if (same != nullptr && (same == word || EquivalentValue(m_program, same, word))) return true;
++        }
++        if (const IrValue* lanes = BallotLanes(word, component); lanes != nullptr) return positive ? Implies(lanes, condition, depth) : Excludes(lanes, condition, depth);
++        if (word->Opcode() == IrOpcode::BitwiseNot32 && word->ArgumentCount() == 1u) return !positive && WordBit(condition, word->Argument(0), component, depth, true);
++        if (Binary(word, IrOpcode::BitwiseAnd32)) return LaneBit(word->Argument(0), component, condition, depth, positive) || LaneBit(word->Argument(1), component, condition, depth, positive);
++        if (Binary(word, IrOpcode::BitwiseOr32)) return LaneBit(word->Argument(0), component, condition, depth, positive) && LaneBit(word->Argument(1), component, condition, depth, positive);
++        return Coinductive(word, condition, positive ? Mode::BitImplies : Mode::BitExcludes, component, depth, [&](const IrValue* next, std::uint32_t nextDepth) { return LaneBit(next, component, condition, nextDepth, positive); });
++    }
++
++    const IrResourcePlan& m_program;
++    std::vector<Assumption> m_assumed;
++    std::unordered_map<MemoKey, bool, MemoHash> m_memo;
++    std::map<std::pair<const IrBlock*, const IrBlock*>, bool> m_dominance;
++    std::uint32_t m_steps = 0;
++    std::uint64_t m_assumptionHits = 0;
++};
++
++constexpr std::uint32_t activeMaskPhiDepth = 24u;
++
++}
++
+ bool ActiveMaskImplies(const IrResourcePlan& program, const IrValue* mask, const IrValue* condition) {
+     if (mask == nullptr || condition == nullptr) return false;
+     mask = mask->Resolve();
+@@ -67,6 +346,11 @@ bool ActiveMaskImplies(const IrResourcePlan& program, const IrValue* mask, const
+     return false;
+ }
+ 
++bool ActiveMaskSelects(const IrResourcePlan& program, const IrValue* mask, const IrValue* condition) {
++    if (mask == nullptr || condition == nullptr) return false;
++    return ActiveMaskImplies(program, mask, condition) || MaskProof(program).Implies(mask, condition, activeMaskPhiDepth);
++}
++
+ bool IsRuntimeUniformOp(IrOpcode opcode) {
+     switch (opcode) {
+         case IrOpcode::BitCastU32F32:
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtRuntimeValidator.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtRuntimeValidator.cpp
+index f793746fa0..bb59106d73 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtRuntimeValidator.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtRuntimeValidator.cpp
+@@ -57,7 +57,7 @@ bool RuntimeValidator::Validate(IrValue* raw, bool requireUniform) {
+         }
+     }
+     if (!requireUniform) return finish(ValidateArguments(inst, false));
+-    if (_activeMask != nullptr && IsRuntimeSelect(op) && inst.ArgumentCount() == 3 && ActiveMaskImplies(_program, _activeMask, inst.Argument(0))) {
++    if (_activeMask != nullptr && IsRuntimeSelect(op) && inst.ArgumentCount() == 3 && ActiveMaskSelects(_program, _activeMask, inst.Argument(0))) {
+         if (_type == RuntimeValueType::Integer && !Validate(inst.Argument(2), false)) {
+             return finish(false);
+         }
+diff --git a/core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp b/core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp
+index f03f129774..775a9b55e1 100644
+--- a/core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp
++++ b/core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp
+@@ -105,7 +105,7 @@ private:
+         }
+         if (value->Opcode() == IrOpcode::Void) return fail();
+         const auto mask = contexts[context].mask;
+-        if (mask != nullptr && IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3 && ActiveMaskImplies(plan, mask, value->Argument(0))) return compile(value->Argument(1), context, depth + 1);
++        if (mask != nullptr && IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3 && ActiveMaskSelects(plan, mask, value->Argument(0))) return compile(value->Argument(1), context, depth + 1);
+         const auto key = std::make_pair(static_cast<const IrValue*>(value), context);
+         if (const auto found = built.find(key); found != built.end()) return found->second == Building ? fail() : found->second;
+         built.emplace(key, Building);
+diff --git a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+new file mode 100644
+index 0000000000..9a7267b985
+--- /dev/null
++++ b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+@@ -0,0 +1,122 @@
++#include "BdaAbi.hpp"
++#include "Recompiler.hpp"
++#include <spirv-tools/libspirv.hpp>
++#include <spirv/unified1/spirv.hpp>
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++constexpr std::uint32_t TableAddress = 0x20000000u;
++constexpr std::uint32_t OutputAddress = 0x30000000u;
++constexpr std::uint32_t TableEntries = 64u;
++
++constexpr std::array<std::uint32_t, 20> WaterfallShader{
++    0xbe850380u, 0xbe86037eu, 0x7daa0080u, 0xbf88000fu, 0x34020085u, 0xbe87037eu,
++    0x7e100501u, 0x7da40208u, 0xf40c0202u, 0x10000000u, 0xbf8cc07fu, 0xf0001f00u, 0x00020200u, 0xbe874707u, 0xbf89fff7u,
++    0xbefe0306u, 0xbf8c3f70u, 0xe0701000u, 0x80040200u, 0xbf810000u,
++};
++
++std::array<std::uint32_t, 8> ImageDescriptor(std::uint32_t entry) {
++    std::array<std::uint32_t, 8> words{};
++    words[0] = (0x40000000u + entry * 0x10000u) >> 8u;
++    words[1] = 56u << 20u;
++    words[2] = 63u;
++    words[3] = 0xfacu | (8u << 28u);
++    return words;
++}
++
++std::vector<std::uint32_t> Table() {
++    std::vector<std::uint32_t> table(TableEntries * 8u);
++    for (std::uint32_t entry = 0; entry < TableEntries; entry++) {
++        const auto words = ImageDescriptor(entry);
++        std::copy(words.begin(), words.end(), table.begin() + entry * 8u);
++    }
++    return table;
++}
++
++std::array<std::uint32_t, 20> UserData(std::uint32_t table) {
++    std::array<std::uint32_t, 20> user{};
++    user[4] = table;
++    user[16] = OutputAddress;
++    user[18] = 1024u;
++    user[19] = 0xfacu | (77u << 12u);
++    return user;
++}
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 8> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityImageQuery, spv::CapabilitySampled1D,
++                                                               spv::CapabilityImage1D, spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++RecompileResult Compile(std::span<const std::uint32_t> code, std::uint32_t table) {
++    static const auto entries = Table();
++    static std::array<std::byte, 64u * 1024u> output{};
++    const auto user = UserData(table);
++    const std::vector<MemoryRegion> regions{{TableAddress, std::as_bytes(std::span<const std::uint32_t>(entries))}, {OutputAddress, std::span<const std::byte>(output)}};
++    const ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, code, 0, {}},
++        {32u, 0, std::span<const std::uint32_t>(user), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    return Recompile(request);
++}
++
++std::vector<std::uint32_t> ValidWords(const RecompileResult& result, const char* what) {
++    const auto view = result.spirv.Words();
++    std::vector<std::uint32_t> words(view.begin(), view.end());
++    std::string log;
++    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
++    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* message) { log += message; });
++    spvtools::ValidatorOptions options;
++    options.SetScalarBlockLayout(true);
++    const bool valid = tools.Validate(words.data(), words.size(), options);
++    if (!valid) std::fprintf(stderr, "%s\n", log.c_str());
++    Require(valid, what);
++    return words;
++}
++
++void TestWaterfallReadsAnImageTable() {
++    const auto result = Compile(WaterfallShader, TableAddress);
++    ValidWords(result, "the waterfall module validates");
++    Require(std::ranges::any_of(result.bindings, [](const auto& binding) { return binding.role == DescriptorRole::ImageTable; }),
++            "a T# loaded at a first-lane offset inside a waterfall loop is read through an image table");
++}
++
++}
++
++int main() {
++    try {
++        TestWaterfallReadsAnImageTable();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++    std::puts("descriptor selection tests passed");
++    return 0;
++}
+diff --git a/docs/dev/debt/changes/feat-shader-waterfall-mask-proof.md b/docs/dev/debt/changes/feat-shader-waterfall-mask-proof.md
+new file mode 100644
+index 0000000000..90b7b20487
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-waterfall-mask-proof.md
+@@ -0,0 +1,5 @@
++# shader
++
++## change [Image table pointer indexing]
++
++- [Image table pointer indexing](../../../core/shader/recompiler/Optimization/src/ResourceTracker.cpp) propagates 32-bit value bounds through `ReadFirstLane` and `SelectU32` so waterfall key masks keep their bit domain. A first-lane offset's select is resolved only where the read's active mask [provably implies](../../../core/shader/recompiler/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp) its condition; a mask loaded from memory, or a proof past 2^20 steps or 48 Phis, still refuses the T#. The proof assumes a ballot holds every live lane's bit, and that unselected inactive lanes need not be uniform across the full wave. The same assumption lets the two `s_load`s of one T# record match when one offset is added before `v_readfirstlane` and the other after (`ReadFirstLane(Select(mask, (key << 5) + 16, old), mask)` against `ReadFirstLane(key, mask) << 5`): with no active lane the hardware reads lane 0 of the inactive arm, and the table still binds the whole record.
+-- 
+2.55.0
+
