@@ -63,6 +63,10 @@ enum shadow_heap_va shadow_heap_va_mode(void);
 /* The title address and byte size of the shader-visible heap whose descriptor 0 is at cpu_start. */
 BOOL shadow_title(SIZE_T cpu_start, UINT64 *title_va, UINT64 *size);
 enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index);
+/* shadow_find_index, preferring a slot whose view is one of views (a mask of 1 << enum shadow_view;
+ * 0: the first slot found): the same words can be in slots of different views. */
+BOOL shadow_find_index_view(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT views,
+                            UINT *index);
 /* GPU address ranges [begin, end) of buffers the title made views of; returns the count. */
 UINT shadow_buffer_ranges(UINT64 (*out)[2], UINT max);
 /* Changes whenever a buffer range is added or grows. */

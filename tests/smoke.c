@@ -3476,6 +3476,80 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* A single-level texture's SRV and UAV have the same T#: a binding finds the slot holding the view
+ * it wants (a storage image bound to the SRV's slot, or a sampled one to the UAV's, was refused), and
+ * a sampled binding of a UAV copied from a CPU heap still gets an SRV of its texture. */
+static void test_shadow_views(void *dev)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    UINT (WINAPI *find_index)(SIZE_T, const UINT32 *, UINT, UINT) = (void *)GetProcAddress(m, "ReboxShadowFindIndex");
+    UINT (WINAPI *srv_for_uav)(SIZE_T, UINT) = (void *)GetProcAddress(m, "ReboxShadowSrvForUav");
+    HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+            (void *)GetProcAddress(m, "ReboxShadowHeap");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC cd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 32, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    void *heap = NULL, *cpu_heap = NULL;
+    ID3D12Resource *tex = NULL;
+    UINT32 *res, words[8];
+    UINT64 title_va;
+    UINT inc, stride, count, uav_slot, srv_slot;
+    SIZE_T cpu, cpu_only;
+    HRESULT hr;
+
+    CHECK(find_index && srv_for_uav && shadow_heap, "d3d12_xs exports the shadow view lookups");
+    if (!find_index || !srv_for_uav || !shadow_heap) return;
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12DescriptorHeap, &cpu_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex);
+    CHECK(SUCCEEDED(hr), "objects for the shadow view test (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    cpu_only = XSLOT(cpu_heap, 9, SIZE_T)(cpu_heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (FAILED(shadow_heap(cpu, &title_va, (void **)&res, &stride, &count)))
+    {
+        printf("skip shadow views: no shadow for this device\n");
+        goto done;
+    }
+    /* Slot 0 the UAV, slot 2 the SRV, slot 3 the UAV again, copied from a CPU heap. */
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            tex, NULL, NULL, cpu);
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, tex, NULL, cpu + 2 * inc);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            tex, NULL, NULL, cpu_only);
+    XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, 1, cpu + 3 * inc, cpu_only,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    memcpy(words, res, sizeof(words));
+    if (memcmp(words, (BYTE *)res + 2 * stride, sizeof(words)))
+    {
+        printf("skip shadow views: the texture's SRV and UAV have different T#s here\n");
+        goto done;
+    }
+    uav_slot = find_index(cpu, words, 8, 1u << 4 /* SHADOW_VIEW_UAV_TEXTURE */);
+    srv_slot = find_index(cpu, words, 8, 1u << 1 /* SHADOW_VIEW_SRV_TEXTURE */);
+    CHECK(uav_slot == 0 || uav_slot == 3, "a storage image's T# finds a UAV slot (%u), not the SRV's", uav_slot);
+    CHECK(srv_slot == 2, "a sampled image's T# finds the SRV slot (%u), not a UAV's", srv_slot);
+    CHECK(srv_for_uav(cpu, 0) >= count && srv_for_uav(cpu, 0) != ~0u,
+          "a texture UAV made in the heap gets an SRV in its reserved tail (%u)", srv_for_uav(cpu, 0));
+    CHECK(srv_for_uav(cpu, 3) >= count && srv_for_uav(cpu, 3) != ~0u,
+          "a texture UAV copied from a CPU heap gets an SRV in the reserved tail too (%u)", srv_for_uav(cpu, 3));
+
+done:
+    if (tex) ID3D12Resource_Release(tex);
+    if (cpu_heap) XSLOT(cpu_heap, 2, ULONG)(cpu_heap);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 /* RDNA2 compute shader for the deferred dispatch test (llvm-mc -mcpu=gfx1030): stores
  * 0x1234abcd through the V# at the start of the descriptor table s[0:1] points at. It opens with
  * the FLAT_SCRATCH setup console shaders have, which d3d12_xs NOPs out.
@@ -6478,6 +6552,7 @@ static void test_xbox(void)
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);
+    test_shadow_views(dev);
     test_console_dispatch(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);

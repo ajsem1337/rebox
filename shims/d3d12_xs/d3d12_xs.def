@@ -18,6 +18,8 @@ EXPORTS
     ReboxShadowHeap
     ReboxShadowRead
     ReboxShadowFind
+    ReboxShadowFindIndex
+    ReboxShadowSrvForUav
     ReboxGuestBufferEntry
     ReboxConsoleCompile
     ReboxConsoleRectStages

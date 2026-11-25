@@ -1025,36 +1025,51 @@ static BOOL loose_match(const UINT32 *slot, const UINT32 *words, UINT n, BOOL sa
 
 BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT *index)
 {
-    struct shadow_heap *heap = NULL;
+    return shadow_find_index_view(heap_cpu, words, n, sampler, loose, 0, index);
+}
+
+/* A slot's view is one of views (a mask of 1 << enum shadow_view; 0 takes any). */
+static BOOL view_wanted(const struct entry *e, UINT views)
+{
+    return !views || (e->index < e->heap->count && (views & (1u << e->heap->views[e->index])));
+}
+
+BOOL shadow_find_index_view(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT views,
+                            UINT *index)
+{
     UINT32 key[8];
-    BOOL found = FALSE;
+    BOOL found = FALSE, wanted = FALSE;
 
     if (!words || !n || n > 8)
         return FALSE;
     make_key(words, n, sampler, key);
     AcquireSRWLockShared(&lock);
-    for (struct entry *e = buckets[0][hash_key(key)]; e && !found; e = e->next)
-        if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, key, sizeof(key)))
+    /* The first slot with these words, or one holding a view of the wanted kind: a texture's
+     * single-level SRV and UAV have the same T#, and a storage image bound to the SRV's slot (or a
+     * sampled one to the UAV's) was refused. */
+    for (struct entry *e = buckets[0][hash_key(key)]; e && !wanted; e = e->next)
+        if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, key, sizeof(key)) && (!found || view_wanted(e, views)))
         {
             *index = e->index;
             found = TRUE;
+            wanted = view_wanted(e, views);
         }
     /* Loose: through the masked index, then loose_match on the candidates (heaps hold up to a
      * million descriptors; scanning one per binding made compiles slow). */
-    if (loose && !found)
+    if (loose && !wanted)
     {
         UINT32 k[8];
         index_key(key, sampler, !sampler && n == 4 ? 2 : 1, k);
-        for (struct entry *e = buckets[!sampler && n == 4 ? 2 : 1][hash_key(k)]; e && !found; e = e->next)
-            if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, k, sizeof(k))
+        for (struct entry *e = buckets[!sampler && n == 4 ? 2 : 1][hash_key(k)]; e && !wanted; e = e->next)
+            if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, k, sizeof(k)) && (!found || view_wanted(e, views))
                     && loose_match((const UINT32 *)(e->heap->data + (SIZE_T)e->index * e->heap->stride), words, n,
                                    sampler))
             {
                 *index = e->index;
                 found = TRUE;
+                wanted = view_wanted(e, views);
             }
     }
-    (void)heap;
     ReleaseSRWLockShared(&lock);
     return found;
 }
@@ -1152,6 +1167,7 @@ static void srv_from_uav(const struct uav_texture *u, D3D12_SHADER_RESOURCE_VIEW
 BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
 {
     ID3D12Device *device = rebox_shared_device();
+    ID3D12Resource *res = NULL;
     struct shadow_heap *heap = NULL;
     BOOL found = FALSE;
     UINT32 key[4];
@@ -1192,7 +1208,13 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
             found = TRUE;
         }
     }
+    /* A UAV the slot got by a copy from a CPU-only heap, which keeps no UAV descriptions: an SRV of
+     * the whole texture it views. */
+    if (!found && heap && uav_index < heap->count && heap->views[uav_index] == SHADOW_VIEW_UAV_TEXTURE && heap->res)
+        res = heap->res[uav_index];
     ReleaseSRWLockExclusive(&lock);
+    if (!found && res)
+        found = shadow_reserve_srv(heap_cpu, res, index);
     return found;
 }
 
@@ -1494,4 +1516,20 @@ BOOL WINAPI ReboxShadowFind(const UINT32 *words, UINT word_count, BOOL sampler, 
                 + (SIZE_T)best->index * best->heap->stride;
     ReleaseSRWLockShared(&lock);
     return best != NULL;
+}
+
+/* For tests: the index of a slot of the heap at cpu (a handle as the title has it) holding these
+ * words, preferring one whose view is in views (shadow_find_index_view); ~0u for none. */
+UINT WINAPI ReboxShadowFindIndex(SIZE_T cpu, const UINT32 *words, UINT word_count, UINT views)
+{
+    UINT index;
+    return shadow_find_index_view(shadow_cpu_to_inner(cpu), words, word_count, FALSE, FALSE, views, &index) ? index : ~0u;
+}
+
+/* For tests: the slot of an SRV for the texture UAV in slot index of the heap at cpu, as a sampled
+ * binding of it gets (shadow_reserve_srv_for_uav); ~0u for none. */
+UINT WINAPI ReboxShadowSrvForUav(SIZE_T cpu, UINT index)
+{
+    UINT srv;
+    return shadow_reserve_srv_for_uav(shadow_cpu_to_inner(cpu), index, &srv) ? srv : ~0u;
 }

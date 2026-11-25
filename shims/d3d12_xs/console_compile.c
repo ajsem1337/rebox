@@ -3033,7 +3033,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                  * are made in its reserved tail; matching that ignores rewritten fields is the
                  * last resort. */
                 LONG64 lookup_start = ticks_now();
-                BOOL found = shadow_find_index(heap, w, per, sampler, !sampler, index)
+                UINT views = 0;
+                for (UINT v = SHADOW_VIEW_NONE; v <= SHADOW_VIEW_SAMPLER; v++)
+                    views |= view_fits(b.kind, (enum shadow_view)v) ? 1u << v : 0;
+                BOOL found = shadow_find_index_view(heap, w, per, sampler, !sampler, views, index)
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
                 BOOL null_view = FALSE;
