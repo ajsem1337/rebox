@@ -920,6 +920,7 @@ static SRWLOCK physical_lock = SRWLOCK_INIT;
 static volatile DWORD physical_owner; /* the thread holding physical_lock exclusively, or 0 */
 static struct physical_unit *units;
 static ULONG_PTR unit_count, unit_capacity;
+static volatile LONG64 snapshot_bytes, snapshot_conflicts, copies_mapped, physical_bytes; /* ReboxPhysicalMemoryStats */
 
 /* Address -> the page mapped there: open addressing on 64 KiB-aligned addresses. A page mapped as
  * part of a run shares that run's view (view, view_bytes); a copy is its own. */
@@ -1017,6 +1018,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
         return FALSE;
     }
     s->live = (LONG)*count;
+    InterlockedAdd64(&physical_bytes, (LONG64)bytes);
     lock_physical();
     if (!mapped_at && !(mapped_at = VirtualAlloc(NULL, MAPPED_SLOTS * sizeof(*mapped_at), MEM_COMMIT | MEM_RESERVE,
                                                  PAGE_READWRITE)))
@@ -1046,6 +1048,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG flags, ULONG_PTR *count, ULONG_P
     unlock_physical();
     if (!ok)
     {
+        InterlockedAdd64(&physical_bytes, -(LONG64)bytes);
         UnmapViewOfFile(s->home);
         CloseHandle(s->handle);
         free(s);
@@ -1065,6 +1068,7 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR *pages)
             continue;
         s = units[u].section;
         units[u].section = NULL;
+        InterlockedAdd64(&physical_bytes, -(LONG64)units[u].size_units * PAGE_UNIT);
         /* Views still mapped keep the section's memory; the home view and handle go with the
          * last page. */
         if (!--s->live)
@@ -1127,6 +1131,164 @@ static void alias_unlink(SIZE_T slot)
     mapped_at[slot].next_alias = 0;
 }
 
+/* What a copy was given, so unmapping it writes back only what changed through it (a whole copy
+ * written back wiped what was written to the page elsewhere meanwhile). A copy of every 64 KiB
+ * once took as much memory again as the copies themselves (GiBs: every page of memory made GPU
+ * memory in place is a copy). So by default the snapshot is a hash of each SNAP_BLOCK bytes:
+ * unmapping, a block whose copy hashes as it was given is unchanged; one that changed goes back
+ * whole if the page's own block still hashes as given (nothing else wrote it), as the qwords
+ * that changed would have. A block changed both through the copy and elsewhere (a conflict) keeps
+ * what the page has, and is counted (the memory log). A write through ReboxWritePhysicalPages
+ * goes to both, and the block's hash follows it. REBOX_COPY_SNAPSHOT=full keeps whole copies,
+ * as before. */
+#define SNAP_BLOCK 128u
+#define SNAP_UNKNOWN 0x5eed5eed5eed5eedull /* a block whose given bytes aren't known */
+
+
+static BOOL snapshot_hashed(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        char *v = rebox_getenv("REBOX_COPY_SNAPSHOT");
+        mode = !(v && !strcmp(v, "full"));
+        free(v);
+    }
+    return mode;
+}
+
+static UINT64 block_hash(const BYTE *p)
+{
+    const UINT64 *q = (const UINT64 *)p;
+    UINT64 h = 0x243f6a8885a308d3ull;
+    for (UINT i = 0; i < SNAP_BLOCK / 8; i++)
+    {
+        h = (h ^ q[i]) * 0x9e3779b97f4a7c15ull;
+        h ^= h >> 31;
+    }
+    return h == SNAP_UNKNOWN ? h + 1 : h;
+}
+
+static SIZE_T snapshot_size(ULONG_PTR u)
+{
+    SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
+    return snapshot_hashed() ? size / SNAP_BLOCK * sizeof(UINT64) : size;
+}
+
+/* Under physical_lock: the snapshot of the copy in slot, of page unit u's contents now. */
+static void snapshot_take(SIZE_T slot, ULONG_PTR u)
+{
+    SIZE_T n = snapshot_size(u);
+    const BYTE *home;
+    BYTE *s;
+
+    mapped_at[slot].snapshot = NULL;
+    if (!units[u].section || !(s = malloc(n)))
+        return;
+    home = unit_home(u);
+    if (snapshot_hashed())
+        for (SIZE_T b = 0; b < n / sizeof(UINT64); b++)
+            ((UINT64 *)s)[b] = block_hash(home + b * SNAP_BLOCK);
+    else
+        memcpy(s, home, n);
+    mapped_at[slot].snapshot = s;
+    InterlockedAdd64(&snapshot_bytes, (LONG64)n);
+}
+
+static void snapshot_drop(SIZE_T slot)
+{
+    if (!mapped_at[slot].snapshot)
+        return;
+    InterlockedAdd64(&snapshot_bytes, -(LONG64)snapshot_size(mapped_at[slot].unit));
+    free(mapped_at[slot].snapshot);
+    mapped_at[slot].snapshot = NULL;
+}
+
+/* Under physical_lock: what changed through the copy of unit u at copy (slot's) written to the
+ * page. The qwords that went back. */
+static UINT64 snapshot_write_back(SIZE_T slot, ULONG_PTR u, const BYTE *copy)
+{
+    SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
+    BYTE *home = unit_home(u);
+    UINT64 changed = 0;
+
+    if (!snapshot_hashed())
+    {
+        const UINT64 *c = (const UINT64 *)copy, *snapshot = (const UINT64 *)mapped_at[slot].snapshot;
+        UINT64 *h = (UINT64 *)home;
+        for (SIZE_T q = 0; q < size / 8; q++)
+            if (c[q] != snapshot[q])
+                h[q] = c[q], changed++;
+        return changed;
+    }
+    for (SIZE_T b = 0; b < size / SNAP_BLOCK; b++)
+    {
+        UINT64 given = ((const UINT64 *)mapped_at[slot].snapshot)[b];
+        const UINT64 *c = (const UINT64 *)(copy + b * SNAP_BLOCK);
+        UINT64 *h = (UINT64 *)(home + b * SNAP_BLOCK);
+        if (block_hash((const BYTE *)c) == given)
+            continue;
+        if (block_hash((const BYTE *)h) != given)
+        {
+            /* Written elsewhere too (or not known as given): what the page has stays. */
+            LONG64 n = InterlockedIncrement64(&snapshot_conflicts);
+            if (n <= 16)
+                rebox_log("xmem: a copy of physical page %#llx and the page itself both changed in %u bytes at +%#llx: "
+                          "the page's are kept", (unsigned long long)((u + 1) << 4), SNAP_BLOCK,
+                          (unsigned long long)(b * SNAP_BLOCK));
+            continue;
+        }
+        for (UINT q = 0; q < SNAP_BLOCK / 8; q++)
+            if (h[q] != c[q])
+                h[q] = c[q], changed++;
+    }
+    return changed;
+}
+
+/* Under physical_lock: n bytes at offset into unit u, about to be written both to the page and to
+ * its copy at copy (slot's): which edge blocks (those the write covers in part) were as given, in
+ * the page (1) or the copy (2), so their hashes can follow the write (snapshot_written). */
+static void snapshot_before_write(SIZE_T slot, const BYTE *home, const BYTE *copy, SIZE_T offset, SIZE_T n, int edge[2])
+{
+    const UINT64 *given = (const UINT64 *)mapped_at[slot].snapshot;
+    SIZE_T b[2] = { offset / SNAP_BLOCK, (offset + n - 1) / SNAP_BLOCK };
+
+    for (int k = 0; k < 2; k++)
+    {
+        SIZE_T start = b[k] * SNAP_BLOCK;
+        edge[k] = 0;
+        if (offset <= start && offset + n >= start + SNAP_BLOCK) /* covered whole */
+            continue;
+        edge[k] = block_hash(home + start) == given[b[k]] ? 1 : block_hash(copy + start) == given[b[k]] ? 2 : 0;
+    }
+}
+
+static void snapshot_written(SIZE_T slot, const BYTE *home, const BYTE *copy, SIZE_T offset, SIZE_T n, const int edge[2])
+{
+    UINT64 *given = (UINT64 *)mapped_at[slot].snapshot;
+    SIZE_T b0 = offset / SNAP_BLOCK, b1 = (offset + n - 1) / SNAP_BLOCK;
+
+    for (SIZE_T b = b0; b <= b1; b++)
+    {
+        SIZE_T start = b * SNAP_BLOCK;
+        int state = b == b0 ? edge[0] : b == b1 ? edge[1] : 1;
+        if (offset <= start && offset + n >= start + SNAP_BLOCK)
+            state = 1; /* all of it is what was written, in both */
+        given[b] = state == 1 ? block_hash(home + start) : state == 2 ? block_hash(copy + start) : SNAP_UNKNOWN;
+    }
+}
+
+/* For d3d12_xs's memory log: physical pages allocated and not freed, copies of them mapped (no
+ * placeholder there, or memory made GPU memory in place), what their snapshots take, and the
+ * blocks found changed both through a copy and elsewhere (kept as the page had them). */
+void WINAPI ReboxPhysicalMemoryStats(UINT64 *allocated, UINT64 *copies, UINT64 *snapshots, UINT64 *conflicts)
+{
+    *allocated = (UINT64)physical_bytes;
+    *copies = (UINT64)copies_mapped;
+    *snapshots = (UINT64)snapshot_bytes;
+    *conflicts = (UINT64)snapshot_conflicts;
+}
+
 static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view_bytes, BOOL copy)
 {
     SIZE_T slot = mapped_slot(address, TRUE);
@@ -1137,7 +1299,12 @@ static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view
     if (slot == (SIZE_T)-1)
         return;
     if (mapped_at[slot].address == address) /* mapped again in place: off the old page's list */
+    {
         alias_unlink(slot);
+        if (mapped_at[slot].copy)
+            InterlockedDecrement64(&copies_mapped);
+        snapshot_drop(slot);
+    }
     mapped_at[slot].address = address;
     mapped_at[slot].unit = u;
     mapped_at[slot].next_alias = units[u].first_alias;
@@ -1147,8 +1314,11 @@ static void set_slot(ULONG_PTR address, ULONG_PTR u, ULONG_PTR view, SIZE_T view
     mapped_at[slot].copy = copy;
     /* A copy keeps what it was given, so unmapping it writes back only what changed through it. */
     mapped_at[slot].snapshot = NULL;
-    if (copy && units[u].section && (mapped_at[slot].snapshot = malloc((SIZE_T)units[u].size_units * PAGE_UNIT)))
-        memcpy(mapped_at[slot].snapshot, unit_home(u), (SIZE_T)units[u].size_units * PAGE_UNIT);
+    if (copy)
+    {
+        InterlockedIncrement64(&copies_mapped);
+        snapshot_take(slot, u);
+    }
 }
 
 static void clear_slot(SIZE_T slot)
@@ -1158,8 +1328,9 @@ static void clear_slot(SIZE_T slot)
         units[u].mapped = 0;
     if (units[u].copy_at == mapped_at[slot].address)
         units[u].copy_at = 0;
-    free(mapped_at[slot].snapshot);
-    mapped_at[slot].snapshot = NULL;
+    if (mapped_at[slot].copy)
+        InterlockedDecrement64(&copies_mapped);
+    snapshot_drop(slot);
     alias_unlink(slot);
     mapped_at[slot].address = 1; /* a tombstone */
 }
@@ -1660,17 +1831,12 @@ static void unmap_range(ULONG_PTR start, ULONG_PTR end)
         if (mapped_at[slot].copy)
         {
             SIZE_T size = (SIZE_T)units[u].size_units * PAGE_UNIT;
-            const UINT64 *snapshot = (const UINT64 *)mapped_at[slot].snapshot;
             /* Only what changed through the copy goes back: the page may have been written
              * elsewhere since it was copied (DirectStorage, another mapping), and a whole copy
              * written back wiped a loaded asset with the zeros it was copied with. */
-            if (units[u].section && snapshot && !IsBadReadPtr((void *)at, size))
+            if (units[u].section && mapped_at[slot].snapshot && !IsBadReadPtr((void *)at, size))
             {
-                const UINT64 *copy = (const UINT64 *)at;
-                UINT64 *home = (UINT64 *)unit_home(u), changed = 0;
-                for (SIZE_T q = 0; q < size / 8; q++)
-                    if (copy[q] != snapshot[q])
-                        home[q] = copy[q], changed++;
+                UINT64 changed = snapshot_write_back(slot, u, (const BYTE *)at);
                 if (changed)
                 {
                     static LONG logged;
@@ -1920,9 +2086,9 @@ void WINAPI ReboxPhysicalAdopted(ULONGLONG address, ULONGLONG size)
         mapped_at[slot].view = at;
         mapped_at[slot].view_bytes = (SIZE_T)units[u].size_units * PAGE_UNIT;
         units[u].copy_at = at;
-        if (!mapped_at[slot].snapshot && units[u].section
-                && (mapped_at[slot].snapshot = malloc((SIZE_T)units[u].size_units * PAGE_UNIT)))
-            memcpy(mapped_at[slot].snapshot, unit_home(u), (SIZE_T)units[u].size_units * PAGE_UNIT);
+        InterlockedIncrement64(&copies_mapped);
+        if (!mapped_at[slot].snapshot)
+            snapshot_take(slot, u);
         if (units[u].mapped == at)
             units[u].copy = TRUE;
         converted++;
@@ -2193,14 +2359,24 @@ BOOL WINAPI ReboxWritePhysicalPages(const ULONG_PTR *pages, ULONG_PTR count, SIZ
             rebox_log("xmem: trace: %#llx bytes written into page %#llx at +%#llx, mapped at %#llx (thread %#lx)",
                       (unsigned long long)n, (unsigned long long)pages[i], (unsigned long long)offset,
                       (unsigned long long)units[u].mapped, GetCurrentThreadId());
-        memcpy(unit_home(u) + offset, from, n);
-        dirty_page_bytes(u, offset, n);
-        if (units[u].copy_at)
         {
-            SIZE_T slot = slot_at(units[u].copy_at);
-            memcpy((BYTE *)units[u].copy_at + offset, from, n);
-            if (slot != (SIZE_T)-1 && mapped_at[slot].snapshot) /* not a write through the copy */
-                memcpy(mapped_at[slot].snapshot + offset, from, n);
+            SIZE_T slot = units[u].copy_at ? slot_at(units[u].copy_at) : (SIZE_T)-1;
+            BYTE *home = unit_home(u), *copy = (BYTE *)units[u].copy_at;
+            BOOL hashed = slot != (SIZE_T)-1 && mapped_at[slot].snapshot && snapshot_hashed();
+            int edge[2];
+            if (hashed)
+                snapshot_before_write(slot, home, copy, offset, n, edge);
+            memcpy(home + offset, from, n);
+            dirty_page_bytes(u, offset, n);
+            if (copy)
+            {
+                memcpy(copy + offset, from, n);
+                /* Not a write through the copy: its snapshot has it too. */
+                if (hashed)
+                    snapshot_written(slot, home, copy, offset, n, edge);
+                else if (slot != (SIZE_T)-1 && mapped_at[slot].snapshot)
+                    memcpy(mapped_at[slot].snapshot + offset, from, n);
+            }
         }
         if (units[u].mapped && reports)
             reports[report_count].address = units[u].mapped + offset, reports[report_count++].size = n;

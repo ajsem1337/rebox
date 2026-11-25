@@ -30,6 +30,7 @@ EXPORTS
     ReboxPhysicalDescribe
     ReboxMapPhysicalAlias
     ReboxPhysicalPageAt
+    ReboxPhysicalMemoryStats
     ReboxProbeAdd
     ReboxProbeHits
     ReboxAppStateRegister

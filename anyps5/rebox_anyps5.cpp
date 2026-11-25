@@ -412,6 +412,14 @@ SA5_API std::uint32_t sa5_gds_bytes(void)
     return 0x10000u;
 }
 
+// What AnyPS5 holds in memory, for d3d12_xs's memory log: its result memo (APS5_RESULT_MEMO_MB
+// bounds it) and its resource plans.
+SA5_API void sa5_memory_stats(std::uint64_t* memo_bytes, std::uint64_t* plan_bytes)
+{
+    *memo_bytes = ResultMemoBytes();
+    *plan_bytes = ResourcePlanTotals().heldBytes;
+}
+
 SA5_API void sa5_result_free(sa5_result* result)
 {
     delete result;

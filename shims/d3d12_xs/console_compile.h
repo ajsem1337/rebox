@@ -126,3 +126,6 @@ void console_trace_op(const char *op, UINT a, UINT b, UINT c, UINT width, UINT h
 UINT64 console_stage_id(const void *shader, SIZE_T size);
 BOOL console_stage_watched(UINT64 id);
 UINT64 console_last_draw_vs(void);
+
+/* The finalized modules kept (they live for the process), and their SPIR-V's bytes. */
+void console_compile_module_stats(UINT *count, UINT64 *bytes);
