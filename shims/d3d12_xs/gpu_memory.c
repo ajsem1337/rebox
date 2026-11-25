@@ -343,6 +343,18 @@ BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size)
     return found;
 }
 
+/* Whether [gpu, gpu + size) is inside one of the chunks, by GPU VA. */
+BOOL gpu_memory_holds_gpu(UINT64 gpu, UINT64 size)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (struct chunk *c = chunks; c && !found; c = c->next)
+        found = gpu >= c->gpu && gpu + size <= c->gpu + c->size;
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 /* Bytes of title memory made GPU memory in place: the title's own pages stay behind them. */
 UINT64 gpu_memory_adopted_bytes(void)
 {

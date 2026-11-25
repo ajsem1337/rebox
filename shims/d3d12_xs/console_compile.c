@@ -1042,7 +1042,22 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
      * memory of no stated size, and requiring all of that to be GPU memory refused them, which
      * broke the shaders that use them. */
     check = min(*bytes, 0x10000ull);
-    if (!address || !check || address < 0x100000000ull || address + check > 0x400000000000ull
+    /* Below 4 GiB is the driver's low window, not title memory: only Rebox's own GPU memory
+     * chunks there are buffers a title can know of. Anything else is a V# whose words aren't an
+     * address (a float, 1.0 = 0x3f800000, faulted the GPU there). */
+    if (address && check && address < 0x100000000ull)
+    {
+        if (gpu_memory_holds_gpu(address, check))
+            return TRUE;
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: a guest buffer at %#llx (low, not GPU memory Rebox made): read as empty",
+                          (unsigned long long)address);
+        }
+        return FALSE;
+    }
+    if (!address || !check || address + check > 0x400000000000ull
             || (address + check > 0x200000000000ull && address < 0x210000000000ull))
         return TRUE;
     if (!resolved)

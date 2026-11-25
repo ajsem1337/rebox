@@ -37,6 +37,8 @@ BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset);
 BOOL gpu_memory_adopt(UINT64 address, UINT64 size);
 /* If address is identity-mapped GPU memory (CPU address == GPU VA), the end of its chunk. */
 BOOL gpu_memory_identity_extent(UINT64 address, UINT64 *end);
+/* Whether [gpu, gpu + size) is inside one of the chunks, by GPU VA. */
+BOOL gpu_memory_holds_gpu(UINT64 gpu, UINT64 size);
 /* Bytes of title memory made GPU memory in place (gpu_memory_adopt). */
 UINT64 gpu_memory_adopted_bytes(void);
 /* The same through chunks that touch: the end of the identity-mapped GPU memory that runs on
