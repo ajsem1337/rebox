@@ -1,0 +1,318 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ee52796..9f3c3bc 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7571,6 +7571,7 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     VkPipeline vk_pipeline;
+     uint32_t view_mask;
+ 
++    list->rebox.quiet_skip = false;
+     /* Deferred console graphics compile for each draw's descriptors (d3d12_xs caches). */
+     if (list->current_pipeline != VK_NULL_HANDLE
+             && !(list->state && d3d12_pipeline_state_is_graphics(list->state)
+@@ -7613,6 +7614,14 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+             && d3d12_pipeline_state_rebox_graphics(list->state))
+         vk_pipeline = d3d12_command_list_rebox_graphics_pipeline(list, &new_active_flags);
+ 
++    /* rebox (patch 0018): a PSO with only fallback shaders has no pipeline; its fallback would draw
++     * nothing, so the draw is left out. */
++    if (!vk_pipeline && list->state->rebox_fallback)
++    {
++        list->rebox.quiet_skip = true;
++        return false;
++    }
++
+     /* Try to grab the pipeline we compiled ahead of time. If we cannot do so, fall back. */
+     if (!vk_pipeline && !(vk_pipeline = d3d12_pipeline_state_get_pipeline(list->state,
+             &list->dynamic_state, list->dsv.format, &new_active_flags)))
+@@ -9423,7 +9432,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+ 
+     if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_GRAPHICS))
+     {
+-        WARN("Failed to begin render pass, ignoring draw call.\n");
++        if (!list->rebox.quiet_skip)
++            WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
+ 
+@@ -9512,7 +9522,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+ 
+     if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_GRAPHICS))
+     {
+-        WARN("Failed to begin render pass, ignoring draw call.\n");
++        if (!list->rebox.quiet_skip)
++            WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
+ 
+@@ -17394,7 +17405,8 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+         {
+             if (!d3d12_command_list_begin_render_pass(list, signature->pipeline_type))
+             {
+-                WARN("Failed to begin render pass, ignoring draw.\n");
++                if (!list->rebox.quiet_skip)
++                    WARN("Failed to begin render pass, ignoring draw.\n");
+                 return;
+             }
+         }
+@@ -17854,7 +17866,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+             if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_GRAPHICS))
+             {
+-                WARN("Failed to begin render pass, ignoring draw.\n");
++                if (!list->rebox.quiet_skip)
++                    WARN("Failed to begin render pass, ignoring draw.\n");
+                 break;
+             }
+ 
+@@ -17877,7 +17890,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+ 
+             if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_GRAPHICS))
+             {
+-                WARN("Failed to begin render pass, ignoring draw.\n");
++                if (!list->rebox.quiet_skip)
++                    WARN("Failed to begin render pass, ignoring draw.\n");
+                 break;
+             }
+ 
+@@ -17899,7 +17913,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+             if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_MESH_GRAPHICS))
+             {
+-                WARN("Failed to begin render pass, ignoring draw.\n");
++                if (!list->rebox.quiet_skip)
++                    WARN("Failed to begin render pass, ignoring draw.\n");
+                 break;
+             }
+ 
+@@ -20960,7 +20975,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list
+ 
+     if (!d3d12_command_list_begin_render_pass(list, VKD3D_PIPELINE_TYPE_MESH_GRAPHICS))
+     {
+-        WARN("Failed to begin render pass, ignoring draw call.\n");
++        if (!list->rebox.quiet_skip)
++            WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
+ 
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 8a7b33f..5df2568 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3394,6 +3394,9 @@ void vkd3d_rebox_bindless_targets(struct d3d12_device *device, uint32_t targets[
+     }
+ }
+ 
++static void rebox_words_acquire(uint32_t words);
++static void rebox_words_release(uint32_t words);
++
+ /* The compute pipeline for one compile of a deferred console shader. */
+ static VkPipeline d3d12_pipeline_state_rebox_create_compute(struct d3d12_pipeline_state *state,
+         const uint32_t *spirv, uint32_t spirv_words, uint32_t subgroup_size)
+@@ -3440,9 +3443,11 @@ static VkPipeline d3d12_pipeline_state_rebox_create_compute(struct d3d12_pipelin
+     else if (subgroup_size)
+         WARN("rebox: console shader wants subgroup size %u, which can't be required.\n", subgroup_size);
+ 
++    rebox_words_acquire(spirv_words);
+     start = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkCreateComputePipelines(device->vk_device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &vk_pipeline));
+     took = vkd3d_get_current_time_ns() - start;
++    rebox_words_release(spirv_words);
+     VK_CALL(vkDestroyShaderModule(device->vk_device, module, NULL));
+     if (vr < 0)
+     {
+@@ -3469,6 +3474,99 @@ static VkPipeline d3d12_pipeline_state_rebox_create_compute(struct d3d12_pipelin
+ struct rebox_graphics_build;
+ static VkPipeline rebox_graphics_build(const struct rebox_graphics_build *b, uint32_t *dynamic_state_flags);
+ 
++/* rebox (patch 0018): whether the PSO being created on this thread is one d3d12_xs gave fallback
++ * shaders (its ReboxFallbackPso). */
++static bool vkd3d_rebox_fallback_pso(void)
++{
++    typedef BOOL (WINAPI *PFN_fallback_pso)(void);
++    static PFN_fallback_pso fn;
++    static bool resolved;
++    vkd3d_module_t module;
++
++    if (!resolved)
++    {
++        if ((module = vkd3d_dlopen("d3d12_xs.dll")))
++            fn = (PFN_fallback_pso)vkd3d_dlsym(module, "ReboxFallbackPso");
++        resolved = true;
++    }
++    return fn && fn();
++}
++
++/* rebox (patch 0018): SPIR-V words of console pipelines being made at once. The driver's compile of
++ * a world's largest modules (1-2.4M words) holds GBs each, and several at once took the process's
++ * heap past 30 GB. A pipeline is made once the words in flight and its own fit in
++ * REBOX_PIPELINE_WORDS_IN_FLIGHT (default 1.5M; 0: no limit), or when nothing else is in flight;
++ * they are let in in the order they asked. */
++static struct
++{
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++    uint64_t in_flight, next_ticket, serving;
++    uint32_t limit;
++} rebox_words;
++static pthread_once_t rebox_words_once = PTHREAD_ONCE_INIT;
++
++static void rebox_words_init(void)
++{
++    char value[32];
++
++    pthread_mutex_init(&rebox_words.lock, NULL);
++    pthread_cond_init(&rebox_words.cond, NULL);
++    rebox_words.limit = 1500000;
++    if (vkd3d_get_env_var("REBOX_PIPELINE_WORDS_IN_FLIGHT", value, sizeof(value)))
++        rebox_words.limit = strtoul(value, NULL, 0);
++}
++
++static void rebox_words_acquire(uint32_t words)
++{
++    static uint32_t waits;
++    uint64_t ticket;
++    bool waited = false;
++
++    pthread_once(&rebox_words_once, rebox_words_init);
++    if (!rebox_words.limit)
++        return;
++    pthread_mutex_lock(&rebox_words.lock);
++    ticket = rebox_words.next_ticket++;
++    while (ticket != rebox_words.serving
++            || (rebox_words.in_flight && rebox_words.in_flight + words > rebox_words.limit))
++    {
++        waited = true;
++        pthread_cond_wait(&rebox_words.cond, &rebox_words.lock);
++    }
++    rebox_words.serving++;
++    rebox_words.in_flight += words;
++    pthread_cond_broadcast(&rebox_words.cond);
++    pthread_mutex_unlock(&rebox_words.lock);
++    if (waited)
++    {
++        uint32_t n = __atomic_add_fetch(&waits, 1, __ATOMIC_RELAXED);
++        if (!(n & (n - 1)))
++            ERR("rebox: %u console pipelines waited for SPIR-V words in flight (limit %u).\n", n, rebox_words.limit);
++    }
++}
++
++static void rebox_words_release(uint32_t words)
++{
++    if (!rebox_words.limit)
++        return;
++    pthread_mutex_lock(&rebox_words.lock);
++    rebox_words.in_flight -= words;
++    pthread_cond_broadcast(&rebox_words.cond);
++    pthread_mutex_unlock(&rebox_words.lock);
++}
++
++static bool rebox_variant_log(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char value[8];
++        on = vkd3d_get_env_var("REBOX_VARIANT_LOG", value, sizeof(value)) && !strcmp(value, "1");
++    }
++    return on;
++}
++
+ struct rebox_pipeline_job
+ {
+     struct rebox_pipeline_job *next;
+@@ -3661,6 +3759,9 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state
+         }
+         memset(&state->rebox_variants[state->rebox_variant_count], 0, sizeof(state->rebox_variants[0]));
+         memcpy(state->rebox_variants[state->rebox_variant_count++].key, out->key, sizeof(out->key));
++        if (rebox_variant_log() && state->rebox_variant_count > 1)
++            ERR("rebox: variants: PSO %p compute variant %zu: module %016"PRIx64"%016"PRIx64" (%u SPIR-V words).\n",
++                    state, state->rebox_variant_count, out->key[1], out->key[0], out->spirv_words);
+         rwlock_unlock_write(&state->lock);
+         if (d3d12_pipeline_state_rebox_queue_variant(state, out))
+             return VK_NULL_HANDLE;
+@@ -3814,10 +3915,14 @@ static VkPipeline rebox_graphics_build(const struct rebox_graphics_build *b, uin
+          * modules here, outside every timer in d3d12_xs. */
+         static uint64_t total_ns;
+         static uint32_t count;
+-        uint64_t start = vkd3d_get_current_time_ns(), took;
++        uint32_t words = b->words[0] + b->words[1] + b->words[2] + b->words[3];
++        uint64_t start, took;
++        rebox_words_acquire(words);
++        start = vkd3d_get_current_time_ns();
+         vk_pipeline = d3d12_pipeline_state_create_pipeline_variant(state, &pipeline_key, b->dsv_format, VK_NULL_HANDLE,
+                 0, dynamic_state_flags);
+         took = vkd3d_get_current_time_ns() - start;
++        rebox_words_release(words);
+         total_ns += took;
+         count++;
+         if (took > 50000000ull || !(count & (count - 1)))
+@@ -3918,6 +4023,26 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+     if (listed)
+         return vk_pipeline;
+ 
++    if (rebox_variant_log())
++    {
++        /* A new variant: which of its parts differ from the PSO's first one. */
++        const uint64_t parts[3] = { vs->key[0], ps->key[0], key_hash | (control && evaluation ? 1ull << 32 : 0) };
++        size_t count;
++        rwlock_lock_write(&state->lock);
++        count = state->rebox_variant_count;
++        if (!count)
++            memcpy(state->rebox_first_parts, parts, sizeof(parts));
++        rwlock_unlock_write(&state->lock);
++        if (count)
++            ERR("rebox: variants: PSO %p variant %zu: %s %016"PRIx64"%s, %s %016"PRIx64"%s, pipeline key %08"PRIx64
++                    "%s%s.\n", state, count + 1,
++                    graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT ? "mesh" : "vertex", parts[0],
++                    parts[0] != state->rebox_first_parts[0] ? " (differs)" : "", "pixel", parts[1],
++                    parts[1] != state->rebox_first_parts[1] ? " (differs)" : "", parts[2] & 0xffffffffu,
++                    (uint32_t)parts[2] != (uint32_t)state->rebox_first_parts[2] ? " (differs)" : "",
++                    (parts[2] >> 32) != (state->rebox_first_parts[2] >> 32) ? ", rect list differs" : "");
++    }
++
+     /* Vertex input: element r's slot, format and offset (D3D12_APPEND_ALIGNED_ELEMENT follows the
+      * slot's previous element). */
+     memset(&override, 0, sizeof(override));
+@@ -6512,6 +6637,16 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
+     graphics->library_flags = 0;
+     graphics->library_create_flags = 0;
+ 
++    /* rebox: a PSO d3d12_xs made with fallback shaders (its console stages are compiled at each
++     * draw, patch 0006) gets no pipeline of its own: one that draws nothing, made for every one of
++     * a title's tens of thousands of PSOs at load. */
++    if ((state->rebox_fallback = vkd3d_rebox_fallback_pso()))
++    {
++        graphics->pipeline_dynamic_states = d3d12_graphics_pipeline_state_get_dynamic_state_flags(state, NULL);
++        can_compile_pipeline_early = false;
++        create_library = false;
++    }
++
+     if (create_library && has_gpl)
+     {
+         if (!(graphics->library = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a1e175d..bafde53 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2387,6 +2387,12 @@ struct d3d12_pipeline_state
+      * private data at its first draw. */
+     struct vkd3d_rebox_graphics *rebox_graphics;
+     bool rebox_graphics_checked;
++    /* rebox (patch 0018): d3d12_xs made this PSO with fallback shaders (ReboxFallbackPso), which draw
++     * nothing: no pipeline is made for it, and a draw without a console pipeline is skipped. */
++    bool rebox_fallback;
++    /* rebox (patch 0018): what the first console graphics variant was made from (vertex and pixel
++     * stage keys, pipeline key hash), to say what later ones differ by (REBOX_VARIANT_LOG=1). */
++    uint64_t rebox_first_parts[3];
+ 
+     union
+     {
+@@ -3347,6 +3353,7 @@ struct d3d12_command_list
+         bool rect_list; /* the console's rect list (topology 17) is set: drawn as a triangle list or, for
+                          * deferred console graphics, with rect-list stages (patch 0011) */
+         bool rect_pipeline; /* the bound pipeline is such a rect-list one (its topology is a patch list) */
++        bool quiet_skip; /* the last draw was left out on purpose (patch 0018): no warning */
+     } rebox;
+     bool has_replaced_shaders;
+ 

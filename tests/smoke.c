@@ -1745,6 +1745,13 @@ static void test_present(void *dev, void *queue)
         hr = rs ? XSLOT(dev, 10, HRESULT, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **)(dev, &gd,
                 &IID_ID3D12PipelineState, &pso) : E_FAIL;
         CHECK(SUCCEEDED(hr), "graphics PSO from untranslated console shaders gets fallbacks (%#lx)", hr);
+        {
+            /* vkd3d-proton (patch 0018) asks during creation and makes no pipeline for it; the draw
+             * below is left out rather than drawn with one that draws nothing. */
+            BOOL (WINAPI *fallback_pso)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"),
+                    "ReboxFallbackPso");
+            CHECK(fallback_pso && !fallback_pso(), "d3d12_xs exports ReboxFallbackPso, FALSE outside PSO creation");
+        }
         if (pso)
         {
             /* RSSetViewports 21, RSSetScissorRects 22, IASetPrimitiveTopology
@@ -3334,6 +3341,45 @@ static void anyps5_round_trip(UINT64 res_va, const void *res_data, UINT res_size
                 if ((f = fopen(path, "wb"))) { fwrite(words, 4, word_count, f); fclose(f); }
             }
             free_words(words);
+        }
+
+        /* With a draw block, a host buffer whose length is in it (SA5_LENGTH_IN_DRAW_BLOCK) makes the
+         * same module whatever its size: a flattened SRT's size baked in made a module (and a
+         * pipeline) of a world's large compute shaders for every size it came in. */
+        {
+            int (*finalize_draw)(const struct sa5_result *, const struct sa5_remap *, UINT32,
+                    const struct sa5_host_buffer *, UINT32, UINT32, UINT32 **, UINT32 *, char *, size_t) =
+                    (void *)GetProcAddress(sa5, "sa5_finalize_draw");
+            int (*validate)(const UINT32 *, UINT32, char *, size_t) = (void *)GetProcAddress(sa5, "sa5_validate");
+            UINT32 *a = NULL, *c = NULL, a_count = 0, c_count = 0;
+            BOOL baked_differ = FALSE, valid = FALSE;
+            for (UINT32 i = 0; i < nremap; i++)
+                remaps[i].draw_index_base = SA5_DRAW_ADDRESSES + 4 * i;
+            /* Baked, two sizes make two modules. */
+            if (finalize_draw && !finalize_draw(result, remaps, nremap, hosts, nhost, 128, &a, &a_count, error,
+                    sizeof(error)))
+            {
+                for (UINT32 i = 0; i < nhost; i++)
+                    hosts[i].array_length += 4;
+                if (!finalize_draw(result, remaps, nremap, hosts, nhost, 128, &c, &c_count, error, sizeof(error)))
+                    baked_differ = a_count != c_count || memcmp(a, c, a_count * 4);
+                free_words(a);
+                if (c)
+                    free_words(c);
+                a = c = NULL;
+            }
+            CHECK(baked_differ, "sa5_finalize_draw with a baked host buffer length: a module for each size");
+            for (UINT32 i = 0; i < nhost; i++)
+                hosts[i].array_length = SA5_LENGTH_IN_DRAW_BLOCK;
+            if (finalize_draw && !finalize_draw(result, remaps, nremap, hosts, nhost, 128, &a, &a_count, error,
+                    sizeof(error)))
+                valid = validate && !validate(a, a_count, error, sizeof(error));
+            CHECK(a && valid, "sa5_finalize_draw reads a host buffer's length from the draw block "
+                  "(%u words, %s) %s", a_count, valid ? "valid" : "invalid", valid ? "" : error);
+            if (a)
+                free_words(a);
+            if (c)
+                free_words(c);
         }
     }
     result_free(result);

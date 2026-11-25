@@ -221,6 +221,11 @@ SA5_API void sa5_free_words(uint32_t *words);
  * Each host buffer without a baked address is addresses[push_slot]; each remap's element i is
  * heap index indices[draw_index_base + i]. */
 #define SA5_DRAW_ADDRESSES 8
+/* With sa5_finalize_draw, a host buffer whose array_length is SA5_LENGTH_IN_DRAW_BLOCK has its
+ * length (what OpArrayLength returns) in word 2 * SA5_DRAW_ADDRESSES + push_slot of the draw block,
+ * so a buffer whose size changes from draw to draw (a flattened SRT, shader data) doesn't change
+ * the module. A caller using it starts its draw_index_bases past those SA5_DRAW_ADDRESSES words. */
+#define SA5_LENGTH_IN_DRAW_BLOCK 0xffffffffu
 SA5_API int sa5_finalize_draw(const struct sa5_result *result, const struct sa5_remap *remaps, uint32_t remap_count,
                               const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t draw_block_base,
                               uint32_t **out, uint32_t *out_count, char *error, size_t error_size);

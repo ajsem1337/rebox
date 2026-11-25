@@ -653,8 +653,17 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
     for (const auto& inst : m.insts)
         if (Op(inst) == OpTypePointer && inst[2] == StorageClassStorageBuffer) sbPointers.emplace_back(inst[1], inst[3]);
     for (const auto& [ptr, pointee] : sbPointers) psbOf[ptr] = m.Pointer(StorageClassPhysicalStorageBuffer, pointee);
-    std::map<std::uint32_t, std::uint32_t> lengthConstants;
-    for (const auto& b : list) lengthConstants[b.var] = m.Constant(b.length);
+    // Each buffer's length: a constant, or (SA5_LENGTH_IN_DRAW_BLOCK) the index of its draw block word.
+    std::map<std::uint32_t, std::uint32_t> lengthConstants, lengthWords;
+    for (const auto& b : list) {
+        if (b.length != SA5_LENGTH_IN_DRAW_BLOCK) {
+            lengthConstants[b.var] = m.Constant(b.length);
+            continue;
+        }
+        if (!draw) Fail("a host buffer's length is in a draw block, but there is none");
+        if (b.slot >= SA5_DRAW_ADDRESSES) Fail("a host buffer's length is past the draw block's lengths");
+        lengthWords[b.var] = m.Constant(2u * SA5_DRAW_ADDRESSES + b.slot);
+    }
     std::map<std::uint32_t, std::uint32_t> slotConstants;
     for (const auto& b : list) slotConstants[b.slot] = m.Constant(b.slot);
     const std::uint32_t memberConstant = pushed && !draw ? m.Constant(member) : 0u;
@@ -667,6 +676,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
     std::map<std::uint32_t, std::uint32_t> rootOf;   // derived pointer -> host buffer variable
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> elementOf;  // guest buffer pointer -> table, entry*4
     bool inFunction = false, needPrologue = false;
+    std::uint32_t drawPointer = 0;  // this function's draw block pointer
     for (auto& inst : m.insts) {
         const auto op = Op(inst);
         // Drop the variables and everything that names them outside functions.
@@ -698,6 +708,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
             !(op == OpVariable && inst[3] == StorageClassFunction)) {
             // First instruction after the entry block's variables: load each host buffer's address.
             const std::uint32_t block = draw ? draw->Pointer(m, out) : 0u;
+            drawPointer = block;
             for (const auto& b : list) {
                 const std::uint32_t pointer = m.NewId();
                 std::uint32_t value = b.address;
@@ -721,7 +732,9 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
         if (inFunction) {
             const auto derived = [&](std::uint32_t id) { return rootOf.count(id) != 0; };
             if (op == OpArrayLength && inst.size() >= 5 && vars.count(inst[3])) {
-                out.push_back(Make(OpCopyObject, {inst[1], inst[2], lengthConstants[inst[3]]}));
+                std::uint32_t length = lengthConstants.count(inst[3]) ? lengthConstants[inst[3]] : 0u;
+                if (!length) length = draw->Word(m, out, drawPointer, lengthWords[inst[3]]);
+                out.push_back(Make(OpCopyObject, {inst[1], inst[2], length}));
                 continue;
             }
             if (op == OpArrayLength && inst.size() >= 5 && elementOf.count(inst[3])) {

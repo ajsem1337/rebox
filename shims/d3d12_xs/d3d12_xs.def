@@ -23,6 +23,7 @@ EXPORTS
     ReboxGuestBufferEntry
     ReboxConsoleCompile
     ReboxConsoleRectStages
+    ReboxFallbackPso
     ReboxConsoleLastResult
     ReboxConsoleFaults
     ReboxGuestBufferLength

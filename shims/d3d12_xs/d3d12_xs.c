@@ -156,6 +156,24 @@ static void note_fallback(const char *kind)
                      kind, n);
 }
 
+/* Set while a graphics PSO with fallback shaders is created on this thread: vkd3d-proton (patch
+ * 0018) asks ReboxFallbackPso and makes no pipeline for it (its console stages get theirs at draw
+ * time; a draw without one is left out, as the fallback would draw nothing). A title made one
+ * pipeline each for some 80,000 such PSOs at load. REBOX_EAGER_FALLBACK_PIPELINES=1 makes them
+ * as before. */
+static __thread BOOL creating_fallback;
+
+BOOL WINAPI ReboxFallbackPso(void)
+{
+    static int eager = -1;
+    if (eager < 0)
+    {
+        const char *env = getenv("REBOX_EAGER_FALLBACK_PIPELINES");
+        eager = env && *env == '1';
+    }
+    return creating_fallback && !eager;
+}
+
 static void note_failed_fallback(const char *kind, HRESULT hr)
 {
     static LONG count;
@@ -483,12 +501,14 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
             copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         note_fallback("graphics");
     }
+    creating_fallback = miss && fallback_enabled();
     hr = orig_create_graphics(device, &copy, riid, pso);
     if (retry_without_cache(hr, &copy.CachedPSO))
     {
         memset(&copy.CachedPSO, 0, sizeof(copy.CachedPSO));
         hr = orig_create_graphics(device, &copy, riid, pso);
     }
+    creating_fallback = FALSE;
     if (SUCCEEDED(hr) && miss && fallback_enabled() && pso)
         attach_console_graphics(desc, *pso, 0x1);
     /* Bytecode that passed as PC's or came from the cache can still fail to compile: Xbox DXIL
@@ -503,7 +523,9 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         if (copy.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
             copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         note_failed_fallback("graphics", hr);
+        creating_fallback = TRUE;
         hr = orig_create_graphics(device, &copy, riid, pso);
+        creating_fallback = FALSE;
     }
     return hr;
 }
@@ -671,12 +693,14 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
 
     copy.SizeInBytes = desc->SizeInBytes;
     copy.pPipelineStateSubobjectStream = stream;
+    creating_fallback = miss && fallback_enabled();
     hr = orig_create_pipeline(device, &copy, riid, pso);
     if (cached_pso && retry_without_cache(hr, (D3D12_CACHED_PIPELINE_STATE *)(stream + cached_pso)))
     {
         memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
         hr = orig_create_pipeline(device, &copy, riid, pso);
     }
+    creating_fallback = FALSE;
     /* A mesh pipeline: its mesh and pixel shaders, compiled at each mesh dispatch (patch 0013). One
      * with an amplification shader (other_stages) keeps its fallbacks: AnyPS5 has no task stage. */
     if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages && mesh.BytecodeLength
@@ -709,7 +733,9 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
         if (cached_pso)
             memset(stream + cached_pso, 0, sizeof(D3D12_CACHED_PIPELINE_STATE));
         note_failed_fallback("stream", hr);
+        creating_fallback = TRUE;
         hr = orig_create_pipeline(device, &copy, riid, pso);
+        creating_fallback = FALSE;
     }
     free(stream);
     return hr;

@@ -58,6 +58,9 @@ static void note_regions_full(const char *what, UINT n, UINT max)
 #define GRAPHICS_PUSH_DATA 112u
 #define GRAPHICS_PUSHED_MAX SA5_DRAW_ADDRESSES /* per-draw host buffers: in the draw block */
 #define COMPUTE_DRAW_BLOCK 128 /* where a dispatch's draw block address is in its push block */
+/* A draw block (sa5_finalize_draw): its host buffers' addresses (2 words each), their lengths
+ * (SA5_LENGTH_IN_DRAW_BLOCK, a word each), then its bindings' heap slots from DRAW_INDICES. */
+#define DRAW_INDICES (3 * SA5_DRAW_ADDRESSES)
 /* A mesh stage's push data ends earlier: AnyPS5's mesh path reads its draw parameters from push bytes
  * 104-127 (sa5_finalize_draw freezes them, so nothing is pushed there). */
 #define MESH_PUSH_DATA 96u
@@ -692,8 +695,17 @@ static UINT64 zero_buffer(UINT32 size)
 static SRWLOCK modules_lock = SRWLOCK_INIT;
 /* result: a graphics stage's AnyPS5 result, kept when it was compiled for a rect-list draw
  * (ReboxConsoleRectStages builds that draw's tessellation stages from it). */
-static struct module { UINT64 key[2]; UINT32 *words, count; struct sa5_result *result; struct module *next; } *modules[256];
-static UINT module_count;
+/* vk_key: the key vkd3d-proton gets (its pipelines are cached by it): the key of the first module
+ * with the same SPIR-V, so two keys that finalize to the same words share one pipeline. Such an
+ * alias shares that module's words. */
+static struct module
+{
+    UINT64 key[2], vk_key[2], content;
+    UINT32 *words, count;
+    struct sa5_result *result;
+    struct module *next, *content_next;
+} *modules[256], *modules_by_content[256];
+static UINT module_count, module_aliases;
 static UINT64 module_bytes;
 
 static struct module *find_module(const UINT64 key[2])
@@ -754,35 +766,150 @@ static void module_built(const UINT64 key[2])
 
 static struct module *add_module(const UINT64 key[2], const UINT32 *words, UINT32 count)
 {
-    struct module *m = malloc(sizeof(*m)), *other;
+    struct module *m = malloc(sizeof(*m)), *other, *same = NULL;
+    const UINT64 content = hash_words(0xcbf29ce484222325ull ^ count, words, count * sizeof(*words));
 
-    if (!m || !(m->words = malloc(count * sizeof(*words))))
-    {
-        free(m);
+    if (!m)
         return NULL;
-    }
+    memset(m, 0, sizeof(*m));
     memcpy(m->key, key, sizeof(m->key));
-    memcpy(m->words, words, count * sizeof(*words));
+    memcpy(m->vk_key, key, sizeof(m->vk_key));
+    m->content = content;
     m->count = count;
-    m->result = NULL;
     AcquireSRWLockExclusive(&modules_lock);
     for (other = modules[key[0] & 255]; other && memcmp(other->key, key, sizeof(other->key)); other = other->next)
         ;
+    if (!other)
+        for (same = modules_by_content[content & 255]; same; same = same->content_next)
+            if (same->content == content && same->count == count && !memcmp(same->words, words, count * sizeof(*words)))
+                break;
     if (other)
     {
-        free(m->words);
         free(m);
         m = other;
     }
-    else
+    else if (same)
     {
+        /* The same SPIR-V under another key (inputs that differ only in what the module doesn't
+         * keep): one pipeline for both. */
+        m->words = same->words;
+        memcpy(m->vk_key, same->vk_key, sizeof(m->vk_key));
         m->next = modules[key[0] & 255];
         modules[key[0] & 255] = m;
+        module_aliases++;
+    }
+    else if ((m->words = malloc(count * sizeof(*words))))
+    {
+        memcpy(m->words, words, count * sizeof(*words));
+        m->next = modules[key[0] & 255];
+        modules[key[0] & 255] = m;
+        m->content_next = modules_by_content[content & 255];
+        modules_by_content[content & 255] = m;
         module_count++;
         module_bytes += (UINT64)count * sizeof(*words);
     }
+    else
+    {
+        free(m);
+        m = NULL;
+    }
     ReleaseSRWLockExclusive(&modules_lock);
     return m;
+}
+
+/* REBOX_VARIANT_LOG=1: for each console stage's second and later modules, what they differ from
+ * its first one by: AnyPS5's result (the code it made for that call's descriptors and memory), the
+ * host buffers given to sa5_finalize_draw (field by field), the bindings, and the SPIR-V. With
+ * vkd3d-proton's "variants:" lines (patch 0018), to see why a stage has more than one pipeline. */
+static const char *stage_name(UINT32 stage);
+
+static BOOL variant_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *env = getenv("REBOX_VARIANT_LOG");
+        on = env && *env == '1';
+    }
+    return on;
+}
+
+static void variant_note(UINT64 stage, UINT32 stage_bit, const UINT64 identity[2], const struct sa5_host_buffer *hosts,
+                         UINT32 host_count, UINT64 bind_hash, const struct module *m)
+{
+    static struct variant_first
+    {
+        UINT64 stage, identity[2], bind_hash;
+        struct sa5_host_buffer hosts[8];
+        UINT32 host_count, modules;
+        const struct module *module;
+    } firsts[4096];
+    static SRWLOCK lock = SRWLOCK_INIT;
+    struct variant_first *v = NULL, copy;
+    char line[512];
+    int at = 0;
+    UINT32 differing = 0;
+
+    AcquireSRWLockExclusive(&lock);
+    for (UINT i = 0; i < 64; i++)
+    {
+        struct variant_first *e = &firsts[(stage + i) % ARRAYSIZE(firsts)];
+        if (!e->stage || e->stage == stage)
+        {
+            v = e;
+            break;
+        }
+    }
+    if (v && !v->stage)
+    {
+        v->stage = stage;
+        memcpy(v->identity, identity, sizeof(v->identity));
+        v->bind_hash = bind_hash;
+        v->host_count = min(host_count, 8u);
+        memcpy(v->hosts, hosts, v->host_count * sizeof(*hosts));
+        v->module = m;
+    }
+    if (v)
+        v->modules++;
+    if (v)
+        copy = *v;
+    ReleaseSRWLockExclusive(&lock);
+    if (!v || copy.modules < 2)
+        return;
+
+    if (memcmp(copy.identity, identity, sizeof(copy.identity)))
+        at += snprintf(line + at, sizeof(line) - at, " AnyPS5 result,");
+    if (copy.bind_hash != bind_hash)
+        at += snprintf(line + at, sizeof(line) - at, " bindings,");
+    if (copy.host_count != host_count)
+        at += snprintf(line + at, sizeof(line) - at, " host buffer count (%u, was %u),", host_count, copy.host_count);
+    for (UINT32 i = 0; i < min(host_count, copy.host_count) && at < 400; i++)
+    {
+        const struct sa5_host_buffer *a = &copy.hosts[i], *b = &hosts[i];
+        if (a->set != b->set || a->binding != b->binding)
+            at += snprintf(line + at, sizeof(line) - at, " host %u binding,", i);
+        if (a->push_slot != b->push_slot || a->push_base != b->push_base)
+            at += snprintf(line + at, sizeof(line) - at, " host %u slot,", i);
+        if (a->array_length != b->array_length)
+            at += snprintf(line + at, sizeof(line) - at, " host %u length (%u, was %u),", i, b->array_length,
+                           a->array_length);
+        if (a->address != b->address)
+            at += snprintf(line + at, sizeof(line) - at, " host %u address,", i);
+        if (a->guest_array != b->guest_array)
+            at += snprintf(line + at, sizeof(line) - at, " host %u kind,", i);
+    }
+    if (copy.module->count != m->count)
+        at += snprintf(line + at, sizeof(line) - at, " SPIR-V size (%u words, was %u)", m->count, copy.module->count);
+    else
+    {
+        for (UINT32 i = 0; i < m->count; i++)
+            differing += copy.module->words[i] != m->words[i];
+        at += snprintf(line + at, sizeof(line) - at, differing ? " %u SPIR-V words" : " same SPIR-V", differing);
+    }
+    if (at && line[at - 1] == ',')
+        line[--at] = 0;
+    rebox_log("d3d12_xs: variants: console %s shader %016llx module %u differs from its first by:%s",
+              stage_name(stage_bit), (unsigned long long)stage, copy.modules, line);
 }
 
 /* For the memory log: the finalized modules kept, and their SPIR-V's bytes. */
@@ -2144,8 +2271,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     static __thread struct sa5_region regions[MAX_REGIONS];
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
-    UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX];
-    UINT32 pushed_count = 0;
+    UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX], identity[2] = { 0 }, bind_hash = 0;
+    UINT32 pushed_count = 0, draw_lengths[SA5_DRAW_ADDRESSES] = { 0 };
     UINT32 remap_count = 0, host_count = 0, n, index_count = 0, *words = NULL, word_count = 0;
     static __thread UINT32 indices[MAX_ELEMENTS];
     static __thread struct { UINT position; UINT64 source; SIZE_T heap; } pending[64]; /* late T#s of this stage */
@@ -2796,6 +2923,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         LONG64 t = ticks_now();
         sa5.identity(result, key);
         part_add(PART_IDENTITY, ticks_now() - t);
+        memcpy(identity, key, sizeof(identity));
     }
     key[1] ^= hash_bytes(0xcbf29ce484222325ull, in->bindless, sizeof(in->bindless));
     if (graphics)
@@ -3168,9 +3296,10 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             }
             remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, in->bindless[b.kind][0],
                                                         in->bindless[b.kind][1], b.count, &indices[index_count],
-                                                        index_count };
+                                                        DRAW_INDICES - 2 * SA5_DRAW_ADDRESSES + index_count };
             key[0] = hash_bytes(key[0], &b.binding, sizeof(b.binding));
             key[0] = hash_bytes(key[0], &b.count, sizeof(b.count));
+            bind_hash = hash_bytes(hash_bytes(bind_hash, &b.binding, sizeof(b.binding)), &b.count, sizeof(b.count));
             /* The heap slots are in the draw block, not the module (a UE5 title copies its
              * descriptors to new slots every draw, and a world's compute passes theirs: a module per
              * draw or dispatch, and a pipeline each, compute's built while its dispatches were
@@ -3246,14 +3375,23 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     binding_failure_note(failure_id);
                     goto done;
                 }
-                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, pushed_count, bytes / 4, 0,
-                        in->push_offset + stage_push, 0 };
+                /* Their sizes change from draw to draw too: the length is in the draw block. */
+                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, pushed_count, SA5_LENGTH_IN_DRAW_BLOCK,
+                        0, in->push_offset + stage_push, 0 };
+                draw_lengths[pushed_count] = bytes / 4;
                 pushed_va[pushed_count++] = va;
             }
             else
             {
-                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count, bytes / 4, 0, 0,
-                        graphics ? va : 0 };
+                /* A dispatch's per-dispatch buffers have their lengths in its draw block (a flattened
+                 * SRT's size, baked in, made a module and a pipeline of a world's 350,000-word compute
+                 * shaders for every size it came in); the process-wide ones' are constant. */
+                BOOL per_dispatch = !graphics && host_count < SA5_DRAW_ADDRESSES
+                        && (b.role == ROLE_IMAGE_TABLE_MAP || b.role == ROLE_FLATTENED_SRT || b.role == ROLE_SHADER_DATA);
+                hosts[host_count] = (struct sa5_host_buffer){ b.set, b.binding, host_count,
+                        per_dispatch ? SA5_LENGTH_IN_DRAW_BLOCK : bytes / 4, 0, 0, graphics ? va : 0 };
+                if (per_dispatch)
+                    draw_lengths[host_count] = bytes / 4;
                 if (graphics)
                     key[0] = hash_bytes(key[0], &va, sizeof(va));
             }
@@ -3291,10 +3429,19 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 fclose(f);
             }
         }
-        /* The key is what vkd3d-proton's breadcrumbs record before the dispatch or draw (patch 0008). */
-        rebox_log("d3d12_xs: console shader %016llx: compiled a variant (%u SPIR-V words, %u guest bindings, "
-                     "%u host buffers; key %016llx)", (unsigned long long)hash_bytes(0xcbf29ce484222325ull, req.code,
-                     req.code_dwords * 4u), module->count, remap_count, host_count, (unsigned long long)key[0]);
+        /* The key is what vkd3d-proton's breadcrumbs record before the dispatch or draw (patch 0008):
+         * a module with the same SPIR-V as another goes by that one's key. */
+        {
+            UINT64 code_hash = hash_bytes(0xcbf29ce484222325ull, req.code, req.code_dwords * 4u);
+            char same[48] = "";
+            if (memcmp(module->vk_key, key, sizeof(key)))
+                snprintf(same, sizeof(same), "; same SPIR-V as key %016llx", (unsigned long long)module->vk_key[0]);
+            rebox_log("d3d12_xs: console shader %016llx: compiled a variant (%u SPIR-V words, %u guest bindings, "
+                         "%u host buffers; key %016llx%s)", (unsigned long long)code_hash, module->count, remap_count,
+                         host_count, (unsigned long long)key[0], same);
+            if (variant_log())
+                variant_note(code_hash, h->stage, identity, hosts, host_count, bind_hash, module);
+        }
     }
 
     phase_end(&mark, PHASE_MODULE);
@@ -3302,19 +3449,20 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     out->spirv = module->words;
     out->spirv_words = module->count;
     out->subgroup_size = sa5.subgroup_size(result);
-    memcpy(out->key, key, sizeof(key));
+    memcpy(out->key, module->vk_key, sizeof(out->key));
     push = sa5.push_constants(result, &push_size);
     memcpy(out->push, push, min(push_size, graphics ? stage_push : 128u));
     if (!graphics)
     {
-        /* A dispatch's draw block: its host buffers' addresses (by push slot, their index here),
-         * then its bindings' heap slots; its address at push byte COMPUTE_DRAW_BLOCK. */
-        static __thread UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS];
+        /* A dispatch's draw block (DRAW_INDICES): its host buffers' addresses (by push slot, their index here),
+         * their lengths, then its bindings' heap slots; its address at push byte COMPUTE_DRAW_BLOCK. */
+        static __thread UINT32 block[DRAW_INDICES + MAX_ELEMENTS];
         UINT64 va;
-        memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
+        memset(block, 0, DRAW_INDICES * sizeof(UINT32));
+        memcpy(block + 2 * SA5_DRAW_ADDRESSES, draw_lengths, sizeof(draw_lengths));
         memcpy(block, host_va, min(host_count, (UINT32)SA5_DRAW_ADDRESSES) * sizeof(UINT64));
-        memcpy(block + 2 * SA5_DRAW_ADDRESSES, indices, index_count * sizeof(UINT32));
-        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32), NULL)))
+        memcpy(block + DRAW_INDICES, indices, index_count * sizeof(UINT32));
+        if (!(va = draw_buffer(block, (DRAW_INDICES + max(index_count, 1u)) * sizeof(UINT32), NULL)))
         {
             log_failure(h, "no GPU memory for the draw block", NULL);
             goto done;
@@ -3323,14 +3471,15 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     }
     if (graphics)
     {
-        /* The draw block: the per-draw host buffers' addresses, then every remapped binding's heap
+        /* The draw block: the per-draw host buffers' addresses and lengths, then every remapped binding's heap
          * slots (sa5_finalize_draw); its address follows the stage's push data. */
-        static __thread UINT32 block[2 * SA5_DRAW_ADDRESSES + MAX_ELEMENTS];
+        static __thread UINT32 block[DRAW_INDICES + MAX_ELEMENTS];
         UINT64 va;
-        memset(block, 0, 2 * SA5_DRAW_ADDRESSES * sizeof(UINT32));
+        memset(block, 0, DRAW_INDICES * sizeof(UINT32));
+        memcpy(block + 2 * SA5_DRAW_ADDRESSES, draw_lengths, sizeof(draw_lengths));
         memcpy(block, pushed_va, pushed_count * sizeof(UINT64));
-        memcpy(block + 2 * SA5_DRAW_ADDRESSES, indices, index_count * sizeof(UINT32));
-        if (!(va = draw_buffer(block, (2 * SA5_DRAW_ADDRESSES + max(index_count, 1u)) * sizeof(UINT32), &block_cpu)))
+        memcpy(block + DRAW_INDICES, indices, index_count * sizeof(UINT32));
+        if (!(va = draw_buffer(block, (DRAW_INDICES + max(index_count, 1u)) * sizeof(UINT32), &block_cpu)))
         {
             log_failure(h, "no GPU memory for the draw block", NULL);
             goto done;
@@ -3341,7 +3490,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             AcquireSRWLockExclusive(&late_lock);
             for (UINT i = 0; i < pending_count && late_count < ARRAYSIZE(late); i++)
                 late[late_count++] = (struct late_texture){
-                        (UINT32 *)(block_cpu + (2 * SA5_DRAW_ADDRESSES + pending[i].position) * sizeof(UINT32)),
+                        (UINT32 *)(block_cpu + (DRAW_INDICES + pending[i].position) * sizeof(UINT32)),
                         pending[i].source, pending[i].heap, 0, stage_id };
             ReleaseSRWLockExclusive(&late_lock);
         }
@@ -3520,9 +3669,9 @@ HRESULT WINAPI ReboxConsoleRectStages(const struct rebox_compile_out *vs, const 
     memset(evaluation, 0, sizeof(*evaluation));
     control->spirv = r->control->words;
     control->spirv_words = r->control->count;
-    memcpy(control->key, r->control->key, sizeof(control->key));
+    memcpy(control->key, r->control->vk_key, sizeof(control->key));
     evaluation->spirv = r->evaluation->words;
     evaluation->spirv_words = r->evaluation->count;
-    memcpy(evaluation->key, r->evaluation->key, sizeof(evaluation->key));
+    memcpy(evaluation->key, r->evaluation->vk_key, sizeof(evaluation->key));
     return S_OK;
 }
