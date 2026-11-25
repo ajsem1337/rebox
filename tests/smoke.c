@@ -4304,6 +4304,96 @@ static void test_xapu(void)
  * use, and again after a reported write (DirectStorage reports its writes the same way). */
 /* A texture placed on memory the title has only reserved: it is filled once the memory is
  * committed and written, after a few submissions (rechecked with backoff). */
+/* Views of memory (slot 70) of sampled textures get memory of their own, kept per address and
+ * description. A world streaming in reuses its texture pools: a view of another shape over the
+ * same memory retires the old texture, which is released once the GPU is past it, so the memory
+ * stays bounded; a view of the same shape in another format (sRGB) is kept beside it. */
+static void test_view_texture_retire(void *dev, void *queue)
+{
+    void (WINAPI *view_memory)(UINT64 *, UINT64 *, UINT64 *, UINT64 *) =
+            (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxViewMemory");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    struct { D3D12_SHADER_RESOURCE_VIEW_DESC v; UINT64 address; BYTE pad[8]; } view = { { DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING } };
+    BYTE console_desc[0x40] = { 0 };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN };
+    UINT64 views0, retired0, textures0, bytes0, views, retired, textures, peak, bytes;
+    ID3D12CommandAllocator *alloc = NULL;
+    void *heap = NULL, *list = NULL, *memory;
+    SIZE_T start;
+    const int count = 64;
+
+    if (!view_memory || !(memory = VirtualAlloc(NULL, 4 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)))
+        return;
+    if (FAILED(XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap)))
+        return;
+    start = XSLOT(heap, 9, SIZE_T)(heap);
+    view.v.Texture2D.MipLevels = 1;
+    view.address = (UINT64)(ULONG_PTR)memory;
+    view_memory(&views0, &retired0, &textures0, &bytes0);
+    /* A pool slot refilled with textures of a new size each time. */
+    for (int i = 0; i < count; i++)
+    {
+        td.Width = 64 + 4 * i;
+        memcpy(console_desc, &td, sizeof(td));
+        XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    }
+    view_memory(&views, &retired, &peak, &bytes);
+    CHECK(peak - textures0 == count && views - views0 == 1,
+          "views of memory: %d textures of other shapes over the same memory leave one view kept (%llu kept, "
+          "%llu of their textures alive)", count, (unsigned long long)(views - views0),
+          (unsigned long long)(peak - textures0));
+    /* A submission, so the GPU's progress is watched; then the retired ones are released. */
+    if (SUCCEEDED(XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&alloc))
+            && SUCCEEDED(XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *,
+                               ID3D12PipelineState *, REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                               NULL, &IID_ID3D12GraphicsCommandList, &list)))
+    {
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    }
+    for (int i = 0; i < 100; i++)
+    {
+        view_memory(&views, &retired, &textures, &bytes);
+        if (textures - textures0 <= 1)
+            break;
+        Sleep(100);
+    }
+    CHECK(textures - textures0 == 1 && retired == retired0 && bytes - bytes0 < 1 << 20,
+          "views of memory: the %d retired textures are released once the GPU is past them (%llu alive, %llu waiting, "
+          "%llu bytes)", count - 1, (unsigned long long)(textures - textures0), (unsigned long long)retired,
+          (unsigned long long)(bytes - bytes0));
+    /* The last shape again, in sRGB: kept beside it; and the first again: the same one. */
+    view.v.Format = td.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    memcpy(console_desc, &td, sizeof(td));
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    view.v.Format = td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    memcpy(console_desc, &td, sizeof(td));
+    console_desc[4] = 0x5a; /* the PC's padding: not part of the key */
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    view_memory(&views, &retired, &textures, &bytes);
+    CHECK(textures - textures0 == 2 && views - views0 == 2 && retired == retired0,
+          "views of memory: an sRGB view of the same texture is kept beside it, and the same one again is found "
+          "(%llu kept, %llu alive, %llu retired)", (unsigned long long)(views - views0),
+          (unsigned long long)(textures - textures0), (unsigned long long)(retired - retired0));
+    /* A small texture inside it, past its start (a view of a mip, maybe): both stay. */
+    td.Width = td.Height = 16;
+    memcpy(console_desc, &td, sizeof(td));
+    view.address = (UINT64)(ULONG_PTR)memory + 0x4000;
+    XSLOT(dev, 70, void, const void *, const void *, SIZE_T)(dev, console_desc, &view, start);
+    view_memory(&views, &retired, &textures, &bytes);
+    CHECK(textures - textures0 == 3 && views - views0 == 3 && retired == retired0,
+          "views of memory: a texture inside another, past its start, leaves it (%llu kept, %llu retired)",
+          (unsigned long long)(views - views0), (unsigned long long)(retired - retired0));
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    XSLOT(heap, 2, ULONG)(heap);
+    /* The memory stays: the views kept still name it. */
+}
+
 static void test_placed_texture_late(void *dev, void *queue)
 {
     struct { UINT mode; DXGI_FORMAT format; UINT width, height, layers, mips; BOOL volume, mip_major; } surface =
@@ -5509,6 +5599,7 @@ static void test_xbox(void)
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     test_placed_texture_array(dev, queue);
     test_placed_texture_late(dev, queue);
+    test_view_texture_retire(dev, queue);
     test_placed_texture_written(dev, queue);
     test_placed_texture_tracked(dev, queue);
     test_list_queries(dev, queue);

@@ -184,6 +184,7 @@ method the title asked for that isn't implemented.
 | `REBOX_GPU_MEMORY=0` | Give GPU-visible `XMemAlloc` types plain `VirtualAlloc` memory instead of D3D12 heaps |
 | `REBOX_DIRTY_PAGES=0` | Don't reserve title memory (`XMemVirtualAlloc`, `XMemAlloc` pages) with `MEM_WRITE_WATCH`: placed textures there are found changed by fingerprints, as in GPU memory, instead of by the pages written before each submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
 | `REBOX_TEXTURE_TRACKING=0` | Don't write-track placed textures in physical-page views (their pages read-only, the first write to each 64 KiB page noted): they are found changed by fingerprints again, the hot ones every submission ([docs/d3d12x.md](docs/d3d12x.md) "Texture changes") |
+| `REBOX_VIEW_RETIRE=0` | Keep every texture made for a view of memory (slots 70, 71), as before: by default one with memory of its own is released, once the GPU is past it, when a view texture of another shape is made over its memory (a streaming world reusing its texture pools grew them without end) |
 | `REBOX_STOCK_VULKAN=1` | Don't switch AMD GPUs to `.#radv-rebox` |
 | `REBOX_PRESENT=0` | No window or swapchain for `PresentX` (frame dumps still work) |
 | `REBOX_VSYNC=N` | `PresentX` sync interval, default 1. Frames the display isn't taking (a hidden Wayland window) are dropped, never waited for |

@@ -2850,9 +2850,59 @@ static void retry_pending_adopts(void)
     ReleaseSRWLockExclusive(&pending_adopt_lock);
 }
 
+/* Memory Rebox gives placed resources of their own, for the memory log every 10 s: how many are
+ * alive and their bytes, by kind, and how many were made and destroyed since the last log. Placed
+ * ones are the title's (slots 44 and 133), view ones made for views of memory (slots 70 and 71). */
+enum own_kind { OWN_PLACED_TEXTURE, OWN_PLACED_BUFFER, OWN_VIEW_TEXTURE, OWN_VIEW_BUFFER, OWN_KINDS };
+static const char *const own_names[OWN_KINDS] = { "placed textures", "placed buffers", "view textures",
+                                                   "view buffers" };
+static struct { volatile LONG64 live, bytes, made, gone; } own_stats[OWN_KINDS];
+struct own_note { enum own_kind kind; UINT64 bytes; UINT callback; };
+
+static void WINAPI own_destroyed(void *data)
+{
+    struct own_note *n = data;
+    InterlockedDecrement64(&own_stats[n->kind].live);
+    InterlockedAdd64(&own_stats[n->kind].bytes, -(LONG64)n->bytes);
+    InterlockedIncrement64(&own_stats[n->kind].gone);
+    free(n);
+}
+
+static UINT64 allocation_size(struct proxy *p, const D3D12_RESOURCE_DESC *d)
+{
+    D3D12_RESOURCE_ALLOCATION_INFO info = { 0 };
+    ((D3D12_RESOURCE_ALLOCATION_INFO *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_ALLOCATION_INFO *, UINT, UINT,
+            const D3D12_RESOURCE_DESC *))PC_SLOT(p->inner, 25))(p->inner, &info, 0, 1, d);
+    return info.SizeInBytes == ~0ull ? 0 : info.SizeInBytes;
+}
+
+static void own_note(ID3D12Resource *res, enum own_kind kind, UINT64 bytes)
+{
+    ID3DDestructionNotifier *notifier;
+    struct own_note *n;
+
+    if (!res || !(n = calloc(1, sizeof(*n))))
+        return;
+    if (FAILED(ID3D12Resource_QueryInterface(res, &IID_ID3DDestructionNotifier, (void **)&notifier)))
+    {
+        free(n);
+        return;
+    }
+    n->kind = kind;
+    n->bytes = bytes;
+    InterlockedIncrement64(&own_stats[kind].live);
+    InterlockedAdd64(&own_stats[kind].bytes, (LONG64)bytes);
+    InterlockedIncrement64(&own_stats[kind].made);
+    ID3DDestructionNotifier_RegisterDestructionCallback(notifier, own_destroyed, n, &n->callback);
+    ID3DDestructionNotifier_Release(notifier);
+}
+
 struct alias_heap { UINT64 address, size; ID3D12Heap *heap; };
 static struct alias_heap alias_heaps[4096];
 static SRWLOCK alias_lock = SRWLOCK_INIT;
+static UINT alias_heap_count;
+static UINT64 alias_heap_bytes;
+static volatile LONG64 alias_heap_made;
 
 static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D12_RESOURCE_DESC *d,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out, BOOL gpu)
@@ -2913,7 +2963,14 @@ static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D1
             return hr;
         }
         if (e->heap)
+        {
             ID3D12Heap_Release(e->heap);
+            alias_heap_bytes -= e->size;
+        }
+        else
+            alias_heap_count++;
+        alias_heap_bytes += info.SizeInBytes;
+        alias_heap_made++;
         e->address = address;
         e->size = info.SizeInBytes;
         e->heap = heap;
@@ -2934,11 +2991,11 @@ static HRESULT place_aliased_texture(struct proxy *p, UINT64 address, const D3D1
  * logged once per kind: textures (the chunk heaps hold buffers only, and console tilings aren't
  * modelled), memory that couldn't be made GPU memory, and placements the heap refuses. An address in
  * a GPU-only view of title memory is placed over the CPU memory behind it. */
-static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
-        const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
-        void **out)
+static HRESULT placed_resource_x(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address, const D3D12_RESOURCE_DESC *desc,
+        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out, BOOL view,
+        enum own_kind *own)
 {
-    static const D3D12_HEAP_PROPERTIES own = { D3D12_HEAP_TYPE_DEFAULT };
+    static const D3D12_HEAP_PROPERTIES own_heap = { D3D12_HEAP_TYPE_DEFAULT };
     static LONG logged[3];
     D3D12_RESOURCE_DESC storage;
     const D3D12_RESOURCE_DESC *d = pc_desc(desc, &storage);
@@ -2947,6 +3004,8 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
     HRESULT hr = E_FAIL;
     int why;
 
+    if (own)
+        *own = OWN_KINDS;
     if (!d || !out)
         return E_INVALIDARG;
     {
@@ -3030,11 +3089,26 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D
                      (unsigned long long)address, d->Dimension, (unsigned long long)d->Width,
                      why == 0 ? "a texture, uploaded from title memory when that changes"
                      : why == 1 ? "not in GPU memory" : "the heap refused the placement");
-    hr = device_CreateCommittedResource(p, &own, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+    hr = device_CreateCommittedResource(p, &own_heap, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+    if (SUCCEEDED(hr) && *out)
+    {
+        enum own_kind kind = why == 0 ? (view ? OWN_VIEW_TEXTURE : OWN_PLACED_TEXTURE)
+                                      : (view ? OWN_VIEW_BUFFER : OWN_PLACED_BUFFER);
+        own_note(*out, kind, allocation_size(p, d));
+        if (own)
+            *own = kind;
+    }
     /* A texture is the memory at its address on the console: keep it filled from there. */
     if (SUCCEEDED(hr) && why == 0 && *out)
         title_texture_register(*out, address, desc, d, state);
     return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreatePlacedResourceX(struct proxy *p, D3D12_GPU_VIRTUAL_ADDRESS address,
+        const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid,
+        void **out)
+{
+    return placed_resource_x(p, address, desc, state, clear, riid, out, FALSE, NULL);
 }
 
 /* Device methods of the newer layout (SDK 0x20004) a retail title uses, after xcl (ivall/xcl,
@@ -3108,16 +3182,46 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResourceLayoutX(struct pr
 /* A resource placed at a title address for views of memory (slots 70 and 71), made once per address
  * and description and kept, as xcl's resource_at. Found through a hash table: a title loading its
  * world makes views at hundreds of thousands of addresses, and a scan of every one per view (under
- * an exclusive lock) left its threads queued here and its frames 30 s apart. */
-static struct memory_view_resource
+ * an exclusive lock) left its threads queued here and its frames 30 s apart.
+ *
+ * Kept while the title's memory is still that texture: a view texture with memory of its own (a
+ * sampled texture, filled from title memory) is retired when a view texture of another shape is
+ * made over any of its memory. On the console that memory is the new texture's now, and the old
+ * one's contents are gone. A world streaming in reuses its texture pools all the time, and with
+ * every texture kept their memory grew without end (tens of GiB in a few minutes, until the host
+ * killed the process). Views of the same memory in the same shape, another format (sRGB and
+ * linear), stay, and so does a texture with the new one wholly inside it, not at its start (that
+ * may be a view of one of its mips or slices). A retired one stops being filled from title memory and is released once the GPU
+ * has finished everything submitted before it was retired, and at least VIEW_RETIRE_MS later.
+ * REBOX_VIEW_RETIRE=0 keeps every one, as before. */
+#define VIEW_RETIRE_MS 2000
+#define VIEW_PAGE_BUCKETS 65536
+
+struct view_page { UINT64 page; struct memory_view *v; struct view_page *next; };
+
+static struct memory_view
 {
-    UINT64 address;
+    UINT64 address, end;        /* end: of the title memory an own texture covers */
     D3D12_RESOURCE_DESC desc;
     ID3D12Resource *res;
-    SIZE_T next; /* the next in the bucket, plus one */
-} *memory_views;
-static SIZE_T memory_view_count, memory_view_capacity, *memory_view_buckets, memory_view_bucket_count;
+    struct memory_view *next;   /* in its bucket */
+    struct view_page *pages;    /* own textures: each 64 KiB page they cover, in view_pages */
+    UINT page_count;
+} **memory_view_buckets;
+static SIZE_T memory_view_count, memory_view_bucket_count;
+static struct view_page *view_pages[VIEW_PAGE_BUCKETS];
+static struct retired_view { ID3D12Resource *res; LONG64 at; } *views_retired;
+static SIZE_T views_retired_count, views_retired_capacity;
+static LONG64 views_retired_total, views_released_total;
 static SRWLOCK memory_view_lock = SRWLOCK_INIT;
+
+/* The description as a key: the PC's padding after Dimension zeroed (a console desc's bytes there
+ * aren't known to mean anything). The console's tail at +0x34 (the PC's padding) is kept. */
+static void memory_view_key(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC *key)
+{
+    *key = *desc;
+    memset((BYTE *)key + sizeof(key->Dimension), 0, offsetof(D3D12_RESOURCE_DESC, Alignment) - sizeof(key->Dimension));
+}
 
 static SIZE_T memory_view_hash(UINT64 address, const D3D12_RESOURCE_DESC *desc)
 {
@@ -3128,59 +3232,203 @@ static SIZE_T memory_view_hash(UINT64 address, const D3D12_RESOURCE_DESC *desc)
     return (SIZE_T)(h ^ (h >> 32));
 }
 
+static SIZE_T view_page_bucket(UINT64 page)
+{
+    return (SIZE_T)(page * 0x9e3779b97f4a7c15ull >> 48) % VIEW_PAGE_BUCKETS;
+}
+
+/* The same memory in the same shape: only the format (of the same size) or the flags differ. Or
+ * [address, end) is a part of v's memory past its start: maybe a view of one of its mips. */
+static BOOL view_stays(const struct memory_view *v, UINT64 address, UINT64 end, const D3D12_RESOURCE_DESC *d)
+{
+    if (address > v->address && end <= v->end)
+        return TRUE;
+    return v->address == address && v->end == end && v->desc.Dimension == d->Dimension
+            && v->desc.Width == d->Width && v->desc.Height == d->Height
+            && v->desc.DepthOrArraySize == d->DepthOrArraySize && v->desc.MipLevels == d->MipLevels
+            && v->desc.Layout == d->Layout
+            && *(const UINT *)((const BYTE *)&v->desc + 0x34) == *(const UINT *)((const BYTE *)d + 0x34);
+}
+
 /* Under memory_view_lock (shared or exclusive). */
-static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DESC *desc, SIZE_T hash)
+static ID3D12Resource *memory_view_find(UINT64 address, const D3D12_RESOURCE_DESC *key, SIZE_T hash)
 {
     if (!memory_view_bucket_count)
         return NULL;
-    for (SIZE_T i = memory_view_buckets[hash & (memory_view_bucket_count - 1)]; i; i = memory_views[i - 1].next)
-        if (memory_views[i - 1].address == address && !memcmp(&memory_views[i - 1].desc, desc, sizeof(*desc)))
-            return memory_views[i - 1].res;
+    for (struct memory_view *v = memory_view_buckets[hash & (memory_view_bucket_count - 1)]; v; v = v->next)
+        if (v->address == address && !memcmp(&v->desc, key, sizeof(*key)))
+            return v->res;
     return NULL;
 }
 
-/* Under memory_view_lock, exclusive. */
-static void memory_view_add(UINT64 address, const D3D12_RESOURCE_DESC *desc, ID3D12Resource *res, SIZE_T hash)
+/* Under memory_view_lock, exclusive: out of the tables, onto the retired list. */
+static void memory_view_retire(struct memory_view *v, LONG64 now)
 {
-    if (memory_view_count == memory_view_capacity)
+    struct memory_view **at;
+
+    for (at = &memory_view_buckets[memory_view_hash(v->address, &v->desc) & (memory_view_bucket_count - 1)];
+            *at; at = &(*at)->next)
+        if (*at == v)
+        {
+            *at = v->next;
+            break;
+        }
+    for (UINT k = 0; k < v->page_count; k++)
     {
-        SIZE_T n = memory_view_capacity ? memory_view_capacity * 2 : 1024;
-        struct memory_view_resource *grown = realloc(memory_views, n * sizeof(*grown));
-        if (!grown)
-            return;
-        memory_views = grown;
-        memory_view_capacity = n;
+        struct view_page **pp;
+        for (pp = &view_pages[view_page_bucket(v->pages[k].page)]; *pp; pp = &(*pp)->next)
+            if (*pp == &v->pages[k])
+            {
+                *pp = v->pages[k].next;
+                break;
+            }
     }
+    memory_view_count--;
+    if (views_retired_count == views_retired_capacity)
+    {
+        SIZE_T n = views_retired_capacity ? views_retired_capacity * 2 : 256;
+        struct retired_view *grown = realloc(views_retired, n * sizeof(*grown));
+        if (grown)
+            views_retired = grown, views_retired_capacity = n;
+    }
+    if (views_retired_count < views_retired_capacity)
+    {
+        /* Its contents are the old texture's: title memory isn't, from now on. */
+        title_texture_gpu_written(v->res);
+        views_retired[views_retired_count++] = (struct retired_view){ v->res, now };
+        views_retired_total++;
+    }
+    /* else kept: better than released under the GPU's feet */
+    free(v->pages);
+    free(v);
+}
+
+static BOOL view_retire_enabled(void)
+{
+    static LONG setting = -1;
+    if (setting < 0)
+    {
+        char *v = rebox_getenv("REBOX_VIEW_RETIRE");
+        setting = !(v && v[0] == '0');
+        free(v);
+    }
+    return setting;
+}
+
+/* Under memory_view_lock, exclusive. own: an own texture over [address, end). */
+static void memory_view_add(UINT64 address, const D3D12_RESOURCE_DESC *key, ID3D12Resource *res, SIZE_T hash,
+                            BOOL own, UINT64 end)
+{
+    struct memory_view *v;
+
     if (memory_view_count + 1 > memory_view_bucket_count)
     {
-        SIZE_T n = memory_view_bucket_count ? memory_view_bucket_count * 4 : 4096, *buckets = calloc(n, sizeof(*buckets));
+        SIZE_T n = memory_view_bucket_count ? memory_view_bucket_count * 4 : 4096;
+        struct memory_view **buckets = calloc(n, sizeof(*buckets));
         if (!buckets)
             return;
+        for (SIZE_T b = 0; b < memory_view_bucket_count; b++)
+            while ((v = memory_view_buckets[b]))
+            {
+                memory_view_buckets[b] = v->next;
+                v->next = buckets[memory_view_hash(v->address, &v->desc) & (n - 1)];
+                buckets[memory_view_hash(v->address, &v->desc) & (n - 1)] = v;
+            }
         free(memory_view_buckets);
         memory_view_buckets = buckets;
         memory_view_bucket_count = n;
-        for (SIZE_T i = 0; i < memory_view_count; i++)
+    }
+    if (!(v = calloc(1, sizeof(*v))))
+        return;
+    v->address = address;
+    v->desc = *key;
+    v->res = res;
+    if (own && end > address && view_retire_enabled())
+    {
+        UINT64 p0 = address >> 16, p1 = (end - 1) >> 16;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        /* Own textures of another shape over this memory are the title's no longer. */
+        for (UINT64 page = p0; page <= p1; page++)
         {
-            SIZE_T b = memory_view_hash(memory_views[i].address, &memory_views[i].desc) & (n - 1);
-            memory_views[i].next = buckets[b];
-            buckets[b] = i + 1;
+            struct view_page *n;
+        again:
+            for (n = view_pages[view_page_bucket(page)]; n; n = n->next)
+                if (n->page == page && n->v->address < end && n->v->end > address
+                        && !view_stays(n->v, address, end, key))
+                {
+                    memory_view_retire(n->v, now.QuadPart);
+                    goto again;
+                }
+        }
+        v->end = end;
+        if ((v->pages = calloc(p1 - p0 + 1, sizeof(*v->pages))))
+        {
+            v->page_count = (UINT)(p1 - p0 + 1);
+            for (UINT k = 0; k < v->page_count; k++)
+            {
+                SIZE_T b = view_page_bucket(p0 + k);
+                v->pages[k] = (struct view_page){ p0 + k, v, view_pages[b] };
+                view_pages[b] = &v->pages[k];
+            }
         }
     }
-    memory_views[memory_view_count] = (struct memory_view_resource){ address, *desc, res,
-            memory_view_buckets[hash & (memory_view_bucket_count - 1)] };
-    memory_view_buckets[hash & (memory_view_bucket_count - 1)] = ++memory_view_count;
+    v->next = memory_view_buckets[hash & (memory_view_bucket_count - 1)];
+    memory_view_buckets[hash & (memory_view_bucket_count - 1)] = v;
+    memory_view_count++;
+}
+
+/* Releases the retired view resources retired before `before` (a QueryPerformanceCounter time: the
+ * oldest submission the GPU hasn't finished, or VIEW_RETIRE_MS ago if earlier). */
+static void memory_views_reap(LONG64 before)
+{
+    ID3D12Resource *stack[256];
+    UINT n = 0;
+
+    if (!views_retired_count)
+        return;
+    AcquireSRWLockExclusive(&memory_view_lock);
+    for (SIZE_T i = 0; i < views_retired_count && n < ARRAYSIZE(stack); )
+        if (views_retired[i].at < before)
+        {
+            stack[n++] = views_retired[i].res;
+            views_retired[i] = views_retired[--views_retired_count];
+        }
+        else
+            i++;
+    views_released_total += n;
+    ReleaseSRWLockExclusive(&memory_view_lock);
+    while (n)
+    {
+        ID3D12Resource *res = stack[--n]; /* the macro names its argument twice */
+        ID3D12Resource_Release(res);
+    }
+}
+
+/* For tests: memory views kept, retired ones waiting for the GPU, and the view textures with memory
+ * of their own alive, and their bytes. */
+void WINAPI ReboxViewMemory(UINT64 *views, UINT64 *retired, UINT64 *textures, UINT64 *bytes)
+{
+    AcquireSRWLockShared(&memory_view_lock);
+    *views = memory_view_count;
+    *retired = views_retired_count;
+    ReleaseSRWLockShared(&memory_view_lock);
+    *textures = (UINT64)own_stats[OWN_VIEW_TEXTURE].live;
+    *bytes = (UINT64)own_stats[OWN_VIEW_TEXTURE].bytes;
 }
 
 static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *desc, UINT64 address)
 {
+    D3D12_RESOURCE_DESC key;
     ID3D12Resource *res;
     SIZE_T hash;
 
     if (!desc || !address)
         return NULL;
-    hash = memory_view_hash(address, desc);
+    memory_view_key(desc, &key);
+    hash = memory_view_hash(address, &key);
     AcquireSRWLockShared(&memory_view_lock);
-    res = memory_view_find(address, desc, hash);
+    res = memory_view_find(address, &key, hash);
     ReleaseSRWLockShared(&memory_view_lock);
     if (res)
         return res;
@@ -3190,12 +3438,19 @@ static ID3D12Resource *resource_at(struct proxy *p, const D3D12_RESOURCE_DESC *d
      * threads making the same one keep the first. */
     {
         ID3D12Resource *made = NULL, *found;
-        if (FAILED(device_CreatePlacedResourceX(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL,
-                                                &IID_ID3D12Resource, (void **)&made)))
+        enum own_kind own = OWN_KINDS;
+        UINT64 end = address;
+        if (FAILED(placed_resource_x(p, address, desc, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
+                                     (void **)&made, TRUE, &own)))
             made = NULL;
+        if (made && own == OWN_VIEW_TEXTURE)
+        {
+            D3D12_RESOURCE_DESC storage;
+            end = address + max(title_texture_size(desc), allocation_size(p, pc_desc(desc, &storage)));
+        }
         AcquireSRWLockExclusive(&memory_view_lock);
-        if (!(found = memory_view_find(address, desc, hash)) && made)
-            memory_view_add(address, desc, made, hash);
+        if (!(found = memory_view_find(address, &key, hash)) && made)
+            memory_view_add(address, &key, made, hash, own == OWN_VIEW_TEXTURE, end);
         ReleaseSRWLockExclusive(&memory_view_lock);
         if (found)
         {
@@ -3742,6 +3997,57 @@ static struct gpu_latency_entry gpu_latency[4096];
 static UINT gpu_latency_head, gpu_latency_tail;
 static SRWLOCK gpu_latency_lock = SRWLOCK_INIT;
 
+/* Memory, every 10 s: a run killed for using too much (a host OOM watcher) left no other trace.
+ * Then the resources Rebox gives memory of their own: alive (MiB), +made -destroyed in the last
+ * 10 s; alias heaps (place_aliased_texture); memory views kept, and retired ones waiting for the
+ * GPU and released; title textures registered, and their uploads in flight. */
+static void memory_log(void)
+{
+    PROCESS_MEMORY_COUNTERS_EX pm = { sizeof(pm) };
+    MEMORYSTATUSEX host = { sizeof(host) };
+    struct title_texture_stats tt;
+    char own[512];
+    int at = 0;
+    UINT heaps;
+    UINT64 heap_bytes, heaps_made;
+    SIZE_T views, retired;
+    LONG64 retired_total, released_total;
+
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof(pm));
+    GlobalMemoryStatusEx(&host);
+    for (int k = 0; k < OWN_KINDS; k++)
+    {
+        LONG64 made = InterlockedExchange64(&own_stats[k].made, 0), gone = InterlockedExchange64(&own_stats[k].gone, 0);
+        at += snprintf(own + at, sizeof(own) - at, "%s%s %lld (%lld MiB, +%lld -%lld)", k ? ", " : "", own_names[k],
+                       (long long)own_stats[k].live, (long long)(own_stats[k].bytes >> 20), (long long)made,
+                       (long long)gone);
+        if (at >= (int)sizeof(own))
+            break;
+    }
+    AcquireSRWLockShared(&alias_lock);
+    heaps = alias_heap_count;
+    heap_bytes = alias_heap_bytes;
+    ReleaseSRWLockShared(&alias_lock);
+    heaps_made = InterlockedExchange64(&alias_heap_made, 0);
+    AcquireSRWLockShared(&memory_view_lock);
+    views = memory_view_count;
+    retired = views_retired_count;
+    retired_total = views_retired_total;
+    released_total = views_released_total;
+    ReleaseSRWLockShared(&memory_view_lock);
+    title_textures_stats(&tt);
+    rebox_log("d3d12_xs: memory: private %llu MiB, working set %llu MiB; GPU memory chunks %llu MiB, "
+              "%llu MiB of them title memory in place; host %llu of %llu MiB free; own memory: %s; alias heaps %u "
+              "(%llu MiB, +%llu); memory views %llu, %llu retired waiting (%lld retired, %lld released in all); "
+              "title textures %u (%u dirty), uploads in flight %u (%llu MiB)",
+              (unsigned long long)pm.PrivateUsage >> 20, (unsigned long long)pm.WorkingSetSize >> 20,
+              (unsigned long long)ReboxGpuBytesInUse() >> 20, (unsigned long long)gpu_memory_adopted_bytes() >> 20,
+              (unsigned long long)host.ullAvailPhys >> 20, (unsigned long long)host.ullTotalPhys >> 20, own, heaps,
+              (unsigned long long)heap_bytes >> 20, (unsigned long long)heaps_made, (unsigned long long)views,
+              (unsigned long long)retired, (long long)retired_total, (long long)released_total, tt.textures, tt.dirty,
+              tt.uploads, (unsigned long long)tt.upload_bytes >> 20);
+}
+
 static DWORD WINAPI gpu_latency_thread(void *arg)
 {
     LARGE_INTEGER f, now;
@@ -3752,6 +4058,7 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
     last_log = now.QuadPart;
     for (;;)
     {
+        LONG64 reap_before;
         Sleep(20);
         QueryPerformanceCounter(&now);
         AcquireSRWLockExclusive(&gpu_latency_lock);
@@ -3768,6 +4075,10 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
             ID3D12Fence_Release(e->fence);
             gpu_latency_tail++;
         }
+        /* Retired view resources go once the GPU is past everything submitted before them. */
+        reap_before = now.QuadPart - f.QuadPart * VIEW_RETIRE_MS / 1000;
+        if (gpu_latency_tail != gpu_latency_head)
+            reap_before = min(reap_before, gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].at);
         if (now.QuadPart - last_log >= 10 * f.QuadPart)
         {
             double ms = 1000.0 / (double)f.QuadPart;
@@ -3779,22 +4090,12 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
                           finished ? total * ms / finished : 0.0, longest * ms, gpu_latency_head - gpu_latency_tail,
                           oldest * ms, gpu_latency_tail != gpu_latency_head
                           ? gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].queue : NULL);
-            /* Memory, every 10 s: a run killed for using too much (a host OOM watcher) left no other trace. */
-            {
-                PROCESS_MEMORY_COUNTERS_EX pm = { sizeof(pm) };
-                MEMORYSTATUSEX host = { sizeof(host) };
-                K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof(pm));
-                GlobalMemoryStatusEx(&host);
-                rebox_log("d3d12_xs: memory: private %llu MiB, working set %llu MiB; GPU memory chunks %llu MiB, "
-                          "%llu MiB of them title memory in place; host %llu of %llu MiB free",
-                          (unsigned long long)pm.PrivateUsage >> 20, (unsigned long long)pm.WorkingSetSize >> 20,
-                          (unsigned long long)ReboxGpuBytesInUse() >> 20, (unsigned long long)gpu_memory_adopted_bytes() >> 20,
-                          (unsigned long long)host.ullAvailPhys >> 20, (unsigned long long)host.ullTotalPhys >> 20);
-            }
+            memory_log();
             total = longest = finished = 0;
             last_log = now.QuadPart;
         }
         ReleaseSRWLockExclusive(&gpu_latency_lock);
+        memory_views_reap(reap_before);
     }
     return 0;
 }

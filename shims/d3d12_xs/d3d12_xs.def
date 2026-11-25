@@ -29,6 +29,7 @@ EXPORTS
     ReboxTitleMemoryWritten
     ReboxDetileSize
     ReboxTile
+    ReboxViewMemory
     D3D12XboxSetProcessDebugFlags
     D3D12ConfigureVirtualMemoryX
     D3D12XboxGetProcessDebugFlags

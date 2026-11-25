@@ -1149,6 +1149,7 @@ struct batch
     ID3D12CommandQueue *queue; /* not a reference: only compared */
     ID3D12Resource *buffers[64];
     UINT count;
+    UINT64 bytes;
 };
 
 static struct batch *batches[32];
@@ -1348,6 +1349,8 @@ void title_textures_upload(ID3D12CommandQueue *queue)
                 t->fingerprint = fingerprint(t);
             if ((b->buffers[b->count] = record_upload(device, b->list, t)))
             {
+                D3D12_RESOURCE_DESC bd = ID3D12Resource_GetDesc(b->buffers[b->count]);
+                b->bytes += bd.Width;
                 b->count++;
                 t->uploads++;
                 upload_stats.uploads++;
@@ -1387,6 +1390,24 @@ done:
     if (b)
         batch_free(b);
     if (device) ID3D12Device_Release(device);
+}
+
+void title_textures_stats(struct title_texture_stats *s)
+{
+    memset(s, 0, sizeof(*s));
+    AcquireSRWLockShared(&lock);
+    for (struct title_texture *t = textures; t; t = t->next)
+        s->textures++;
+    ReleaseSRWLockShared(&lock);
+    s->dirty = (UINT)dirty_count;
+    AcquireSRWLockShared(&batch_lock);
+    for (int i = 0; i < (int)ARRAYSIZE(batches); i++)
+        if (batches[i])
+        {
+            s->uploads += batches[i]->count;
+            s->upload_bytes += batches[i]->bytes;
+        }
+    ReleaseSRWLockShared(&batch_lock);
 }
 
 /* For tests and tools: the size of a surface in title memory, and tiling linear data into it. */
