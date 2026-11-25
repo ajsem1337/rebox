@@ -112,6 +112,18 @@ xbox_one_s_bt='050000005e040000e002000008040000,Xbox Wireless Controller (Blueto
 export SDL_GAMECONTROLLERCONFIG="$xbox_one_s_bt${SDL_GAMECONTROLLERCONFIG:+
 $SDL_GAMECONTROLLERCONFIG}"
 
+# An audio output: without a sound server Wine has no render endpoint. Some titles then stall
+# rather than fail: GTA VI never creates its spatial audio stream, its audio update returns with
+# its queue lock held, and the audio frame buffers fill until an assertion (int3) ~80 frames in.
+# See README "Audio" (a PulseAudio null sink is enough). REBOX_NO_AUDIO_CHECK=1 silences this.
+if [[ ${REBOX_NO_AUDIO_CHECK:-0} != 1 ]]; then
+    audio_rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    audio_pulse=${PULSE_SERVER#unix:}
+    if [[ ! -S ${audio_pulse:-$audio_rt/pulse/native} && ! -S $audio_rt/pulse/native && ! -S $audio_rt/pipewire-0 ]]; then
+        echo "rebox-run: warning: no PulseAudio or PipeWire socket found, so the title has no audio output; some titles stall without one (README, Audio)" >&2
+    fi
+fi
+
 # Console system DLLs that are pure computation, taken from the dump's own system partition
 # (EmbeddedXvd/Windows/System32, next to or inside the game directory, or REBOX_CONSOLE_SYSTEM)
 # rather than stubbed: xg_xs.dll, the console's texture-layout library (Unreal's D3D12 RHI needs
