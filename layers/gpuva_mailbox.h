@@ -20,4 +20,8 @@ struct gpuva_mailbox
      * the new pages are mapped over it. xmem.dll's exception handler holds a write there until
      * busy_size is 0 again, then lets it retry (in the new pages). */
     volatile uint64_t busy_address, busy_size;
+    /* The end of the highest allocation the layer has made in the window (0: none yet).
+     * Addresses in the window at or above it are no memory at all: d3d12_xs reads a buffer
+     * descriptor based there as empty (a garbage V# base there faulted the GPU). */
+    volatile uint64_t window_end;
 };

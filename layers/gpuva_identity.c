@@ -38,6 +38,8 @@
 
 #include "gpuva_mailbox.h"
 
+static struct gpuva_mailbox *mailbox_get(void);
+
 #define LAYER_NAME "VK_LAYER_REBOX_gpuva_identity"
 #define EXPORT __attribute__((visibility("default")))
 
@@ -183,6 +185,16 @@ static uint64_t window_alloc(uint64_t size, uint64_t align)
         break;
     }
     pthread_mutex_unlock(&window_lock);
+    if (addr)
+    {
+        static uint64_t high;
+        struct gpuva_mailbox *box;
+        uint64_t end = addr + size, seen = __atomic_load_n(&high, __ATOMIC_RELAXED);
+        while (end > seen && !__atomic_compare_exchange_n(&high, &seen, end, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            ;
+        if (end > seen && (box = mailbox_get()))
+            __atomic_store_n(&box->window_end, end > seen ? end : seen, __ATOMIC_RELEASE);
+    }
     return addr;
 }
 

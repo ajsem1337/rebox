@@ -1112,6 +1112,15 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
      * the window's last allocation: a GPU fault, the same address every run. */
     if (address + check > 0x200000000000ull && address < 0x210000000000ull)
     {
+        UINT64 end = gpu_memory_window_end();
+        if (end && address >= end)
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: a guest buffer at %#llx is past every allocation in the GPU memory window "
+                          "(%#llx): read as empty", (unsigned long long)address, (unsigned long long)end);
+            return FALSE;
+        }
         if (*bytes > (256ull << 20))
         {
             static LONG logged;

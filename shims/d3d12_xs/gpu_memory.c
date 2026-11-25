@@ -343,6 +343,24 @@ BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size)
     return found;
 }
 
+/* The end of the identity window's highest allocation (layers/gpuva_mailbox.h), or 0. */
+UINT64 gpu_memory_window_end(void)
+{
+    static struct gpuva_mailbox *(WINAPI *get_mailbox)(void);
+    static BOOL resolved;
+    struct gpuva_mailbox *box;
+
+    if (!resolved)
+    {
+        HMODULE xmem = GetModuleHandleA("xmem.dll");
+        get_mailbox = xmem ? (void *)GetProcAddress(xmem, "ReboxGpuvaMailbox") : NULL;
+        resolved = TRUE;
+    }
+    if (!get_mailbox || !(box = get_mailbox()) || box->magic != GPUVA_MAILBOX_MAGIC)
+        return 0;
+    return box->window_end;
+}
+
 /* Whether [gpu, gpu + size) is inside one of the chunks, by GPU VA. */
 BOOL gpu_memory_holds_gpu(UINT64 gpu, UINT64 size)
 {
