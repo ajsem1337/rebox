@@ -137,7 +137,7 @@ How each AnyPS5 binding role is served:
 
 | AnyPS5 binding role | Here |
 |---|---|
-| Guest buffers (storage buffers: every V#, constant buffers included) | a table of {address, length} built from the V# words, read through BDA (buffers' GPU VAs are device addresses). vkd3d-proton keeps CBVs as uniform-buffer descriptors, which a storage-buffer binding can't read, and V#s from memory have no heap slot |
+| Guest buffers (storage buffers: every V#, constant buffers included) | a table of {address, length} built from the V# words, read through BDA (buffers' GPU VAs are device addresses). vkd3d-proton keeps CBVs as uniform-buffer descriptors, which a storage-buffer binding can't read, and V#s from memory have no heap slot. The module checks only the length, so a V# with no base (or one in the first 64 KiB) gets length 0 (`ReboxGuestBufferEntry`): with its records kept, every load through it was a scalar read of address 0, a GPU page fault |
 | Guest images and samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at the slot where the shadow holds the same words, if that slot holds the matching kind of view (the shadow records each slot's kind). AnyPS5 may rewrite a T#'s `DST_SEL` and gives samplers point-filtered twins, so matching ignores those fields |
 | Samplers in no heap (built from literals in the code, or a twin) | decoded from the S# into a real sampler in the heap's hidden tail: every shader-visible heap has 256 extra slots the title doesn't see (`GetDesc` hides them) |
 | A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail |
