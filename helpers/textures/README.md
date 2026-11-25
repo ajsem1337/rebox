@@ -14,14 +14,14 @@ For each sampled texture of a pool (`.ttpf`):
 4. the result is compared byte for byte with Leonida's `tools/ttpf_mips.py` export. `--png DIR`
    also writes both as PNGs (mip 0 of the first slice) to look at.
 
-It runs Leonida's tools (GPLv3), so like `helpers/bcpack` it is GPL-3.0-or-later and a separate
-program; nothing of Leonida's is copied here. The dev shell's `LEONIDA_SRC` (the flake's
-`leonida-src` pin) is used unless `--leonida` names another checkout.
+It runs Leonida's tools (GPLv3), so it is GPL-3.0-or-later and a separate program; nothing of
+Leonida's is copied here. It needs a Leonida checkout of your own, given as `--leonida DIR` (or
+`LEONIDA_SRC`); without one it stops and says so. Nothing else in Rebox uses Leonida.
 
 ```sh
 nix develop -c make build/texcheck.exe
-nix develop -c python3 helpers/textures/texcheck.py path/to/title/data/ttdb
-nix develop -c python3 helpers/textures/texcheck.py --shape 2d_array --limit 20 path/to/title/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py --leonida ~/src/Leonida path/to/title/data/ttdb
+nix develop -c python3 helpers/textures/texcheck.py --leonida ~/src/Leonida --shape 2d_array --limit 20 path/to/title/data/ttdb
 ```
 
 `--every N` and `--limit N` sample each pool, `--max-bytes` skips large textures (Leonida's

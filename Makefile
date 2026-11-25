@@ -15,7 +15,7 @@ COMMON  := shims/common/rebox_log.c
 # Whole stub DLLs for imports nobody provides (scan_imports.py --gen-stubs).
 STUB_DLLS := $(notdir $(wildcard $(GEN)/dlls/*))
 
-all: shims layer $(BUILD)/smoke.exe
+all: shims layer $(BUILD)/smoke.exe $(BUILD)/bcpack_test
 
 # What the flake's shims package builds (it has no tests/).
 shims: $(SHIMS:%=$(BUILD)/%.dll) $(STUB_DLLS:%=$(BUILD)/stub/%.dll) $(if $(XODUS_IDL),$(BUILD)/xgameruntime.dll)
@@ -71,9 +71,6 @@ CFLAGS_acphal := -DHAVE_FFMPEG_XMA2 -I$(FFMPEG_XMA2)/include
 LIBS_acphal := -L$(FFMPEG_XMA2)/lib -lavcodec -lswresample -lavutil -lbcrypt
 endif
 
-# The DirectStorage shim talks to the BCPack helper over a localhost socket.
-LIBS_xcrdapi := -lws2_32
-
 # d3d12_xs detiles console textures with AMD's addrlib (Mesa, MIT): ADDRLIB is Mesa's
 # src/amd/addrlib, which the flake sets. Without it detile.cpp builds as stubs.
 ifneq ($(ADDRLIB),)
@@ -121,6 +118,13 @@ $(BUILD)/smoke.exe: tests/smoke.c $(GEN)/test_shaders.h anyps5/rebox_anyps5.h sh
 $(BUILD)/Bink2Smoke.dll: tests/fake_bink.c
 	@mkdir -p $(BUILD)
 	$(MINGW_CC) $(CFLAGS) -shared -static-libgcc -o $@ $<
+
+# The BCPack decoder's unit tests (shims/xcrdapi/bcpack.c, plain C), built natively with the
+# sanitizers and run by tests/run-smoke.sh; also decodes single chunks (see the file's top).
+BCPACK_TEST_FLAGS ?= -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined
+$(BUILD)/bcpack_test: tests/bcpack_test.c shims/xcrdapi/bcpack.c shims/xcrdapi/bcpack.h
+	@mkdir -p $(BUILD)
+	$(CC) $(BCPACK_TEST_FLAGS) -Wall -o $@ tests/bcpack_test.c shims/xcrdapi/bcpack.c
 
 # Native Linux probe: can the Vulkan driver map memory at the same GPU and CPU
 # address? Run it on the target GPU (see the comment at its top).

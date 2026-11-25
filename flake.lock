@@ -1,39 +1,5 @@
 {
   "nodes": {
-    "bcpack-rs-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1795358576,
-        "narHash": "sha256-peCEZ7whcqaywMEZAxhOssJfz9XZUjQW+3k5fkS5sxU=",
-        "owner": "Ahmet-Dedeler",
-        "repo": "bcpack-rs",
-        "rev": "5bf5cc56ed56f1ababf1f9592300bd182ff90bd8",
-        "type": "github"
-      },
-      "original": {
-        "owner": "Ahmet-Dedeler",
-        "repo": "bcpack-rs",
-        "rev": "5bf5cc56ed56f1ababf1f9592300bd182ff90bd8",
-        "type": "github"
-      }
-    },
-    "leonida-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1795376786,
-        "narHash": "sha256-APKIBdTqiZXJ5ZRyolPHgPQcLiUM/qekk+xmxGyd1jg=",
-        "owner": "ItsNotRexed",
-        "repo": "Leonida",
-        "rev": "f847748cc76bd3777f9c070c4034eb2fc1c04e64",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ItsNotRexed",
-        "repo": "Leonida",
-        "rev": "f847748cc76bd3777f9c070c4034eb2fc1c04e64",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1795187554,
@@ -52,8 +18,6 @@
     },
     "root": {
       "inputs": {
-        "bcpack-rs-src": "bcpack-rs-src",
-        "leonida-src": "leonida-src",
         "nixpkgs": "nixpkgs",
         "winegdk-src": "winegdk-src",
         "xodus-xgameruntime": "xodus-xgameruntime"

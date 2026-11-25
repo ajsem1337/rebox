@@ -21,18 +21,17 @@
  * REBOX_DSTORAGE_SUBMIT=enqueue for every queue, runs requests as they are enqueued.
  *
  * Requests run in order on one worker thread per queue, reading from host files or memory.
- * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests go to
- * helpers/bcpack, a separate process running Leonida's GPLv3 decoder (rebox-run starts it and
- * sets REBOX_BCPACK_PORT), over a localhost connection per worker thread. A destination in physical
+ * zlib-compressed requests are inflated (zlib-wrapped or raw deflate). BCPack requests (bits 1-4:
+ * BC1, BC3-BC7) are decoded by bcpack.c, zlib first when a request has both, with tables the user
+ * supplies (see "BCPack" below and README.md). A destination in physical
  * pages (options bit 21: an array of 64 KiB page numbers, the offset into the first at +0x10) is
  * decoded into a buffer and written through the pages (xmem ReboxWritePhysicalPages). The page
  * numbers are read as the request runs, unless the array is on the enqueuing thread's stack (xcl:
  * titles pass those too), which is copied at enqueue. Swizzled
- * destinations and physical-page sources aren't supported, nor is BCPack without the helper:
+ * destinations and physical-page sources aren't supported, nor is BCPack without its tables:
  * those requests fail with E_NOTIMPL and are logged, and the next status entry reports it. */
 
 #define COBJMACROS
-#include <winsock2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +40,7 @@
 
 #include "../common/rebox_log.h"
 #include "../d3d12_xs/puff.h"
+#include "bcpack.h"
 
 #define OPT_ZLIB 0x1ull
 #define OPT_BCPACK (0xfull << 1)
@@ -392,7 +392,8 @@ static BOOL writable_range(const void *p, SIZE_T size)
     return TRUE;
 }
 
-static HRESULT inflate_into(BYTE *dst, UINT32 dst_size, const BYTE *src, UINT32 src_size)
+/* produced (if not NULL) gets the bytes written. */
+static HRESULT inflate_into(BYTE *dst, UINT32 dst_size, const BYTE *src, UINT32 src_size, UINT32 *produced)
 {
     unsigned long out = dst_size, in;
     int ret;
@@ -402,125 +403,127 @@ static HRESULT inflate_into(BYTE *dst, UINT32 dst_size, const BYTE *src, UINT32 
         src += 2, src_size -= 2;
     in = src_size;
     ret = puff(dst, &out, src, &in);
+    if (produced)
+        *produced = ret ? 0 : (UINT32)out;
     return ret ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA) : S_OK;
 }
 
-/* ---------------------------------------------------------------- BCPack, through the helper */
+/* ---------------------------------------------------------------------------------- BCPack */
 
-#define BCPACK_MAGIC 0x4b504342u /* 'BCPK' */
+/* Decoded in process (bcpack.c), with tables the user supplies: they are Microsoft's format data
+ * and not part of Rebox. Looked for, once, at REBOX_BCPACK_TABLES, then bcpack-tables.bin next to
+ * this DLL, then $XDG_CONFIG_HOME/rebox/bcpack-tables.bin (or ~/.config/rebox/...). Unix paths
+ * are read through Wine's Z: drive. Without them BCPack requests fail with E_NOTIMPL. */
+static struct bcpack_tables *bcpack_tables;
 
-static BOOL send_all(SOCKET s, const void *data, size_t size)
+/* A Unix path (starting with /) as Z:path; Windows paths as they are. */
+static void host_path(char *out, size_t size, const char *path)
 {
-    const char *p = data;
-    while (size)
+    snprintf(out, size, "%s%s", path[0] == '/' ? "Z:" : "", path);
+}
+
+static BOOL env(const char *name, char *out, DWORD size)
+{
+    DWORD n = GetEnvironmentVariableA(name, out, size);
+    return n && n < size;
+}
+
+static BYTE *read_whole(const char *path, DWORD *size)
+{
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    LARGE_INTEGER length;
+    BYTE *data = NULL;
+    DWORD read = 0;
+
+    if (f == INVALID_HANDLE_VALUE)
+        return NULL;
+    if (GetFileSizeEx(f, &length) && length.QuadPart <= 1 << 20 && (data = malloc(length.QuadPart + 1))
+            && (!ReadFile(f, data, (DWORD)length.QuadPart, &read, NULL) || read != length.QuadPart))
     {
-        int n = send(s, p, size > 0x40000000 ? 0x40000000 : (int)size, 0);
-        if (n <= 0)
-            return FALSE;
-        p += n, size -= n;
+        free(data);
+        data = NULL;
     }
-    return TRUE;
+    CloseHandle(f);
+    *size = read;
+    return data;
 }
 
-static BOOL recv_all(SOCKET s, void *data, size_t size)
+static BOOL CALLBACK load_bcpack_tables(INIT_ONCE *once, void *param, void **ctx)
 {
-    char *p = data;
-    while (size)
+    char candidates[3][MAX_PATH + 64], value[MAX_PATH], tried[3 * (MAX_PATH + 64) + 8] = "";
+    unsigned count = 0;
+    HMODULE self;
+
+    if (env("REBOX_BCPACK_TABLES", value, sizeof(value)))
+        host_path(candidates[count++], sizeof(candidates[0]), value);
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (const char *)load_bcpack_tables, &self)
+            && GetModuleFileNameA(self, value, sizeof(value)) && strrchr(value, '\\'))
     {
-        int n = recv(s, p, size > 0x40000000 ? 0x40000000 : (int)size, 0);
-        if (n <= 0)
-            return FALSE;
-        p += n, size -= n;
+        strcpy(strrchr(value, '\\') + 1, "bcpack-tables.bin");
+        strcpy(candidates[count++], value);
     }
+    if (env("XDG_CONFIG_HOME", value, sizeof(value)) && value[0] == '/')
+        snprintf(candidates[count++], sizeof(candidates[0]), "Z:%s/rebox/bcpack-tables.bin", value);
+    else if (env("HOME", value, sizeof(value)) && value[0] == '/')
+        snprintf(candidates[count++], sizeof(candidates[0]), "Z:%s/.config/rebox/bcpack-tables.bin", value);
+
+    for (unsigned i = 0; i < count; i++)
+    {
+        const char *why = "can't be read";
+        DWORD size = 0;
+        BYTE *data = read_whole(candidates[i], &size);
+        if (data && (bcpack_tables = bcpack_tables_parse(data, size, &why)))
+        {
+            rebox_log("xcrdapi: BCPack tables from %s", candidates[i]);
+            free(data);
+            return TRUE;
+        }
+        free(data);
+        if (data || i == 0)
+            rebox_log("xcrdapi: BCPack tables at %s not used: %s", candidates[i], why);
+        snprintf(tried + strlen(tried), sizeof(tried) - strlen(tried), "%s%s", i ? ", " : "", candidates[i]);
+    }
+    rebox_log("xcrdapi: no BCPack tables (looked at %s; set REBOX_BCPACK_TABLES): BCPack requests fail with "
+              "E_NOTIMPL", count ? tried : "nothing");
     return TRUE;
 }
 
-/* One connection per worker thread, made on first use. A TLS slot rather than __thread, which
- * would make mingw's GCC depend on libmcfgthread-2.dll. */
-static DWORD bcpack_tls = TLS_OUT_OF_INDEXES;
-
-static BOOL CALLBACK alloc_tls(INIT_ONCE *once, void *param, void **ctx)
+/* REBOX_BCPACK_DUMP=DIR: each packed chunk (after zlib, if the request has both) is written to
+ * DIR as bc<codec>-<sequence>-<destination size>.bin, up to REBOX_BCPACK_DUMP_MAX (default 4096). */
+static void dump_chunk(UINT32 codec, const BYTE *data, UINT32 size, UINT32 dst_size)
 {
-    bcpack_tls = TlsAlloc();
-    return TRUE;
+    static volatile LONG sequence;
+    static int max = -1;
+    char dir[MAX_PATH], path[MAX_PATH + 64], value[32];
+    HANDLE f;
+    LONG n;
+
+    if (!env("REBOX_BCPACK_DUMP", dir, sizeof(dir)))
+        return;
+    if (max < 0)
+        max = env("REBOX_BCPACK_DUMP_MAX", value, sizeof(value)) ? atoi(value) : 4096;
+    if ((n = InterlockedIncrement(&sequence)) > max)
+        return;
+    snprintf(path, sizeof(path), "%s%s\\bc%u-%05ld-%u.bin", dir[0] == '/' ? "Z:" : "", dir, codec, n, dst_size);
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        DWORD written;
+        WriteFile(f, data, size, &written, NULL);
+        CloseHandle(f);
+    }
+    if (n == 1 || n == max)
+        rebox_log("xcrdapi: BCPack chunk %ld dumped to %s%s", n, path, n == max ? " (the last)" : "");
 }
 
-static SOCKET get_socket(void)
+static HRESULT bcpack_decode_request(UINT32 codec, const BYTE *raw, UINT32 raw_size, BYTE *dst, UINT32 dst_size)
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    void *v;
 
-    InitOnceExecuteOnce(&once, alloc_tls, NULL, NULL);
-    v = bcpack_tls == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(bcpack_tls);
-    return v ? (SOCKET)(ULONG_PTR)v - 1 : INVALID_SOCKET;
-}
-
-static void set_socket(SOCKET s)
-{
-    if (bcpack_tls != TLS_OUT_OF_INDEXES)
-        TlsSetValue(bcpack_tls, s == INVALID_SOCKET ? NULL : (void *)(ULONG_PTR)(s + 1));
-}
-
-static SOCKET bcpack_connect(void)
-{
-    const char *port = getenv("REBOX_BCPACK_PORT");
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
-    SOCKET s;
-    BOOL nodelay = TRUE;
-
-    if ((s = get_socket()) != INVALID_SOCKET)
-        return s;
-    if (!port || !*port)
-        return INVALID_SOCKET;
-    {
-        static LONG started;
-        WSADATA wsa;
-        if (!InterlockedExchange(&started, 1))
-            WSAStartup(MAKEWORD(2, 2), &wsa);
-    }
-    addr.sin_port = htons((u_short)atoi(port));
-    if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET)
-        return INVALID_SOCKET;
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)))
-    {
-        static LONG logged;
-        if (InterlockedIncrement(&logged) <= 4)
-            rebox_log("xcrdapi: can't reach the BCPack helper on port %s (error %d)", port, WSAGetLastError());
-        closesocket(s);
-        return INVALID_SOCKET;
-    }
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
-    set_socket(s);
-    return s;
-}
-
-static HRESULT bcpack_decode(UINT32 codec, const BYTE *raw, UINT32 raw_size, BYTE *dst, UINT32 dst_size)
-{
-    UINT32 header[4] = { BCPACK_MAGIC, codec, dst_size, raw_size }, reply[2];
-    SOCKET s = bcpack_connect();
-
-    if (s == INVALID_SOCKET)
-        return E_NOTIMPL;
-    if (!send_all(s, header, sizeof(header)) || !send_all(s, raw, raw_size) || !recv_all(s, reply, sizeof(reply)))
-    {
-        closesocket(s);
-        set_socket(INVALID_SOCKET);
-        return E_FAIL;
-    }
-    if (reply[1] > dst_size)
-    {
-        /* Can't happen with the helper's decoder; drop the connection rather than resync. */
-        closesocket(s);
-        set_socket(INVALID_SOCKET);
-        return E_FAIL;
-    }
-    if (reply[1] && !recv_all(s, dst, reply[1]))
-    {
-        closesocket(s);
-        set_socket(INVALID_SOCKET);
-        return E_FAIL;
-    }
-    return (HRESULT)reply[0];
+    InitOnceExecuteOnce(&once, load_bcpack_tables, NULL, NULL);
+    dump_chunk(codec, raw, raw_size, dst_size);
+    return bcpack_decode(bcpack_tables, codec, raw, raw_size, dst, dst_size, NULL);
 }
 
 typedef BOOL (WINAPI *write_pages_fn)(const ULONG_PTR *, ULONG_PTR, SIZE_T, const void *, SIZE_T);
@@ -659,8 +662,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         free(buffer);
         return hr;
     }
-    if ((r->options & (OPT_SWIZZLE | OPT_SOURCE_PHYSICAL))
-            || (bcpack && !getenv("REBOX_BCPACK_PORT")))
+    if (r->options & (OPT_SWIZZLE | OPT_SOURCE_PHYSICAL))
     {
         static LONG logged;
         if (InterlockedIncrement(&logged) <= 16)
@@ -670,7 +672,7 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
         return E_NOTIMPL;
     }
     if (!r->source_size)
-        return S_OK;
+        return bcpack ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA) : S_OK; /* an empty packed stream codes no blocks */
     if (!r->destination || !r->source)
         return E_INVALIDARG;
     if (!(r->options & OPT_ZLIB) && !bcpack && r->destination_size < r->source_size)
@@ -717,18 +719,33 @@ static HRESULT run_request(struct queue *q, const struct entry *e)
     }
     if (SUCCEEDED(hr) && bcpack)
     {
-        hr = bcpack_decode((UINT32)((r->options & OPT_BCPACK) >> 1), data, r->source_size, r->destination,
-                           r->destination_size);
+        /* zlib first, if both: into intermediate_size bytes (or, if the title gives none, room
+         * for twice the blocks), whose bytes produced are the packed stream. */
+        UINT32 codec = (UINT32)((r->options & OPT_BCPACK) >> 1), packed_size = r->source_size;
+        const BYTE *packed = data;
+        BYTE *middle = NULL;
+
+        if (r->options & OPT_ZLIB)
+        {
+            UINT64 room = r->intermediate_size ? r->intermediate_size : 2ull * r->destination_size + 65536;
+            if (room > 0x7fffffff || !(middle = malloc(room)))
+                hr = E_OUTOFMEMORY;
+            else
+                hr = inflate_into(middle, (UINT32)room, data, r->source_size, &packed_size);
+            packed = middle;
+        }
+        if (SUCCEEDED(hr))
+            hr = bcpack_decode_request(codec, packed, packed_size, r->destination, r->destination_size);
+        free(middle);
         if (FAILED(hr))
         {
             static LONG logged;
             if (InterlockedIncrement(&logged) <= 16)
-                rebox_log("xcrdapi: BCPack codec %u, %u -> %u bytes: %#lx", (unsigned)((r->options & OPT_BCPACK) >> 1),
-                             r->source_size, r->destination_size, hr);
+                rebox_log("xcrdapi: BCPack codec %u, %u -> %u bytes: %#lx", codec, packed_size, r->destination_size, hr);
         }
     }
     else if (SUCCEEDED(hr) && (r->options & OPT_ZLIB))
-        hr = inflate_into(r->destination, r->destination_size, data, r->source_size);
+        hr = inflate_into(r->destination, r->destination_size, data, r->source_size, NULL);
     else if (SUCCEEDED(hr) && from_memory)
         memcpy(r->destination, r->source, r->source_size);
     if (data && data != r->destination && data != r->source)

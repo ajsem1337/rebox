@@ -13,6 +13,13 @@ trap 'rm -rf "$work"' EXIT
 
 : "${WINE:?}" "${VKD3D_PROTON_DIR:?}" "${DXVK_DIR:?}" "${REBOX_SHIMS_DIR:?}"
 
+# The BCPack decoder's unit tests (native, synthetic tables). REBOX_BCPACK_TABLES naming a table
+# file (a Unix path) adds checks on it.
+echo "== BCPack decoder"
+bcpack_tables=()
+[[ -f ${REBOX_BCPACK_TABLES:-} ]] && bcpack_tables=("$REBOX_BCPACK_TABLES")
+"$here/build/bcpack_test" "${bcpack_tables[@]}" | grep -v '^     '
+
 # "Console" shader: bytes no D3D12 implementation will accept.
 printf 'REBOX-FAKE-CONSOLE-SHADER-%s' "$(date +%s)" > "$work/fake.bin"
 

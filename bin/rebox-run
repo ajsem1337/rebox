@@ -15,9 +15,8 @@
 #   REBOX_GPUVA_LAYER_DIR  directory holding VK_LAYER_REBOX_gpuva_identity's manifest (flake sets it)
 #   XGR_*                 Gaming Runtime stand-in settings (shims/xgameruntime/README.md); XGR_PLS_DIR,
 #                         XGR_LOG and GTX_LOG default to the prefix
-#   REBOX_BCPACK=0     don't start the BCPack helper (helpers/bcpack); REBOX_BCPACK_HISTORY
-#                         passes calibrated BC6H/BC7 history tables, REBOX_BCPACK_STRICT=1
-#                         refuses chunks that need provisional ones
+#   REBOX_BCPACK_TABLES  BCPack table file (README "BCPack tables"); default: next to the
+#                         DLLs, then ~/.config/rebox/bcpack-tables.bin
 #   REBOX_CONSOLE_MODE ConsoleMode registry value the title reads (default 0x64, Series X)
 #   REBOX_FFX_STUB=0   run the package's own FidelityFX loader instead of our stub
 #   REBOX_RADV_ICD     ICD manifest of .#radv-rebox (flake sets it); used on AMD GPUs
@@ -376,26 +375,6 @@ if [[ -z ${VK_ICD_FILENAMES:-} && -n ${REBOX_RADV_ICD:-} && ${REBOX_STOCK_VULKAN
 fi
 
 echo "rebox-run: $exe (title $title_id), prefix $WINEPREFIX, shader cache $cache" >&2
-# BCPack textures (DirectStorage, shims/xcrdapi): Leonida's GPLv3 decoder can't share the
-# title's process with AnyPS5 (GPL-2.0-only), so it runs as helpers/bcpack, a separate process
-# the shim reaches over localhost. It exits when this process (Wine, after the exec) does.
-if [[ ${REBOX_BCPACK:-1} != 0 && -n ${REBOX_BCPACK_SCRIPT:-} && -n ${LEONIDA_SRC:-} ]]; then
-    portfile="$WINEPREFIX/bcpack-helper.port"
-    rm -f "$portfile"
-    helper_args=(--leonida "$LEONIDA_SRC" --port-file "$portfile" --watch-pid $$)
-    [[ -n ${REBOX_BCPACK_HISTORY:-} ]] && helper_args+=(--history "$REBOX_BCPACK_HISTORY")
-    [[ ${REBOX_BCPACK_STRICT:-0} == 1 ]] && helper_args+=(--strict)
-    # BC1 through bcpack-rs (bcpack-serve; the flake sets it): REBOX_BCPACK_SERVE= keeps Leonida's.
-    [[ -n ${REBOX_BCPACK_SERVE:-} ]] && helper_args+=(--bc1-serve "$REBOX_BCPACK_SERVE")
-    "${REBOX_BCPACK_PYTHON:-python3}" -I "$REBOX_BCPACK_SCRIPT" "${helper_args[@]}" \
-        > "$WINEPREFIX/bcpack-helper.log" 2>&1 &
-    for _ in $(seq 100); do [[ -s $portfile ]] && break; sleep 0.1; done
-    if [[ -s $portfile ]]; then
-        export REBOX_BCPACK_PORT=$(cat "$portfile")
-    else
-        echo "rebox-run: the BCPack helper didn't start ($WINEPREFIX/bcpack-helper.log); BCPack textures will be missing" >&2
-    fi
-fi
 
 # Everything the title's process prints (shim logs, crash reports, Wine's errors) is also kept in
 # the prefix: last-run.log, and the run before it in last-run.log.1.

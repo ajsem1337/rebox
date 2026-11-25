@@ -5,8 +5,9 @@
 # texture's tiled memory image is read from its pool (as DirectStorage would write it), the swizzle
 # mode is picked by the same rule as shims/d3d12_xs/title_textures.c, and the image is detiled by
 # d3d12_xs's own code (build/texcheck.exe: detile.cpp and addrlib, run under Wine). The result is
-# compared with Leonida's independent decoder (tools/ttpf_mips.py, GPLv3, which is why this runs as
-# a separate program like helpers/bcpack). See helpers/textures/README.md.
+# compared with Leonida's independent decoder (tools/ttpf_mips.py, GPLv3, which is why this is a
+# separate program). It needs a Leonida checkout of your own (--leonida, or LEONIDA_SRC). See
+# helpers/textures/README.md.
 #
 #   texcheck.py --leonida DIR [--texcheck build/texcheck.exe] [--every N] [--limit N]
 #               [--max-bytes N] [--shape 2d|2d_array|cubemap|volume] [--png DIR] POOL_OR_DIR...
@@ -86,7 +87,8 @@ def detile_batch(texcheck, wine, jobs):
 
 def main():
     ap = argparse.ArgumentParser(description="compare d3d12_xs's detiling with Leonida's on real pools")
-    ap.add_argument("--leonida", default=os.environ.get("LEONIDA_SRC"), help="Leonida checkout")
+    ap.add_argument("--leonida", default=os.environ.get("LEONIDA_SRC"),
+                    help="a Leonida checkout (default: LEONIDA_SRC); its pool reader and exporter are the reference")
     ap.add_argument("--texcheck", default="build/texcheck.exe")
     ap.add_argument("--wine", default=os.environ.get("WINE", "wine"))
     ap.add_argument("--every", type=int, default=50, help="every Nth texture of each pool")
@@ -97,8 +99,9 @@ def main():
     ap.add_argument("--png", help="write ours_/leonida_ PNGs (mip 0, first slice) here")
     ap.add_argument("pools", nargs="+")
     args = ap.parse_args()
-    if not args.leonida:
-        ap.error("--leonida (or LEONIDA_SRC) is required")
+    if not args.leonida or not os.path.isfile(os.path.join(args.leonida, "tools", "ttpf_mips.py")):
+        ap.error("this check reads the pools and compares with Leonida's tools: give a Leonida checkout "
+                 "(--leonida DIR or LEONIDA_SRC; one with tools/ttpf_mips.py). Rebox doesn't provide one")
     sys.path.insert(0, os.path.join(args.leonida, "tools"))
     import ttpf_mips as tm
     import dds_png

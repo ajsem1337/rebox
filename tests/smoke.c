@@ -3937,6 +3937,106 @@ static void test_xcrdapi(void)
     DeleteFileW(path);
 }
 
+/* BCPack through XCRDAPI.dll, with the synthetic tables of the format notes (uniform models, pair
+ * tables giving c%8 and c/8%8; no Microsoft data), written here and named by REBOX_BCPACK_TABLES:
+ * a BC4 request from a file offset, zlib then BC4 with an intermediate size, and an empty BC7
+ * stream, which fails. The decoder itself is tested by tests/bcpack_test.c. */
+static void test_xcrdapi_bcpack(void)
+{
+    static const char vector_hex[] =
+        "0000000000000000050505050404040401010101101010100201000000000000"
+        "000014052068b0f803030202242424240200000000000000000000000404040410"
+        "101010000000002068b0f8242424240000000000000000";
+    static const BYTE expected[16] = { 0x8a, 0x7d, 0xd0, 0x58, 0x3f, 0xd0, 0x58, 0x3f,
+                                       0x8b, 0x7e, 0x1a, 0xeb, 0x07, 0x1a, 0xeb, 0x07 };
+    struct { UINT64 source_type; UINT16 capacity; INT8 priority; const char *name; } fdesc = { 0, 128 }, mdesc = { 1, 128 };
+    struct req { UINT64 options; void *dst; UINT64 page; UINT32 dst_size, reserved; void *src; UINT64 offset;
+                 UINT32 src_size, intermediate; UINT64 tag; const char *name; };
+    HMODULE m = LoadLibraryA("XCRDAPI.dll");
+    HRESULT (WINAPI *get_factory)(REFIID, void **) = m ? (void *)GetProcAddress(m, "DStorageGetFactory") : NULL;
+    void *factory = NULL, *fq = NULL, *mq = NULL, *file = NULL, *status = NULL;
+    char tables_path[MAX_PATH], dir[MAX_PATH];
+    WCHAR chunk_path[MAX_PATH], wdir[MAX_PATH];
+    BYTE *tables = calloc(1, 77982), vector[88], zlib[2 + 5 + 88 + 4], out1[16], out2[16], out3[16];
+    HANDLE h;
+    DWORD written;
+
+    if (!get_factory || !tables)
+    {
+        CHECK(0, "XCRDAPI.dll for BCPack");
+        free(tables);
+        return;
+    }
+    for (unsigned i = 0; i < 88; i++)
+        sscanf(vector_hex + 2 * i, "%2hhx", &vector[i]);
+    for (unsigned mdl = 0; mdl < 128; mdl++)
+        for (unsigned b = 0; b <= mdl / 16 + 1; b++)
+        {
+            unsigned f = 1u << (15 - mdl / 16);
+            tables[18 * mdl + 2 * b] = (BYTE)f, tables[18 * mdl + 2 * b + 1] = (BYTE)(f >> 8);
+        }
+    for (unsigned c = 0; c < 64; c++)
+        tables[2560 + c] = tables[2880 + c] = tables[2944 + c] = (BYTE)((c & 7) | (c >> 3) << 4);
+    tables[3008] = 0x46;
+    GetTempPathA(MAX_PATH, dir);
+    GetTempFileNameA(dir, "bct", 0, tables_path);
+    h = CreateFileA(tables_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    WriteFile(h, tables, 77982, &written, NULL);
+    CloseHandle(h);
+    SetEnvironmentVariableA("REBOX_BCPACK_TABLES", tables_path);
+
+    /* The vector at offset 100 of a file, and as a stored zlib stream after it. */
+    zlib[0] = 0x78, zlib[1] = 0x01, zlib[2] = 0x01, zlib[3] = 88, zlib[4] = 0, zlib[5] = (BYTE)~88, zlib[6] = 0xff;
+    memcpy(zlib + 7, vector, 88);
+    memset(zlib + 95, 0, 4); /* Adler-32, not checked */
+    GetTempPathW(MAX_PATH, wdir);
+    GetTempFileNameW(wdir, L"bcp", 0, chunk_path);
+    h = CreateFileW(chunk_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    for (int i = 0; i < 100; i++) { BYTE b = (BYTE)i; WriteFile(h, &b, 1, &written, NULL); }
+    WriteFile(h, vector, 88, &written, NULL);
+    WriteFile(h, zlib, sizeof(zlib), &written, NULL);
+    CloseHandle(h);
+
+    get_factory(&IID_IUnknown, &factory);
+    if (factory && SUCCEEDED(XSLOT(factory, 3, HRESULT, const void *, REFIID, void **)(factory, &fdesc, &IID_IUnknown, &fq))
+            && SUCCEEDED(XSLOT(factory, 3, HRESULT, const void *, REFIID, void **)(factory, &mdesc, &IID_IUnknown, &mq))
+            && SUCCEEDED(XSLOT(factory, 4, HRESULT, const WCHAR *, REFIID, void **)(factory, chunk_path, &IID_IUnknown, &file))
+            && SUCCEEDED(XSLOT(factory, 5, HRESULT, UINT32, const char *, REFIID, void **)(factory, 3, "bcpack",
+                                                                                            &IID_IUnknown, &status)))
+    {
+        struct req r1 = { 4 << 1, out1, 0, 16, 0, file, 100, 88 };
+        struct req r2 = { 1 | 4 << 1, out2, 0, 16, 0, file, 188, sizeof(zlib), 128 /* intermediate */ };
+        struct req r3 = { 7 << 1 | 1ull << 22, out3, 0, 16, 0, vector, 0, 0 };
+        memset(out1, 0xcc, 16), memset(out2, 0xcc, 16);
+        XSLOT(fq, 3, void, const struct req *)(fq, &r1);
+        XSLOT(fq, 4, void, void *, UINT32)(fq, status, 0);
+        XSLOT(fq, 3, void, const struct req *)(fq, &r2);
+        XSLOT(fq, 4, void, void *, UINT32)(fq, status, 1);
+        XSLOT(fq, 6, void)(fq);
+        XSLOT(mq, 3, void, const struct req *)(mq, &r3);
+        XSLOT(mq, 4, void, void *, UINT32)(mq, status, 2);
+        XSLOT(mq, 6, void)(mq);
+        for (int i = 0; i < 500 && !(XSLOT(status, 3, BOOL, UINT32)(status, 0) && XSLOT(status, 3, BOOL, UINT32)(status, 1)
+                                     && XSLOT(status, 3, BOOL, UINT32)(status, 2)); i++)
+            Sleep(10);
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 0) == S_OK && !memcmp(out1, expected, 16),
+              "DirectStorage BCPack BC4 from a file offset (%#lx)", XSLOT(status, 4, HRESULT, UINT32)(status, 0));
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 1) == S_OK && !memcmp(out2, expected, 16),
+              "DirectStorage zlib, then BCPack BC4, through an intermediate size");
+        CHECK(XSLOT(status, 4, HRESULT, UINT32)(status, 2) == HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+              "DirectStorage: an empty BC7 stream fails its request (%#lx)", XSLOT(status, 4, HRESULT, UINT32)(status, 2));
+    }
+    else
+        CHECK(0, "DirectStorage queues, a file and a status array for BCPack");
+    if (file) XSLOT(file, 2, ULONG)(file);
+    if (status) XSLOT(status, 2, ULONG)(status);
+    if (fq) XSLOT(fq, 2, ULONG)(fq);
+    if (mq) XSLOT(mq, 2, ULONG)(mq);
+    DeleteFileW(chunk_path);
+    DeleteFileA(tables_path);
+    free(tables);
+}
+
 /* An audio state monitor looked up by name, as GameChat2.dll does: Wine's aborts the process; ours
  * (through the GetProcAddress replacement) says full volume. */
 static void test_audio_state_monitor(void)
@@ -6457,6 +6557,7 @@ int main(int argc, char **argv)
         CHECK(1, "an assertion (int3) in the exe was stepped over");
     }
     test_xcrdapi();
+    test_xcrdapi_bcpack();
     test_gameinput();
     test_acphal();
     test_acphal_xma();

@@ -15,20 +15,9 @@
       url = "github:xodus-gaming/xgameruntime/642e41c7617310c5d1b39d4e525b01ecae261f9e";
       flake = false;
     };
-    # Leonida's clean-room BCPack decoder (GPLv3), run by helpers/bcpack as a separate process
-    # (it can't share a process with AnyPS5, GPL-2.0-only).
-    leonida-src = {
-      url = "github:ItsNotRexed/Leonida/f847748cc76bd3777f9c070c4034eb2fc1c04e64";
-      flake = false;
-    };
-    # bcpack-rs (MIT OR Apache-2.0): the BC1 decoder behind helpers/bcpack/bcpack-serve.rs.
-    bcpack-rs-src = {
-      url = "github:Ahmet-Dedeler/bcpack-rs/5bf5cc56ed56f1ababf1f9592300bd182ff90bd8";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime, leonida-src, bcpack-rs-src }:
+  outputs = { self, nixpkgs, winegdk-src, xodus-xgameruntime }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -245,20 +234,6 @@
           '';
         };
 
-        # BC1 BCPack decoding for helpers/bcpack: our bcpack-serve.rs built as a binary of bcpack-rs.
-        bcpack-serve = pkgs.rustPlatform.buildRustPackage {
-          pname = "bcpack-serve";
-          version = "0.2.0";
-          src = bcpack-rs-src;
-          cargoLock.lockFile = "${bcpack-rs-src}/Cargo.lock";
-          postPatch = ''
-            mkdir -p src/bin
-            cp ${./helpers/bcpack/bcpack-serve.rs} src/bin/bcpack-serve.rs
-          '';
-          cargoBuildFlags = [ "--bin" "bcpack-serve" ];
-          doCheck = false;
-        };
-
         scan-imports = pyTool "scan_imports.py" ./tools/scan_imports.py;
         # mingw gcc on PATH lets the probe find d3d12.h for GUID and vtable names.
         d3d12x-probe = pyTool "d3d12x_probe.py" ./tools/d3d12x_probe.py;
@@ -273,11 +248,7 @@
           export REBOX_SRC=${shims-src}
           export REBOX_MAKE_FLAGS="${lib.concatStringsSep " " shimsMakeFlags}"
           export REBOX_BUILD_ENV=${mingwBuildEnv}
-          export REBOX_BCPACK_SCRIPT=${./helpers/bcpack/bcpack-helper.py}
           export REBOX_CA_BUNDLE=''${REBOX_CA_BUNDLE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}
-          export REBOX_BCPACK_PYTHON=''${REBOX_BCPACK_PYTHON:-${pkgs.pypy3}/bin/pypy3}
-          export LEONIDA_SRC=${leonida-src}
-          export REBOX_BCPACK_SERVE=''${REBOX_BCPACK_SERVE-${bcpack-serve}/bin/bcpack-serve}
           export PATH=$PATH:${lib.makeBinPath [ mingwCC pkgs.gnumake pkgs.python3 pkgs.findutils ]}
           export REBOX_GPUVA_LAYER_DIR=''${REBOX_GPUVA_LAYER_DIR:-${gpuva-layer}/share/vulkan/explicit_layer.d}
           export REBOX_RADV_ICD=''${REBOX_RADV_ICD:-${radv-rebox}/share/vulkan/icd.d/radeon_icd.x86_64.json}
@@ -304,7 +275,6 @@
           export REBOX_SHIMS_DIR=$PWD/build
           export FFMPEG_XMA2=${self.packages.${system}.ffmpeg-xma2}
           export XODUS_IDL=${xodus-xgameruntime}/include
-          export LEONIDA_SRC=${leonida-src}
           # AMD's addrlib (Mesa, MIT), for detiling console textures in d3d12_xs.
           export ADDRLIB=${pkgs.mesa.src}/src/amd/addrlib
           export REBOX_ANYPS5_DIR=${self.packages.${system}.rebox-anyps5}

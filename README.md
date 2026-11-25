@@ -59,6 +59,7 @@ shims/acphal/             acphal.dll: the APU heap, and an audio coprocessor cha
                           commands and ticks audio frames (nothing is mixed)
 shims/xapu/               xapu.dll: the audio decoder queue: Opus packets decoded by FFmpeg as each command is queued
 shims/chad/               chad.dll: the audio DSP (XDsp); it connects and takes commands that do nothing
+shims/xcrdapi/            XCRDAPI.dll: DirectStorage queues, zlib, and BCPack (bcpack.c) decoded in process
 layers/                   VK_LAYER_REBOX_gpuva_identity: host Vulkan layer mapping host-visible
                           memory at the same GPU and CPU address
 patches/                  Mesa patch letting RADV place memory at lower-half device addresses;
@@ -69,6 +70,7 @@ generated/                stubs from tools/scan_imports.py --gen-stubs (one-off 
 tools/scan_imports.py     which imports can't be resolved under Wine + shims; generates stubs
 tools/d3d12x_probe.py     recovers D3D12.X IIDs, vtable slots and inlined field accesses from console binaries
 tests/                    smoke test (xmem, forwarders, PSO substitution, negative control);
+                          bcpack_test.c tests the BCPack decoder natively;
                           gpuva_probe.c checks whether the Vulkan driver can map GPU VA == CPU VA
 docs/d3d12x.md            D3D12.X interfaces, unified memory and presentation
 docs/anyps5.md            console shaders through AnyPS5: shadow heaps, compute and graphics
@@ -111,12 +113,28 @@ nix develop -c bash -c 'make all build/smoke.exe && tests/run-smoke.sh'
 
 The prefix keeps what a run leaves behind: `imports.txt` (the scan), `last-run.log` (everything
 the title's process printed: shim logs, crash reports with module+RVA, Wine's errors; the run
-before is `last-run.log.1`), `xgameruntime.log` and `bcpack-helper.log`. Those four files are
-what to look at, or send, after a run.
+before is `last-run.log.1`) and `xgameruntime.log`. Those three files are what to look at, or
+send, after a run.
 
 Then iterate: `REBOX_LOG=/path` keeps the shim log, `REBOX_STUB_FATAL=1` stops at the first
 unimplemented stub the title reaches, and `xgameruntime.log` lists any Gaming Runtime interface or
 method the title asked for that isn't implemented.
+
+### BCPack tables
+
+BCPack, the console's hardware texture compression, is decoded in the title's process by
+`shims/xcrdapi/bcpack.c`. Decoding needs a 77,982-byte file of constant tables (entropy models,
+index rank tables, BC7 control words and per-format dictionaries). They are Microsoft's format
+data, so Rebox doesn't include them: supply your own copy as `bcpack-tables.bin`. The first of
+these that exists is used:
+
+1. `REBOX_BCPACK_TABLES`: a path, Unix (`/home/...`) or Windows (`Z:\...`);
+2. `bcpack-tables.bin` next to `XCRDAPI.dll` (the Rebox DLLs);
+3. `$XDG_CONFIG_HOME/rebox/bcpack-tables.bin`, or `~/.config/rebox/bcpack-tables.bin`.
+
+The log says which file was used, or that none was found. A file of the wrong size, or whose
+entropy models don't add up, is reported and not used. Without tables, every BCPack request fails
+with `E_NOTIMPL` (zlib and plain reads still work), and textures that need BCPack are missing.
 
 ### Environment
 
@@ -207,6 +225,8 @@ method the title asked for that isn't implemented.
 | `REBOX_DUMP_FRAMES_EVERY=N` | Also dump a frame every N seconds (the first frame, then the first one N seconds after the last dump) |
 | `REBOX_DUMP_TITLE_TEXTURE=<address>` | With `REBOX_DUMP_FRAMES`, write the title memory of the placed texture at that hex address as `DIR/texture_<address>_<n>.bin` each time the texture state log runs (every 600 submissions, eight times) |
 | `REBOX_DUMP_GPU_TEXTURE=<address>` | With `REBOX_DUMP_FRAMES`, at each dumped frame also read back the GPU contents of the texture placed at that hex title address, as `DIR/texture_<n>.bmp`, and log its mean value: whether a target the title samples was drawn at all |
+| `REBOX_BCPACK_TABLES=PATH` | The BCPack table file ([BCPack tables](#bcpack-tables)) |
+| `REBOX_BCPACK_DUMP=DIR` | Write each BCPack chunk a request decodes (after zlib, when a request has both) to `DIR/bc<codec>-<n>-<destination bytes>.bin`, at most `REBOX_BCPACK_DUMP_MAX` (default 4096) of them: real packed data for `build/bcpack_test decode` |
 | `REBOX_DSTORAGE_IGNORE_FAILURES=1` | A DirectStorage request that fails (logged and counted as before) no longer makes the next status entry report the failure: whether a title gives up on a whole batch for one failed request (a BCPack block the decoder refuses) |
 | `REBOX_DISPATCHX=1` | Console DispatchX calls (list slot 80, 78 on older lists) run as Dispatch; by default they are dropped, since the title's ray tracing builder dispatches this way and run, they faulted the GPU |
 | `REBOX_MEMORY_WAITS=0` | Console memory waits in lists (Wait32/64BitValueX) are ignored; lists are ordered only by the title's fences: whether the waits are what stalls a title's queues |
@@ -236,6 +256,16 @@ down missing translations.
   `E_FAIL` when it doesn't.
   The same holds for a synthetic console container (`DXIL` part with a `NOBC`/`FSSM` stub). Real
   PC DXBC compiles directly even when a broken cache entry exists for its hash.
+- `build/bcpack_test` (run first by `tests/run-smoke.sh`, natively under ASan and UBSan) tests
+  the BCPack decoder with synthetic tables. It decodes the format notes' two reference vectors byte
+  for byte. A synthetic encoder builds streams that round trip through the decoder and through a
+  separate model of the lane schedule: multi-fragment lanes with and without reset, alphabet
+  reductions, model shapes, long lengths, all 16 lanes competing for the 8-byte budget. Every format
+  and every BC6H and BC7 mode, rotation and partition is checked field by field with standard block
+  readers, including references across the 256-block history and into the dictionaries. Every error
+  condition is checked too: truncation at every length, trailing bytes (ignored), and noise.
+  `REBOX_BCPACK_TABLES` adds checks on a real table file. The smoke test decodes BC4 through
+  `XCRDAPI.dll`, from a file offset and after zlib.
 - Every import of the console DLLs titles bundle resolves under Wine + vkd3d-proton + shims.
   `XMemGetWorkingSetStatistics` answers the selector the AMD upscaler passes (`0x20000001`):
   TRUE, with private commit in the u64 at `+8` (the call shape is from Xbox2Windows's call-site
@@ -343,14 +373,17 @@ down missing translations.
   `amd_fidelityfx_loader_xbox.dll` in place of the package's. That stub answers FSR's queries
   (quality-mode ratios, but no jitter) and scales the colour input into the output with a
   compute blit. There's no temporal anti-aliasing; frame generation reports no provider.
-- **BCPack decodes slowly, and BC6H/BC7 approximately.** BCPack, the console's hardware texture
-  compression (about 14% of one title's catalogued textures), is decoded by Leonida's GPLv3 decoder running as a
-  separate process ([helpers/bcpack](helpers/bcpack/README.md)), at about 3 MB/s per DirectStorage
-  queue under PyPy, far below the console's hardware. BC1 is the exception: bcpack-rs
-  (`bcpack-serve`, MIT/Apache) decodes it at 34-40 MB/s per core. BC6H and BC7 often need history tables
-  Leonida doesn't ship, so those use its provisional entries unless calibrated tables are given
-  (`REBOX_BCPACK_HISTORY`). Swizzled destinations and physical-page sources in DirectStorage
-  requests aren't supported.
+- **BCPack needs tables from you, and isn't checked against the console.** BCPack, the console's
+  hardware texture compression (about 14% of one title's catalogued textures), is decoded in
+  process by `shims/xcrdapi/bcpack.c` (BC1, BC3, BC4, BC5, BC6H, BC7), written from a description
+  of the format. Its tables are Microsoft's data and not in the repository
+  ([BCPack tables](#bcpack-tables)); without them BCPack requests fail. On real chunks from one
+  title's texture pools, BC1 matches an independent decoder (Leonida's, run as a separate program)
+  byte for byte: 100 chunks, 2.1 million blocks. That decoder lacks the dictionary entries the BC7
+  chunks reference, so BC7 was only checked by eye and by how smooth its blocks come out. BC3,
+  BC4, BC5 and BC6H have no real-data check yet. Decoding runs at about 40 MB/s of blocks per
+  core. Swizzled destinations and physical-page sources in DirectStorage requests aren't
+  supported.
 - **Textures placed at title addresses are copies.** On the console a texture placed with
   `CreatePlacedResourceX` is the memory at its address, in a Gfx10 tiled layout. Here it has its
   own memory, filled from the title's: `d3d12_xs` detiles it with AMD's addrlib (Mesa, MIT) when
@@ -395,8 +428,9 @@ down missing translations.
 
 Rebox is licensed under the GNU General Public License, version 2 only
 ([LICENSE](LICENSE)), so it can load AnyPS5's shader recompiler (GPL-2.0-only) in-process.
-`helpers/bcpack` is GPL-3.0-or-later and runs as a separate process, except `bcpack-serve.rs`
-(MIT OR Apache-2.0, a separate program built against bcpack-rs); see its README.
+BCPack's method (its interleaved rANS entropy layer) is covered by Microsoft's patent
+US 11,234,023 B2, whatever the code's licence; its tables are Microsoft's data and are never part
+of the repository.
 The patches in `patches/` modify vkd3d-proton (LGPL-2.1+), Mesa (MIT), Wine (LGPL-2.1+) and AnyPS5
 (GPL-2.0-only) and are offered under
 those projects' licences too. Game data, dumps and anything derived from them (`build/`) are never
