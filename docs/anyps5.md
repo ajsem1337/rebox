@@ -138,15 +138,15 @@ How each AnyPS5 binding role is served:
 | AnyPS5 binding role | Here |
 |---|---|
 | Guest buffers (storage buffers: every V#, constant buffers included) | a table of {address, length} built from the V# words, read through BDA (buffers' GPU VAs are device addresses). vkd3d-proton keeps CBVs as uniform-buffer descriptors, which a storage-buffer binding can't read, and V#s from memory have no heap slot. The module checks only the length, so a V# with no base (or one in the first 64 KiB) gets length 0 (`ReboxGuestBufferEntry`): with its records kept, every load through it was a scalar read of address 0, a GPU page fault |
-| Guest images and samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at the slot where the shadow holds the same words, if that slot holds the matching kind of view (the shadow records each slot's kind). AnyPS5 may rewrite a T#'s `DST_SEL` and gives samplers point-filtered twins, so matching ignores those fields |
+| Guest images and samplers (set 0, `stage*65 + local`) | the vkd3d-proton descriptor at a slot where the shadow holds the same words, if that slot holds the matching kind of view (the shadow records each slot's kind), preferring such a slot of several holding those words (a single-level texture's SRV and UAV have the same T#, and a storage image found the SRV's slot). AnyPS5 may rewrite a T#'s `DST_SEL` and gives samplers point-filtered twins, so matching ignores those fields |
 | Samplers in no heap (built from literals in the code, or a twin) | decoded from the S# into a real sampler in the heap's hidden tail: every shader-visible heap has 256 extra slots the title doesn't see (`GetDesc` hides them) |
-| A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail |
+| A storage image also bound as a sampled image (size queries) | an SRV of the same texture and view in the hidden tail (of the whole texture for a UAV copied from a CPU-only heap, which keeps no view descriptions) |
 | FlattenedSrt (binding 61): every dword the shader's scalar loads read through user SGPRs | its words, in GPU memory shared by content |
 | BDA page table (59) | the memory that exists: `ReboxGpuAlloc` chunks and the buffers the title made views of, at their GPU VAs, plus each shadow heap's title address mapped to its GPU copy, so a stray address becomes an AnyPS5 fault record instead of a GPU page fault. One table for the process (16,384 ranges, the unused ones empty at the top of the address space; AnyPS5 binary-searches it and checks its length is 4 + 8 × count words), at a fixed address, rewritten in place when what it maps changes |
 | Fault buffer (60), GDS (58) | one of each for the process. The fault record and the SRT guard word (set when a speculated descriptor turns out wrong) are read at each compile, logged (the first 20 of each) and cleared. Faults come from earlier dispatches, so the log doesn't name the shader |
 | ShaderData (62) | its words, as FlattenedSrt |
-| A graphics stage's T# that is empty when the draw is recorded | the dummy texture, and its address (the T# the code's image instructions use n-th, in first-use order as AnyPS5 numbers a binding's elements, traced to the `s_load_dwordx8` off a table SGPR that loaded it) noted: at the next submissions the descriptor there is read again and, once the title has written it (the target title fills a per-draw table after recording the draw, as the console GPU reads it only when it runs), its view's heap slot is written into the draw block |
-| A graphics stage's V# that is empty when the draw is recorded | an empty buffer (reads zero), and its address (the n-th empty V# the code loads, from its `s_load_dwordx4`s off the table SGPRs) noted: at the next submissions the V# there is read again and its address and length are written into the stage's guest buffer table (a video shader's constants come so, with its T#s; read as zero, every frame was black) |
+| A graphics stage's T# that is empty when the draw is recorded, or not a T# (patch 0020 makes it empty) | the dummy texture, and its address (of the T#s the code's image instructions use, in first-use order as AnyPS5 numbers a binding's elements, the n-th whose slot holds no T# now, traced to the `s_load_dwordx8` off a table SGPR that loaded it) noted: at the next submissions the descriptor there is read again and, once the title has written it (the target title fills a per-draw table after recording the draw, as the console GPU reads it only when it runs), its view's heap slot is written into the draw block |
+| A graphics stage's V# that is empty when the draw is recorded, or not a V# (patch 0020) | an empty buffer (reads zero), and its address (the n-th of the code's `s_load_dwordx4`s off the table SGPRs whose slot holds no V# now) noted: at the next submissions the V# there is read again and its address and length are written into the stage's guest buffer table (a video shader's constants come so, with its T#s; read as zero, every frame was black) |
 | Image and sampler tables (261/260/63): T#s and S#s indexed at run time, found by walking tables in guest memory | bound like guest images and samplers, each element at the heap slot holding its words; the map (64) is host data. An empty table is refused with a message |
 | LDS spill (set 1), scratch (set 2) | not supported: the compile fails and the dispatch is skipped, logged once per shader |
 
@@ -192,7 +192,11 @@ A console mesh shader is an NGG program: the hardware GS stage in fast-launch mo
 mesh shaders the target title creates, all dumped by `REBOX_DUMP_SHADERS`):
 
 - **Inputs.** User data from s8 (s0-s7 are the merged stage's system SGPRs), laid out as a vertex
-  shader's: root parameters from s8 in the graphics layout. s3 bits 24-27 hold the wave's index in
+  shader's user data, so its root parameters are from s16, not s8: user-data dword i is s(8 + i)
+  (the FSSM's root layout names the same dwords as a vertex or pixel stage's, VIctory's
+  `HwStage::user_sgpr`; the title's mesh code reads its tables through s16 and s17).
+  `d3d12_xs` shifts the call's user SGPRs by 8 for a mesh stage (`mesh_user_sgprs`);
+  `REBOX_MESH_USER_DATA_S8=1` doesn't. s3 bits 24-27 hold the wave's index in
   the group; v5 holds `group * stride + lane`, the code reading the first lane's and dividing by
   the stride, `max(lanes, maximum vertices, maximum primitives)` (128 in every one of the title's:
   128 lanes, two wave64 waves, up to 128 vertices and 128 triangles).
@@ -260,7 +264,17 @@ program (`mesh`). `tools/ms-plan.py DUMP_DIR OUT_DIR` writes a mesh plan from th
 `REBOX_DUMP_SHADERS` dumps (each FSSM to `OUT_DIR`, its `FLAT_SCRATCH` setup made `s_nop`s as
 `console_compile.c` does), and `SA5_DUMP_SPIRV=DIR` writes each mesh module `ms` finalizes, as it does
 for `cs`. `ms` and `vs` take a draw's user SGPRs from `SA5_USER=v0,v1,...` (hex, from s0) and guest
-memory from `SA5_MEMORY=ADDRESS:w0,w1,...` or `SA5_MEMORY=ADDRESS+BYTES` (that many zero bytes). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
+memory from `SA5_MEMORY=ADDRESS:w0,w1,...`, `SA5_MEMORY=ADDRESS+BYTES` (that many zero bytes) or
+`SA5_MEMORY=ADDRESS@FILE` (a file's bytes). `tools/ps-plan.py DUMP_DIR OUT_DIR [ID...]` writes a
+pixel plan from the `*.ps.bin` containers, each shader named by the id `d3d12_xs` logs it under,
+with the register state `console_fssm.c` gives it; with `--draw`, each line also gets `u=` (user
+SGPRs) and `m=ADDRESS@FILE` (guest memory): a table per user SGPR the FSSM's resource records name
+(VIctory's reading: kind, root type, table offset, register, dwords, user-data dword, root
+parameter), each slot holding a T#, V# or S# of its kind, or the words `MEM_T`/`MEM_V` give, as a
+refused draw's log shows them. `vs` with `SA5_PUSH_SIZE` finalizes each module as a graphics stage
+is finalized; `SA5_REMAP=1` moves its guest descriptor arrays onto bindless arrays read through a
+draw block too, as `d3d12_xs` does (`sa5_finalize_draw`). `bench THREADS PLAN [FIRST [COUNT]]`
+measures compile throughput: a pixel plan's
 shaders compiled and validated on that many threads at once. Compute shaders, `ps` and `bench`
 compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the disk cache
 included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
@@ -319,8 +333,13 @@ stopped this way is logged as `console shader <hash> left a loop at its limit`; 
 turns the guard off and another value sets the limit. With patch 0014, `APS5_LOOP_GUARD=stages`
 gives each stage its own limit instead (128 iterations in pixel programs, 256 in vertex and mesh
 programs, 4096 in compute programs), and `APS5_LOOP_GUARD_PIXEL`, `_VERTEX`, `_MESH` and `_COMPUTE`
-set one stage's. The other patches are listed in
-[patches/anyps5/README.md](../patches/anyps5/README.md).
+set one stage's. Patch 0020's null descriptors are on for graphics stages: `d3d12_xs` sets
+`APS5_NULL_INVALID_DESCRIPTORS=graphics`, so a T# or V# that isn't one when a draw is recorded (the
+target title fills a draw's tables after recording it, and until then they hold an earlier draw's
+words: V#s where T#s go, constants) is bound as a null descriptor instead of refusing the stage, and
+its slot is filled at submission as an empty one's is (the late T#s and V#s above).
+`REBOX_ANYPS5_NULL_INVALID=0` turns it off; compute stages are refused as before. The other patches
+are listed in [patches/anyps5/README.md](../patches/anyps5/README.md).
 
 ## Where AnyPS5 runs
 
