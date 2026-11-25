@@ -8,7 +8,8 @@
  *                                              memory (see vertex_sweep)
  *   sa5_check ps PLAN [FIRST [COUNT]]          the pixel shaders in PLAN (format: pixel_sweep) with
  *                                              their PSO register state, compile only, no guest
- *                                              memory; one "ps NAME ok|FAIL ..." line each
+ *                                              memory unless a line gives a draw's (u=, m=:
+ *                                              pixel_parse); one "ps NAME ok|FAIL ..." line each
  *   sa5_check cs PLAN [FIRST [COUNT]]          the compute shaders in PLAN (format: compute_sweep),
  *                                              compile only, no guest memory, validated, loops
  *                                              counted
@@ -91,9 +92,11 @@ static uint8_t *read_all(const char *path, long *size)
     return data;
 }
 
-/* A pixel plan line: NAME CODE SKIP RSRC1 RSRC2 ENA NINTERP COL DEPTH CNTL. Returns 1 with the request
- * filled in (the code in *data, for the caller to free), 0 for a line that isn't one, -1 if the code
- * can't be read. */
+/* A pixel plan line: NAME CODE SKIP RSRC1 RSRC2 ENA NINTERP COL DEPTH CNTL, then optionally
+ * u=V0,V1,... (hex user SGPRs from s0) and m=ADDRESS@PATH (a file's bytes as guest memory at that
+ * address): a draw's user SGPRs and tables (tools/ps-plan.py --draw). Returns 1 with the request
+ * filled in (the code in *data, for the caller to free; the memory in req->regions[0].data, too), 0
+ * for a line that isn't one, -1 if the code or memory can't be read. */
 static int pixel_parse(const char *line, char name[64], struct sa5_pixel_request *req, uint32_t *user_data,
                        uint8_t **data)
 {
@@ -138,6 +141,39 @@ static int pixel_parse(const char *line, char name[64], struct sa5_pixel_request
     }
     req->col_format = col;
     req->depth_export = depth;
+    {
+        const char *u = strstr(line, " u="), *m = strstr(line, " m=");
+        if (u)
+        {
+            const char *p = u + 3;
+            for (unsigned i = 0; i < 32; i++)
+            {
+                char *end;
+                user_data[i] = (uint32_t)strtoul(p, &end, 16);
+                if (end == p || *end != ',')
+                    break;
+                p = end + 1;
+            }
+        }
+        if (m)
+        {
+            static __thread struct sa5_region region;
+            char file[1024], winfile[1100];
+            unsigned long long address;
+            long bytes;
+            if (sscanf(m + 3, "%llx@%1023s", &address, file) != 2)
+                return -1;
+            snprintf(winfile, sizeof(winfile), "%s%s", file[0] == '/' ? "Z:" : "", file);
+            for (char *p = winfile; *p; p++)
+                if (*p == '/') *p = '\\';
+            region.address = address;
+            if (!(region.data = read_all(winfile, &bytes)))
+                return -1;
+            region.size = (size_t)bytes;
+            req->regions = &region;
+            req->region_count = 1;
+        }
+    }
     req->use_cache = getenv("SA5_USE_CACHE") != NULL;
     req->wave = !sa5_analyse(req->code, req->code_dwords, req->user_data_count, &layout, slots, 0, ignored,
                              sizeof(ignored)) ? layout.wave : 64;
@@ -199,6 +235,8 @@ static int pixel_sweep(const char *plan, int first, int count)
         }
         fflush(stdout);
         free(data);
+        if (req.region_count)
+            free((void *)req.regions[0].data);
     }
     fclose(f);
     printf("%s ps-check: %d of %d pixel shaders compile with their PSO register state, %d of those pass spirv-val "
@@ -570,7 +608,8 @@ static void env_user_data(uint32_t *user, unsigned count, int skip)
 }
 
 /* SA5_MEMORY=ADDRESS:w0,w1,... (hex): guest memory, up to max words, as one region; or
- * SA5_MEMORY=ADDRESS+BYTES (hex): that many bytes of zeros there. Returns the region count (0 or 1). */
+ * SA5_MEMORY=ADDRESS+BYTES (hex): that many bytes of zeros there; or SA5_MEMORY=ADDRESS@PATH: a
+ * file's bytes there (tools/ps-plan.py --draw writes such tables). Returns the region count (0 or 1). */
 static uint32_t env_memory(struct sa5_region *region, uint32_t *memory, uint32_t max)
 {
     const char *p = getenv("SA5_MEMORY");
@@ -582,6 +621,18 @@ static uint32_t env_memory(struct sa5_region *region, uint32_t *memory, uint32_t
     if (!p)
         return 0;
     address = strtoull(p, &end, 16);
+    if (*end == '@')
+    {
+        char winfile[1100];
+        static long bytes;
+        snprintf(winfile, sizeof(winfile), "%s%s", end[1] == '/' ? "Z:" : "", end + 1);
+        for (char *q = winfile; *q; q++)
+            if (*q == '/') *q = '\\';
+        if (!zeros)
+            zeros = read_all(winfile, &bytes);
+        *region = (struct sa5_region){ address, zeros, zeros ? (size_t)bytes : 0 };
+        return 1;
+    }
     if (*end == '+')
     {
         size_t bytes = (size_t)strtoull(end + 1, NULL, 16);
@@ -696,11 +747,16 @@ static int vertex_sweep(const char *plan, int first, int count)
                 printf("\n");
             }
             /* SA5_PUSH_SIZE set: finalize as a graphics stage does, host buffers' addresses pushed
-             * after the stage's push data (the guest buffer table) or baked (the rest). */
+             * after the stage's push data (the guest buffer table) or baked (the rest), and with
+             * SA5_REMAP=1 each guest descriptor array (images, samplers, image and sampler tables)
+             * moved onto a bindless array whose heap indices come from a draw block, as d3d12_xs
+             * does (sa5_finalize_draw). */
             if (getenv("SA5_PUSH_SIZE"))
             {
                 struct sa5_host_buffer hosts[8];
-                uint32_t host_count = 0, *out = NULL, out_count = 0, pushed = 0;
+                struct sa5_remap remaps[32];
+                uint32_t host_count = 0, remap_count = 0, index_base = 0, *out = NULL, out_count = 0, pushed = 0;
+                int remap = getenv("SA5_REMAP") != NULL;
                 for (uint32_t i = 0; i < sa5_result_binding_count(result) && host_count < 8; i++)
                 {
                     struct sa5_binding b;
@@ -708,11 +764,19 @@ static int vertex_sweep(const char *plan, int first, int count)
                     if (b.role == 0 && b.kind == 1)
                         hosts[host_count++] = (struct sa5_host_buffer){ b.set, b.binding, pushed++, 0, 1,
                                 req.push_size, 0 };
+                    else if (remap && (b.role <= 2 || b.role == 8 || b.role == 9 || b.role == 11) && remap_count < 32)
+                    {
+                        remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, 0, 100 + b.kind,
+                                b.count ? b.count : 1, NULL, index_base };
+                        index_base += b.count ? b.count : 1;
+                    }
                     else if (b.role > 2)
                         hosts[host_count++] = (struct sa5_host_buffer){ b.set, b.binding, host_count, b.word_count, 0,
                                 0, 0x123450000ull };
                 }
-                if (sa5_finalize(result, NULL, 0, hosts, host_count, &out, &out_count, error, sizeof(error)))
+                if (remap ? sa5_finalize_draw(result, remaps, remap_count, hosts, host_count, req.push_size,
+                                              &out, &out_count, error, sizeof(error))
+                          : sa5_finalize(result, NULL, 0, hosts, host_count, &out, &out_count, error, sizeof(error)))
                 {
                     for (char *p = error; *p; p++)
                         if (*p == '\n') *p = ' ';

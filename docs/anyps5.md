@@ -264,7 +264,17 @@ program (`mesh`). `tools/ms-plan.py DUMP_DIR OUT_DIR` writes a mesh plan from th
 `REBOX_DUMP_SHADERS` dumps (each FSSM to `OUT_DIR`, its `FLAT_SCRATCH` setup made `s_nop`s as
 `console_compile.c` does), and `SA5_DUMP_SPIRV=DIR` writes each mesh module `ms` finalizes, as it does
 for `cs`. `ms` and `vs` take a draw's user SGPRs from `SA5_USER=v0,v1,...` (hex, from s0) and guest
-memory from `SA5_MEMORY=ADDRESS:w0,w1,...` or `SA5_MEMORY=ADDRESS+BYTES` (that many zero bytes). `bench THREADS PLAN [FIRST [COUNT]]` measures compile throughput: a pixel plan's
+memory from `SA5_MEMORY=ADDRESS:w0,w1,...`, `SA5_MEMORY=ADDRESS+BYTES` (that many zero bytes) or
+`SA5_MEMORY=ADDRESS@FILE` (a file's bytes). `tools/ps-plan.py DUMP_DIR OUT_DIR [ID...]` writes a
+pixel plan from the `*.ps.bin` containers, each shader named by the id `d3d12_xs` logs it under,
+with the register state `console_fssm.c` gives it; with `--draw`, each line also gets `u=` (user
+SGPRs) and `m=ADDRESS@FILE` (guest memory): a table per user SGPR the FSSM's resource records name
+(VIctory's reading: kind, root type, table offset, register, dwords, user-data dword, root
+parameter), each slot holding a T#, V# or S# of its kind, or the words `MEM_T`/`MEM_V` give, as a
+refused draw's log shows them. `vs` with `SA5_PUSH_SIZE` finalizes each module as a graphics stage
+is finalized; `SA5_REMAP=1` moves its guest descriptor arrays onto bindless arrays read through a
+draw block too, as `d3d12_xs` does (`sa5_finalize_draw`). `bench THREADS PLAN [FIRST [COUNT]]`
+measures compile throughput: a pixel plan's
 shaders compiled and validated on that many threads at once. Compute shaders, `ps` and `bench`
 compile with no cache; `SA5_USE_CACHE=1` compiles through AnyPS5's caches, the disk cache
 included, as `d3d12_xs` does. Of the target title's 6,685 dumped mesh shaders, 5,538 compile, pass spirv-val
