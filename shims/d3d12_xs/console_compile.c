@@ -139,6 +139,17 @@ static void set_anyps5_environment(void)
      * APS5_LOOP_GUARD=0 turns it off; another value sets the limit. */
     if (!getenv("APS5_LOOP_GUARD"))
         _putenv("APS5_LOOP_GUARD=0x100000");
+    /* patches/anyps5/0020: a graphics stage's T# or V# that isn't one when the draw is recorded is
+     * bound as a null descriptor instead of the stage being refused. The target title fills a
+     * draw's tables after recording it, so they still hold an earlier draw's words then (V#s where
+     * T#s go, constants): 148 of its pixel stages were refused so for the run. Such a slot is
+     * filled at submission as an empty one is (console_resolve_late). REBOX_ANYPS5_NULL_INVALID=0
+     * turns it off; compute keeps refusing (its dispatches have no late slots). */
+    {
+        const char *null_invalid = getenv("REBOX_ANYPS5_NULL_INVALID");
+        if (!(null_invalid && null_invalid[0] == '0') && !getenv("APS5_NULL_INVALID_DESCRIPTORS"))
+            _putenv("APS5_NULL_INVALID_DESCRIPTORS=graphics");
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
@@ -1034,9 +1045,25 @@ static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
 static UINT64 late_load_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n,
                                UINT32 opcode);
 
+/* Whether the guest memory at address holds a T# (dwords 8: an image type, 8-15, in word 3's top
+ * nibble) or a V# (dwords 4: type 0 in word 3's top two bits, and an address or a size), or can't be
+ * read. Empty words and an earlier draw's words left in a per-draw table don't. */
+static BOOL slot_holds_descriptor(UINT64 address, UINT dwords)
+{
+    BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+    UINT32 w[8] = { 0 };
+
+    if (!ReboxShadowRead(address, w, dwords * 4u))
+        return TRUE;
+    if (dwords == 8)
+        return (w[3] >> 28) >= 8;
+    return !(w[3] >> 30) && (w[0] || w[1] || w[2]);
+}
+
 /* The n-th T# the code's image instructions use, in the order they first use it (AnyPS5 numbers a
  * binding's elements so: a video shader samples its Y plane, loaded third, first), traced to the
- * s_load_dwordx8 off a table SGPR that loaded its registers; else the n-th such load. */
+ * s_load_dwordx8 off a table SGPR that loaded its registers, counting only those whose slot holds
+ * no T# now; else the n-th such load. */
 static UINT64 late_source(const struct rebox_deferred_shader *h, const struct rebox_compile_in *in, UINT n)
 {
     const UINT32 *code = (const UINT32 *)((const BYTE *)h + h->code_offset);
@@ -1067,6 +1094,23 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
             if (k == used_count && used_count < ARRAYSIZE(used))
                 used[used_count++] = sgpr;
         }
+    }
+    /* The n-th of the T#s the code uses whose slot holds no T# now (empty, or an earlier draw's
+     * words): AnyPS5 gives those empty, and the ones the title has written already as they are, so
+     * the n-th empty binding is the n-th such slot, not the n-th T#. */
+    {
+        UINT64 unready[32];
+        UINT unready_count = 0;
+        for (UINT u = 0; u < used_count; u++)
+            for (UINT k = load_count; k-- > 0;)
+                if (loads[k].sgpr == used[u])
+                {
+                    if (!slot_holds_descriptor(loads[k].address, 8))
+                        unready[unready_count++] = loads[k].address;
+                    break;
+                }
+        if (n < unready_count)
+            return unready[n];
     }
     if (n < used_count)
         for (UINT k = load_count; k-- > 0;) /* the last load into those registers */
@@ -1182,23 +1226,29 @@ static UINT64 late_load_source(const struct rebox_deferred_shader *h, const stru
 {
     BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
     const UINT32 *code = (const UINT32 *)((const BYTE *)h + h->code_offset);
-    UINT seen = 0;
 
-    for (UINT32 i = 0; i + 1 < h->code_dwords; i++)
+    /* V#s: first only the slots that hold no V# now (AnyPS5 gives those empty, the rest as they
+     * are), then any. */
+    for (UINT pass = opcode == 2 ? 0 : 1; pass < 2; pass++)
     {
-        UINT32 w0 = code[i], w1 = code[i + 1], sbase, op, words[8] = { 0 };
-        UINT64 address;
-        if (w0 >> 26 != 0x3d) /* SMEM */
-            continue;
-        op = (w0 >> 18) & 0xff;
-        sbase = (w0 & 0x3f) * 2;
-        i++; /* SMEM is two dwords */
-        if (op != opcode || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
-            continue;
-        address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
-        /* In a shadow heap, whatever it holds now: AnyPS5 may have read it empty a moment before. */
-        if (ReboxShadowRead(address, words, sizeof(words)) && seen++ == n)
-            return address;
+        UINT seen = 0;
+        for (UINT32 i = 0; i + 1 < h->code_dwords; i++)
+        {
+            UINT32 w0 = code[i], w1 = code[i + 1], sbase, op, words[8] = { 0 };
+            UINT64 address;
+            if (w0 >> 26 != 0x3d) /* SMEM */
+                continue;
+            op = (w0 >> 18) & 0xff;
+            sbase = (w0 & 0x3f) * 2;
+            i++; /* SMEM is two dwords */
+            if (op != opcode || sbase < 8 || sbase > 15 || !in->user_sgprs[sbase] || (w1 >> 25) != 0x7d /* no SOFFSET */)
+                continue;
+            address = (UINT64)in->user_sgprs[sbase] + (w1 & 0x1fffff);
+            /* In a shadow heap, whatever it holds now: AnyPS5 may have read it empty a moment before. */
+            if (ReboxShadowRead(address, words, sizeof(words)) && (pass || !slot_holds_descriptor(address, 4))
+                    && seen++ == n)
+                return address;
+        }
     }
     return 0;
 }

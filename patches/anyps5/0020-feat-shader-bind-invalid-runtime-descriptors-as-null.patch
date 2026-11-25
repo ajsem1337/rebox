@@ -1,0 +1,262 @@
+From b07560366fb3e3093f7df324f89f23a329003b67 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 09:54:31 +0000
+Subject: [PATCH] feat(shader): bind invalid runtime descriptors as null with
+ APS5_NULL_INVALID_DESCRIPTORS
+
+A host that records a draw before the title writes that draw's
+descriptor table reads the table at record time and finds an earlier
+draw's words still there: a V# where a T# goes, or constants. Such a
+stage failed with "runtime image descriptor is invalid" or "buffer
+descriptor uses an unsupported type", and its draws were skipped,
+though the title writes the right descriptor before the GPU runs.
+
+APS5_NULL_INVALID_DESCRIPTORS=graphics binds a required T# that is not
+an image descriptor, and a V# whose type is not a buffer's (or that
+sets ADD_TID outside compute), as a null descriptor in every stage but
+compute; any other value but 0 does so in every stage. The host then
+fills the slot itself before submitting. Off by default: a shader that
+really reads such words reads zeros instead of failing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  16 +++
+ .../Optimization/src/ResourceMaterializer.cpp |  14 +-
+ .../tests/NullInvalidDescriptorTests.cpp      | 133 ++++++++++++++++++
+ docs/dev/ENVIRONMENT.md                       |   1 +
+ .../feat-shader-null-invalid-descriptors.md   |   5 +
+ 5 files changed, 168 insertions(+), 1 deletion(-)
+ create mode 100644 core/shader/recompiler/tests/NullInvalidDescriptorTests.cpp
+ create mode 100644 docs/dev/debt/changes/feat-shader-null-invalid-descriptors.md
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index 1bba058631..fcf36dcd14 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -500,6 +500,22 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND NOT TARGET null_invalid_descriptor_tests)
++        add_test_executable(null_invalid_descriptor_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/NullInvalidDescriptorTests.cpp")
++        target_link_libraries(null_invalid_descriptor_tests PRIVATE ${target} ${runtimeTarget})
++        target_include_directories(null_invalid_descriptor_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(null_invalid_descriptor_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(null_invalid_descriptor_tests)
++        add_test(NAME null_invalid_descriptor COMMAND null_invalid_descriptor_tests)
++        set_tests_properties(null_invalid_descriptor PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(null_invalid_descriptor_tests PRIVATE libc)
++            set_tests_properties(null_invalid_descriptor PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND NOT TARGET loop_guard_stage_tests)
+         add_test_executable(loop_guard_stage_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/LoopGuardStageTests.cpp")
+         target_link_libraries(loop_guard_stage_tests PRIVATE ${target} ${runtimeTarget})
+diff --git a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+index 6977c0fcb4..bdffcfb240 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+@@ -49,6 +49,13 @@ bool MaterializeProfiled() {
+     return profile;
+ }
+ 
++bool NullInvalidDescriptors(IrShaderStage stage) {
++    const char* value = std::getenv("APS5_NULL_INVALID_DESCRIPTORS");
++    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return false;
++    if (std::strcmp(value, "graphics") == 0) return stage != IrShaderStage::Compute;
++    return true;
++}
++
+ struct DecodedImage {
+     IrTextureNumericClass numericClass = IrTextureNumericClass::Unsupported;
+     RdnaImageDimension dimension = RdnaImageDimension::Unknown;
+@@ -1659,7 +1666,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime,
+             descriptor.dwordCount = 8u;
+         }
+         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(image, descriptor)) {
+-            if (!image.optionalDescriptor || !undefinedImageWords(descriptor)) {
++            if ((!image.optionalDescriptor || !undefinedImageWords(descriptor)) && !NullInvalidDescriptors(plan.stage)) {
+                 char detail[256];
+                 std::snprintf(detail, sizeof(detail), ": image %u first used at pc 0x%x (%s, read %d, written %d, r128 %d), T# %08x %08x %08x %08x %08x %08x %08x %08x", i, image.firstUsePc, image.optionalDescriptor ? "optional" : "required", image.read ? 1 : 0, image.written ? 1 : 0, image.r128 ? 1 : 0, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
+                 throw std::runtime_error(std::string("runtime image descriptor is invalid") + detail);
+@@ -1844,6 +1851,11 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
+             snapshot.buffers.at(i).dwords[1] &= ~0x40000000u;
+             snapshot.buffers.at(i).dwords[3] = 0u;
+         }
++        const auto stored = decodeBufferDescriptor(snapshot.buffers.at(i));
++        if ((stored.Type() != 0u || (plan.stage != IrShaderStage::Compute && stored.AddTid())) && NullInvalidDescriptors(plan.stage)) {
++            auto& words = snapshot.buffers.at(i).dwords;
++            std::fill(words.begin(), words.begin() + 4, 0u);
++        }
+         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
+         if (decoded.Type() != 0u) {
+             const auto& words = snapshot.buffers.at(i).dwords;
+diff --git a/core/shader/recompiler/tests/NullInvalidDescriptorTests.cpp b/core/shader/recompiler/tests/NullInvalidDescriptorTests.cpp
+new file mode 100644
+index 0000000000..8fd0f82b3a
+--- /dev/null
++++ b/core/shader/recompiler/tests/NullInvalidDescriptorTests.cpp
+@@ -0,0 +1,133 @@
++#include "BdaAbi.hpp"
++#include "Recompiler.hpp"
++#include <spirv/unified1/spirv.hpp>
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <exception>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++void SetEnvironment(const char* value) {
++#ifdef _WIN32
++    _putenv_s("APS5_NULL_INVALID_DESCRIPTORS", value == nullptr ? "" : value);
++#else
++    if (value == nullptr) {
++        unsetenv("APS5_NULL_INVALID_DESCRIPTORS");
++    } else {
++        setenv("APS5_NULL_INVALID_DESCRIPTORS", value, 1);
++    }
++#endif
++}
++
++constexpr std::uint32_t TableAddress = 0x20000000u;
++constexpr std::uint32_t OutputAddress = 0x30000000u;
++
++constexpr std::array<std::uint32_t, 10> ImageLoadShader{
++    0xbe850380u, 0xf40c0202u, 0xfa000000u, 0xbf8cc07fu, 0xf0001f08u, 0x00020100u,
++    0xbf8c3f70u, 0xe0701000u, 0x80040100u, 0xbf810000u,
++};
++
++constexpr std::array<std::uint32_t, 10> BufferLoadShader{
++    0xbe850380u, 0xf4080202u, 0xfa000000u, 0xbf8cc07fu, 0xe0301000u, 0x80020100u,
++    0xbf8c3f70u, 0xe0701000u, 0x80040100u, 0xbf810000u,
++};
++
++constexpr std::array<std::uint32_t, 8> StaleBufferWordsAsImage{0x2731fe20u, 0x01380001u, 0x00000001u, 0x31014facu, 0u, 0u, 0u, 0u};
++constexpr std::array<std::uint32_t, 8> ConstantsAsImage{0x3f800000u, 0u, 0u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3dccc000u, 0x3c23d70au};
++constexpr std::array<std::uint32_t, 8> StaleWordsAsBuffer{0xbde8f99eu, 0x3e8e13e4u, 0u, 0x40e4f32cu, 0u, 0u, 0u, 0u};
++
++std::array<std::uint32_t, 20> UserData() {
++    std::array<std::uint32_t, 20> user{};
++    user[4] = TableAddress;
++    user[16] = OutputAddress;
++    user[18] = 1024u;
++    user[19] = 0xfacu | (77u << 12u);
++    return user;
++}
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 8> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityImageQuery, spv::CapabilitySampled1D,
++                                                               spv::CapabilityImage1D, spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++RecompileResult Compile(std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& slot) {
++    static std::array<std::byte, 64u * 1024u> output{};
++    std::vector<std::uint32_t> table(slot.begin(), slot.end());
++    const auto user = UserData();
++    const std::vector<MemoryRegion> regions{{TableAddress, std::as_bytes(std::span<const std::uint32_t>(table))}, {OutputAddress, std::span<const std::byte>(output)}};
++    const ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, code, 0, {}},
++        {32u, 0, std::span<const std::uint32_t>(user), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    return Recompile(request);
++}
++
++std::string Failure(std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& slot) {
++    try {
++        static_cast<void>(Compile(code, slot));
++    } catch (const std::exception& error) {
++        return error.what();
++    }
++    return {};
++}
++
++bool BindsZeroWords(const RecompileResult& result, std::uint32_t words) {
++    return std::ranges::any_of(result.bindings, [&](const DescriptorBinding& binding) {
++        return binding.guestDescriptor.size() == words && std::ranges::all_of(binding.guestDescriptor, [](std::uint32_t word) { return word == 0u; });
++    });
++}
++
++void TestInvalidImagesAreRefusedByDefault() {
++    SetEnvironment(nullptr);
++    Require(Failure(ImageLoadShader, StaleBufferWordsAsImage).find("runtime image descriptor is invalid") != std::string::npos, "a V# read where a T# is required is refused");
++    Require(Failure(ImageLoadShader, ConstantsAsImage).find("runtime image descriptor is invalid") != std::string::npos, "constants read where a T# is required are refused");
++    Require(Failure(BufferLoadShader, StaleWordsAsBuffer).find("buffer descriptor uses an unsupported type") != std::string::npos, "words of a V# type that is not a buffer are refused");
++}
++
++void TestInvalidDescriptorsBecomeNull() {
++    SetEnvironment("1");
++    Require(BindsZeroWords(Compile(ImageLoadShader, StaleBufferWordsAsImage), 8u), "a V# read where a T# is required is bound as a null image");
++    Require(BindsZeroWords(Compile(ImageLoadShader, ConstantsAsImage), 8u), "constants read where a T# is required are bound as a null image");
++    Require(Failure(BufferLoadShader, StaleWordsAsBuffer).empty(), "words of a V# type that is not a buffer are read as a null buffer");
++}
++
++void TestGraphicsLeavesComputeRefused() {
++    SetEnvironment("graphics");
++    Require(Failure(ImageLoadShader, StaleBufferWordsAsImage).find("runtime image descriptor is invalid") != std::string::npos, "graphics leaves a compute program's invalid T# refused");
++    Require(Failure(BufferLoadShader, StaleWordsAsBuffer).find("buffer descriptor uses an unsupported type") != std::string::npos, "graphics leaves a compute program's invalid V# refused");
++    SetEnvironment(nullptr);
++}
++
++}
++
++int main() {
++    TestInvalidImagesAreRefusedByDefault();
++    TestInvalidDescriptorsBecomeNull();
++    TestGraphicsLeavesComputeRefused();
++    std::puts("null invalid descriptor tests passed");
++    return 0;
++}
+diff --git a/docs/dev/ENVIRONMENT.md b/docs/dev/ENVIRONMENT.md
+index 975947d127..f8167cb7c7 100644
+--- a/docs/dev/ENVIRONMENT.md
++++ b/docs/dev/ENVIRONMENT.md
+@@ -68,6 +68,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
+ | `APS5_NO_SRT_TAPE` | presence | `core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp` |  | runs the runtime-source walk of a plan in the IR evaluator instead of the compiled tape |
+ | `APS5_NO_TABLE_RESOLUTION_REUSE` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | stops a result memo miss from reusing an unchanged image table's resolution, so the table is resolved again |
+ | `APS5_NO_TABLE_SNAPSHOT_REUSE` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | turns off the image table snapshot reuse, so every capture reads and compares each table column |
++| `APS5_NULL_INVALID_DESCRIPTORS` | string | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | `graphics` (every stage but compute) or any other non-empty value but `0` (every stage): a required T# that is not an image descriptor, or a V# of a type that is not a buffer (or with `ADD_TID` outside compute), is bound as a null descriptor instead of the compile failing; for hosts that fill the descriptor before the GPU runs the shader |
+ | `APS5_NO_WINDOW_NARROWING` | presence | `core/shader/recompiler/SpirvBackend/src/SpirvMemory/SpirvModuleSetup.cpp` |  | indexes every slot of the shader's vector window instead of only the slots the program uses |
+ | `APS5_PROBE` | string | `core/shader/recompiler/Translation/src/DispatchInstructions.cpp` |  | pc:vgpr[:shift] probe that copies that VGPR into v255 after the instruction so image stores write it as a per-lane trace |
+ | `APS5_RAYTRACING` | string | `core/shader/recompiler/Translation/src/DispatchInstructions.cpp` |  | selects the image_bvh_intersect_ray behaviour: strict throws and miss writes 0xffffffff |
+diff --git a/docs/dev/debt/changes/feat-shader-null-invalid-descriptors.md b/docs/dev/debt/changes/feat-shader-null-invalid-descriptors.md
+new file mode 100644
+index 0000000000..1c9736135a
+--- /dev/null
++++ b/docs/dev/debt/changes/feat-shader-null-invalid-descriptors.md
+@@ -0,0 +1,5 @@
++# shader
++
++## add Functional
++
++- [Invalid runtime descriptors bound as null](../../../core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp) (shader recompiler) - `APS5_NULL_INVALID_DESCRIPTORS=graphics` (or any other value but `0`, for every stage) binds a required T# whose TYPE is not an image's or whose format is undefined, and a V# whose TYPE is not a buffer's (or that sets `ADD_TID` outside compute), as a null descriptor instead of failing the compile with "runtime image descriptor is invalid" or "buffer descriptor uses an unsupported type". A console host that records a draw before the title writes that draw's descriptor table finds the table still holding an earlier draw's words (a V# where a T# goes, constants); the host then has to fill the slot before the GPU runs. A shader that really reads such words reads zeros instead of failing, which hides a wrong table: it is off by default.
+-- 
+2.55.0
+

@@ -145,8 +145,8 @@ How each AnyPS5 binding role is served:
 | BDA page table (59) | the memory that exists: `ReboxGpuAlloc` chunks and the buffers the title made views of, at their GPU VAs, plus each shadow heap's title address mapped to its GPU copy, so a stray address becomes an AnyPS5 fault record instead of a GPU page fault. One table for the process (16,384 ranges, the unused ones empty at the top of the address space; AnyPS5 binary-searches it and checks its length is 4 + 8 × count words), at a fixed address, rewritten in place when what it maps changes |
 | Fault buffer (60), GDS (58) | one of each for the process. The fault record and the SRT guard word (set when a speculated descriptor turns out wrong) are read at each compile, logged (the first 20 of each) and cleared. Faults come from earlier dispatches, so the log doesn't name the shader |
 | ShaderData (62) | its words, as FlattenedSrt |
-| A graphics stage's T# that is empty when the draw is recorded | the dummy texture, and its address (the T# the code's image instructions use n-th, in first-use order as AnyPS5 numbers a binding's elements, traced to the `s_load_dwordx8` off a table SGPR that loaded it) noted: at the next submissions the descriptor there is read again and, once the title has written it (the target title fills a per-draw table after recording the draw, as the console GPU reads it only when it runs), its view's heap slot is written into the draw block |
-| A graphics stage's V# that is empty when the draw is recorded | an empty buffer (reads zero), and its address (the n-th empty V# the code loads, from its `s_load_dwordx4`s off the table SGPRs) noted: at the next submissions the V# there is read again and its address and length are written into the stage's guest buffer table (a video shader's constants come so, with its T#s; read as zero, every frame was black) |
+| A graphics stage's T# that is empty when the draw is recorded, or not a T# (patch 0020 makes it empty) | the dummy texture, and its address (of the T#s the code's image instructions use, in first-use order as AnyPS5 numbers a binding's elements, the n-th whose slot holds no T# now, traced to the `s_load_dwordx8` off a table SGPR that loaded it) noted: at the next submissions the descriptor there is read again and, once the title has written it (the target title fills a per-draw table after recording the draw, as the console GPU reads it only when it runs), its view's heap slot is written into the draw block |
+| A graphics stage's V# that is empty when the draw is recorded, or not a V# (patch 0020) | an empty buffer (reads zero), and its address (the n-th of the code's `s_load_dwordx4`s off the table SGPRs whose slot holds no V# now) noted: at the next submissions the V# there is read again and its address and length are written into the stage's guest buffer table (a video shader's constants come so, with its T#s; read as zero, every frame was black) |
 | Image and sampler tables (261/260/63): T#s and S#s indexed at run time, found by walking tables in guest memory | bound like guest images and samplers, each element at the heap slot holding its words; the map (64) is host data. An empty table is refused with a message |
 | LDS spill (set 1), scratch (set 2) | not supported: the compile fails and the dispatch is skipped, logged once per shader |
 
@@ -319,8 +319,13 @@ stopped this way is logged as `console shader <hash> left a loop at its limit`; 
 turns the guard off and another value sets the limit. With patch 0014, `APS5_LOOP_GUARD=stages`
 gives each stage its own limit instead (128 iterations in pixel programs, 256 in vertex and mesh
 programs, 4096 in compute programs), and `APS5_LOOP_GUARD_PIXEL`, `_VERTEX`, `_MESH` and `_COMPUTE`
-set one stage's. The other patches are listed in
-[patches/anyps5/README.md](../patches/anyps5/README.md).
+set one stage's. Patch 0020's null descriptors are on for graphics stages: `d3d12_xs` sets
+`APS5_NULL_INVALID_DESCRIPTORS=graphics`, so a T# or V# that isn't one when a draw is recorded (the
+target title fills a draw's tables after recording it, and until then they hold an earlier draw's
+words: V#s where T#s go, constants) is bound as a null descriptor instead of refusing the stage, and
+its slot is filled at submission as an empty one's is (the late T#s and V#s above).
+`REBOX_ANYPS5_NULL_INVALID=0` turns it off; compute stages are refused as before. The other patches
+are listed in [patches/anyps5/README.md](../patches/anyps5/README.md).
 
 ## Where AnyPS5 runs
 
