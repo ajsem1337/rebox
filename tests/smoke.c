@@ -4958,6 +4958,100 @@ done:
     free(expected);
 }
 
+/* An A8 glyph atlas placed early in memory nothing watches (a GPU memory chunk, or here the
+ * title's own VirtualAlloc), uploaded once while empty, then many newer single-mip uncompressed
+ * textures, all presumed hot, more than the hot budget: the atlas gains a letter, and the next
+ * submission uploads it. The hot check went from the newest within its budget and never reached
+ * the atlas (a credits sequence without its x-height letters). */
+static void test_placed_atlas_behind_hot(void *dev, void *queue)
+{
+    enum { W = 1024, H = 1024, FILLERS = 48, FW = 512 };
+    D3D12_RESOURCE_DESC ad = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, W, H, 1, 1, DXGI_FORMAT_A8_UNORM, { 1, 0 },
+                               (D3D12_TEXTURE_LAYOUT)0x100 /* the console's linear */ };
+    D3D12_RESOURCE_DESC fd = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, FW, FW, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               (D3D12_TEXTURE_LAYOUT)0x100 };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, W * H, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+    D3D12_HEAP_PROPERTIES readback = { D3D12_HEAP_TYPE_READBACK };
+    ID3D12Resource *atlas = NULL, *fillers[FILLERS] = { 0 }, *buf = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *fence = NULL;
+    void *list = NULL;
+    BYTE *memory = VirtualAlloc(NULL, W * H, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    BYTE *filler = VirtualAlloc(NULL, FW * FW * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), *out = NULL;
+    UINT64 value = 0;
+    UINT differ = W * H;
+    HRESULT hr = memory && filler ? S_OK : E_OUTOFMEMORY;
+
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                   const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, (UINT64)(ULONG_PTR)memory, &ad,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE, NULL, &IID_ID3D12Resource, (void **)&atlas);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                   D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &readback,
+                   D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                   &IID_ID3D12Fence, (void **)&fence);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                   REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, &list);
+    if (FAILED(hr))
+        goto done;
+    /* The atlas uploads empty; then the newer textures, each uploaded once (64 a submission). */
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    for (int i = 0; i < FILLERS; i++)
+    {
+        memset(filler, i, FW * FW * 4);
+        XSLOT(dev, 44, HRESULT, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *,
+              REFIID, void **)(dev, (UINT64)(ULONG_PTR)filler, &fd, D3D12_RESOURCE_STATE_COPY_SOURCE, NULL,
+              &IID_ID3D12Resource, (void **)&fillers[i]);
+    }
+    for (int i = 0; i < 3; i++)
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    /* A letter. */
+    for (int y = 500; y < 516; y++)
+        memset(memory + y * W + 700, 0xff, 12);
+    ID3D12CommandAllocator_Reset(alloc);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { atlas, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+        D3D12_TEXTURE_COPY_LOCATION dst = { buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                            { .PlacedFootprint = { 0, { DXGI_FORMAT_A8_UNORM, W, H, 1, W } } } };
+        XSLOT(list, 16, void, const D3D12_TEXTURE_COPY_LOCATION *, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION *,
+              const D3D12_BOX *)(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, ++value);
+    for (int i = 0; i < 1000 && ID3D12Fence_GetCompletedValue(fence) < value; i++)
+        Sleep(10);
+    if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&out)))
+    {
+        differ = 0;
+        for (int i = 0; i < W * H; i++)
+            differ += out[i] != memory[i];
+        ID3D12Resource_Unmap(buf, 0, NULL);
+    }
+done:
+    CHECK(SUCCEEDED(hr) && !differ, "a glyph atlas placed before more presumed-hot textures than the hot budget holds "
+          "gets its new letter at the next submission (%u texels differ, %#lx)", differ, hr);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (fence) ID3D12Fence_Release(fence);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (buf) ID3D12Resource_Release(buf);
+    for (int i = 0; i < FILLERS; i++)
+        if (fillers[i]) ID3D12Resource_Release(fillers[i]);
+    if (atlas) ID3D12Resource_Release(atlas);
+    if (memory) VirtualFree(memory, 0, MEM_RELEASE);
+    if (filler) VirtualFree(filler, 0, MEM_RELEASE);
+}
+
 /* The older SDK's list has PC's query methods at 28-31 (XValkyrie; a UE5 title calls them): a
  * timestamp through EndQuery (29) and ResolveQueryData (30) reaches a readback buffer. */
 static void test_list_queries(void *dev, void *queue)
@@ -5696,6 +5790,7 @@ static void test_xbox(void)
     test_view_texture_held(dev, queue);
     test_placed_texture_written(dev, queue);
     test_placed_texture_tracked(dev, queue);
+    test_placed_atlas_behind_hot(dev, queue);
     test_list_queries(dev, queue);
     test_mip_major_layout();
     test_console_shader(dev, queue);
