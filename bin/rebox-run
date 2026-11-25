@@ -398,7 +398,10 @@ if [[ -n ${REBOX_FOSSILIZE_DB:-} && -n ${REBOX_FOSSILIZE_DIR:-} ]]; then
         if [[ -f $merged ]]; then
             echo "rebox-run: replaying recorded pipelines ($merged) on $REBOX_FOSSILIZE_REPLAY threads" >&2
             start=$SECONDS
-            timeout "${REBOX_FOSSILIZE_REPLAY_S:-900}" "$REBOX_FOSSILIZE_DIR/bin/fossilize-replay" \
+            # The identity layer stays (the same device features, so the same cache keys), without
+            # its mailbox: that is memory xmem.dll maps inside Wine, and the replay's workers read it
+            # unmapped and crashed.
+            timeout "${REBOX_FOSSILIZE_REPLAY_S:-900}" env -u REBOX_GPUVA_MAILBOX "$REBOX_FOSSILIZE_DIR/bin/fossilize-replay" \
                 --num-threads "$REBOX_FOSSILIZE_REPLAY" --progress "$merged" >&2 || true
             echo "rebox-run: replay took $((SECONDS - start)) s" >&2
         fi
