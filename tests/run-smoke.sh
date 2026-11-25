@@ -5,6 +5,9 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")/.." && pwd)
+# A dev shell exports $out (its output path); the log captured in $out below must not be passed to
+# every command's environment (over 128 KiB, exec fails with E2BIG).
+unset out
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
